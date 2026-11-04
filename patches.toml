@@ -59,6 +59,12 @@ pr = 1084
 sha = "a0476792700411ba0e9362646223ae0a979a0dc8"
 note = "Windows app icon without the macOS rounded-square look."
 
+[[patch]]
+name = "warm-chats-parked-cap"
+pr = 1101
+sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
+note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min (ZERON_PARKED_SESSION_CAP=0 disables); reuses laid-out transcripts on chat switch; model catalogs stay fresh for 10 min."
+
 # Open upstream PRs that conflict with main today. Enable one once it is
 # rebased (or after recording a resolution, see README).
 [[patch]]
