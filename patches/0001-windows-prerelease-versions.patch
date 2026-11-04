@@ -1,0 +1,129 @@
+From d1dd6c62feecf03f7574f2bd9954251b0730040c Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 4 Nov 2026 23:06:11 +0700
+Subject: [PATCH] Windows: accept prerelease versions in the updater and
+ packaging
+
+The Windows updater only staged versions made of dotted numbers, and
+package-windows.ps1 and zeron.iss only read X.Y.Z. A prerelease build
+(0.2.137-nightly.N, 0.2.137-beta.N) could not be packaged or updated to.
+
+- windows.rs: a staged version must parse as a release or prerelease and
+  stay to [0-9A-Za-z.-] (it names the downloaded file); no v prefix.
+- package-windows.ps1 reads an optional -prerelease tail and passes the
+  numeric core to Inno Setup, whose VersionInfoVersion takes numbers only.
+---
+ crates/update/src/windows.rs | 37 ++++++++++++++++++++++++++++++++----
+ dist/windows/zeron.iss       |  6 +++++-
+ scripts/package-windows.ps1  |  7 +++++--
+ 3 files changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
+index 717b6876c..1be2061cc 100644
+--- a/crates/update/src/windows.rs
++++ b/crates/update/src/windows.rs
+@@ -61,11 +61,15 @@ pub async fn stage(
+     manifest: &super::Manifest,
+     directory: &Path,
+ ) -> anyhow::Result<PathBuf> {
++    // The version names the downloaded file, so it stays to dotted numbers
++    // plus an optional prerelease (`0.2.137-nightly.202611041900`).
+     ensure!(
+-        manifest
+-            .version
+-            .split('.')
+-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
++        super::parse_version(&manifest.version).is_some()
++            && !manifest.version.starts_with('v')
++            && manifest
++                .version
++                .bytes()
++                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+         "invalid Windows release version"
+     );
+     let file = artifact(&manifest.version);
+@@ -483,6 +487,31 @@ mod tests {
+         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+     }
+ 
++    #[tokio::test]
++    async fn prerelease_versions_stage_and_unsafe_ones_are_rejected() {
++        for (version, accepted) in [
++            ("0.2.137-nightly.202611041900", true),
++            ("0.2.137-beta.1", true),
++            ("v0.2.137", false),
++            ("0.2.137+build", false),
++            ("0.2.137-../x", false),
++            ("0.2.137/x", false),
++        ] {
++            let dir = tempfile::tempdir().unwrap();
++            let manifest = super::super::Manifest {
++                version: version.into(),
++                ..Default::default()
++            };
++            let error = stage("http://127.0.0.1:1", &manifest, dir.path())
++                .await
++                .unwrap_err()
++                .to_string();
++            // Accepted versions get past the version check to the checksum one.
++            assert_eq!(error.contains("checksum"), accepted, "{version}: {error}");
++            assert_eq!(error.contains("invalid Windows release version"), !accepted);
++        }
++    }
++
+     #[tokio::test]
+     async fn corrupt_download_preserves_install_and_removes_staging() {
+         use std::io::Write;
+diff --git a/dist/windows/zeron.iss b/dist/windows/zeron.iss
+index 703c979db..c309ea46d 100644
+--- a/dist/windows/zeron.iss
++++ b/dist/windows/zeron.iss
+@@ -14,6 +14,10 @@
+ #ifndef AppVersion
+   #error AppVersion must be defined (/DAppVersion=x.y.z)
+ #endif
++#ifndef NumericVersion
++  ; File version resources take numbers only; a prerelease passes its core.
++  #define NumericVersion AppVersion
++#endif
+ #ifndef Arch
+   #error Arch must be defined (/DArch=x86_64 or /DArch=aarch64)
+ #endif
+@@ -42,7 +46,7 @@ AppPublisher=Zeron
+ AppPublisherURL=https://zeron.sh
+ AppSupportURL=https://github.com/zeronsh/zeron/issues
+ AppUpdatesURL=https://github.com/zeronsh/zeron/releases
+-VersionInfoVersion={#AppVersion}
++VersionInfoVersion={#NumericVersion}
+ PrivilegesRequired=lowest
+ DefaultDirName={autopf}\Zeron
+ DisableProgramGroupPage=yes
+diff --git a/scripts/package-windows.ps1 b/scripts/package-windows.ps1
+index 4c5e12211..8c729670c 100644
+--- a/scripts/package-windows.ps1
++++ b/scripts/package-windows.ps1
+@@ -61,11 +61,14 @@ try {
+             $process.Kill()
+             throw 'Executable version probe timed out'
+         }
+-        $versionMatch = [regex]::Match($stdout.Result.Trim(), '\Azeron (\d+\.\d+\.\d+)\z')
++        $versionMatch = [regex]::Match($stdout.Result.Trim(), '\Azeron ((\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?)\z')
+         if ($process.ExitCode -ne 0 -or -not $versionMatch.Success) {
+             throw "Cannot read executable version: $($stderr.Result)"
+         }
+         $version = $versionMatch.Groups[1].Value
++        # Windows file version resources take numbers only, so a prerelease
++        # (0.2.137-nightly.N) stamps its numeric core there.
++        $numericVersion = $versionMatch.Groups[2].Value
+     } finally { $process.Dispose() }
+     $out = Join-Path $root 'target/package'
+     $arch = Get-WindowsPackageArch $probe.FileName
+@@ -84,7 +87,7 @@ try {
+     # The per-user installer wraps the same staged directory (zeron-update.json
+     # included), so installed copies update in place like the portable zip.
+     $iscc = Find-InnoSetupCompiler
+-    & $iscc /Qp "/DAppVersion=$version" "/DArch=$arch" `
++    & $iscc /Qp "/DAppVersion=$version" "/DNumericVersion=$numericVersion" "/DArch=$arch" `
+         "/DPackageDir=$([IO.Path]::GetFullPath($stage))" `
+         "/DOutputDir=$([IO.Path]::GetFullPath($out))" `
+         ([IO.Path]::GetFullPath((Join-Path $root 'dist/windows/zeron.iss')))

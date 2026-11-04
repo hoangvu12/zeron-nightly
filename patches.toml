@@ -1,0 +1,46 @@
+# What goes into Zeron nightly, applied in this order on top of upstream.
+#
+# Each [[patch]] is one of:
+#   pr = N, sha = "..."   an upstream pull request, merged at the pinned commit.
+#                         Pinning means a later push to the PR cannot reach your
+#                         machine until you review it and move the pin.
+#   file = "patches/..."  a patch in this repo, applied with `git am -3`.
+#   branch = "name"       a branch of this repo, merged at its tip.
+#
+# `enabled = false` keeps an entry without applying it. A patch that no longer
+# applies is dropped from that night's build and listed in the release notes;
+# the rest of the build goes on without it.
+
+[upstream]
+repo = "zeronsh/zeron"
+branch = "main"
+
+[nightly]
+repo = "hoangvu12/zeron-nightly"
+
+[[patch]]
+name = "windows-prerelease-versions"
+file = "patches/0001-windows-prerelease-versions.patch"
+note = "Lets the Windows updater and packaging take 0.2.137-nightly.N versions. Needed by every nightly."
+
+[[patch]]
+name = "large-plain-folder-index"
+pr = 1196
+sha = "44d08d24675660638e957b0ef42c638188e70bce"
+note = "Walk-based index for large plain folders, kept current with a watch. Stacked on #1184."
+
+# Open upstream PRs that conflict with main today. Enable one once it is
+# rebased (or after recording a resolution, see README).
+[[patch]]
+name = "slash-command-latency"
+pr = 927
+sha = ""
+enabled = false
+note = "Kill discovery probes, cache command catalogs. Conflicts with main."
+
+[[patch]]
+name = "engine-streaming-storage-idle"
+pr = 1127
+sha = ""
+enabled = false
+note = "Incremental transcript mirror, delta-log snapshots, quieter idle. Big; conflicts with main."

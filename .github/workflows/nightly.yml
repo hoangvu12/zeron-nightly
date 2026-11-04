@@ -1,0 +1,155 @@
+name: nightly
+
+# Upstream main + patches.toml, assembled from scratch (scripts/assemble.py),
+# built for Windows and published as a release. Installed nightlies update from
+# this repo's releases/latest/download (manifest.json + the .exe it names).
+
+on:
+  schedule:
+    - cron: "0 19 * * *" # 02:00 in Vietnam
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if upstream and the patch list are unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/zeronsh/zeron.git
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # `secrets` is not valid in step `if:`; surface it through env.
+      PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+    outputs:
+      version: ${{ steps.assemble.outputs.version }}
+      head: ${{ steps.assemble.outputs.head }}
+      build: ${{ steps.changed.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+      - name: clone upstream
+        run: git clone --quiet --filter=blob:none "$UPSTREAM" src
+      - name: assemble
+        id: assemble
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/scripts/assemble.py --src src --report report.md
+      - name: skip when nothing changed
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINGERPRINT: ${{ steps.assemble.outputs.fingerprint }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          last=$(gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null \
+            | sed -n 's/.*<!-- fingerprint: \([0-9a-f]*\) -->.*/\1/p')
+          if [ "$FORCE" = "true" ] || [ "$last" != "$FINGERPRINT" ]; then
+            echo build=true >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream and patches unchanged since the last nightly ($last); skipping."
+            echo build=false >> "$GITHUB_OUTPUT"
+          fi
+      - name: bundle the nightly commits
+        if: steps.changed.outputs.build == 'true'
+        run: git -C src bundle create ../nightly.bundle nightly ^refs/nightly/upstream
+      - uses: actions/upload-artifact@v4
+        if: steps.changed.outputs.build == 'true'
+        with:
+          name: source
+          path: |
+            nightly.bundle
+            report.md
+          if-no-files-found: error
+      # Optional: the default token cannot push upstream's workflow files, so
+      # publishing the branch needs a token with the Workflows permission.
+      - name: push the nightly branch
+        if: steps.changed.outputs.build == 'true' && env.PUSH_TOKEN != ''
+        run: git -C src push --force "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" nightly:refs/heads/nightly
+
+  windows:
+    needs: assemble
+    if: needs.assemble.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: source
+          path: source
+      - name: check out the assembled nightly
+        run: |
+          git clone --quiet --filter=blob:none $env:UPSTREAM src
+          git -C src fetch --quiet ../source/nightly.bundle nightly:nightly
+          git -C src checkout --quiet nightly
+          if ((git -C src rev-parse HEAD) -ne '${{ needs.assemble.outputs.head }}') { throw 'bundle does not match the assembled head' }
+      - name: rust toolchain (rust-toolchain.toml)
+        working-directory: src
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src -> target
+      - name: updater tests
+        working-directory: src
+        run: cargo test --locked -p zeron-update
+      - name: package installer, portable zip and updater exe
+        working-directory: src
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            src/target/package/*.exe
+            src/target/package/*.zip
+            src/target/package/manifest.json
+          if-no-files-found: error
+
+  publish:
+    needs: [assemble, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.assemble.outputs.version }}
+      PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release
+        run: |
+          # The tag needs a commit in this repo: the nightly head once the
+          # branch is pushed, otherwise the tooling commit that built it.
+          target="$GITHUB_SHA"
+          if [ -n "$PUSH_TOKEN" ]; then target="${{ needs.assemble.outputs.head }}"; fi
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$target" \
+            --title "Zeron $VERSION" --notes-file dist/report.md --latest \
+            dist/*.exe dist/*.zip dist/manifest.json dist/nightly.bundle
+      - name: keep the last 14 nightlies
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[14:] | .[].tagName' |
+          while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done
