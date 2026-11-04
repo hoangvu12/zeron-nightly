@@ -29,6 +29,36 @@ pr = 1196
 sha = "44d08d24675660638e957b0ef42c638188e70bce"
 note = "Walk-based index for large plain folders, kept current with a watch. Stacked on #1184."
 
+[[patch]]
+name = "diff-capture-orphaned-git"
+pr = 1220
+sha = "1013fbb55308cddde91d665636f73807b10b86ce"
+note = "Closes git's stdout before waiting when a diff capture truncates, so Windows stops leaving git.exe behind."
+
+[[patch]]
+name = "dead-run-shimmer"
+pr = 840
+sha = "febdceb6e950f123f5cbc5f78d3a031d4a70a919"
+note = "Stops the tool-group shimmer on dead runs, which kept repainting at 30 fps."
+
+[[patch]]
+name = "flaky-test-fixes"
+pr = 869
+sha = "b9f2c4b89f526f9d7d64d0e2a7496da99cc84c31"
+note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests."
+
+[[patch]]
+name = "composer-click-through"
+pr = 1191
+sha = "92ea6927e59bffc5df0017b64da949bc4833e11d"
+note = "Clicks in the composer no longer open images underneath it."
+
+[[patch]]
+name = "windows-icon"
+pr = 1084
+sha = "a0476792700411ba0e9362646223ae0a979a0dc8"
+note = "Windows app icon without the macOS rounded-square look."
+
 # Open upstream PRs that conflict with main today. Enable one once it is
 # rebased (or after recording a resolution, see README).
 [[patch]]
