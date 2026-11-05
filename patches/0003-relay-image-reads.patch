@@ -1,0 +1,386 @@
+From 856681736312eb99d2e8ecbc809db57034b4fb9c Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Fri, 6 Nov 2026 05:03:38 +0700
+Subject: [PATCH] Images from another device load in a few round trips, not one
+ per chunk
+
+Over the relay each chunk read is a round trip (~100 ms between two
+networks), and the app read a remote image's 45 KB chunks one after
+another: a 1 MB image waited 23 times in a row.
+
+- engine: ReadAttachmentChunk and ReadChatImageChunk replies carry the
+  file's `size`.
+- ui/attachments.rs: after the first chunk, the rest are asked for 8 at a
+  time and joined in order. With a size, exactly the chunks the file has;
+  from an older engine without one, reads run ahead to the chunk that says
+  `done` (at most a window past the end). A later chunk that fails is
+  retried twice, so a relay link dropping mid-image costs a retry, not the
+  image. A chunk that doesn't line up fails the image rather than tearing
+  it.
+
+Nothing changes on the relay or the edge.
+
+Tests: ui chunks_are_read_several_at_a_time_and_retried_when_dropped,
+ui attachments (36), reply_image (2), transcript (136/137; the one
+failure, expanded_tool_call_text_drag_selects, passes alone 3/3), engine
+reply_images (4), uploads:: (15), chat_image (1), e2e image tests (2),
+device_routing relayed image size (the test's later terminal step still
+times out on Windows, as before).
+---
+ crates/engine/src/reply_images.rs     |   1 +
+ crates/engine/src/rpc.rs              |   6 +-
+ crates/engine/src/uploads.rs          |   4 +
+ crates/engine/tests/device_routing.rs |   2 +
+ crates/ui/src/attachments.rs          | 240 ++++++++++++++++++++++----
+ 5 files changed, 221 insertions(+), 32 deletions(-)
+
+diff --git a/crates/engine/src/reply_images.rs b/crates/engine/src/reply_images.rs
+index ea9340578..b66dfd94d 100644
+--- a/crates/engine/src/reply_images.rs
++++ b/crates/engine/src/reply_images.rs
+@@ -260,6 +260,7 @@ pub(crate) fn read_chunk(
+         data: BASE64.encode(&buf),
+         next_offset,
+         done: next_offset >= size,
++        size,
+     })
+ }
+ 
+diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
+index eee71f30c..017be6031 100644
+--- a/crates/engine/src/rpc.rs
++++ b/crates/engine/src/rpc.rs
+@@ -37,10 +37,10 @@
+ //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
+ //!   `UploadCommit {uploadId, fileName}` → `{path}`,
+ //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
+-//!   done}` (path-jailed to the uploads dir + workspace-known chat cwds),
++//!   done, size}` (path-jailed to the uploads dir + workspace-known chat cwds),
+ //!   `ReadChatImageChunk {chatId, path, offset}` → the same reply, for an image
+-//!   a reply names in Markdown (jailed to that one chat's working folder, no
+-//!   link followed).
++//!   a reply names in Markdown (any local file on the chat's host; see
++//!   `reply_images`).
+ //! - Tool outputs: `ReadToolOutput {chatId, toolId, offset}` → `ToolOutputChunk`
+ //!   (`{text, nextOffset, done, bytes, lines, trimmed, exitCode?}`): one command's
+ //!   whole output from this host's run journal, redacted as the doc's tail is
+diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
+index a79d1deb1..f0f426a37 100644
+--- a/crates/engine/src/uploads.rs
++++ b/crates/engine/src/uploads.rs
+@@ -96,6 +96,9 @@ pub struct AttachmentChunk {
+     pub data: String,
+     pub next_offset: u64,
+     pub done: bool,
++    /// The whole file's size, so a remote reader can ask for every chunk
++    /// at once rather than one round trip after another.
++    pub size: u64,
+ }
+ 
+ struct UploadsInner {
+@@ -276,6 +279,7 @@ impl Uploads {
+             data: BASE64.encode(&buf),
+             next_offset,
+             done: next_offset >= size,
++            size,
+         })
+     }
+ 
+diff --git a/crates/engine/tests/device_routing.rs b/crates/engine/tests/device_routing.rs
+index 0b3c018dd..ab7aadd5b 100644
+--- a/crates/engine/tests/device_routing.rs
++++ b/crates/engine/tests/device_routing.rs
+@@ -878,6 +878,8 @@ async fn target_device_id_routes_over_the_relay() {
+         .unwrap();
+     assert_eq!(remote_picture, local_picture);
+     assert_eq!(remote_picture["mimeType"], "image/png");
++    // The size crosses too: A's app asks for the rest of the chunks at once.
++    assert_eq!(remote_picture["size"], payload.len());
+     // A doesn't host that chat, so it never serves it itself.
+     assert!(
+         client
+diff --git a/crates/ui/src/attachments.rs b/crates/ui/src/attachments.rs
+index 98f8af42f..e966a7eb3 100644
+--- a/crates/ui/src/attachments.rs
++++ b/crates/ui/src/attachments.rs
+@@ -628,9 +628,8 @@ pub struct LoadedAttachmentImage {
+     pub image: Arc<Image>,
+ }
+ 
+-/// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
+-/// the same stuck-offset guard as zeron's `readAttachmentImage`). Returns the
+-/// file's name, MIME type and bytes.
++/// `ReadAttachmentChunk` reads, several at a time (see [`read_chunks`]).
++/// Returns the file's name, MIME type and bytes.
+ pub(crate) async fn read_attachment_bytes(
+     engine: &EngineHandle,
+     executor: &BackgroundExecutor,
+@@ -649,8 +648,43 @@ pub(crate) async fn read_attachment_bytes(
+     .await
+ }
+ 
++/// Chunk reads in flight at once after the first. Over the relay each read is
++/// a round trip (~100 ms between two networks), so one at a time made a 1 MB
++/// image 23 waits in a row.
++const READ_CONCURRENCY: usize = 8;
++/// Tries per chunk after the first: a relay link that drops mid-image costs
++/// a retry, not the image.
++const READ_CHUNK_ATTEMPTS: u32 = 3;
++
++/// One `{name, mimeType, data, nextOffset, done, size?}` reply. `size` is
++/// absent from engines older than the field.
++struct ReadChunk {
++    name: String,
++    mime: String,
++    data: String,
++    next_offset: u64,
++    done: bool,
++    size: Option<u64>,
++}
++
++impl ReadChunk {
++    fn parse(reply: &serde_json::Value) -> Option<Self> {
++        Some(Self {
++            name: reply.get("name")?.as_str()?.to_string(),
++            mime: reply.get("mimeType")?.as_str()?.to_string(),
++            data: reply.get("data")?.as_str()?.to_string(),
++            next_offset: reply.get("nextOffset")?.as_u64()?,
++            done: reply.get("done")?.as_bool()?,
++            size: reply.get("size").and_then(|size| size.as_u64()),
++        })
++    }
++}
++
+ /// The chunk loop behind [`read_attachment_bytes`], for any method that
+-/// answers `{name, mimeType, data, nextOffset, done}` at an `offset`.
++/// answers `{name, mimeType, data, nextOffset, done}` at an `offset`. The
++/// first reply sets the chunk size (and, from a current host, the file's);
++/// the rest are asked for [`READ_CONCURRENCY`] at a time and joined in order.
++/// Without a size, reads run ahead to the chunk that says `done`.
+ async fn read_chunks(
+     engine: &EngineHandle,
+     executor: &BackgroundExecutor,
+@@ -659,40 +693,75 @@ async fn read_chunks(
+     request: serde_json::Value,
+     expected_raster_mime: Option<&str>,
+ ) -> Option<(String, String, Vec<u8>)> {
+-    let mut name = String::new();
+-    let mut mime = String::new();
+-    let mut b64 = String::new();
+-    let mut offset = 0u64;
+-    let mut done = false;
+-    for _ in 0..MAX_READ_CHUNKS {
++    use futures::StreamExt as _;
++    let read = |offset: u64| {
+         let mut params = request.clone();
+         params["offset"] = offset.into();
+         let params = with_target(params, target_device_id);
+-        let chunk = call_with_timeout(engine, executor, method, params, READ_CHUNK_TIMEOUT)
+-            .await
+-            .ok()?;
+-        name = chunk.get("name")?.as_str()?.to_string();
+-        mime = chunk.get("mimeType")?.as_str()?.to_string();
+-        if expected_raster_mime.is_some_and(|expected| expected != mime) {
+-            return None;
++        async move {
++            let reply =
++                call_with_timeout(engine, executor, method, params, READ_CHUNK_TIMEOUT).await?;
++            ReadChunk::parse(&reply).ok_or_else(|| format!("{method} sent a malformed chunk"))
+         }
+-        let data = chunk.get("data")?.as_str()?;
+-        if b64.len().saturating_add(data.len()) > (MAX_ATTACHMENT_BYTES as usize).div_ceil(3) * 4 {
++    };
++    let max_b64 = (MAX_ATTACHMENT_BYTES as usize).div_ceil(3) * 4;
++    // The first read isn't retried: a refusal comes back here, and
++    // repeating it changes nothing.
++    let first = read(0).await.ok()?;
++    if expected_raster_mime.is_some_and(|expected| expected != first.mime)
++        || first.data.len() > max_b64
++    {
++        return None;
++    }
++    let (name, mime) = (first.name, first.mime);
++    let mut b64 = first.data;
++    if !first.done {
++        let step = first.next_offset;
++        if step == 0 {
+             return None;
+         }
+-        b64.push_str(data);
+-        done = chunk.get("done")?.as_bool()?;
+-        if done {
+-            break;
++        let (size, read) = (first.size, &read);
++        let offsets = (1..MAX_READ_CHUNKS as u64)
++            .map(|k| k * step)
++            .take_while(|offset| size.is_none_or(|size| *offset < size));
++        let mut rest = futures::stream::iter(offsets)
++            .map(|offset| async move {
++                let mut attempt = 1;
++                loop {
++                    match read(offset).await {
++                        Ok(chunk) => return Ok((offset, chunk)),
++                        Err(err) if attempt < READ_CHUNK_ATTEMPTS => {
++                            tracing::warn!(error = %err, offset, attempt, "image chunk retry");
++                            executor
++                                .timer(Duration::from_millis(100 * attempt as u64))
++                                .await;
++                            attempt += 1;
++                        }
++                        Err(err) => return Err(err),
++                    }
++                }
++            })
++            .buffered(READ_CONCURRENCY);
++        let mut done = false;
++        while let Some(chunk) = rest.next().await {
++            let (offset, chunk) = chunk.ok()?;
++            // A chunk that doesn't line up means the file changed under the
++            // read (or the host chunks differently): no image beats a torn one.
++            if chunk.mime != mime || b64.len().saturating_add(chunk.data.len()) > max_b64 {
++                return None;
++            }
++            b64.push_str(&chunk.data);
++            if chunk.done {
++                done = true;
++                break;
++            }
++            if chunk.next_offset != offset + step {
++                return None;
++            }
+         }
+-        let next = chunk.get("nextOffset")?.as_u64()?;
+-        if next <= offset {
++        if !done {
+             return None;
+         }
+-        offset = next;
+-    }
+-    if !done {
+-        return None;
+     }
+     // Callers await this on the UI thread; decode the (up to 24 MiB) payload
+     // off it.
+@@ -1962,6 +2031,119 @@ mod generated_image_tests {
+         }
+     }
+ 
++    /// A host answering in 45 000-byte chunks, slowly enough for reads to
++    /// overlap, failing the offsets in `drops` once each (`u32::MAX` times
++    /// for those in `dead`).
++    struct ChunkedRpc {
++        bytes: Vec<u8>,
++        sends_size: bool,
++        drops: Mutex<Vec<u64>>,
++        dead: Vec<u64>,
++        offsets: Mutex<Vec<u64>>,
++        in_flight: std::sync::atomic::AtomicUsize,
++        peak: std::sync::atomic::AtomicUsize,
++    }
++
++    impl ChunkedRpc {
++        fn new(bytes: Vec<u8>, sends_size: bool, drops: Vec<u64>, dead: Vec<u64>) -> Self {
++            Self {
++                bytes,
++                sends_size,
++                drops: Mutex::new(drops),
++                dead,
++                offsets: Mutex::new(vec![]),
++                in_flight: Default::default(),
++                peak: Default::default(),
++            }
++        }
++    }
++
++    #[async_trait::async_trait]
++    impl zeron_rpc::RpcService for ChunkedRpc {
++        async fn handle(
++            &self,
++            _: &str,
++            params: serde_json::Value,
++        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
++            use std::sync::atomic::Ordering::SeqCst;
++            let offset = params["offset"].as_u64().unwrap();
++            self.offsets.lock().unwrap().push(offset);
++            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
++            self.peak.fetch_max(now, SeqCst);
++            tokio::time::sleep(Duration::from_millis(5)).await;
++            self.in_flight.fetch_sub(1, SeqCst);
++            let dropped = {
++                let mut drops = self.drops.lock().unwrap();
++                let at = drops.iter().position(|dropped| *dropped == offset);
++                at.map(|at| drops.remove(at)).is_some()
++            };
++            if dropped || self.dead.contains(&offset) {
++                return Err(zeron_rpc::RpcError::Failed("link dropped".into()));
++            }
++            let size = self.bytes.len() as u64;
++            let start = offset.min(size);
++            let next = (start + 45_000).min(size);
++            let mut reply = serde_json::json!({
++                "name": "shot.png",
++                "mimeType": "image/png",
++                "data": BASE64.encode(&self.bytes[start as usize..next as usize]),
++                "nextOffset": next,
++                "done": next >= size,
++            });
++            if self.sends_size {
++                reply["size"] = size.into();
++            }
++            zeron_rpc::RpcReply::value(&reply)
++        }
++    }
++
++    #[tokio::test]
++    async fn chunks_are_read_several_at_a_time_and_retried_when_dropped() {
++        use std::sync::atomic::Ordering::SeqCst;
++        let executor = gpui_platform::background_executor();
++        let bytes: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
++        let chunks = bytes.len().div_ceil(45_000);
++        for sends_size in [true, false] {
++            let host = Arc::new(ChunkedRpc::new(
++                bytes.clone(),
++                sends_size,
++                vec![90_000],
++                vec![],
++            ));
++            let engine = EngineHandle::from_test_client(zeron_rpc::memory_client(host.clone()));
++            let (_, _, read) =
++                read_attachment_bytes(&engine, &executor, Some("pc"), "/a.png", None)
++                    .await
++                    .unwrap();
++            assert_eq!(read, bytes, "sends_size: {sends_size}");
++            let offsets = host.offsets.lock().unwrap().clone();
++            // Every chunk once, the dropped one twice; without a size, at
++            // most a window's worth of reads run past the end.
++            let extra = offsets.len() - (chunks + 1);
++            if sends_size {
++                assert_eq!(extra, 0);
++            } else {
++                assert!(extra < READ_CONCURRENCY, "{extra} reads past the end");
++            }
++            let peak = host.peak.load(SeqCst);
++            assert!((2..=READ_CONCURRENCY).contains(&peak), "peak {peak}");
++        }
++
++        // A chunk that never arrives fails the image rather than tearing it.
++        let host = Arc::new(ChunkedRpc::new(bytes.clone(), true, vec![], vec![450_000]));
++        let engine = EngineHandle::from_test_client(zeron_rpc::memory_client(host.clone()));
++        assert!(
++            read_attachment_bytes(&engine, &executor, None, "/a.png", None)
++                .await
++                .is_none()
++        );
++        let offsets = host.offsets.lock().unwrap();
++        assert_eq!(
++            offsets.iter().filter(|offset| **offset == 450_000).count(),
++            READ_CHUNK_ATTEMPTS as usize
++        );
++    }
++
+     #[test]
+     fn generated_image_cancelled_load_releases_claim_without_losing_completed_images() {
+         let owner = "cancelled-generated-owner";
+-- 
+2.52.0.windows.1
+

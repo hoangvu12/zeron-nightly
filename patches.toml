@@ -76,6 +76,11 @@ name = "markdown-reply-images"
 file = "patches/0002-markdown-reply-images.patch"
 note = "Markdown images in replies (`![alt](path)`) show from any local folder on the chat's host (network and device paths still refused), and the host keeps a copy when the reply finishes so they outlive their files. Relative paths work in scratch chats; agents are told to use Markdown instead of show_image. Desktop only; not upstream."
 
+[[patch]]
+name = "relay-image-reads"
+file = "patches/0003-relay-image-reads.patch"
+note = "Images from a chat on another device load in a few relay round trips instead of one per 45 KB chunk: the host reports the file's size and the app asks for 8 chunks at a time, retrying a chunk the relay drops. Works against older hosts too (without the size). Nothing changes on the relay. Desktop only; not upstream. Applies on top of markdown-reply-images."
+
 # Open upstream PRs that conflict with main today. Enable one once it is
 # rebased (or after recording a resolution, see README).
 [[patch]]
