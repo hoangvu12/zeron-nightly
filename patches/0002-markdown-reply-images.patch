@@ -1,0 +1,1316 @@
+From b61ea9bedf8b49828dc08fb63d34dbf419ffddd3 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 5 Nov 2026 23:19:58 +0700
+Subject: [PATCH] Markdown images in replies: any local folder, kept when the
+ reply finishes
+
+An image a reply names in Markdown (`![alt](path)`) showed only when the
+file sat inside the chat's own folder, was read live from the file each
+time, and a relative path in a projectless (scratch) chat stayed a link.
+Agents reached for show_image instead: one tool call per picture.
+
+- engine/reply_images.rs (new): a reply's image paths resolve on the
+  chat's host from any local folder: absolute, `~/...`, or relative to
+  the chat's folder. Still refused: URLs, network (UNC) and device paths,
+  and a link that leads to one (each component is lstat'ed; links to
+  local paths are followed). Only PNG/JPEG/WebP/GIF by extension and
+  first bytes, at most 10 MB.
+- When a reply segment finishes, the host copies each image it names (up
+  to 8) to {uploads}/reply-images/, named by chat and resolved path, so
+  it outlives its file. Same name every time: a replay or restart
+  rewrites, never adds. ReadChatImageChunk serves that copy first, else
+  the file.
+- rpc.rs: the chat's folder only joins relative paths now; the host
+  check (only the chat's host answers) stays.
+- ui/reply_images.rs: `~/...` and relative paths the UI can't expand (a
+  scratch chat's `~/.zeron/scratch/...` folder) go to the host as
+  written.
+- mcp: the instructions tell agents to show an image file as a Markdown
+  image; show_image stays available.
+
+Tests: engine reply_images (4), uploads (15), rpc chat_image (1), e2e
+chat_images_come_from_any_folder_of_their_chats_host and
+a_finished_replys_images_outlive_their_files, zeron-mcp (59).
+---
+ crates/engine/src/lib.rs          |   1 +
+ crates/engine/src/reply_images.rs | 423 ++++++++++++++++++++++++++++++
+ crates/engine/src/rpc.rs          | 128 +++------
+ crates/engine/src/sessions.rs     |  33 ++-
+ crates/engine/src/uploads.rs      | 223 +---------------
+ crates/engine/tests/e2e.rs        | 130 +++++++--
+ crates/mcp/src/jsonrpc.rs         |   6 +-
+ crates/ui/src/reply_images.rs     |  50 ++--
+ 8 files changed, 636 insertions(+), 358 deletions(-)
+ create mode 100644 crates/engine/src/reply_images.rs
+
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 938abb2a5..3a3e28d3d 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -61,6 +61,7 @@ pub mod profile;
+ pub mod project_actions;
+ pub mod registry;
+ pub mod remote_terminals;
++mod reply_images;
+ pub mod repos;
+ pub mod rpc;
+ pub mod run_journal;
+diff --git a/crates/engine/src/reply_images.rs b/crates/engine/src/reply_images.rs
+new file mode 100644
+index 000000000..ea9340578
+--- /dev/null
++++ b/crates/engine/src/reply_images.rs
+@@ -0,0 +1,423 @@
++//! Images an agent's reply names in Markdown (`![alt](path)`), from any
++//! local folder on the chat's host.
++//!
++//! The UI asks the chat's host for each one (`ReadChatImageChunk`, relayed
++//! when the chat runs on another device). When a reply segment finishes, the
++//! host also keeps a copy of each image it names under
++//! `{uploads}/reply-images/`, named by chat and resolved path, so the picture
++//! outlives its file. A read serves that copy when there is one, the file
++//! otherwise. Keeping runs once per finished segment and always writes the
++//! same name, so a replay or a restart rewrites a copy rather than adding one.
++//!
++//! Any local path is allowed: absolute, `~/…`, or relative to the chat's
++//! folder. Still refused: URLs, network (UNC) and device paths, and links
++//! that lead to one, since merely opening `\\host\share\…` sends the user's
++//! credentials to that host. Only a PNG, JPEG, WebP, or GIF by its extension
++//! AND its first bytes, of at most [`zeron_proto::IMAGE_MAX_BYTES`].
++
++use std::collections::VecDeque;
++use std::ffi::OsString;
++use std::io::{Read, Seek, Write};
++use std::path::{Path, PathBuf};
++
++use base64::Engine as _;
++use base64::engine::general_purpose::STANDARD as BASE64;
++use sha2::{Digest, Sha256};
++
++use crate::EngineError;
++use crate::uploads::{
++    AttachmentChunk, READ_CHUNK_BYTES, lexical_components, mime_by_ext, raster_signature,
++};
++
++/// Where the kept copies live, under the uploads dir.
++const KEPT_DIR: &str = "reply-images";
++/// Images kept per finished segment; any past these are still read live.
++const MAX_KEPT: usize = 8;
++/// Links followed while resolving one path.
++const MAX_LINKS: usize = 40;
++
++/// The image sources `text` names (`![alt](src)`, `![alt](<src>)`), in
++/// order and once each, outside fenced code.
++pub(crate) fn sources(text: &str) -> Vec<String> {
++    let mut out: Vec<String> = Vec::new();
++    let mut fence: Option<&str> = None;
++    for line in text.lines() {
++        let trimmed = line.trim_start();
++        if let Some(marker) = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m)) {
++            match fence {
++                Some(open) if open == marker => fence = None,
++                None => fence = Some(marker),
++                Some(_) => {}
++            }
++            continue;
++        }
++        if fence.is_some() {
++            continue;
++        }
++        let mut rest = line;
++        while let Some(start) = rest.find("![") {
++            rest = &rest[start + 2..];
++            let Some(close) = rest.find("](") else { break };
++            rest = &rest[close + 2..];
++            let source = if let Some(inner) = rest.strip_prefix('<') {
++                let Some(end) = inner.find('>') else { break };
++                rest = &inner[end + 1..];
++                &inner[..end]
++            } else {
++                let end = rest
++                    .find(|c: char| c == ')' || c.is_whitespace())
++                    .unwrap_or(rest.len());
++                let (source, after) = rest.split_at(end);
++                rest = after;
++                source
++            };
++            let source = source.trim();
++            if !source.is_empty() && !out.iter().any(|known| known == source) {
++                out.push(source.to_owned());
++            }
++        }
++    }
++    out
++}
++
++/// Where `source` points on this host, lexically (no filesystem call):
++/// absolute, `~/…`, or relative to the chat's `folder`. `None` for a URL, a
++/// network or device path, or a relative path with no folder to join.
++pub(crate) fn resolve(source: &str, folder: Option<&Path>) -> Option<PathBuf> {
++    let source = source.trim();
++    if has_scheme(source) {
++        return None;
++    }
++    let path = match source.strip_prefix('~') {
++        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
++            crate::repos::session_home_dir()
++                .ok()?
++                .join(rest.trim_start_matches(['/', '\\']))
++        }
++        Some(_) => return None,
++        None if Path::new(source).is_absolute() => PathBuf::from(source),
++        None => folder?.join(source),
++    };
++    Some(lexical_components(&path)?.into_iter().collect())
++}
++
++/// `http:`, `file:`, `data:`…; a drive letter (`C:\`) is not one.
++fn has_scheme(source: &str) -> bool {
++    source.split_once(':').is_some_and(|(scheme, _)| {
++        scheme.len() > 1
++            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
++            && scheme
++                .chars()
++                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
++    })
++}
++
++/// A resolved path's anchor (`C:` + `\` on Windows, `/` elsewhere) and the
++/// names below it.
++fn split_anchor(mut parts: Vec<OsString>) -> (PathBuf, Vec<OsString>) {
++    let names = parts.split_off(if cfg!(windows) { 2 } else { 1 }.min(parts.len()));
++    (parts.into_iter().collect(), names)
++}
++
++/// `path` with each link on it followed, `lstat`ing every component before
++/// anything opens it: a link (a Windows junction counts) to a network or
++/// device path is refused unfollowed, as is a Windows device name or a loop.
++/// `None` when part of it doesn't exist.
++fn local_target(path: &Path) -> Option<PathBuf> {
++    let (mut walked, names) = split_anchor(lexical_components(path)?);
++    let mut pending: VecDeque<OsString> = names.into();
++    let mut links = 0;
++    while let Some(name) = pending.pop_front() {
++        #[cfg(windows)]
++        if crate::uploads::is_windows_device_name(&name) {
++            return None;
++        }
++        walked.push(&name);
++        if !std::fs::symlink_metadata(&walked)
++            .ok()?
++            .file_type()
++            .is_symlink()
++        {
++            continue;
++        }
++        links += 1;
++        if links > MAX_LINKS {
++            return None;
++        }
++        let target = std::fs::read_link(&walked).ok()?;
++        walked.pop();
++        let (anchor, names) = split_anchor(lexical_components(&walked.join(target))?);
++        walked = anchor;
++        pending = names.into_iter().chain(pending).collect();
++    }
++    Some(walked)
++}
++
++/// The type of the image at `file` (a path with no links left on it), when
++/// it is one a reply may show.
++fn checked(file: &Path) -> Result<&'static str, EngineError> {
++    let refused = |why: &str| EngineError::Other(why.into());
++    let meta = std::fs::metadata(file)?;
++    if !meta.is_file() {
++        return Err(refused("Image is not a file"));
++    }
++    if meta.len() > zeron_proto::IMAGE_MAX_BYTES as u64 {
++        return Err(refused("Image is too large"));
++    }
++    let mime = mime_by_ext(file)
++        .filter(|mime| {
++            matches!(
++                *mime,
++                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
++            )
++        })
++        .ok_or_else(|| refused("Not a PNG, JPEG, WebP, or GIF image"))?;
++    let mut head = Vec::with_capacity(12);
++    std::fs::File::open(file)?.take(12).read_to_end(&mut head)?;
++    if raster_signature(&head).map(|(_, mime)| mime) != Some(mime) {
++        return Err(refused("Image content doesn't match its name"));
++    }
++    Ok(mime)
++}
++
++/// Where the copy of `path` a reply in `chat_id` names is kept.
++fn kept(uploads_dir: &Path, chat_id: &str, path: &Path) -> Option<PathBuf> {
++    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
++    let key = Sha256::digest(format!("{chat_id}\0{}", path.display()).as_bytes());
++    Some(uploads_dir.join(KEPT_DIR).join(format!("{key:x}.{ext}")))
++}
++
++/// Keep a copy of each image `text` names (see the module docs). Blocking;
++/// an image that can't be kept stays a live read.
++pub(crate) fn keep(uploads_dir: &Path, chat_id: &str, folder: &Path, text: &str) {
++    for source in sources(text).into_iter().take(MAX_KEPT) {
++        let Some(path) = resolve(&source, Some(folder)) else {
++            continue;
++        };
++        if let Err(err) = keep_one(uploads_dir, chat_id, &path) {
++            tracing::debug!(chat = %chat_id, %source, error = %err, "reply image not kept");
++        }
++    }
++}
++
++fn keep_one(uploads_dir: &Path, chat_id: &str, path: &Path) -> Result<(), EngineError> {
++    let refused = |why: &str| EngineError::Other(why.into());
++    let destination =
++        kept(uploads_dir, chat_id, path).ok_or_else(|| refused("Image has no extension"))?;
++    let file = local_target(path).ok_or_else(|| refused("Image is not a local file"))?;
++    let mime = checked(&file)?;
++    let mut bytes = Vec::new();
++    std::fs::File::open(&file)?
++        .take(zeron_proto::IMAGE_MAX_BYTES as u64 + 1)
++        .read_to_end(&mut bytes)?;
++    // Checked again: the file may have changed since.
++    if bytes.len() > zeron_proto::IMAGE_MAX_BYTES
++        || raster_signature(&bytes).map(|(_, found)| found) != Some(mime)
++    {
++        return Err(refused("Image changed while it was kept"));
++    }
++    let dir = destination.parent().expect("a kept image has a folder");
++    std::fs::create_dir_all(dir)?;
++    let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
++    temporary.write_all(&bytes)?;
++    temporary
++        .persist(&destination)
++        .map_err(|e| EngineError::Io(e.error))?;
++    Ok(())
++}
++
++/// One chunk of the image `source` names in a reply in `chat_id`: its kept
++/// copy when there is one, else the file itself.
++pub(crate) fn read_chunk(
++    uploads_dir: &Path,
++    chat_id: &str,
++    folder: Option<&Path>,
++    source: &str,
++    offset: u64,
++) -> Result<AttachmentChunk, EngineError> {
++    let refused = |why: &str| EngineError::Other(why.into());
++    let path = resolve(source, folder)
++        .ok_or_else(|| refused("Image is not a local path on the chat's device"))?;
++    let file = match kept(uploads_dir, chat_id, &path).filter(|kept| kept.is_file()) {
++        Some(kept) => kept,
++        None => local_target(&path)
++            .ok_or_else(|| refused("Image is missing, or behind a network or device path"))?,
++    };
++    let mime_type = checked(&file)?;
++    let mut handle = std::fs::File::open(&file)?;
++    let size = handle.metadata()?.len();
++    let start = offset.min(size);
++    let next_offset = (start + READ_CHUNK_BYTES).min(size);
++    handle.seek(std::io::SeekFrom::Start(start))?;
++    let mut buf = Vec::with_capacity((next_offset - start) as usize);
++    handle.take(next_offset - start).read_to_end(&mut buf)?;
++    Ok(AttachmentChunk {
++        name: Path::new(source)
++            .file_name()
++            .map(|n| n.to_string_lossy().into_owned())
++            .unwrap_or_else(|| "image".into()),
++        mime_type: mime_type.to_owned(),
++        data: BASE64.encode(&buf),
++        next_offset,
++        done: next_offset >= size,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture";
++
++    fn read_all(uploads: &Path, chat: &str, folder: Option<&Path>, source: &str) -> Vec<u8> {
++        let (mut offset, mut out) = (0, Vec::new());
++        loop {
++            let chunk = read_chunk(uploads, chat, folder, source, offset)
++                .unwrap_or_else(|e| panic!("{source}: {e}"));
++            out.extend(BASE64.decode(&chunk.data).unwrap());
++            if chunk.done {
++                return out;
++            }
++            offset = chunk.next_offset;
++        }
++    }
++
++    #[test]
++    fn sources_are_the_images_outside_code() {
++        let text = "Before ![a](shots/a.png) and ![b [x]](<C:\\Users\\HP MEDIA\\b.png>).\n\
++                    ![a again](shots/a.png \"title\")\n\
++                    ```\n![not](code.png)\n```\n\
++                    [a link](c.png) ![](  ) ![last](/tmp/d.webp)";
++        assert_eq!(
++            sources(text),
++            ["shots/a.png", r"C:\Users\HP MEDIA\b.png", "/tmp/d.webp"]
++        );
++    }
++
++    #[test]
++    fn only_local_paths_resolve() {
++        let folder = std::env::temp_dir().join("chat");
++        assert_eq!(
++            resolve("shots/a.png", Some(&folder)),
++            resolve(&folder.join("shots").join("a.png").to_string_lossy(), None)
++        );
++        assert!(resolve("a.png", None).is_none());
++        assert!(resolve("~/a.png", None).is_some());
++        let mut refused = vec![
++            "https://example.com/a.png",
++            "file:///tmp/a.png",
++            "data:image/png;base64,iVBORw0KGgo=",
++            "~someone/a.png",
++        ];
++        // Network and device paths, as Windows reads them.
++        #[cfg(windows)]
++        refused.extend([
++            r"\\host\share\a.png",
++            "//host/share/a.png",
++            r"\\.\COM1\a.png",
++            "C:a.png",
++        ]);
++        for source in refused {
++            assert!(resolve(source, Some(&folder)).is_none(), "{source}");
++        }
++    }
++
++    #[test]
++    fn images_read_from_any_folder_and_from_their_kept_copy_once_kept() {
++        let uploads = tempfile::tempdir().unwrap();
++        let folder = tempfile::tempdir().unwrap();
++        let elsewhere = tempfile::tempdir().unwrap();
++        let outside = elsewhere.path().join("outside.png");
++        std::fs::write(&outside, PNG).unwrap();
++        std::fs::write(folder.path().join("here.png"), PNG).unwrap();
++        let outside_text = outside.to_string_lossy().into_owned();
++
++        // Live, from outside the chat's folder and relative to it.
++        assert_eq!(read_all(uploads.path(), "c", None, &outside_text), PNG);
++        assert_eq!(
++            read_all(uploads.path(), "c", Some(folder.path()), "here.png"),
++            PNG
++        );
++
++        // A long file arrives in chunks that concatenate to it.
++        let mut long = PNG.to_vec();
++        long.resize(100_000, 7);
++        std::fs::write(folder.path().join("long.png"), &long).unwrap();
++        assert_eq!(
++            read_all(uploads.path(), "c", Some(folder.path()), "long.png"),
++            long
++        );
++
++        // Kept, it outlives its file, for that chat only.
++        let reply = format!("![one](<{outside_text}>) ![two](here.png)");
++        keep(uploads.path(), "c", folder.path(), &reply);
++        keep(uploads.path(), "c", folder.path(), &reply);
++        let kept_dir = uploads.path().join(KEPT_DIR);
++        assert_eq!(std::fs::read_dir(&kept_dir).unwrap().count(), 2);
++        std::fs::remove_file(&outside).unwrap();
++        assert_eq!(read_all(uploads.path(), "c", None, &outside_text), PNG);
++        assert!(read_chunk(uploads.path(), "other", None, &outside_text, 0).is_err());
++    }
++
++    #[test]
++    fn what_is_not_an_image_file_is_refused() {
++        let uploads = tempfile::tempdir().unwrap();
++        let folder = tempfile::tempdir().unwrap();
++        let at = |name: &str| folder.path().join(name);
++        std::fs::create_dir(at("dir.png")).unwrap();
++        std::fs::write(at("notes.txt"), b"secret").unwrap();
++        std::fs::write(at("fake.png"), b"secret, not a png").unwrap();
++        std::fs::write(at("photo.png"), b"\xff\xd8\xffjpeg").unwrap();
++        std::fs::write(at("logo.svg"), b"<svg/>").unwrap();
++        std::fs::File::create(at("big.png"))
++            .unwrap()
++            .set_len(zeron_proto::IMAGE_MAX_BYTES as u64 + 1)
++            .unwrap();
++        let mut refused = vec![
++            ("dir.png", "not a file"),
++            ("notes.txt", "Not a PNG"),
++            ("logo.svg", "Not a PNG"),
++            ("fake.png", "doesn't match its name"),
++            ("photo.png", "doesn't match its name"),
++            ("big.png", "too large"),
++            ("gone.png", "missing"),
++        ];
++        #[cfg(windows)]
++        refused.extend([
++            (r"\\host\share\x.png", "not a local path"),
++            ("nul.png", "missing"),
++        ]);
++        for (name, why) in refused {
++            let error = read_chunk(uploads.path(), "c", Some(folder.path()), name, 0)
++                .expect_err(name)
++                .to_string();
++            assert!(error.contains(why), "{name}: {error}");
++        }
++        keep(
++            uploads.path(),
++            "c",
++            folder.path(),
++            "![](fake.png) ![](big.png)",
++        );
++        assert!(!uploads.path().join(KEPT_DIR).exists());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn links_are_followed_only_to_local_paths() {
++        let uploads = tempfile::tempdir().unwrap();
++        let folder = tempfile::tempdir().unwrap();
++        let elsewhere = tempfile::tempdir().unwrap();
++        std::fs::write(elsewhere.path().join("x.png"), PNG).unwrap();
++        std::os::unix::fs::symlink(elsewhere.path(), folder.path().join("linked")).unwrap();
++        std::os::unix::fs::symlink("x.png", elsewhere.path().join("alias.png")).unwrap();
++        std::os::unix::fs::symlink("loop.png", folder.path().join("loop.png")).unwrap();
++        for name in ["linked/x.png", "linked/alias.png"] {
++            assert_eq!(
++                read_all(uploads.path(), "c", Some(folder.path()), name),
++                PNG
++            );
++        }
++        assert!(read_chunk(uploads.path(), "c", Some(folder.path()), "loop.png", 0).is_err());
++    }
++}
+diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
+index a8ea87f41..eee71f30c 100644
+--- a/crates/engine/src/rpc.rs
++++ b/crates/engine/src/rpc.rs
+@@ -388,43 +388,20 @@ struct OpenTerminalParams {
+ /// Matches the UI canvas panel key (`AppState::panel_session_key`).
+ const CANVAS_TERMINAL_PREFIX: &str = "space-canvas:";
+ 
+-/// The folder a chat with this `cwd` may show reply images from (see
+-/// `chat_image_root`), as configured: the jail matches a reply's path against
+-/// it raw or canonical. Fails closed: no folder of its own (a legacy
+-/// projectless chat runs in home), a relative or missing folder, and any
+-/// folder that is `home` or above it, or holds one of `data` (Zeron's own
+-/// dirs), are refused, comparing canonical forms. A scratch folder is
+-/// resolved under `scratch_root`, never created: only a run creates it.
++/// The folder a reply's relative image paths in a chat with this `cwd` join
++/// (see `reply_image_folder`): a scratch folder under `scratch_root`, else
++/// the cwd with `~` expanded. `None` when there is no absolute one.
+ fn chat_image_folder(
+     cwd: Option<&str>,
+     scratch_root: &std::path::Path,
+-    home: &std::path::Path,
+-    data: &[std::path::PathBuf],
+-) -> Result<std::path::PathBuf, &'static str> {
+-    let cwd = cwd
+-        .filter(|cwd| !zeron_proto::projectless::is_home_cwd(cwd))
+-        .ok_or("the chat has no working folder of its own")?;
++) -> Option<std::path::PathBuf> {
++    let cwd = cwd.map(str::trim).filter(|cwd| !cwd.is_empty())?;
+     let folder = if zeron_proto::projectless::is_scratch_cwd(cwd) {
+-        scratch_root.join(cwd.trim().rsplit('/').next().unwrap_or_default())
++        scratch_root.join(cwd.rsplit('/').next().unwrap_or_default())
+     } else {
+-        std::path::PathBuf::from(crate::repos::expand_home(cwd)?)
++        std::path::PathBuf::from(crate::repos::expand_home(cwd).ok()?)
+     };
+-    if !folder.is_absolute() {
+-        return Err("the chat's folder is not an absolute path");
+-    }
+-    let canonical =
+-        std::fs::canonicalize(&folder).map_err(|_| "the chat's folder doesn't exist")?;
+-    let home = std::fs::canonicalize(home).map_err(|_| "this host's home folder is unknown")?;
+-    if home.starts_with(&canonical)
+-        || canonical.parent().is_none()
+-        || data
+-            .iter()
+-            .filter_map(|dir| std::fs::canonicalize(dir).ok())
+-            .any(|dir| dir.starts_with(&canonical))
+-    {
+-        return Err("the chat works in the home folder, above it, or around Zeron's data");
+-    }
+-    Ok(folder)
++    folder.is_absolute().then_some(folder)
+ }
+ 
+ /// A cwd the user (or a project-less chat) meant as "host home", not a folder.
+@@ -1365,12 +1342,10 @@ impl EngineRpc {
+         self.file_search_root(p).await
+     }
+ 
+-    /// The one folder a chat's reply images (`![alt](path)`) may come from:
+-    /// its working folder on this host. Refused, failing closed, when the chat
+-    /// runs elsewhere, has no folder of its own, or works in the home folder,
+-    /// above it, or around Zeron's own data — so a reply can never show an
+-    /// image from all of home, or another chat's attachments.
+-    fn chat_image_root(&self, chat_id: &str) -> Result<std::path::PathBuf, RpcError> {
++    /// A chat this host runs, and the folder its replies' relative image
++    /// paths (`![alt](path)`) join (`crate::reply_images`). Refused when the
++    /// chat runs elsewhere: only its host reads its images.
++    fn reply_image_folder(&self, chat_id: &str) -> Result<Option<std::path::PathBuf>, RpcError> {
+         let refused = |why: &str| RpcError::BadParams(why.into());
+         let chat = self
+             .workspace
+@@ -1380,20 +1355,10 @@ impl EngineRpc {
+         if chat.device_id != self.doc_host.device_id() {
+             return Err(refused("chat belongs to another device"));
+         }
+-        let home = session_home_dir().map_err(refused)?;
+-        // The data dir always exists; uploads and scratch may live elsewhere.
+-        let data = [
+-            self.repos.data_dir().to_path_buf(),
+-            self.uploads.dir().to_path_buf(),
+-            self.repos.scratch_root(),
+-        ];
+-        chat_image_folder(
++        Ok(chat_image_folder(
+             chat.cwd.as_deref(),
+             &self.repos.scratch_root(),
+-            &home,
+-            &data,
+-        )
+-        .map_err(refused)
++        ))
+     }
+ 
+     /// Accept only a checkout already named by a local chat or contained in a
+@@ -5024,9 +4989,16 @@ impl RpcService for EngineRpc {
+             }
+             methods::READ_CHAT_IMAGE_CHUNK => {
+                 let p: ReadChatImageChunkParams = parse_params(params)?;
+-                let root = self.chat_image_root(&p.chat_id)?;
++                let folder = self.reply_image_folder(&p.chat_id)?;
++                let uploads = self.uploads.dir().to_path_buf();
+                 let chunk = tokio::task::spawn_blocking(move || {
+-                    crate::uploads::read_chat_image_chunk(&p.path, p.offset, &root)
++                    crate::reply_images::read_chunk(
++                        &uploads,
++                        &p.chat_id,
++                        folder.as_deref(),
++                        &p.path,
++                        p.offset,
++                    )
+                 })
+                 .await
+                 .map_err(|e| RpcError::Failed(e.to_string()))?
+@@ -5036,7 +5008,7 @@ impl RpcService for EngineRpc {
+             methods::READ_TOOL_OUTPUT => {
+                 let p: ReadToolOutputParams = parse_params(params)?;
+                 // Only the host has the journal; the same chat check as a
+-                // reply's pictures (`chat_image_root`). A subagent's doc is
++                // reply's pictures (`reply_image_folder`). A subagent's doc is
+                 // its root chat's.
+                 let chat_id = crate::tool_output::journal_chat(&p.chat_id);
+                 let chat = self
+@@ -5870,58 +5842,24 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn chat_image_folders_fail_closed() {
++    fn chat_image_folders_are_where_relative_paths_join() {
+         let home = tempfile::tempdir().unwrap();
+         let project = home.path().join("code").join("app");
+-        let data = home.path().join(".zeron");
+-        let scratch_root = data.join("scratch");
+-        std::fs::create_dir_all(&project).unwrap();
+-        std::fs::create_dir_all(scratch_root.join("2026-10-25-a1b2c3d4")).unwrap();
+-        let data_dirs = [
+-            data.clone(),
+-            data.join("orgs").join("o").join("u").join("uploads"),
+-            scratch_root.clone(),
+-        ];
+-        let folder =
+-            |cwd: Option<&str>| chat_image_folder(cwd, &scratch_root, home.path(), &data_dirs);
++        let scratch_root = home.path().join(".zeron").join("scratch");
++        let folder = |cwd: Option<&str>| chat_image_folder(cwd, &scratch_root);
+         assert_eq!(
+             folder(Some(&project.to_string_lossy())),
+-            Ok(project.clone())
++            Some(project.clone())
+         );
+         assert_eq!(
+             folder(Some("~/.zeron/scratch/2026-10-25-a1b2c3d4")),
+-            Ok(scratch_root.join("2026-10-25-a1b2c3d4"))
++            Some(scratch_root.join("2026-10-25-a1b2c3d4"))
+         );
+-        let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
+-        let missing = text(&home.path().join("gone"));
+-        let home_text = text(home.path());
+-        let above_home = text(home.path().parent().unwrap());
+-        // `/`, or the drive (`C:\`) on Windows, where `/` isn't absolute.
+-        let root = text(home.path().ancestors().last().unwrap());
+-        let data_text = text(&data);
+-        let scratch_text = text(&scratch_root);
+-        for (cwd, why) in [
+-            (None, "no working folder of its own"),
+-            (Some("~"), "no working folder of its own"),
+-            (Some(""), "no working folder of its own"),
+-            (Some("relative/app"), "not an absolute path"),
+-            (Some(missing.as_str()), "doesn't exist"),
+-            (
+-                Some("~/.zeron/scratch/2026-10-25-zzzz9999"),
+-                "doesn't exist",
+-            ),
+-            (Some(home_text.as_str()), "home folder, above it"),
+-            (Some(above_home.as_str()), "home folder, above it"),
+-            (Some(root.as_str()), "home folder, above it"),
+-            (Some(data_text.as_str()), "around Zeron's data"),
+-            (Some(scratch_text.as_str()), "around Zeron's data"),
+-            (Some("~/.zeron/scratch/."), "around Zeron's data"),
+-            (Some("~/.zeron/scratch/.."), "around Zeron's data"),
+-        ] {
+-            let error = folder(cwd).expect_err(&format!("{cwd:?}"));
+-            assert!(error.contains(why), "{cwd:?}: {error}");
++        assert!(folder(Some("~")).is_some_and(|home| home.is_absolute()));
++        for cwd in [None, Some(""), Some("relative/app")] {
++            assert_eq!(folder(cwd), None, "{cwd:?}");
+         }
+-        assert!(!scratch_root.join("2026-10-25-zzzz9999").exists());
++        assert!(!scratch_root.exists(), "never created");
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 88dd9f227..f4aa9887d 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -2325,6 +2325,27 @@ impl Inner {
+         }
+     }
+ 
++    /// Keep a copy of each image a finished reply segment names in Markdown
++    /// (`crate::reply_images`), off the run loop. `cwd` is the run's own,
++    /// already resolved on this host.
++    fn keep_reply_images(&self, chat_id: &str, cwd: &str, text: &str) {
++        let Some((uploads, _)) = self.generated_images.get() else {
++            return;
++        };
++        if !text.contains("![") {
++            return;
++        }
++        let dir = uploads.dir().to_path_buf();
++        let (chat_id, folder, text) = (
++            chat_id.to_owned(),
++            std::path::PathBuf::from(cwd),
++            text.to_owned(),
++        );
++        tokio::task::spawn_blocking(move || {
++            crate::reply_images::keep(&dir, &chat_id, &folder, &text)
++        });
++    }
++
+     /// Record the chat's harness-native session id (and its cwd): live-process
+     /// cache plus the durable workspace chat row — the row is what survives an
+     /// engine restart (zeron sessions.ts:1039).
+@@ -4290,7 +4311,9 @@ async fn drive_run(
+                         ) {
+                             tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
+                         }
+-                        inner.note_message(&chat_id, &folded_text(&folded));
++                        let text = folded_text(&folded);
++                        inner.keep_reply_images(&chat_id, &run_cwd, &text);
++                        inner.note_message(&chat_id, &text);
+                     }
+                     folded.clear();
+                     dirty = false;
+@@ -4808,7 +4831,9 @@ async fn drive_run(
+             ) {
+                 tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
+             }
+-            inner.note_message(&chat_id, &folded_text(&folded));
++            let text = folded_text(&folded);
++            inner.keep_reply_images(&chat_id, &run_cwd, &text);
++            inner.note_message(&chat_id, &text);
+             folded.clear();
+             dirty = false;
+             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
+@@ -4947,7 +4972,9 @@ async fn drive_run(
+                 ) {
+                     tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
+                 }
+-                inner.note_message(&chat_id, &folded_text(&folded));
++                let text = folded_text(&folded);
++                inner.keep_reply_images(&chat_id, &run_cwd, &text);
++                inner.note_message(&chat_id, &text);
+             }
+             // The turn's session has now seen the transcript through its reply.
+             if let Some((session_id, cwd)) = &run_session {
+diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
+index 63e7e73bb..a79d1deb1 100644
+--- a/crates/engine/src/uploads.rs
++++ b/crates/engine/src/uploads.rs
+@@ -16,8 +16,8 @@
+ //! image types, as in zeron; files in the uploads dir read back whatever their
+ //! type, so a queued message can restore them for editing.
+ //!
+-//! `read_chat_image_chunk` serves the images an agent's reply names in
+-//! Markdown, under a narrower jail: one chat's working folder only.
++//! The images an agent's reply names in Markdown are served by
++//! `crate::reply_images`, which shares this module's path and type checks.
+ 
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+@@ -84,7 +84,7 @@ pub fn pending_refs_in(text: &str) -> Vec<String> {
+ /// Hard cap on an assembled file.
+ const MAX_BYTES: u64 = 32 * 1024 * 1024;
+ /// Multiple of 3 so independent base64 chunks concatenate losslessly.
+-const READ_CHUNK_BYTES: u64 = 45_000;
++pub(crate) const READ_CHUNK_BYTES: u64 = 45_000;
+ 
+ /// `ReadAttachmentChunk` reply.
+ #[derive(Debug, Clone, Serialize)]
+@@ -416,47 +416,11 @@ fn jail(path: &str, roots: &[&Path]) -> Option<PathBuf> {
+         .then_some(resolved)
+ }
+ 
+-/// [`jail`] for one root, without following a single link below it: each
+-/// component under the root is `lstat`ed before anything resolves the path,
+-/// and a symlink (a Windows junction counts) refuses it unfollowed. So a link
+-/// a repository planted can't send the read anywhere, not even to look: a
+-/// junction to `\\host\share` would reach that host with the user's
+-/// credentials. The root itself may sit behind links (`/tmp` →
+-/// `/private/tmp`): a path matches it raw or canonical. Links swapped in
+-/// after the walk aren't guarded: only the user's own processes could, and
+-/// they can read all this already.
+-fn jail_without_links(path: &str, root: &Path) -> Option<PathBuf> {
+-    let requested = lexical_components(Path::new(path))?;
+-    let canonical_root = std::fs::canonicalize(root).ok()?;
+-    let depth = [root, canonical_root.as_path()]
+-        .into_iter()
+-        .filter_map(lexical_components)
+-        .find(|root| requested.len() > root.len() && requested.starts_with(root))?
+-        .len();
+-    let mut walked = canonical_root.clone();
+-    for name in &requested[depth..] {
+-        #[cfg(windows)]
+-        if is_windows_device_name(name) {
+-            return None;
+-        }
+-        walked.push(name);
+-        if std::fs::symlink_metadata(&walked)
+-            .ok()?
+-            .file_type()
+-            .is_symlink()
+-        {
+-            return None;
+-        }
+-    }
+-    let resolved = std::fs::canonicalize(&walked).ok()?;
+-    (resolved.starts_with(&canonical_root) && resolved != canonical_root).then_some(resolved)
+-}
+-
+ /// A name Windows opens as a device in any folder and with any extension
+ /// (`NUL.png`, `com1.jpg`, `CONIN$`), reaching a port or the console instead
+ /// of a file.
+ #[cfg_attr(not(windows), allow(dead_code))]
+-fn is_windows_device_name(name: &std::ffi::OsStr) -> bool {
++pub(crate) fn is_windows_device_name(name: &std::ffi::OsStr) -> bool {
+     let name = name.to_string_lossy().to_ascii_uppercase();
+     let stem = name
+         .split(['.', ':'])
+@@ -477,66 +441,11 @@ fn is_windows_device_name(name: &std::ffi::OsStr) -> bool {
+         || numbered("LPT")
+ }
+ 
+-/// One chunk of an image an agent's reply names in Markdown (`![alt](path)`),
+-/// read from strictly inside `root`, the chat's working folder as configured
+-/// (the RPC layer resolves it and refuses home and anything above it), with
+-/// no link on the way ([`jail_without_links`]). Only a PNG, JPEG, WebP, or
+-/// GIF by its extension AND its first bytes, of at most
+-/// [`zeron_proto::IMAGE_MAX_BYTES`]: not the uploads dir, not another chat's
+-/// folder, not any other file type.
+-pub fn read_chat_image_chunk(
+-    path: &str,
+-    offset: u64,
+-    root: &Path,
+-) -> Result<AttachmentChunk, EngineError> {
+-    use std::io::{Read, Seek};
+-    let refused = |why: &str| EngineError::Other(why.into());
+-    let resolved = jail_without_links(path, root)
+-        .ok_or_else(|| refused("Image is outside the chat's folder, or behind a link"))?;
+-    let meta = std::fs::metadata(&resolved)?;
+-    if !meta.is_file() {
+-        return Err(refused("Image is not a file"));
+-    }
+-    if meta.len() > zeron_proto::IMAGE_MAX_BYTES as u64 {
+-        return Err(refused("Image is too large"));
+-    }
+-    let mime_type = mime_by_ext(&resolved)
+-        .filter(|mime| {
+-            matches!(
+-                *mime,
+-                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+-            )
+-        })
+-        .ok_or_else(|| refused("Not a PNG, JPEG, WebP, or GIF image"))?;
+-    let mut file = std::fs::File::open(&resolved)?;
+-    let mut head = Vec::with_capacity(12);
+-    (&mut file).take(12).read_to_end(&mut head)?;
+-    if raster_signature(&head).map(|(_, mime)| mime) != Some(mime_type) {
+-        return Err(refused("Image content doesn't match its name"));
+-    }
+-    let size = meta.len();
+-    let start = offset.min(size);
+-    let next_offset = (start + READ_CHUNK_BYTES).min(size);
+-    file.seek(std::io::SeekFrom::Start(start))?;
+-    let mut buf = Vec::with_capacity((next_offset - start) as usize);
+-    file.take(next_offset - start).read_to_end(&mut buf)?;
+-    Ok(AttachmentChunk {
+-        name: resolved
+-            .file_name()
+-            .map(|n| n.to_string_lossy().to_string())
+-            .unwrap_or_else(|| "image".into()),
+-        mime_type: mime_type.to_string(),
+-        data: BASE64.encode(&buf),
+-        next_offset,
+-        done: next_offset >= size,
+-    })
+-}
+-
+ /// An absolute local path's components with `.`/`..` resolved WITHOUT
+ /// touching the filesystem. `None` for relative or drive-relative paths and
+ /// for any Windows prefix but a drive letter (UNC, `\\.\` devices, verbatim
+ /// non-disk). `C:` and `\\?\C:` agree; Windows compares case-insensitively.
+-fn lexical_components(path: &Path) -> Option<Vec<std::ffi::OsString>> {
++pub(crate) fn lexical_components(path: &Path) -> Option<Vec<std::ffi::OsString>> {
+     use std::path::{Component, Prefix};
+     if !path.is_absolute() {
+         return None;
+@@ -632,7 +541,7 @@ fn sanitize(file_name: &str) -> String {
+     }
+ }
+ 
+-fn mime_by_ext(path: &Path) -> Option<&'static str> {
++pub(crate) fn mime_by_ext(path: &Path) -> Option<&'static str> {
+     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+         "png" => Some("image/png"),
+         "jpg" | "jpeg" => Some("image/jpeg"),
+@@ -899,124 +808,6 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn chat_images_read_only_raster_files_inside_the_chat_folder() {
+-        let folder = tempfile::tempdir().unwrap();
+-        let elsewhere = tempfile::tempdir().unwrap();
+-        let png = encoded(3, 2, image::ImageFormat::Png);
+-        std::fs::create_dir(folder.path().join("shots")).unwrap();
+-        let inside = folder.path().join("shots").join("before.png");
+-        std::fs::write(&inside, &png).unwrap();
+-        let chunk = read_chat_image_chunk(inside.to_str().unwrap(), 0, folder.path()).unwrap();
+-        assert_eq!(BASE64.decode(&chunk.data).unwrap(), png);
+-        assert!(chunk.done && chunk.mime_type == "image/png" && chunk.name == "before.png");
+-
+-        // A long file arrives in chunks that concatenate to it.
+-        let mut long = png.clone();
+-        long.resize(100_000, 7);
+-        std::fs::write(folder.path().join("long.png"), &long).unwrap();
+-        let long_path = folder.path().join("long.png");
+-        let (mut offset, mut read) = (0, Vec::new());
+-        loop {
+-            let chunk =
+-                read_chat_image_chunk(long_path.to_str().unwrap(), offset, folder.path()).unwrap();
+-            read.extend(BASE64.decode(&chunk.data).unwrap());
+-            if chunk.done {
+-                break;
+-            }
+-            offset = chunk.next_offset;
+-        }
+-        assert_eq!(read, long);
+-
+-        std::fs::write(elsewhere.path().join("x.png"), &png).unwrap();
+-        std::fs::write(folder.path().join("notes.txt"), b"secret").unwrap();
+-        std::fs::write(folder.path().join("fake.png"), b"secret, not a png").unwrap();
+-        std::fs::write(
+-            folder.path().join("photo.png"),
+-            encoded(3, 2, image::ImageFormat::Jpeg),
+-        )
+-        .unwrap();
+-        std::fs::write(folder.path().join("logo.svg"), b"<svg/>").unwrap();
+-        let big = folder.path().join("big.png");
+-        std::fs::File::create(&big)
+-            .unwrap()
+-            .set_len(zeron_proto::IMAGE_MAX_BYTES as u64 + 1)
+-            .unwrap();
+-        let escape = folder
+-            .path()
+-            .join("..")
+-            .join(elsewhere.path().file_name().unwrap())
+-            .join("x.png");
+-        let mut refused = vec![
+-            (elsewhere.path().join("x.png"), "outside the chat's folder"),
+-            (escape, "outside the chat's folder"),
+-            (folder.path().to_path_buf(), "outside the chat's folder"),
+-            (PathBuf::from("before.png"), "outside the chat's folder"),
+-            (
+-                PathBuf::from(r"\\host\share\x.png"),
+-                "outside the chat's folder",
+-            ),
+-            (
+-                PathBuf::from("//host/share/x.png"),
+-                "outside the chat's folder",
+-            ),
+-            (folder.path().join("shots"), "not a file"),
+-            (folder.path().join("notes.txt"), "Not a PNG"),
+-            (folder.path().join("logo.svg"), "Not a PNG"),
+-            (folder.path().join("fake.png"), "doesn't match its name"),
+-            (folder.path().join("photo.png"), "doesn't match its name"),
+-            (big, "too large"),
+-        ];
+-        // No link is followed, even one that stays inside; a FIFO is never
+-        // opened (it would block the read).
+-        #[cfg(unix)]
+-        {
+-            let link = |target: &Path, name: &str| {
+-                let link = folder.path().join(name);
+-                std::os::unix::fs::symlink(target, &link).unwrap();
+-                link
+-            };
+-            refused.extend([
+-                (
+-                    link(&elsewhere.path().join("x.png"), "out.png"),
+-                    "behind a link",
+-                ),
+-                (link(&inside, "alias.png"), "behind a link"),
+-                (
+-                    link(&folder.path().join("shots"), "linked").join("before.png"),
+-                    "behind a link",
+-                ),
+-            ]);
+-            let fifo = folder.path().join("pipe.png");
+-            if std::process::Command::new("mkfifo")
+-                .arg(&fifo)
+-                .status()
+-                .is_ok_and(|status| status.success())
+-            {
+-                refused.push((fifo, "not a file"));
+-            }
+-        }
+-        for (path, why) in refused {
+-            let error = read_chat_image_chunk(&path.to_string_lossy(), 0, folder.path())
+-                .expect_err(&format!("read {path:?}"))
+-                .to_string();
+-            assert!(error.contains(why), "{path:?}: {error}");
+-        }
+-
+-        // A folder reached through a link of its own (`/tmp` on macOS)
+-        // serves its images by either name.
+-        #[cfg(unix)]
+-        {
+-            let via = elsewhere.path().join("chat-folder");
+-            std::os::unix::fs::symlink(folder.path(), &via).unwrap();
+-            for path in [via.join("shots").join("before.png"), inside.clone()] {
+-                let chunk = read_chat_image_chunk(path.to_str().unwrap(), 0, &via)
+-                    .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+-                assert_eq!(BASE64.decode(&chunk.data).unwrap(), png);
+-            }
+-        }
+-    }
+-
+     #[test]
+     fn windows_device_names_are_recognized_whatever_their_extension() {
+         let device = |name: &str| is_windows_device_name(std::ffi::OsStr::new(name));
+@@ -1082,7 +873,7 @@ pub struct ImportedImage {
+ 
+ const MAX_GENERATED_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
+ 
+-fn raster_signature(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
++pub(crate) fn raster_signature(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+         Some(("png", "image/png"))
+     } else if bytes.starts_with(b"\xff\xd8\xff") {
+diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
+index 426fa5c5e..0e6b7ba1f 100644
+--- a/crates/engine/tests/e2e.rs
++++ b/crates/engine/tests/e2e.rs
+@@ -3837,11 +3837,11 @@ async fn publish_image_lands_in_the_live_turn() {
+     core.shutdown().await;
+ }
+ 
+-/// An image a reply names in Markdown reads only from inside that one chat's
+-/// working folder, and never through a folder that would open too much:
+-/// home or above, Zeron's own data, a chat another device runs.
++/// An image a reply names in Markdown reads from any local folder of the
++/// chat's host, relative paths joining the chat's folder; only that host
++/// answers, and only for a chat it knows.
+ #[tokio::test]
+-async fn chat_images_come_only_from_their_chats_own_folder() {
++async fn chat_images_come_from_any_folder_of_their_chats_host() {
+     use base64::Engine as _;
+     let dir = tempfile::tempdir().unwrap();
+     let core = assemble(
+@@ -3867,14 +3867,6 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+     let folder = |path: &std::path::Path| Some(path.to_string_lossy().into_owned());
+     for (chat, device, cwd) in [
+         ("ours", here.as_str(), folder(ours.path())),
+-        ("theirs", here.as_str(), folder(theirs.path())),
+-        // `/`, or a drive (`C:\`) on Windows, where `/` isn't absolute.
+-        (
+-            "root",
+-            here.as_str(),
+-            folder(dir.path().ancestors().last().unwrap()),
+-        ),
+-        ("data", here.as_str(), folder(dir.path())),
+         ("remote", "another-device", folder(ours.path())),
+         (
+             "scratch",
+@@ -3886,13 +3878,14 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+             .create_chat(chat, None, Some(device), None, cwd)
+             .unwrap();
+     }
+-    let read = |chat: &str, path: &std::path::Path| {
++    let read = |chat: &str, path: String| {
+         client.call(
+             zeron_rpc::methods::READ_CHAT_IMAGE_CHUNK,
+             serde_json::json!({ "chatId": chat, "path": path, "offset": 0 }),
+         )
+     };
+-    let chunk = read("ours", &before).await.expect("its own folder");
++    let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
++    let chunk = read("ours", text(&before)).await.expect("its own folder");
+     let data = chunk["data"].as_str().unwrap();
+     assert_eq!(
+         base64::engine::general_purpose::STANDARD
+@@ -3901,29 +3894,116 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+         png
+     );
+     assert_eq!(chunk["mimeType"], "image/png");
+-    assert!(read("theirs", &after).await.is_ok());
+-    // A projectless chat's scratch folder is named, never created, by a read.
++    assert!(read("ours", "before.png".into()).await.is_ok(), "relative");
++    assert!(read("ours", text(&after)).await.is_ok(), "another folder");
++    // A projectless chat's scratch folder joins its relative paths, and is
++    // never created by a read.
+     let scratch = dir.path().join("scratch").join("2026-10-25-a1b2c3d4");
+-    let refused = read("scratch", &scratch.join("x.png")).await.unwrap_err();
+-    assert!(refused.to_string().contains("doesn't exist"), "{refused}");
++    let refused = read("scratch", "x.png".into()).await.unwrap_err();
++    assert!(refused.to_string().contains("missing"), "{refused}");
+     assert!(!scratch.exists());
+     std::fs::create_dir_all(&scratch).unwrap();
+     std::fs::write(scratch.join("x.png"), &png).unwrap();
+-    assert!(read("scratch", &scratch.join("x.png")).await.is_ok());
++    assert!(read("scratch", "x.png".into()).await.is_ok());
+     for (chat, path, why) in [
+-        ("ours", after.as_path(), "outside the chat's folder"),
+-        ("theirs", before.as_path(), "outside the chat's folder"),
+-        ("root", before.as_path(), "home folder, above it"),
+-        ("data", before.as_path(), "around Zeron's data"),
+-        ("remote", before.as_path(), "another device"),
+-        ("missing", before.as_path(), "chat not found"),
++        ("ours", r"\\host\share\x.png".to_owned(), "not a local path"),
++        (
++            "ours",
++            "https://example.com/x.png".to_owned(),
++            "not a local path",
++        ),
++        ("remote", text(&before), "another device"),
++        ("missing", text(&before), "chat not found"),
+     ] {
++        if cfg!(not(windows)) && path.starts_with('\\') {
++            continue;
++        }
+         let error = read(chat, path).await.expect_err(chat).to_string();
+         assert!(error.contains(why), "{chat}: {error}");
+     }
+     core.shutdown().await;
+ }
+ 
++/// The images a finished reply names in Markdown are kept by the chat's
++/// host, so they still show once their files are gone.
++#[tokio::test]
++async fn a_finished_replys_images_outlive_their_files() {
++    use base64::Engine as _;
++    let dir = tempfile::tempdir().unwrap();
++    let shots = tempfile::tempdir().unwrap();
++    let shot = shots.path().join("shot one.png");
++    let png = {
++        let mut bytes = std::io::Cursor::new(Vec::new());
++        image::DynamicImage::new_rgb8(3, 2)
++            .write_to(&mut bytes, image::ImageFormat::Png)
++            .unwrap();
++        bytes.into_inner()
++    };
++    std::fs::write(&shot, &png).unwrap();
++    let path = shot.to_string_lossy().into_owned();
++    let core = assemble(
++        dir.path(),
++        Arc::new(ScriptedHarness {
++            script: vec![
++                AgentEvent::TextDelta {
++                    text: format!("Here it is:\n\n![the shot](<{path}>)\n"),
++                },
++                done(DoneStatus::Completed),
++            ],
++            step_delay: Duration::from_millis(5),
++            hang_until_interrupt: false,
++        }),
++    );
++    let here = core.device_id.clone();
++    core.workspace
++        .create_chat(CHAT, None, Some(&here), None, None)
++        .unwrap();
++    let handle = core.doc_host.open(CHAT).unwrap();
++    queue_as_viewer(
++        handle.doc(),
++        "cmd-run-images",
++        SessionCommandPayload::Run {
++            request: run_request("show me"),
++            message_id: "m-1".into(),
++        },
++    );
++    fn kept(dir: &std::path::Path) -> usize {
++        std::fs::read_dir(dir)
++            .into_iter()
++            .flatten()
++            .flatten()
++            .map(|entry| {
++                let path = entry.path();
++                if path.file_name().is_some_and(|name| name == "reply-images") {
++                    std::fs::read_dir(&path).map_or(0, |files| files.count())
++                } else if path.is_dir() {
++                    kept(&path)
++                } else {
++                    0
++                }
++            })
++            .sum()
++    }
++    wait_for(|| kept(dir.path()) == 1, "the kept image").await;
++    std::fs::remove_file(&shot).unwrap();
++    let client = zeron_rpc::memory_client(core.rpc_service());
++    let chunk = client
++        .call(
++            zeron_rpc::methods::READ_CHAT_IMAGE_CHUNK,
++            serde_json::json!({ "chatId": CHAT, "path": path, "offset": 0 }),
++        )
++        .await
++        .expect("the kept copy");
++    assert_eq!(
++        base64::engine::general_purpose::STANDARD
++            .decode(chunk["data"].as_str().unwrap())
++            .unwrap(),
++        png
++    );
++    assert_eq!(chunk["name"], "shot one.png");
++    core.shutdown().await;
++}
++
+ /// A command's whole output comes from the host's run journal on request
+ /// (`ReadToolOutput`), redacted as the doc's ten-line tail is; the doc says
+ /// how many lines there are. Only the chat's host answers, and only for a
+diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
+index c382f7bb5..b71684528 100644
+--- a/crates/mcp/src/jsonrpc.rs
++++ b/crates/mcp/src/jsonrpc.rs
+@@ -62,8 +62,10 @@ your final reply. Zeron renders it with its own native interface and enforces it
+ content sits directly on the chat with no cards or boxed panels, text uses the interface font \
+ and type scale, and colors are theme tokens that work on frosted glass or opaque, light or dark. \
+ The reader sees the visual above that reply, so don't announce or restate it. To show the \
+-reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
+-draw images through `show_visual`.";
++reader an image file (a screenshot, a rendered PNG), write it into your reply as Markdown, \
++`![alt](path)`, with its local path (absolute, or relative to your working folder; wrap a path \
++with spaces in angle brackets, `![alt](<path>)`). Zeron draws it in place and keeps a copy. \
++Don't draw images through `show_visual`.";
+ 
+ /// Appended to [`INSTRUCTIONS`] when the host launched the agent without its
+ /// own subagent tools ([`zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV`]).
+diff --git a/crates/ui/src/reply_images.rs b/crates/ui/src/reply_images.rs
+index 6a2b4a221..28486d6c8 100644
+--- a/crates/ui/src/reply_images.rs
++++ b/crates/ui/src/reply_images.rs
+@@ -2,15 +2,16 @@
+ //! one an agent showed with `show_image`) and a local image a reply names in
+ //! Markdown (`![alt](path)`) share one look: the image row.
+ //!
+-//! A Markdown image is drawn in place, never copied, and only when it is a
+-//! path on the chat's host — absolute, or relative to the chat's folder — of
+-//! a PNG, JPEG, WebP, or GIF by name. No URL is ever fetched (`http:`,
+-//! `file:`, `data:` …), and `~`, network and device paths are refused. The
+-//! host reads it with `ReadChatImageChunk`, from strictly inside that one
+-//! chat's folder (never home or above it, Zeron's data, or another chat's
+-//! folder) and never through a link, checks its first bytes, and the UI
+-//! decodes it within the shared raster limits. Anything refused or
+-//! unreadable keeps the reply's ordinary rendering — a link — as before.
++//! A Markdown image is drawn in place when it is a path on the chat's host
++//! (absolute, `~/…`, or relative to the chat's folder) of a PNG, JPEG, WebP,
++//! or GIF by name. No URL is ever fetched (`http:`, `file:`, `data:` …), and
++//! network and device paths are refused. The host reads it with
++//! `ReadChatImageChunk` from any local folder, or from the copy it kept when
++//! the reply finished (the engine's `reply_images`), checks its first bytes,
++//! and the UI decodes it within the shared raster limits. A path only the
++//! host can expand (`~`, a projectless chat's folder) goes as written.
++//! Anything refused or unreadable keeps the reply's ordinary rendering — a
++//! link — as before.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::sync::Arc;
+@@ -30,17 +31,24 @@ pub(crate) const MAX_LOADS: usize = 4;
+ pub(crate) fn markdown_image(source: &str, cwd: Option<&str>) -> Option<(String, &'static str)> {
+     let source = source.trim();
+     if source.is_empty()
+-        || source.starts_with('~')
+         || has_scheme(source)
+         || crate::tool_images::is_remote_or_device_path(source)
+     {
+         return None;
+     }
+     let mime = raster_mime(source)?;
++    if source.starts_with('~') {
++        return Some((source.to_owned(), mime));
++    }
+     let path = crate::tool_images::resolve_path(source, cwd);
+-    // A relative path needs a folder to resolve against; a home-relative
+-    // folder (a projectless chat's) can't be expanded here.
+-    crate::tool_images::is_host_absolute(&path).then_some((path, mime))
++    // A home-relative folder (a projectless chat's) can't be expanded here:
++    // the host joins the path to it.
++    let path = if crate::tool_images::is_host_absolute(&path) {
++        path
++    } else {
++        source.to_owned()
++    };
++    Some((path, mime))
+ }
+ 
+ /// `http:`, `file:`, `data:`, `javascript:`…; a drive letter (`C:\`) is not one.
+@@ -248,7 +256,6 @@ mod tests {
+             "file:///tmp/a.png",
+             "data:image/png;base64,iVBORw0KGgo=",
+             "javascript:alert(1).png",
+-            "~/Pictures/a.png",
+             r"\\host\share\a.png",
+             "//host/share/a.png",
+             "C:a.png",
+@@ -259,9 +266,18 @@ mod tests {
+         ] {
+             assert_eq!(image(source), None, "{source:?}");
+         }
+-        // Relative paths need the chat's folder, and one the UI can expand.
+-        assert_eq!(markdown_image("a.png", None), None);
+-        assert_eq!(markdown_image("a.png", Some("~/.zeron/scratch/x")), None);
++        // What only the host can expand goes as written, for it to resolve.
++        for (source, cwd) in [
++            ("a.png", None),
++            ("a.png", Some("~/.zeron/scratch/x")),
++            ("~/Pictures/a.png", cwd),
++        ] {
++            assert_eq!(
++                markdown_image(source, cwd),
++                Some((source.into(), "image/png")),
++                "{source:?} in {cwd:?}"
++            );
++        }
+     }
+ 
+     #[test]
+-- 
+2.52.0.windows.1
+

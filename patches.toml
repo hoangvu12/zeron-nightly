@@ -71,6 +71,11 @@ pr = 1224
 sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
 note = "PR watches start Git off the runtime workers and share one inspection per path, so slow Windows process launches stop freezing the engine for seconds."
 
+[[patch]]
+name = "markdown-reply-images"
+file = "patches/0002-markdown-reply-images.patch"
+note = "Markdown images in replies (`![alt](path)`) show from any local folder on the chat's host (network and device paths still refused), and the host keeps a copy when the reply finishes so they outlive their files. Relative paths work in scratch chats; agents are told to use Markdown instead of show_image. Desktop only; not upstream."
+
 # Open upstream PRs that conflict with main today. Enable one once it is
 # rebased (or after recording a resolution, see README).
 [[patch]]
