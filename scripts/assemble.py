@@ -99,7 +99,7 @@ def rr_cache(src: Path) -> Path:
     return (common if common.is_absolute() else src / common) / "rr-cache"
 
 
-def stamp_version(src: Path, stamp: str) -> str:
+def stamp_version(src: Path, stamp: str, label: str) -> str:
     cargo = src / "Cargo.toml"
     text = cargo.read_text(encoding="utf-8")
     found = re.search(
@@ -109,11 +109,17 @@ def stamp_version(src: Path, stamp: str) -> str:
         sys.exit("no [workspace.package] version in Cargo.toml")
     major, minor, patch = (int(part) for part in found.groups())
     # A prerelease of the next patch sorts above the release it was built on.
-    version = f"{major}.{minor}.{patch + 1}-nightly.{stamp}"
+    version = f"{major}.{minor}.{patch + 1}-{label}.{stamp}"
     line_start = text.rfind("\n", 0, found.end()) + 1
     cargo.write_text(text[:line_start] + f'version = "{version}"' + text[found.end():], encoding="utf-8")
     subprocess.run(["cargo", "update", "--workspace", "--quiet"], cwd=src, check=True)
     git(src, "add", "Cargo.toml", "Cargo.lock")
+    # apps/zgx is a workspace of its own whose lock records the root's crates
+    # it uses by path, at the root's version.
+    zgx = src / "apps" / "zgx"
+    if (zgx / "Cargo.lock").is_file():
+        subprocess.run(["cargo", "update", "--workspace", "--quiet"], cwd=zgx, check=True)
+        git(src, "add", "apps/zgx/Cargo.lock")
     git(src, *IDENT, "commit", "-q", "-m", f"nightly: version {version}")
     return version
 
@@ -121,6 +127,8 @@ def stamp_version(src: Path, stamp: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--src", type=Path, required=True, help="dedicated git checkout to assemble in")
+    parser.add_argument("--config", type=Path, default=TOOLS / "patches.toml",
+                        help="patch list to assemble (patches.toml; patches-v3.toml for v3)")
     parser.add_argument("--stamp", default=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M"))
     parser.add_argument("--report", type=Path, help="write release notes (Markdown) here")
     parser.add_argument("--json", type=Path, help="write the run summary (JSON) here")
@@ -136,7 +144,7 @@ def main() -> None:
         print(f"saved resolutions to {TOOLS / 'rerere'}; commit them")
         return
 
-    config = tomllib.loads((TOOLS / "patches.toml").read_text(encoding="utf-8"))
+    config = tomllib.loads(args.config.read_text(encoding="utf-8"))
     upstream = config["upstream"]
     upstream_url = f"https://github.com/{upstream['repo']}.git"
     nightly_url = f"https://github.com/{config['nightly']['repo']}.git"
@@ -208,7 +216,7 @@ def main() -> None:
         git(src, "rm", "-rq", ".github/workflows")
         git(src, *IDENT, "commit", "-q", "-m", "nightly: drop upstream workflows")
 
-    version = stamp_version(src, args.stamp)
+    version = stamp_version(src, args.stamp, config["nightly"].get("label", "nightly"))
     fingerprint = hashlib.sha256("\n".join(run.inputs).encode()).hexdigest()[:16]
     subject = out(src, "log", "-1", "--format=%s (%cs)", base)
     summary = {

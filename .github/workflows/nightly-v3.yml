@@ -1,0 +1,167 @@
+name: nightly-v3
+
+# Zeron v3 (the zgx interface, apps/zgx): upstream's zeron/zgx branch +
+# patches-v3.toml, assembled from scratch (scripts/assemble.py), built for
+# Windows (scripts/package-v3-windows.ps1) and published as a prerelease that
+# is never the latest. v2 installs follow releases/latest, so they never see
+# these. v3 installs don't update themselves yet: each one is installed by hand.
+
+on:
+  schedule:
+    - cron: "30 19 * * *" # 02:30 in Vietnam
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if upstream and the patch list are unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-v3
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/zeronsh/zeron.git
+  # v3 releases are the ones whose tag has this prerelease (v0.2.137-v3.N).
+  TAG_MATCH: '-v3\.'
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+    outputs:
+      version: ${{ steps.assemble.outputs.version }}
+      head: ${{ steps.assemble.outputs.head }}
+      build: ${{ steps.changed.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+      - name: clone upstream
+        run: git clone --quiet --filter=blob:none "$UPSTREAM" src
+      - name: assemble
+        id: assemble
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/scripts/assemble.py --src src --config tools/patches-v3.toml --report report.md
+      - name: skip when nothing changed
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINGERPRINT: ${{ steps.assemble.outputs.fingerprint }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | test(\"$TAG_MATCH\"))] | sort_by(.createdAt) | last | .tagName // empty")
+          last=""
+          if [ -n "$tag" ]; then
+            last=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq .body \
+              | sed -n 's/.*<!-- fingerprint: \([0-9a-f]*\) -->.*/\1/p')
+          fi
+          if [ "$FORCE" = "true" ] || [ "$last" != "$FINGERPRINT" ]; then
+            echo build=true >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream and patches unchanged since the last v3 nightly ($last); skipping."
+            echo build=false >> "$GITHUB_OUTPUT"
+          fi
+      - name: bundle the nightly commits
+        if: steps.changed.outputs.build == 'true'
+        run: git -C src bundle create ../nightly.bundle nightly ^refs/nightly/upstream
+      - uses: actions/upload-artifact@v4
+        if: steps.changed.outputs.build == 'true'
+        with:
+          name: source
+          path: |
+            nightly.bundle
+            report.md
+          if-no-files-found: error
+      # Its own branch: `nightly` is the v2 nightly's.
+      - name: push the nightly-v3 branch
+        if: steps.changed.outputs.build == 'true' && env.PUSH_TOKEN != ''
+        run: git -C src push --force "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" nightly:refs/heads/nightly-v3
+
+  windows:
+    needs: assemble
+    if: needs.assemble.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: source
+          path: source
+      - name: check out the assembled nightly
+        run: |
+          git clone --quiet --filter=blob:none $env:UPSTREAM src
+          git -C src fetch --quiet ../source/nightly.bundle nightly:nightly
+          git -C src checkout --quiet nightly
+          if ((git -C src rev-parse HEAD) -ne '${{ needs.assemble.outputs.head }}') { throw 'bundle does not match the assembled head' }
+      - name: rust toolchain (rust-toolchain.toml)
+        working-directory: src
+        run: rustup show active-toolchain || rustup toolchain install
+      # The engine's crate links the GPUI interface's library, which compiles
+      # its shaders.
+      - name: locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: v3
+          workspaces: |
+            src -> target
+            src/apps/zgx -> target
+      - name: updater tests
+        working-directory: src
+        run: cargo test --locked -p zeron-update
+      - name: package installer and portable zip
+        run: ./tools/scripts/package-v3-windows.ps1 -Src src
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            src/target/package-v3/*.exe
+            src/target/package-v3/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [assemble, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.assemble.outputs.version }}
+      PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release
+        run: |
+          target="$GITHUB_SHA"
+          if [ -n "$PUSH_TOKEN" ]; then target="${{ needs.assemble.outputs.head }}"; fi
+          # Never the latest: v2 installs update from releases/latest.
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$target" \
+            --title "Zeron v3 $VERSION" --notes-file dist/report.md --prerelease --latest=false \
+            dist/*.exe dist/*.zip dist/nightly.bundle
+      - name: keep the last 14 v3 nightlies
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | test(\"$TAG_MATCH\"))] | sort_by(.createdAt) | reverse | .[14:] | .[].tagName" |
+          while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done

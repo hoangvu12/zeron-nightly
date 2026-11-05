@@ -1,0 +1,91 @@
+# What goes into Zeron v3 nightly: the zgx interface (apps/zgx) on top of
+# upstream's zeron/zgx branch, built and released apart from the v2 nightly
+# (.github/workflows/nightly-v3.yml). Same format as patches.toml.
+#
+# Most entries are engine fixes from patches.toml: v3 runs the engine built
+# from this same tree. Keep them in step with patches.toml by hand.
+
+[upstream]
+repo = "zeronsh/zeron"
+branch = "zeron/zgx"
+
+[nightly]
+repo = "hoangvu12/zeron-nightly"
+# The version's prerelease: 0.2.137-v3.YYYYMMDDHHMM.
+label = "v3"
+
+[[patch]]
+name = "windows-prerelease-versions"
+file = "patches/0001-windows-prerelease-versions.patch"
+note = "Lets the Windows updater and packaging take prerelease versions."
+
+[[patch]]
+name = "v3-windows-install-layout"
+file = "patches/0004-v3-windows-install-layout.patch"
+note = "v3 on Windows opens no console window and reads its ui folder beside zeron.exe. Needed by every v3 nightly."
+
+[[patch]]
+name = "v3-windows-polish"
+pr = 1225
+sha = "09e6532da1d604b1459f7ddc8ec4045440dc522f"
+note = "v3 on Windows looks like the shipping app: frosted surfaces, caption buttons, panel tabs. Pins zgx at memory-floor plus zgx#1495 and #1496."
+
+[[patch]]
+name = "large-plain-folder-index"
+pr = 1196
+sha = "44d08d24675660638e957b0ef42c638188e70bce"
+note = "Walk-based index for large plain folders, kept current with a watch. Stacked on #1184."
+
+[[patch]]
+name = "diff-capture-orphaned-git"
+pr = 1220
+sha = "1013fbb55308cddde91d665636f73807b10b86ce"
+note = "Closes git's stdout before waiting when a diff capture truncates, so Windows stops leaving git.exe behind."
+
+[[patch]]
+name = "dead-run-shimmer"
+pr = 840
+sha = "febdceb6e950f123f5cbc5f78d3a031d4a70a919"
+note = "Stops the tool-group shimmer on dead runs. v2 interface only; kept so the engine matches v2's."
+
+[[patch]]
+name = "flaky-test-fixes"
+pr = 869
+sha = "b9f2c4b89f526f9d7d64d0e2a7496da99cc84c31"
+note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests."
+
+[[patch]]
+name = "composer-click-through"
+pr = 1191
+sha = "92ea6927e59bffc5df0017b64da949bc4833e11d"
+note = "Clicks in the composer no longer open images underneath it. v2 interface only."
+
+[[patch]]
+name = "warm-chats-parked-cap"
+pr = 1101
+sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
+note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min."
+
+[[patch]]
+name = "change-request-spawn-off-runtime"
+pr = 1224
+sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
+note = "PR watches start Git off the runtime workers, so slow Windows process launches stop freezing the engine."
+
+[[patch]]
+name = "markdown-reply-images"
+file = "patches/0002-markdown-reply-images.patch"
+note = "Markdown images in replies from any local folder, kept when the reply finishes. The engine part serves v3 too."
+
+[[patch]]
+name = "relay-image-reads"
+file = "patches/0003-relay-image-reads.patch"
+note = "Images from a chat on another device load in a few relay round trips. Applies on top of markdown-reply-images."
+
+# Not on v3: zeron/zgx has its own new app icon.
+[[patch]]
+name = "windows-icon"
+pr = 1084
+sha = "a0476792700411ba0e9362646223ae0a979a0dc8"
+enabled = false
+note = "zeron/zgx carries its own new icon, which this conflicts with."

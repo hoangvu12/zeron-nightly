@@ -146,10 +146,11 @@ jobs:
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$target" \
             --title "Zeron $VERSION" --notes-file dist/report.md --latest \
             dist/*.exe dist/*.zip dist/manifest.json dist/nightly.bundle
+      # Only v2's: v3 nightlies (tags v0.2.137-v3.N, nightly-v3.yml) keep their own.
       - name: keep the last 14 nightlies
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[14:] | .[].tagName' |
+            --jq '[.[] | select(.tagName | test("-v3\\.") | not)] | sort_by(.createdAt) | reverse | .[14:] | .[].tagName' |
           while read -r tag; do
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done

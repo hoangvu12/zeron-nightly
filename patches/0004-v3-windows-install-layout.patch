@@ -1,0 +1,54 @@
+From 87180fe1eb1cef52d9b2e52b572df555b1aadcc2 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Fri, 6 Nov 2026 05:38:38 +0700
+Subject: [PATCH] zgx on Windows: no console window, and the ui folder beside
+ the exe
+
+A beta build on Windows opened a console window next to the app, and
+looked for its scripts in a macOS bundle's Contents/Resources/ui. An
+install on Windows keeps ui and plugins-builtin beside zeron.exe.
+
+- The beta build uses the windows subsystem, as apps/zeron does.
+- bundled_ui reads the ui folder beside the exe on Windows.
+---
+ apps/zgx/src/main.rs | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
+index 0c5706d3b..8a50b2636 100644
+--- a/apps/zgx/src/main.rs
++++ b/apps/zgx/src/main.rs
+@@ -25,6 +25,9 @@
+ //! `ZERON_ZGX_REPLAY=1` shows every page, as if none were finished.
+ //! `--inspect` (or `ZGX_INSPECT_SOCKET=1`) serves devtools to `zgx inspect`.
+ 
++// The Zeron app on Windows opens no console window, as apps/zeron's.
++#![cfg_attr(all(windows, feature = "beta"), windows_subsystem = "windows")]
++
+ mod about;
+ mod acp_registry;
+ mod agents;
+@@ -1197,13 +1200,18 @@ fn ui_dir() -> PathBuf {
+     }
+ }
+ 
+-/// `Contents/Resources/ui` of the bundle this executable runs from, if any.
++/// `Contents/Resources/ui` of the bundle this executable runs from, if any;
++/// on Windows, the `ui` beside the executable (an install's folder).
+ fn bundled_ui() -> Option<PathBuf> {
+     static BUNDLED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+     BUNDLED
+         .get_or_init(|| {
+             let exe = std::env::current_exe().ok()?;
+-            let ui = exe.parent()?.parent()?.join("Resources").join("ui");
++            let ui = if cfg!(windows) {
++                exe.parent()?.join("ui")
++            } else {
++                exe.parent()?.parent()?.join("Resources").join("ui")
++            };
+             ui.join("app.luau").is_file().then_some(ui)
+         })
+         .clone()
+-- 
+2.52.0.windows.1
+

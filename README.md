@@ -88,6 +88,35 @@ From then on Zeron updates from
 the upstream feed. A nightly may have written data a stable build doesn't
 know yet; stable catches up at its next release.
 
+## Zeron v3 nightly
+
+v3 is the zgx interface (`apps/zgx`), which upstream builds on its
+`zeron/zgx` branch. `.github/workflows/nightly-v3.yml` runs at 19:30 UTC and
+on demand. It works like the v2 nightly, with these differences:
+
+- It assembles `zeron/zgx` plus `patches-v3.toml` (`assemble.py --config
+  patches-v3.toml`). The version is `0.2.137-v3.YYYYMMDDHHMM`.
+- `scripts/package-v3-windows.ps1` builds `zeron-zgx` with its `beta`
+  feature (production sign-in, Zeron's own data) and the engine from the same
+  tree. It packages them with the `ui` scripts as a portable zip and a
+  per-user installer (`dist/zeron-v3.iss`).
+- Releases are prereleases and never the latest, so v2 installs never see
+  them. Each keeps its own last 14.
+- It installs to `%LOCALAPPDATA%\Programs\Zeron v3`, next to v2. Both share
+  `%LOCALAPPDATA%\Zeron` and the engine on port 27654. v3 uses an engine that
+  already runs, so run one app at a time to be safe.
+- v3 installs don't update themselves yet. The Windows updater swaps
+  `zeron.exe` alone and would leave `ui` and the engine behind. Install each
+  new v3 nightly by hand.
+
+To try it locally, use a separate checkout from the v2 one:
+
+```sh
+git clone https://github.com/zeronsh/zeron.git ../zeron-v3-src
+python scripts/assemble.py --src ../zeron-v3-src --config patches-v3.toml
+pwsh scripts/package-v3-windows.ps1 -Src ../zeron-v3-src
+```
+
 ## Optional: publish the `nightly` branch
 
 GitHub's built-in token cannot push commits that touch workflow files, and
