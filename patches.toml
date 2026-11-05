@@ -65,6 +65,12 @@ pr = 1101
 sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
 note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min (ZERON_PARKED_SESSION_CAP=0 disables); reuses laid-out transcripts on chat switch; model catalogs stay fresh for 10 min."
 
+[[patch]]
+name = "change-request-spawn-off-runtime"
+pr = 1224
+sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
+note = "PR watches start Git off the runtime workers and share one inspection per path, so slow Windows process launches stop freezing the engine for seconds."
+
 # Open upstream PRs that conflict with main today. Enable one once it is
 # rebased (or after recording a resolution, see README).
 [[patch]]
