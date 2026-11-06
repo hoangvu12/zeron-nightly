@@ -28,7 +28,8 @@ concurrency:
 env:
   UPSTREAM: https://github.com/zeronsh/zeron.git
   # v3 releases are the ones whose tag has this prerelease (v0.2.137-v3.N).
-  TAG_MATCH: '-v3\.'
+  # (A bracket, not a backslash: it goes into jq string literals.)
+  TAG_MATCH: '-v3[.]'
   # The fixed release v3 installs update from.
   FEED_TAG: v3-latest
 

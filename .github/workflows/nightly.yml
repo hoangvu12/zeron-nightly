@@ -151,7 +151,7 @@ jobs:
       - name: keep the last 14 nightlies
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | test("-v3\\.|^v3-latest$") | not)] | sort_by(.createdAt) | reverse | .[14:] | .[].tagName' |
+            --jq '[.[] | select(.tagName | test("-v3[.]|^v3-latest$") | not)] | sort_by(.createdAt) | reverse | .[14:] | .[].tagName' |
           while read -r tag; do
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done
