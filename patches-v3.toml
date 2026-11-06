@@ -25,6 +25,11 @@ file = "patches/0004-v3-windows-install-layout.patch"
 note = "v3 on Windows opens no console window and reads its ui folder beside zeron.exe. Needed by every v3 nightly."
 
 [[patch]]
+name = "v3-windows-installer-updates"
+file = "patches/0005-v3-windows-installer-updates.patch"
+note = "v3 updates itself on Windows: it downloads the release's installer and runs it silently over its folder, then restarts its engine into the new one once idle. Needed by every v3 nightly."
+
+[[patch]]
 name = "v3-windows-polish"
 pr = 1225
 sha = "09e6532da1d604b1459f7ddc8ec4045440dc522f"

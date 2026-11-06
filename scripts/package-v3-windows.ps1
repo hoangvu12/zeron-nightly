@@ -9,18 +9,24 @@
 #   ui\, plugins-builtin\   the interface's scripts, read where they lie
 #   zeron.ico, LICENSE, THIRD_PARTY_NOTICES.md, licenses\
 #
-# No zeron-update.json: the Windows updater swaps zeron.exe alone, which
-# would leave ui\ and the engine behind. v3 installs update by hand.
+# With -ReleasesUrl, zeron-update.json points the app's updater at that feed
+# with "installer": true: it downloads the release's installer and runs it
+# silently over its folder (patches/0005), since a swap of zeron.exe alone
+# would leave ui\ and the engine behind. Without it, the install doesn't
+# update itself.
 #
-#   ./scripts/package-v3-windows.ps1 -Src ../zeron-nightly-src [-CargoArgs '-j','4']
+#   ./scripts/package-v3-windows.ps1 -Src ../zeron-nightly-src [-ReleasesUrl https://...] [-CargoArgs '-j','4']
 #
-# Writes <Src>/target/package-v3/zeron-<version>-windows-<arch>(.zip|-setup.exe).
+# Writes <Src>/target/package-v3/zeron-<version>-windows-<arch>(.zip|-setup.exe)
+# and, with the installer and -ReleasesUrl, the feed's manifest.json.
 param(
     [Parameter(Mandatory)][string]$Src,
+    [string]$ReleasesUrl,
     [string[]]$CargoArgs = @(),
     [switch]$NoInstaller
 )
 $ErrorActionPreference = 'Stop'
+if ($ReleasesUrl -and -not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
 $tools = Split-Path $PSScriptRoot -Parent
 $root = (Resolve-Path -LiteralPath $Src).Path
 
@@ -71,6 +77,11 @@ function Get-ExeOutput([string]$Path, [string]$Arguments) {
         if ($process.ExitCode -ne 0) { throw "$Path $Arguments failed: $($stderr.Result)" }
         return $stdout.Result.Trim()
     } finally { $process.Dispose() }
+}
+
+# UTF-8 without a BOM, in Windows PowerShell 5.1 as in 7.
+function Write-Utf8([string]$Path, [string]$Text) {
+    [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
 }
 
 function Copy-Tree([string]$From, [string]$To, [string[]]$ExcludeDirs) {
@@ -129,6 +140,9 @@ try {
     New-Item -ItemType Directory -Force -Path $licenses | Out-Null
     Copy-Item -Path 'crates/ui/assets/fonts/licenses/*', 'apps/zgx/fonts/*-OFL.txt' -Destination $licenses
     Copy-Item -LiteralPath 'crates/voice/NOTICE.md' -Destination (Join-Path $stage 'licenses/parakeet-v3.txt')
+    if ($ReleasesUrl) {
+        Write-Utf8 (Join-Path $stage 'zeron-update.json') (@{ releases_url = $ReleasesUrl; installer = $true } | ConvertTo-Json)
+    }
 
     $zip = "$stage.zip"
     Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
@@ -144,5 +158,12 @@ try {
         $setup = Join-Path $out "zeron-$version-windows-$arch-setup.exe"
         if (-not (Test-Path -LiteralPath $setup)) { throw "Installer not produced: $setup" }
         Write-Host "Packaged $setup"
+        if ($ReleasesUrl) {
+            # The feed's manifest (crates/update Manifest): the updater takes
+            # the installer it names, by its checksum.
+            $file = Split-Path $setup -Leaf
+            $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Utf8 (Join-Path $out 'manifest.json') (@{ version = $version; files = @{ $file = @{ sha256 = $hash } } } | ConvertTo-Json -Depth 4)
+        }
     }
 } finally { Pop-Location }

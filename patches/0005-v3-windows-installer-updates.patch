@@ -1,0 +1,187 @@
+From 4723e75b3174fdb6f2c1223e8c8753645fcbcd6a Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Fri, 6 Nov 2026 06:29:50 +0700
+Subject: [PATCH] Windows: updates by installer for an install of more than
+ zeron.exe
+
+Zeron v3 keeps its ui scripts and its engine beside zeron.exe. The
+Windows updater swapped zeron.exe alone, so an update would leave the
+rest behind.
+
+- With "installer": true in zeron-update.json, the updater downloads the
+  release's setup.exe and runs it silently over the folder once the app
+  exits, then opens the app again.
+- v3 keeps the build of the engine it starts, so it can tell when the
+  engine on disk is newer. On Windows nothing else restarts the engine, so
+  it restarts an idle one at once and offers Restart to update when busy.
+---
+ apps/zgx/src/engine/manager.rs | 11 ++++
+ apps/zgx/src/engine_update.rs  |  6 ++-
+ crates/update/src/windows.rs   | 91 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/apps/zgx/src/engine/manager.rs b/apps/zgx/src/engine/manager.rs
+index 4fb221068..25a5d8fde 100644
+--- a/apps/zgx/src/engine/manager.rs
++++ b/apps/zgx/src/engine/manager.rs
+@@ -289,6 +289,17 @@ impl Spawner {
+ /// Zeron.app's engine, started as Zeron.app starts it (crates/launch).
+ fn launch(config: &Config) -> std::io::Result<()> {
+     let exe = std::env::current_exe()?;
++    // Its build kept, as spawn's below: on Windows nothing else restarts it
++    // into a newer install (src/engine_update.rs judges it then).
++    let started = config.data_dir.join(STARTED);
++    let _ = std::fs::remove_file(&started);
++    if let Some(bin) = config.bin.clone() {
++        std::thread::spawn(move || {
++            if let Some(id) = build_of(&bin) {
++                let _ = std::fs::write(&started, id);
++            }
++        });
++    }
+     let child = zeron_launch::launch(
+         &zeron_launch::LaunchConfig {
+             data_dir: config.data_dir.clone(),
+diff --git a/apps/zgx/src/engine_update.rs b/apps/zgx/src/engine_update.rs
+index 929df56d5..63dddc6e8 100644
+--- a/apps/zgx/src/engine_update.rs
++++ b/apps/zgx/src/engine_update.rs
+@@ -170,8 +170,10 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+                 return;
+             };
+             tell_interface(serves_interface(&info["capabilities"]));
+-            // Zeron.app's engine follows its bundle by itself.
+-            if config.follows_bundle() {
++            // Zeron.app's engine follows its bundle by itself. On Windows the
++            // installer replaces zeron-engine.exe beside the app and nothing
++            // restarts the running one, so it's judged here as any other.
++            if config.follows_bundle() && !cfg!(windows) {
+                 return;
+             }
+             let running = info["build"].as_str().map(str::to_owned);
+diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
+index 1be2061cc..31cbdb1c8 100644
+--- a/crates/update/src/windows.rs
++++ b/crates/update/src/windows.rs
+@@ -32,6 +32,25 @@ const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstal
+ #[derive(serde::Deserialize)]
+ struct Config {
+     releases_url: String,
++    /// Updates arrive as the installer (`zeron-<v>-windows-<arch>-setup.exe`),
++    /// run silently over this folder, for an install that is more than
++    /// zeron.exe: Zeron v3 keeps its scripts and its engine beside it.
++    #[serde(default)]
++    installer: bool,
++}
++
++/// The staged installer's name in its download directory.
++const STAGED_INSTALLER: &str = "setup.exe";
++
++fn installer_updates(directory: &Path) -> bool {
++    std::fs::read(directory.join(CONFIG))
++        .ok()
++        .and_then(|bytes| serde_json::from_slice::<Config>(&bytes).ok())
++        .is_some_and(|config| config.installer)
++}
++
++pub fn installer_artifact(version: &str) -> String {
++    format!("zeron-{version}-windows-{}-setup.exe", std::env::consts::ARCH)
+ }
+ 
+ pub(super) fn is_managed(exe: &Path) -> bool {
+@@ -72,6 +91,9 @@ pub async fn stage(
+                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+         "invalid Windows release version"
+     );
++    if installer_updates(directory) {
++        return stage_installer(edge_url, manifest, directory).await;
++    }
+     let file = artifact(&manifest.version);
+     let expected = manifest
+         .files
+@@ -110,6 +132,72 @@ pub async fn stage(
+     Ok(staged)
+ }
+ 
++/// Download the release's installer, verifying its mandatory checksum. An
++/// installer that ran from an earlier download can't remove its own folder,
++/// so those are cleared here first.
++async fn stage_installer(
++    edge_url: &str,
++    manifest: &super::Manifest,
++    directory: &Path,
++) -> anyhow::Result<PathBuf> {
++    let file = installer_artifact(&manifest.version);
++    let expected = manifest
++        .files
++        .get(&file)
++        .and_then(|meta| meta.sha256.as_deref())
++        .context("Windows updates require a SHA-256 checksum")?;
++    ensure!(
++        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
++        "invalid SHA-256 checksum"
++    );
++    if let Ok(entries) = std::fs::read_dir(directory) {
++        for entry in entries.flatten() {
++            if entry.file_name().to_string_lossy().starts_with(".zeron-update-")
++                && entry.path().join(STAGED_INSTALLER).is_file()
++            {
++                let _ = std::fs::remove_dir_all(entry.path());
++            }
++        }
++    }
++    let temporary = tempfile::Builder::new()
++        .prefix(".zeron-update-")
++        .tempdir_in(directory)?;
++    let staged = temporary.path().join(STAGED_INSTALLER);
++    super::download_release_file(edge_url, manifest, &file, &staged).await?;
++    std::fs::write(temporary.path().join("sha256"), expected)?;
++    std::fs::write(temporary.path().join("version"), &manifest.version)?;
++    verify(&staged)?;
++    let _ = temporary.keep();
++    Ok(staged)
++}
++
++/// Run the staged installer silently over `directory` once this process
++/// exits (it waits for it), and with `relaunch`, open the app again after.
++fn apply_installer(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {
++    let installed = directory.join("zeron.exe");
++    ensure!(
++        std::env::current_exe()?.canonicalize()? == installed.canonicalize()?,
++        "update must run from its installation"
++    );
++    verify(staged)?;
++    let mut command = std::process::Command::new(staged);
++    command
++        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"])
++        .arg(format!("/DIR={}", directory.display()))
++        .arg(format!("/WAITPID={}", std::process::id()));
++    if relaunch {
++        command.arg("/RELAUNCH=1");
++    }
++    command
++        .stdin(std::process::Stdio::null())
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null())
++        .creation_flags(CREATE_NO_WINDOW)
++        .spawn()
++        .context("starting the update's installer")?;
++    Ok(())
++}
++
+ fn verify(staged: &Path) -> anyhow::Result<()> {
+     let expected = std::fs::read_to_string(staged.with_file_name("sha256"))?;
+     verify_digest(staged, expected.trim())
+@@ -144,6 +232,9 @@ fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
+ /// and [`Self::recover_from_backup`] cover the leftovers of a hard crash
+ /// between the two renames.
+ pub fn apply(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {
++    if staged.file_name().is_some_and(|name| name == STAGED_INSTALLER) {
++        return apply_installer(staged, directory, relaunch);
++    }
+     let installed = directory.join("zeron.exe");
+     ensure!(
+         std::env::current_exe()?.canonicalize()? == installed.canonicalize()?,
+-- 
+2.52.0.windows.1
+

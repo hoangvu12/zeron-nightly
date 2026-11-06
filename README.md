@@ -105,9 +105,11 @@ on demand. It works like the v2 nightly, with these differences:
 - It installs to `%LOCALAPPDATA%\Programs\Zeron v3`, next to v2. Both share
   `%LOCALAPPDATA%\Zeron` and the engine on port 27654. v3 uses an engine that
   already runs, so run one app at a time to be safe.
-- v3 installs don't update themselves yet. The Windows updater swaps
-  `zeron.exe` alone and would leave `ui` and the engine behind. Install each
-  new v3 nightly by hand.
+- v3 installs update themselves from the `v3-latest` release. Each run
+  replaces its installer and `manifest.json` there. The app downloads that
+  installer and runs it silently over its folder, since swapping `zeron.exe`
+  alone would leave `ui` and the engine behind (`patches/0005`). The engine
+  restarts into the new one once it is idle.
 
 To try it locally, use a separate checkout from the v2 one:
 

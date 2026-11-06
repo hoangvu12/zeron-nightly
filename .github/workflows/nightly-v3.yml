@@ -4,7 +4,9 @@ name: nightly-v3
 # patches-v3.toml, assembled from scratch (scripts/assemble.py), built for
 # Windows (scripts/package-v3-windows.ps1) and published as a prerelease that
 # is never the latest. v2 installs follow releases/latest, so they never see
-# these. v3 installs don't update themselves yet: each one is installed by hand.
+# these. v3 installs update from the `v3-latest` release instead: each run
+# replaces its installer and manifest.json, and the app runs that installer
+# silently over itself (patches/0005).
 
 on:
   schedule:
@@ -27,6 +29,8 @@ env:
   UPSTREAM: https://github.com/zeronsh/zeron.git
   # v3 releases are the ones whose tag has this prerelease (v0.2.137-v3.N).
   TAG_MATCH: '-v3\.'
+  # The fixed release v3 installs update from.
+  FEED_TAG: v3-latest
 
 jobs:
   assemble:
@@ -128,13 +132,14 @@ jobs:
         working-directory: src
         run: cargo test --locked -p zeron-update
       - name: package installer and portable zip
-        run: ./tools/scripts/package-v3-windows.ps1 -Src src
+        run: ./tools/scripts/package-v3-windows.ps1 -Src src -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:FEED_TAG"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
             src/target/package-v3/*.exe
             src/target/package-v3/*.zip
+            src/target/package-v3/manifest.json
           if-no-files-found: error
 
   publish:
@@ -157,7 +162,26 @@ jobs:
           # Never the latest: v2 installs update from releases/latest.
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$target" \
             --title "Zeron v3 $VERSION" --notes-file dist/report.md --prerelease --latest=false \
-            dist/*.exe dist/*.zip dist/nightly.bundle
+            dist/*.exe dist/*.zip dist/manifest.json dist/nightly.bundle
+      # The feed: the new installer first, then the manifest that names it,
+      # then the installers it no longer names.
+      - name: update the v3-latest feed
+        run: |
+          if ! gh release view "$FEED_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Zeron v3 update feed" --prerelease --latest=false \
+              --notes "What installed Zeron v3 nightlies update from. Download a dated v3 release instead."
+          fi
+          setup="zeron-$VERSION-windows-x86_64-setup.exe"
+          gh release upload "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --clobber "dist/$setup"
+          gh release upload "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/manifest.json
+          gh release view "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+          while read -r name; do
+            case "$name" in
+              manifest.json|"$setup") ;;
+              *) gh release delete-asset "$FEED_TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes ;;
+            esac
+          done
       - name: keep the last 14 v3 nightlies
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
