@@ -32,8 +32,13 @@ note = "v3 updates itself on Windows: it downloads the release's installer and r
 [[patch]]
 name = "v3-windows-polish"
 pr = 1225
-sha = "09e6532da1d604b1459f7ddc8ec4045440dc522f"
-note = "v3 on Windows looks like the shipping app: frosted surfaces, caption buttons, panel tabs. Pins zgx at memory-floor plus zgx#1495 and #1496."
+sha = "3503566087a8b7ef2d9bbd81204c70c04ce3a43a"
+note = "v3 on Windows looks like the shipping app: frosted surfaces, caption buttons. Also no console windows, the exe icon, pictures from Windows devices, the model picker on any device and the page card. Merged with zeron/zgx, so it takes that pin of zgx; v3-zgx-windows-fixes adds the zgx side."
+
+[[patch]]
+name = "v3-zgx-windows-fixes"
+file = "patches/0006-v3-zgx-windows-fixes.patch"
+note = "Points v3's zgx at hoangvu12/zgx nightly/v3-zgx: zeron/zgx's pin plus zeronsh/zgx#1495 (Windows glass blur), #1496 (caption colours), the cursor fix under pointer_events none and zeronsh/zgx#1500 (popup cursor, GetDC leak). Applies on top of v3-windows-polish. Drop it once zeron/zgx pins a zgx with all of them."
 
 [[patch]]
 name = "large-plain-folder-index"
