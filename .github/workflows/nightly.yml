@@ -78,14 +78,25 @@ jobs:
         if: steps.changed.outputs.build == 'true' && env.PUSH_TOKEN != ''
         run: git -C src push --force "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" nightly:refs/heads/nightly
 
+  # The build and the updater tests, each on a runner of its own at the same
+  # time.
   windows:
     needs: assemble
     if: needs.assemble.outputs.build == 'true'
     runs-on: windows-2022
     timeout-minutes: 150
+    strategy:
+      matrix:
+        part: [package, tests]
     defaults:
       run:
         shell: pwsh
+    env:
+      # Nightlies only: no LTO across crates (each crate keeps its own). Cargo
+      # takes this over [profile.release]. Thin LTO alone took about two
+      # thirds of a build; the binaries may run slightly slower than
+      # upstream's releases.
+      CARGO_PROFILE_RELEASE_LTO: "false"
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -97,10 +108,16 @@ jobs:
           git -C src fetch --quiet ../source/nightly.bundle nightly:nightly
           git -C src checkout --quiet nightly
           if ((git -C src rev-parse HEAD) -ne '${{ needs.assemble.outputs.head }}') { throw 'bundle does not match the assembled head' }
+      # As upstream's Windows CI: the runner is thrown away after the job.
+      - name: disable Defender real-time scanning
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop }
+          catch { Write-Warning "Could not disable Defender real-time scanning: $_" }
       - name: rust toolchain (rust-toolchain.toml)
         working-directory: src
         run: rustup show active-toolchain || rustup toolchain install
       - name: locate Windows SDK shader compiler
+        if: matrix.part == 'package'
         run: |
           $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
             Sort-Object FullName -Descending | Select-Object -First 1
@@ -108,14 +125,18 @@ jobs:
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ matrix.part }}
           workspaces: src -> target
       - name: updater tests
+        if: matrix.part == 'tests'
         working-directory: src
         run: cargo test --locked -p zeron-update
       - name: package installer, portable zip and updater exe
+        if: matrix.part == 'package'
         working-directory: src
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - uses: actions/upload-artifact@v4
+        if: matrix.part == 'package'
         with:
           name: windows
           path: |

@@ -90,11 +90,88 @@ jobs:
         if: steps.changed.outputs.build == 'true' && env.PUSH_TOKEN != ''
         run: git -C src push --force "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" nightly:refs/heads/nightly-v3
 
-  windows:
+  # The engine (root workspace), the interface (apps/zgx, a workspace of its
+  # own) and the updater tests, each on a runner of its own at the same time.
+  build:
     needs: assemble
     if: needs.assemble.outputs.build == 'true'
     runs-on: windows-2022
-    timeout-minutes: 240
+    timeout-minutes: 150
+    strategy:
+      matrix:
+        include:
+          - part: engine
+            workspace: src -> target
+            exe: src/target/release/zeron-engine.exe
+          - part: app
+            workspace: src/apps/zgx -> target
+            exe: src/apps/zgx/target/release/zeron-zgx.exe
+          - part: tests
+            workspace: src -> target
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Nightlies only: no LTO across crates (each crate keeps its own), and
+      # zgx's codegen-units = 1 back to cargo's 16. Cargo takes these over
+      # [profile.release]. Thin LTO alone took about two thirds of a build;
+      # the binaries may run slightly slower than upstream's releases.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: source
+          path: source
+      - name: check out the assembled nightly
+        run: |
+          git clone --quiet --filter=blob:none $env:UPSTREAM src
+          git -C src fetch --quiet ../source/nightly.bundle nightly:nightly
+          git -C src checkout --quiet nightly
+          if ((git -C src rev-parse HEAD) -ne '${{ needs.assemble.outputs.head }}') { throw 'bundle does not match the assembled head' }
+      # As upstream's Windows CI: the runner is thrown away after the job.
+      - name: disable Defender real-time scanning
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop }
+          catch { Write-Warning "Could not disable Defender real-time scanning: $_" }
+      - name: rust toolchain (rust-toolchain.toml)
+        working-directory: src
+        run: rustup show active-toolchain || rustup toolchain install
+      # The engine's crate links the GPUI interface's library, which compiles
+      # its shaders.
+      - name: locate Windows SDK shader compiler
+        if: matrix.part == 'engine'
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: v3-${{ matrix.part }}
+          workspaces: ${{ matrix.workspace }}
+      - name: updater tests
+        if: matrix.part == 'tests'
+        working-directory: src
+        run: cargo test --locked -p zeron-update
+      - name: build the ${{ matrix.part }}
+        if: matrix.exe
+        run: ./tools/scripts/package-v3-windows.ps1 -Src src -Build ${{ matrix.part }}
+      - uses: actions/upload-artifact@v4
+        if: matrix.exe
+        with:
+          name: bin-${{ matrix.part }}
+          path: ${{ matrix.exe }}
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    needs: [assemble, build]
+    runs-on: windows-2022
+    timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
@@ -112,28 +189,13 @@ jobs:
           git -C src fetch --quiet ../source/nightly.bundle nightly:nightly
           git -C src checkout --quiet nightly
           if ((git -C src rev-parse HEAD) -ne '${{ needs.assemble.outputs.head }}') { throw 'bundle does not match the assembled head' }
-      - name: rust toolchain (rust-toolchain.toml)
-        working-directory: src
-        run: rustup show active-toolchain || rustup toolchain install
-      # The engine's crate links the GPUI interface's library, which compiles
-      # its shaders.
-      - name: locate Windows SDK shader compiler
-        run: |
-          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
-          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          key: v3
-          workspaces: |
-            src -> target
-            src/apps/zgx -> target
-      - name: updater tests
-        working-directory: src
-        run: cargo test --locked -p zeron-update
+          pattern: bin-*
+          path: bin
+          merge-multiple: true
       - name: package installer and portable zip
-        run: ./tools/scripts/package-v3-windows.ps1 -Src src -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:FEED_TAG"
+        run: ./tools/scripts/package-v3-windows.ps1 -Src src -Prebuilt bin -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:FEED_TAG"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -152,10 +214,15 @@ jobs:
       VERSION: ${{ needs.assemble.outputs.version }}
       PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
     steps:
+      # By name: the bin-* artifacts' .exe files are not release assets.
       - uses: actions/download-artifact@v4
         with:
+          name: source
           path: dist
-          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
       - name: release
         run: |
           target="$GITHUB_SHA"

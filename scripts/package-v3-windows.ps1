@@ -17,18 +17,27 @@
 #
 #   ./scripts/package-v3-windows.ps1 -Src ../zeron-nightly-src [-ReleasesUrl https://...] [-CargoArgs '-j','4']
 #
+# CI builds the two binaries on runners of their own: -Build engine or
+# -Build app builds just that one (into its target/release) and stops, and
+# -Prebuilt <folder> packages the zeron-engine.exe and zeron-zgx.exe found
+# there instead of building.
+#
 # Writes <Src>/target/package-v3/zeron-<version>-windows-<arch>(.zip|-setup.exe)
 # and, with the installer and -ReleasesUrl, the feed's manifest.json.
 param(
     [Parameter(Mandatory)][string]$Src,
     [string]$ReleasesUrl,
     [string[]]$CargoArgs = @(),
-    [switch]$NoInstaller
+    [switch]$NoInstaller,
+    [ValidateSet('engine', 'app')][string]$Build,
+    [string]$Prebuilt
 )
 $ErrorActionPreference = 'Stop'
 if ($ReleasesUrl -and -not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
+if ($Build -and $Prebuilt) { throw '-Build and -Prebuilt do not go together' }
 $tools = Split-Path $PSScriptRoot -Parent
 $root = (Resolve-Path -LiteralPath $Src).Path
+$prebuiltDir = if ($Prebuilt) { (Resolve-Path -LiteralPath $Prebuilt).Path }
 
 function Find-InnoSetupCompiler {
     $command = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue
@@ -98,22 +107,34 @@ try {
     $version = $found.Groups[1].Value
     $numericVersion = ($version -split '-', 2)[0]
 
-    cargo build --release --locked -p zeron --bin zeron-engine @CargoArgs
-    if ($LASTEXITCODE -ne 0) { throw 'Engine build failed' }
-    $engine = (Resolve-Path -LiteralPath './target/release/zeron-engine.exe').Path
-
-    # apps/zgx is a workspace of its own; cargo reads its .cargo/config.toml
-    # by where it runs, so build from its folder.
-    Push-Location 'apps/zgx'
-    try {
-        $env:ZERON_BETA_VERSION = $version
-        cargo build --release --locked --features beta @CargoArgs
-        if ($LASTEXITCODE -ne 0) { throw 'Interface build failed' }
-    } finally {
-        Remove-Item Env:ZERON_BETA_VERSION -ErrorAction SilentlyContinue
-        Pop-Location
+    if ($Prebuilt) {
+        $engine = Join-Path $prebuiltDir 'zeron-engine.exe'
+        $app = Join-Path $prebuiltDir 'zeron-zgx.exe'
+        foreach ($bin in $engine, $app) {
+            if (-not (Test-Path -LiteralPath $bin)) { throw "Not in ${Prebuilt}: $(Split-Path $bin -Leaf)" }
+        }
+    } else {
+        if ($Build -ne 'app') {
+            cargo build --release --locked -p zeron --bin zeron-engine @CargoArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Engine build failed' }
+            $engine = (Resolve-Path -LiteralPath './target/release/zeron-engine.exe').Path
+        }
+        if ($Build -ne 'engine') {
+            # apps/zgx is a workspace of its own; cargo reads its
+            # .cargo/config.toml by where it runs, so build from its folder.
+            Push-Location 'apps/zgx'
+            try {
+                $env:ZERON_BETA_VERSION = $version
+                cargo build --release --locked --features beta @CargoArgs
+                if ($LASTEXITCODE -ne 0) { throw 'Interface build failed' }
+            } finally {
+                Remove-Item Env:ZERON_BETA_VERSION -ErrorAction SilentlyContinue
+                Pop-Location
+            }
+            $app = (Resolve-Path -LiteralPath './apps/zgx/target/release/zeron-zgx.exe').Path
+        }
+        if ($Build) { return }
     }
-    $app = (Resolve-Path -LiteralPath './apps/zgx/target/release/zeron-zgx.exe').Path
 
     $said = Get-ExeOutput $app '--version'
     if ($said -ne "zeron $version") { throw "zeron-zgx.exe says '$said', not 'zeron $version'" }

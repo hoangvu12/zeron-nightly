@@ -27,9 +27,13 @@ nightlies update themselves from this repo's releases.
    prerelease: upstream `0.2.136` → `0.2.137-nightly.YYYYMMDDHHMM`. That sorts
    above the release it was built on and below the next one.
 4. If upstream and the patch list are unchanged since the last release, the
-   run stops there. Otherwise Windows builds, the updater tests run, and a
-   release `v<version>` is published with the installer, portable zip, updater
-   `.exe` and `manifest.json`. The last 14 releases are kept.
+   run stops there. Otherwise Windows builds while the updater tests run on a
+   second runner, and a release `v<version>` is published with the installer,
+   portable zip, updater `.exe` and `manifest.json`. The last 14 releases are
+   kept.
+
+Nightlies build without LTO across crates, which cuts most of the build time.
+They may run slightly slower than upstream's releases.
 
 ## Changing what goes in
 
@@ -99,7 +103,10 @@ on demand. It works like the v2 nightly, with these differences:
 - `scripts/package-v3-windows.ps1` builds `zeron-zgx` with its `beta`
   feature (production sign-in, Zeron's own data) and the engine from the same
   tree. It packages them with the `ui` scripts as a portable zip and a
-  per-user installer (`dist/zeron-v3.iss`).
+  per-user installer (`dist/zeron-v3.iss`). In CI the engine, the interface
+  and the updater tests build on three runners at once (`-Build engine` and
+  `-Build app`). A fourth job packages the result (`-Prebuilt`). zgx also
+  builds with 16 codegen units here, not its own 1.
 - Releases are prereleases and never the latest, so v2 installs never see
   them. Each keeps its own last 14.
 - It installs to `%LOCALAPPDATA%\Programs\Zeron v3`, next to v2. Both share
