@@ -30,12 +30,6 @@ sha = "44d08d24675660638e957b0ef42c638188e70bce"
 note = "Walk-based index for large plain folders, kept current with a watch. Stacked on #1184."
 
 [[patch]]
-name = "diff-capture-orphaned-git"
-pr = 1220
-sha = "1013fbb55308cddde91d665636f73807b10b86ce"
-note = "Closes git's stdout before waiting when a diff capture truncates, so Windows stops leaving git.exe behind."
-
-[[patch]]
 name = "dead-run-shimmer"
 pr = 840
 sha = "febdceb6e950f123f5cbc5f78d3a031d4a70a919"
@@ -57,13 +51,14 @@ note = "Clicks in the composer no longer open images underneath it."
 name = "windows-icon"
 pr = 1084
 sha = "a0476792700411ba0e9362646223ae0a979a0dc8"
-note = "Windows app icon without the macOS rounded-square look."
+enabled = false
+note = "Windows app icon without the macOS rounded-square look. Parked: upstream's new app icon (cd0ec07d) replaced the one this reworks, so it would bring the old one back."
 
 [[patch]]
 name = "warm-chats-parked-cap"
 pr = 1101
 sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
-note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min (ZERON_PARKED_SESSION_CAP=0 disables); reuses laid-out transcripts on chat switch; model catalogs stay fresh for 10 min."
+note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min (ZERON_PARKED_SESSION_CAP=0 disables); reuses laid-out transcripts on chat switch; model catalogs stay fresh for 10 min. Its conflict with main's parked waits in sessions.rs replays from rerere/, which also keeps the cap off a chat waiting for its wake turn."
 
 [[patch]]
 name = "change-request-spawn-off-runtime"

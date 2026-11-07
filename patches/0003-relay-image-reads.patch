@@ -1,4 +1,4 @@
-From 856681736312eb99d2e8ecbc809db57034b4fb9c Mon Sep 17 00:00:00 2001
+From 702d7aed5fcda17fa42b763147bb33cd1bd27ecd Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:03:38 +0700
 Subject: [PATCH] Images from another device load in a few round trips, not one
@@ -35,7 +35,7 @@ times out on Windows, as before).
  5 files changed, 221 insertions(+), 32 deletions(-)
 
 diff --git a/crates/engine/src/reply_images.rs b/crates/engine/src/reply_images.rs
-index ea9340578..b66dfd94d 100644
+index ea93405787190af78ed48429e56cda7aca54d3ac..b66dfd94d15995abbf791a887601650d086103a7 100644
 --- a/crates/engine/src/reply_images.rs
 +++ b/crates/engine/src/reply_images.rs
 @@ -260,6 +260,7 @@ pub(crate) fn read_chunk(
@@ -47,7 +47,7 @@ index ea9340578..b66dfd94d 100644
  }
  
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index eee71f30c..017be6031 100644
+index aa60c492ddb0332139c79ea58031b87a9c4fda9c..eb1be33b65878265ff41588c5cd85f39c58496e4 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -37,10 +37,10 @@
@@ -65,7 +65,7 @@ index eee71f30c..017be6031 100644
  //!   (`{text, nextOffset, done, bytes, lines, trimmed, exitCode?}`): one command's
  //!   whole output from this host's run journal, redacted as the doc's tail is
 diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
-index a79d1deb1..f0f426a37 100644
+index a79d1deb1f7defa7fb78ff956651757376165b64..f0f426a376d1371767849b0e4a1eb38a3010492c 100644
 --- a/crates/engine/src/uploads.rs
 +++ b/crates/engine/src/uploads.rs
 @@ -96,6 +96,9 @@ pub struct AttachmentChunk {
@@ -87,7 +87,7 @@ index a79d1deb1..f0f426a37 100644
      }
  
 diff --git a/crates/engine/tests/device_routing.rs b/crates/engine/tests/device_routing.rs
-index 0b3c018dd..ab7aadd5b 100644
+index 8b99f8cdb9c5b002708c59916e38687978b20d11..6b9f005b3c68d6ba2620a1c70fe0fc3a86612bf0 100644
 --- a/crates/engine/tests/device_routing.rs
 +++ b/crates/engine/tests/device_routing.rs
 @@ -878,6 +878,8 @@ async fn target_device_id_routes_over_the_relay() {
@@ -100,7 +100,7 @@ index 0b3c018dd..ab7aadd5b 100644
      assert!(
          client
 diff --git a/crates/ui/src/attachments.rs b/crates/ui/src/attachments.rs
-index 98f8af42f..e966a7eb3 100644
+index 98f8af42f2209677622b07affb59e6ff79a9bc58..e966a7eb38639ea678a65e3f5da61654591c7aa3 100644
 --- a/crates/ui/src/attachments.rs
 +++ b/crates/ui/src/attachments.rs
 @@ -628,9 +628,8 @@ pub struct LoadedAttachmentImage {
@@ -382,5 +382,5 @@ index 98f8af42f..e966a7eb3 100644
      fn generated_image_cancelled_load_releases_claim_without_losing_completed_images() {
          let owner = "cancelled-generated-owner";
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 
