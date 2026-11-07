@@ -78,7 +78,7 @@ def merge(src: Path, rev: str, message: str) -> str | None:
     # rerere.autoupdate stages every hunk it replays; nothing left means done.
     if not conflicts and git(src, *IDENT, "commit", "--no-edit", check=False).returncode == 0:
         return None
-    git(src, "merge", "--abort", check=False)
+    git(src, *IDENT, "merge", "--abort", check=False)
     return f"conflicts in {', '.join(conflicts)}" if conflicts else result.stderr.strip()
 
 
@@ -90,7 +90,9 @@ def apply_file(src: Path, patch: Path) -> str | None:
     conflicts = unresolved(src)
     if not conflicts and git(src, *IDENT, "am", "--continue", check=False).returncode == 0:
         return None
-    git(src, "am", "--abort", check=False)
+    # Without an identity (CI has none) `am --abort` fails and leaves the
+    # conflict behind for every patch after it.
+    git(src, *IDENT, "am", "--abort", check=False)
     return f"conflicts in {', '.join(conflicts)}" if conflicts else result.stderr.strip()
 
 
@@ -151,7 +153,7 @@ def main() -> None:
     patches = [p for p in config.get("patch", []) if p.get("enabled", True)]
 
     for op in ("merge", "am", "rebase", "cherry-pick"):
-        git(src, op, "--abort", check=False)
+        git(src, *IDENT, op, "--abort", check=False)
     git(src, "config", "rerere.enabled", "true")
     git(src, "config", "rerere.autoupdate", "true")
     if (TOOLS / "rerere").is_dir():
