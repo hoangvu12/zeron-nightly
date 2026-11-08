@@ -86,6 +86,11 @@ name = "relay-image-reads"
 file = "patches/0003-relay-image-reads.patch"
 note = "Images from a chat on another device load in a few relay round trips. Applies on top of markdown-reply-images."
 
+[[patch]]
+name = "child-chats-report-back"
+file = "patches/0007-child-chats-report-back.patch"
+note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. Applies on top of relay-image-reads."
+
 # Not on v3: zeron/zgx has its own new app icon.
 [[patch]]
 name = "windows-icon"
