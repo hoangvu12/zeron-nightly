@@ -77,6 +77,12 @@ sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
 note = "PR watches start Git off the runtime workers, so slow Windows process launches stop freezing the engine."
 
 [[patch]]
+name = "revived-turn-zeron-tools"
+pr = 1285
+sha = "f365aadfac10ce2c878fcd09ebc36cb76b0a37bd"
+note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts."
+
+[[patch]]
 name = "markdown-reply-images"
 file = "patches/0002-markdown-reply-images.patch"
 note = "Markdown images in replies from any local folder, kept when the reply finishes. The engine part serves v3 too."

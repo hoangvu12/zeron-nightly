@@ -1,6 +1,6 @@
-From b158d08296e129603fcaa58b66592509917efdac Mon Sep 17 00:00:00 2001
+From 58510a2522027b7e9ba4a411370c3eaab7ba9562 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
-Date: Sun, 8 Nov 2026 21:40:59 +0700
+Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
 
 When an agent hands work to subagents or side chats, each child's answer
@@ -51,14 +51,13 @@ has to poll, and the person never has to nudge either side.
  crates/client/src/session/mod.rs             |   2 +-
  crates/doc/src/commands.rs                   |  17 +-
  crates/doc/src/rebuild.rs                    |   2 +-
- crates/engine/src/deferred.rs                |   4 +-
  crates/engine/src/doc_host.rs                | 333 ++++++-
- crates/engine/src/lib.rs                     |   6 +-
+ crates/engine/src/lib.rs                     |   1 +
  crates/engine/src/rpc.rs                     |   2 +-
  crates/engine/src/rpc/agent_gate.rs          |  66 +-
  crates/engine/src/run_journal.rs             |  19 +
  crates/engine/src/session_reports.rs         | 952 +++++++++++++++++++
- crates/engine/src/sessions.rs                | 947 +++++++++++++++++-
+ crates/engine/src/sessions.rs                | 916 +++++++++++++++++-
  crates/engine/tests/adapter_chaos_live.rs    |   2 +-
  crates/engine/tests/e2e.rs                   |   4 +-
  crates/engine/tests/message_queue.rs         |   6 +-
@@ -69,7 +68,7 @@ has to poll, and the person never has to nudge either side.
  crates/mcp/src/tools.rs                      |  24 +-
  crates/proto/src/agent_messages.rs           | 422 +++++++-
  docs/mcp.md                                  |   8 +
- 44 files changed, 5262 insertions(+), 195 deletions(-)
+ 43 files changed, 5225 insertions(+), 192 deletions(-)
  create mode 100644 apps/zgx/ui/ds/spawn_group.luau
  create mode 100644 apps/zgx/ui/ds/subagent_row.luau
  create mode 100644 apps/zgx/ui/tests/subagent_reports.test.luau
@@ -3359,22 +3358,6 @@ index 0ee8e47a6..778aecc31 100644
              issued_by: "dev-b".into(),
              issued_at: 9,
              based_on: None,
-diff --git a/crates/engine/src/deferred.rs b/crates/engine/src/deferred.rs
-index cb08c694e..e51461e3f 100644
---- a/crates/engine/src/deferred.rs
-+++ b/crates/engine/src/deferred.rs
-@@ -229,8 +229,10 @@ impl DeferredEngine {
-                 Ok(runtime) => {
-                     let service: Arc<dyn RpcService> = runtime.core().rpc_service();
-                     if let Some(port) = served_ipc_port {
--                        runtime.core().sessions.set_ipc_port(port);
-+                        // (Its bearer first: a run revived on boot waits
-+                        // on the port, then reads both.)
-                         runtime.core().sessions.set_ipc_token_file(ipc_token_file);
-+                        runtime.core().sessions.set_ipc_port(port);
-                     }
-                     on_ready(&runtime);
-                     *runtime_slot.lock().await = Some(runtime);
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
 index b4d1b2b38..ddde42a1e 100644
 --- a/crates/engine/src/doc_host.rs
@@ -3791,7 +3774,7 @@ index b4d1b2b38..ddde42a1e 100644
      /// live steerable run — deliver the durable command as the next turn.
      /// After an engine restart `last_request` is empty too, so rebuild the run
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index c8abf9a83..5b0304807 100644
+index 1550bbe40..5b0304807 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -350,6 +350,7 @@ impl EngineCore {
@@ -3802,22 +3785,6 @@ index c8abf9a83..5b0304807 100644
          }
          doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
          let repos = Repos::new(data_dir, &device_id);
-@@ -1253,12 +1254,13 @@ impl Engine {
-         });
-         let server = serve_ipc(config.ipc_port, &config.data_dir, service).await?;
-         // Only a port this process actually serves goes to agents: the
--        // injected MCP server must dial back into THIS engine.
--        runtime.core().sessions.set_ipc_port(config.ipc_port);
-+        // injected MCP server must dial back into THIS engine. (Its bearer
-+        // first: a run revived on boot waits on the port, then reads both.)
-         runtime
-             .core()
-             .sessions
-             .set_ipc_token_file(zeron_rpc::ipc_auth::agent_token_path(&config.data_dir));
-+        runtime.core().sessions.set_ipc_port(config.ipc_port);
-         update_trial::prove_and_commit(runtime.core(), &config);
- 
-         tokio::select! {
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
 index 8bb878b27..31ee9186c 100644
 --- a/crates/engine/src/rpc.rs
@@ -4939,7 +4906,7 @@ index 000000000..555dcf43c
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 2cb6a87ef..27850b7e2 100644
+index 404d662c7..01d818e50 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -29,6 +29,7 @@ use zeron_doc::{
@@ -4960,7 +4927,7 @@ index 2cb6a87ef..27850b7e2 100644
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
  use crate::{EngineError, new_id, now_ms};
-@@ -275,9 +279,16 @@ struct Inner {
+@@ -275,6 +279,10 @@ struct Inner {
      /// while no run was live (between the failed run and its retry) found
      /// nothing to stop, and still ends the turn.
      user_stops: Mutex<HashMap<String, u64>>,
@@ -4971,13 +4938,7 @@ index 2cb6a87ef..27850b7e2 100644
      /// Loopback IPC port this engine serves, once known (0 = not serving):
      /// what the injected `zeron mcp` server dials back into.
      ipc_port: std::sync::atomic::AtomicU16,
-+    /// Rung as the port is recorded: what a run revived on boot, while the
-+    /// engine is still being assembled, waits on ([`Sessions::ipc_port_ready`]).
-+    ipc_ready: tokio::sync::Notify,
-     /// Where this engine publishes its IPC bearer (`{data_dir}/ipc-token`),
-     /// handed to the injected `zeron mcp` as a PATH, never the token itself.
-     ipc_token_file: Mutex<Option<std::path::PathBuf>>,
-@@ -325,6 +336,9 @@ struct Inner {
+@@ -328,6 +336,9 @@ struct Inner {
      turn_listener: OnceLock<TurnListener>,
      /// Plugins whose native MCP servers local runs get (absent in bare tests).
      plugins: OnceLock<crate::plugins::Plugins>,
@@ -4987,17 +4948,15 @@ index 2cb6a87ef..27850b7e2 100644
  }
  
  /// Turn-start hook: called with `(chat_id, cwd)`.
-@@ -355,7 +369,9 @@ impl SessionsEngine {
+@@ -358,6 +369,7 @@ impl SessionsEngine {
                  revivals: Mutex::new(HashMap::new()),
                  cancelled_sends: Mutex::new(HashMap::new()),
                  user_stops: Mutex::new(HashMap::new()),
 +                stopped_at: Mutex::new(HashMap::new()),
                  ipc_port: std::sync::atomic::AtomicU16::new(0),
-+                ipc_ready: tokio::sync::Notify::new(),
+                 ipc_ready: tokio::sync::Notify::new(),
                  ipc_token_file: Mutex::new(None),
-                 journal,
-                 registry,
-@@ -375,6 +391,7 @@ impl SessionsEngine {
+@@ -379,6 +391,7 @@ impl SessionsEngine {
                  scratch_root: OnceLock::new(),
                  turn_listener: OnceLock::new(),
                  plugins: OnceLock::new(),
@@ -5005,35 +4964,7 @@ index 2cb6a87ef..27850b7e2 100644
              }),
          }
      }
-@@ -390,6 +407,27 @@ impl SessionsEngine {
-         self.inner
-             .ipc_port
-             .store(port, std::sync::atomic::Ordering::Relaxed);
-+        self.inner.ipc_ready.notify_waiters();
-+    }
-+
-+    /// Until the IPC port is recorded, or `limit` passes. Boot recovery
-+    /// revives cut-off turns while the engine is still being assembled, before
-+    /// it serves its port: dispatched then, a revived run went out with no
-+    /// Zeron tools (its agent read them as gone, and a parent woken by its
-+    /// children's reports couldn't answer them).
-+    async fn ipc_port_ready(&self, limit: std::time::Duration) {
-+        let deadline = tokio::time::Instant::now() + limit;
-+        loop {
-+            // (Made before the check: `notify_waiters` reaches a `Notified`
-+            // from its making, polled or not.)
-+            let rung = self.inner.ipc_ready.notified();
-+            if self.inner.ipc_port.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-+                return;
-+            }
-+            if tokio::time::timeout_at(deadline, rung).await.is_err() {
-+                return;
-+            }
-+        }
-     }
- 
-     /// Record where the served port's bearer lives (`{data_dir}/ipc-token`).
-@@ -404,6 +442,31 @@ impl SessionsEngine {
+@@ -434,6 +447,31 @@ impl SessionsEngine {
          let _ = self.inner.plugins.set(plugins);
      }
  
@@ -5065,7 +4996,7 @@ index 2cb6a87ef..27850b7e2 100644
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -486,6 +549,11 @@ impl SessionsEngine {
+@@ -516,6 +554,11 @@ impl SessionsEngine {
              .is_some_and(HarnessDescriptor::steers_mid_turn)
      }
  
@@ -5077,7 +5008,7 @@ index 2cb6a87ef..27850b7e2 100644
      /// Whether this chat has a turn in flight — streaming, or parked on a
      /// question it is still owed an answer to (see [`is_active`]). A persistent
      /// session parked BETWEEN turns is not: it holds a warm child with nothing
-@@ -1622,6 +1690,7 @@ impl SessionsEngine {
+@@ -1652,6 +1695,7 @@ impl SessionsEngine {
          *lock(&self.inner.user_stops)
              .entry(chat_id.to_string())
              .or_default() += 1;
@@ -5085,20 +5016,7 @@ index 2cb6a87ef..27850b7e2 100644
          let live = if let Some(run) = lock(&self.inner.runs).get(chat_id) {
              run.shutdown_cut
                  .store(false, std::sync::atomic::Ordering::Release);
-@@ -1969,6 +2038,12 @@ impl SessionsEngine {
-                 let Some(host) = sessions.inner.doc_host() else {
-                     return;
-                 };
-+                // Its Zeron tools need the port the engine is about to serve.
-+                // (One serving none, its in-process transport alone, goes on
-+                // without them after a moment, as any run of its does.)
-+                sessions
-+                    .ipc_port_ready(std::time::Duration::from_secs(10))
-+                    .await;
-                 // A message sent since boot owns the chat now: reviving the
-                 // old turn into it would deliver the old request a second
-                 // time (dispatch checks again as the run starts).
-@@ -2342,6 +2417,7 @@ impl Inner {
+@@ -2378,6 +2422,7 @@ impl Inner {
          outcome: Option<DoneStatus>,
      ) {
          let now = Utc::now();
@@ -5106,7 +5024,7 @@ index 2cb6a87ef..27850b7e2 100644
          let session = {
              let mut statuses = lock(&self.statuses);
              let entry = statuses
-@@ -2429,6 +2505,67 @@ impl Inner {
+@@ -2465,6 +2510,67 @@ impl Inner {
          {
              tracing::warn!(chat = %chat_id, %error, "couldn't wake a sleeping chat");
          }
@@ -5174,7 +5092,7 @@ index 2cb6a87ef..27850b7e2 100644
      }
  
      /// Publish what `chat_id`'s agent waits on after its turn ended (`None`:
-@@ -2466,9 +2603,18 @@ impl Inner {
+@@ -2502,9 +2608,18 @@ impl Inner {
      /// A message the user already sent follows the turn that is ending
      /// (see [`crate::doc_host::ChatDocHandle::continues_with_sent_message`]).
      fn continues_with_sent_message(&self, chat_id: &str) -> bool {
@@ -5196,7 +5114,7 @@ index 2cb6a87ef..27850b7e2 100644
      }
  
      /// Whether a run of `chat_id` launches without its provider's own
-@@ -4285,6 +4431,10 @@ async fn drive_run(
+@@ -4321,6 +4436,10 @@ async fn drive_run(
      let mut waiting_on = turn.watch_waiting();
      let mut wait: Option<ParkedWait> = None;
      let wake_grace = wake_grace();
@@ -5207,7 +5125,7 @@ index 2cb6a87ef..27850b7e2 100644
      // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
      // steerable harness parks here instead of ending the run — the child and
      // its steering mailbox stay warm, and the next user message (dispatch
-@@ -4429,9 +4579,23 @@ async fn drive_run(
+@@ -4465,9 +4584,23 @@ async fn drive_run(
                      continue;
                  }
                  // What a parked wait waits on changed: shown as it is; once
@@ -5234,7 +5152,7 @@ index 2cb6a87ef..27850b7e2 100644
                      if let Some(parked) = wait.as_mut() {
                          parked.grace = if on.is_empty() {
                              parked.grace.or_else(|| Some(tokio::time::Instant::now() + wake_grace))
-@@ -5447,8 +5611,9 @@ async fn drive_run(
+@@ -5483,8 +5616,9 @@ async fn drive_run(
                  let outcome = (!pending_steer && turn_was_active).then_some(*status);
                  // A finished turn whose agent waits on background work that
                  // will wake it parks into a wait: Waiting, its completion
@@ -5246,9 +5164,9 @@ index 2cb6a87ef..27850b7e2 100644
                  if completed_turn.is_some() && !on.is_empty() {
                      let since = Utc::now();
                      wait = Some(ParkedWait {
-@@ -6924,4 +7089,770 @@ mod tests {
-         assert!(s.last_completed_turn.is_some(), "a wait never swallows the finish");
-         rig.core.sessions.shutdown().await;
+@@ -6997,4 +7131,770 @@ mod tests {
+         sessions.ipc_port_ready(limit).await;
+         assert_eq!(start.elapsed(), Duration::ZERO);
      }
 +
 +    type Ask = Arc<
