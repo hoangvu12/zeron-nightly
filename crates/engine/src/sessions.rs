@@ -4920,16 +4920,10 @@ async fn drive_run(
             } else {
                 zeron_doc::TurnUpdate::Keep
             };
-            match doc_ref.commit_provider_event(seq, turn, prompt.as_ref()) {
-                Ok(()) => pm.watermark = pm.watermark.max(seq),
-                Err(err) => tracing::warn!(chat = %chat_id, error = %err, "replay watermark write failed"),
-            }
             // The host's sweep, once per batch: at each turn's end and each
             // person's message (and when a run starts, above), not per event.
-            if batch
-                && let Err(err) = doc_ref.sweep_provider_duplicates()
-            {
-                tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
+            if crate::provider_run::commit_marker(doc_ref, &chat_id, seq, turn, prompt.as_ref(), batch) {
+                pm.watermark = pm.watermark.max(seq);
             }
             continue;
         }
@@ -5803,12 +5797,14 @@ async fn drive_run(
                 } else {
                     zeron_doc::TurnUpdate::Keep
                 };
-                if let Err(err) = doc_ref.commit_provider_event(sequence_num, turn, prompt.as_ref()) {
-                    tracing::warn!(chat = %chat_id, error = %err, "replay watermark write failed");
-                }
-                if let Err(err) = doc_ref.sweep_provider_duplicates() {
-                    tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
-                }
+                crate::provider_run::commit_marker(
+                    doc_ref,
+                    &chat_id,
+                    sequence_num,
+                    turn,
+                    prompt.as_ref(),
+                    true,
+                );
             }
             final_completed_turn = completed_turn;
             // Retiring an already parked process is not a new turn outcome.

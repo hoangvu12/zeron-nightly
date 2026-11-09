@@ -584,7 +584,7 @@ impl SessionDoc {
     /// which drops fields older engines don't know. One atomic value.
     pub fn provider_run_session(&self) -> Option<zeron_proto::ProviderSession> {
         let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
-            self.doc.get_map("meta").get("providerSession")
+            self.doc.get_map("meta").get(crate::provider_mirror::PROVIDER_SESSION)
         else {
             return None;
         };
@@ -602,7 +602,7 @@ impl SessionDoc {
         }
         self.doc
             .get_map("meta")
-            .insert("providerSession", serde_json::to_string(session)?)?;
+            .insert(crate::provider_mirror::PROVIDER_SESSION, serde_json::to_string(session)?)?;
         self.doc.commit();
         Ok(())
     }
@@ -720,11 +720,16 @@ impl SessionDoc {
     ) -> Result<Vec<SessionMessageEntry>, DocError> {
         use loro::{Container, ValueOrContainer};
         let messages = self.doc.get_list("messages");
+        // A provider-run chat's duplicates never show (as in `read_entries`).
+        let hidden = self.hidden_duplicates();
         let mut remaining = max_parts;
         let mut entries = Vec::new();
         for index in (0..messages.len()).rev() {
             if remaining == 0 {
                 break;
+            }
+            if hidden.contains(&index) {
+                continue;
             }
             let Some(ValueOrContainer::Container(Container::Map(map))) = messages.get(index) else {
                 continue;

@@ -84,8 +84,17 @@ pub(crate) struct Mapped {
     /// everything above (`None` for live events, and for replayed ones the
     /// transcript already has).
     pub mark: Option<AgentEvent>,
-    /// The stored event's sequence number, if it was one.
-    pub seq: Option<u64>,
+}
+
+impl Mapped {
+    /// The stored event's sequence number (`None` for live events, and for
+    /// replayed ones the transcript already has).
+    pub fn seq(&self) -> Option<u64> {
+        match &self.mark {
+            Some(AgentEvent::ProviderEvent { sequence_num, .. }) => Some(*sequence_num),
+            _ => None,
+        }
+    }
 }
 
 /// What a payload is, as far as control traffic goes.
@@ -226,18 +235,15 @@ impl Mirror {
             Traffic::Control(control) => Mapped {
                 control: Some(control),
                 mark,
-                seq,
                 ..Mapped::default()
             },
             Traffic::Ignored => Mapped {
                 mark,
-                seq,
                 ..Mapped::default()
             },
             Traffic::Other if person.is_some() => Mapped {
                 person,
                 mark,
-                seq,
                 ..Mapped::default()
             },
             Traffic::Other => {
@@ -246,7 +252,6 @@ impl Mirror {
                     events: self.map_payload(payload),
                     settings,
                     mark,
-                    seq,
                     ..Mapped::default()
                 }
             }

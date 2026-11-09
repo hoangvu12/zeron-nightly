@@ -466,12 +466,12 @@ async fn a_prompt_left_open_by_a_restart_is_asked_again_and_answerable() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn two_copies_of_a_provider_event_converge_to_one_on_every_device() {
+async fn two_copies_of_a_provider_event_converge_to_one_on_every_device_with_no_send() {
     let world = World::new().await;
     let a = world.engine("dev-a");
     let b = world.engine("dev-b");
     let _room = bridge(&a, &b).await;
-    let (chat, cwd) = create_and_mirror(&world, &a).await;
+    let (chat, _cwd) = create_and_mirror(&world, &a).await;
     b.merge(&chat, &a.updates(&chat));
     wait_for("the chat on B", || users_saying(&b.entries(&chat), FIRST_PROMPT) == 1).await;
 
@@ -508,10 +508,6 @@ async fn two_copies_of_a_provider_event_converge_to_one_on_every_device() {
         .push_provider_message(&copy("copy-on-b"), FIRST, seq)
         .unwrap();
     let (from_a, from_b) = (a.updates(&chat), b.updates(&chat));
-    a.merge(&chat, &from_b);
-    b.merge(&chat, &from_a);
-
-    // Never shown, even before the cleanup: every device shows the same one.
     let shown = |host: &Host| {
         host.entries(&chat)
             .into_iter()
@@ -519,29 +515,6 @@ async fn two_copies_of_a_provider_event_converge_to_one_on_every_device() {
             .map(|e| e.id)
             .collect::<Vec<_>>()
     };
-    // (Which copy is the lowest Loro element id's, not necessarily the
-    // first written: the same choice on every device.)
-    let chosen = shown(&a);
-    assert_eq!(chosen.len(), 1, "{chosen:?}");
-    assert_eq!(shown(&b), chosen);
-    assert_eq!(
-        doc_a
-            .doc()
-            .provider_entries()
-            .iter()
-            .filter(|e| e.provider_uuid.as_deref() == Some(FIRST))
-            .count(),
-        3
-    );
-
-    // The host's next run cleans up; the copy kept is the same everywhere.
-    world.fake.queue_turn(Turn::text_zulu());
-    a.send(&chat, &cwd, SECOND, SECOND_PROMPT);
-    wait_for("the reply", || {
-        a.settled(&chat) && a.assistants(&chat, MessageStatus::Complete).len() == 2
-    })
-    .await;
-    b.merge(&chat, &a.updates(&chat));
     let kept = |host: &Host| {
         host.core
             .doc_host
@@ -554,9 +527,32 @@ async fn two_copies_of_a_provider_event_converge_to_one_on_every_device() {
             .map(|e| e.id)
             .collect::<Vec<_>>()
     };
+
+    // B, not the host, gets A's copy: all three are there, one shows.
+    // (Which is the lowest Loro element id's, not necessarily the first
+    // written: the same choice on every device.)
+    b.merge(&chat, &from_a);
+    assert_eq!(kept(&b).len(), 3);
+    let chosen = shown(&b);
+    assert_eq!(chosen.len(), 1, "{chosen:?}");
+
+    // A, the host, gets B's copy while the chat is idle: it sweeps on the
+    // remote change, with no message sent and no run.
+    a.merge(&chat, &from_b);
+    wait_for("the host's sweep", || kept(&a).len() == 1).await;
     assert_eq!(kept(&a), chosen);
-    assert_eq!(kept(&b), chosen);
     assert_eq!(shown(&a), chosen);
+    assert!(
+        !world
+            .fake
+            .requests()
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/events")),
+        "nothing was sent"
+    );
+    // The sweep reaches B: the same copy everywhere.
+    b.merge(&chat, &a.updates(&chat));
+    assert_eq!(kept(&b), chosen);
     assert_eq!(shown(&b), chosen);
     a.core.shutdown().await;
     b.core.shutdown().await;
