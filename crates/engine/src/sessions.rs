@@ -782,6 +782,31 @@ impl SessionsEngine {
         .await
     }
 
+    /// Start a provider-run chat's run with no message: the host resuming
+    /// the chat (after a restart, or taking it over). The run catches the
+    /// transcript up from the chat document's replay watermark and mirrors
+    /// whatever the session does next; it sends nothing. Its harness must
+    /// already be bound to the chat's session
+    /// ([`crate::provider_run::bind_run`]). See
+    /// [`crate::provider_run::resume_as_host`].
+    pub(crate) async fn start_provider_resume(
+        &self,
+        chat_id: &str,
+        request: RunRequest,
+    ) -> Result<String, EngineError> {
+        self.dispatch_inner(
+            chat_id,
+            HarnessId::ClaudeCodeCloud,
+            request,
+            None,
+            false,
+            0,
+            None,
+            true,
+        )
+        .await
+    }
+
     pub(crate) fn take_voice_bridge(
         &self,
         chat_id: &str,
@@ -4463,6 +4488,18 @@ async fn drive_run(
             rebuild.release();
         }
         writer = Some(rebuild);
+        // A host resuming the chat mid-turn: that turn is running.
+        if resume_state.idle {
+            idle_since = None;
+            inner.set_status(&chat_id, SessionStatus::Working, false);
+        }
+    }
+    // Duplicates another host (or an earlier run) left go now: the takeover
+    // sweep (docs/design/provider-run-chats.md §5, "Deduplication").
+    if provider.is_some()
+        && let Err(err) = doc_ref.sweep_provider_duplicates()
+    {
+        tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
     }
 
     let mut final_completed_turn = None;
@@ -5157,7 +5194,22 @@ async fn drive_run(
         let turn_was_active = idle_since.is_none();
         const RESUME_GATE: std::time::Duration = std::time::Duration::from_secs(1);
         if idle_since.is_some() {
-            let self_continued = idle_since
+            // A provider-run chat's mirror shows only what the session did:
+            // its output after a park is a turn running (one typed on
+            // claude.ai, or a replay catching a resuming host up), at once,
+            // and a prompt in it waits for the person.
+            let provider_output = provider.is_some()
+                && match &event {
+                    AgentEvent::TextDelta { text } => !text.is_empty(),
+                    AgentEvent::ReasoningDelta { text } => !text.trim().is_empty(),
+                    AgentEvent::ToolCall { .. }
+                    | AgentEvent::ToolResult { .. }
+                    | AgentEvent::InputRequested { .. }
+                    | AgentEvent::Error { .. } => true,
+                    _ => false,
+                };
+            let self_continued = provider_output
+                || idle_since
                 .is_some_and(|parked_at| parked_at.elapsed() >= RESUME_GATE)
                 && (matches!(
                     &event,

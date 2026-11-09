@@ -96,39 +96,65 @@ struct SessionState {
     /// Where the next fresh run picks up, from the chat document (the
     /// engine's [`RunBinding::resume`]); wins over `last_seq`.
     resume: Option<ProviderResume>,
-    /// What this device last put the session in, so a fresh run whose
-    /// configuration differs sends the change.
-    applied: Applied,
+    /// The settings the session is in, as its last `system/init` (or this
+    /// device's acknowledged change) said; `None` until known.
+    actual: Option<Settings>,
+    /// The settings this device's last run of the chat asked for; `None`
+    /// until one ran here (another device's session, or after a restart).
+    ran_with: Option<Settings>,
 }
 
-/// A session's model and permission mode, as far as this device knows.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Applied {
-    /// `None`: not known (another device's session, or after a restart).
-    pub model: Option<Option<String>>,
-    /// Every session starts in `default` (each recorded `system/init`).
-    pub mode: String,
+/// A Claude Code permission mode (`--permission-mode`, `set_permission_mode`,
+/// `system/init`'s `permissionMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionMode {
+    Default,
+    AcceptEdits,
+    BypassPermissions,
+    Plan,
 }
 
-impl Default for Applied {
-    fn default() -> Self {
-        Self {
-            model: None,
-            mode: "default".into(),
+impl PermissionMode {
+    pub fn from_wire(mode: &str) -> Option<Self> {
+        Some(match mode {
+            "default" => Self::Default,
+            "acceptEdits" => Self::AcceptEdits,
+            "bypassPermissions" => Self::BypassPermissions,
+            "plan" => Self::Plan,
+            _ => return None,
+        })
+    }
+
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
+            Self::Plan => "plan",
         }
     }
+}
+
+/// A session's model and permission mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Settings {
+    /// `None`: the account's default model.
+    pub model: Option<String>,
+    pub mode: PermissionMode,
 }
 
 /// What a fresh run starts from.
 pub(crate) struct RunStart {
     pub session: ProviderSession,
-    /// The opening prompt's event uuid.
-    pub prompt_uuid: String,
+    /// The opening prompt's event uuid, when the engine named its message
+    /// (no id: a new message, and no setting change goes with it).
+    pub prompt_uuid: Option<String>,
     /// Whether the session already has the opening prompt.
     pub delivered: bool,
     /// Where the stream starts, and what the transcript already has.
     pub resume: ProviderResume,
-    pub applied: Applied,
+    pub actual: Option<Settings>,
+    pub ran_with: Option<Settings>,
 }
 
 /// The sessions runs may use, by session id.
@@ -151,10 +177,13 @@ impl Bindings {
                 delivered: HashSet::from([prompt_uuid]),
                 last_seq: Some(0),
                 resume: None,
-                applied: Applied {
-                    model: Some(model),
-                    ..Applied::default()
-                },
+                // Every session starts in `default` (each recorded
+                // `system/init`), on the model it was created with.
+                actual: Some(Settings {
+                    model,
+                    mode: PermissionMode::Default,
+                }),
+                ran_with: None,
             },
         );
     }
@@ -177,7 +206,8 @@ impl Bindings {
                         delivered: HashSet::new(),
                         last_seq: None,
                         resume: binding.resume,
-                        applied: Applied::default(),
+                        actual: None,
+                        ran_with: None,
                     },
                 );
             }
@@ -188,10 +218,7 @@ impl Bindings {
     fn take_run(&self, session_id: &str) -> Option<RunStart> {
         let mut sessions = self.lock();
         let state = sessions.get_mut(session_id)?;
-        let uuid = state
-            .prompt_uuid
-            .take()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let uuid = state.prompt_uuid.take();
         let resume = state.resume.take().unwrap_or_else(|| {
             let seq = state.last_seq.unwrap_or(0);
             ProviderResume {
@@ -203,30 +230,39 @@ impl Bindings {
         });
         Some(RunStart {
             session: state.session.clone(),
-            delivered: state.delivered.contains(&uuid),
+            delivered: uuid.as_ref().is_some_and(|u| state.delivered.contains(u)),
             prompt_uuid: uuid,
             resume,
-            applied: state.applied.clone(),
+            actual: state.actual.clone(),
+            ran_with: state.ran_with.clone(),
         })
     }
 
-    pub(crate) fn note_applied(&self, session_id: &str, applied: Applied) {
+    /// The settings the session is in now (its `system/init`, or a change
+    /// it acknowledged).
+    pub(crate) fn note_actual(&self, session_id: &str, actual: Settings) {
         if let Some(state) = self.lock().get_mut(session_id) {
-            state.applied = applied;
+            state.actual = Some(actual);
         }
+    }
+
+    /// The settings a run of the chat on this device asked for.
+    pub(crate) fn note_ran_with(&self, session_id: &str, settings: Settings) {
+        if let Some(state) = self.lock().get_mut(session_id) {
+            state.ran_with = Some(settings);
+        }
+    }
+
+    pub(crate) fn actual(&self, session_id: &str) -> Option<Settings> {
+        self.lock()
+            .get(session_id)
+            .and_then(|state| state.actual.clone())
     }
 
     pub(crate) fn mark_delivered(&self, session_id: &str, uuid: &str) {
         if let Some(state) = self.lock().get_mut(session_id) {
             state.delivered.insert(uuid.to_owned());
         }
-    }
-
-    /// Whether this device sent the event `uuid` to the session.
-    pub(crate) fn was_delivered(&self, session_id: &str, uuid: &str) -> bool {
-        self.lock()
-            .get(session_id)
-            .is_some_and(|state| state.delivered.contains(uuid))
     }
 
     pub(crate) fn note_seq(&self, session_id: &str, seq: u64) {
@@ -274,7 +310,9 @@ fn provider_error(error: ApiError) -> ProviderCloudError {
         }
         ApiError::Credentials(error) => ProviderCloudError::SignInRequired(error.to_string()),
         ApiError::Disabled(reason) => ProviderCloudError::Disabled(reason),
-        ApiError::Status { status, message } => ProviderCloudError::Provider {
+        ApiError::Status {
+            status, message, ..
+        } => ProviderCloudError::Provider {
             status: Some(status),
             message: format!("Claude cloud returned {status}: {message}"),
         },
@@ -426,6 +464,29 @@ impl Harness for ClaudeCloudHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.start(request, controls, false).await
+    }
+
+    /// A host resuming the chat with no message (after a restart, or taking
+    /// it over): the run sends nothing, catches the transcript up from where
+    /// its document says it got to, asks again the prompts still open, and
+    /// mirrors whatever the session does next.
+    async fn start_idle(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.start(request, controls, true).await
+    }
+}
+
+impl ClaudeCloudHarness {
+    async fn start(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+        idle: bool,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let session_id = zeron_proto::provider_cloud::claude_session_from_cwd(&request.cwd)
             .ok_or_else(|| {
                 HarnessError::Protocol(
@@ -448,23 +509,42 @@ impl Harness for ClaudeCloudHarness {
             .await
             .map_err(harness_error)?;
         let (events, receiver) = mpsc::channel(256);
-        // A configuration this device didn't leave the session in goes
-        // first, under ids derived from the opening prompt's.
-        let opening_controls = session::changes(&start.prompt_uuid, &start.applied, &request);
-        let opening = (!start.delivered && !request.prompt.trim().is_empty())
-            .then(|| (start.prompt_uuid, request.prompt.clone()));
+        // A setting changed here since this device's last run, that the
+        // session isn't in, goes first, under ids derived from the opening
+        // prompt's ([`session::changes`]).
+        let opening_changes = session::changes(
+            start.prompt_uuid.as_deref(),
+            start.ran_with.as_ref(),
+            start.actual.as_ref(),
+            &session::settings_of(&request),
+        );
+        // A message with no id is a new one: its own uuid is minted here.
+        let opening_changes = if idle {
+            (Vec::new(), None)
+        } else {
+            opening_changes
+        };
+        let opening = (!idle && !start.delivered && !request.prompt.trim().is_empty()).then(|| {
+            (
+                start
+                    .prompt_uuid
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                request.prompt.clone(),
+            )
+        });
         tokio::spawn(
             session::RunSession {
                 client: self.client.clone(),
                 bindings: self.bindings.clone(),
                 session: start.session,
                 opening,
-                opening_controls,
+                opening_changes,
                 mirror: mirror::Mirror::new(request.cwd.clone(), start.resume),
                 config: request,
                 stream,
                 controls,
                 events,
+                idle,
             }
             .run(),
         );

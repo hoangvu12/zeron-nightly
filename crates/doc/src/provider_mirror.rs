@@ -154,6 +154,11 @@ impl SessionDoc {
                 if self.provider_turn().is_some() {
                     meta.delete(TURN)?;
                 }
+                // A turn's prompts end with it (an interrupted turn's never
+                // get a response): none is asked again after this.
+                if meta.get(PROMPTS).is_some() {
+                    meta.delete(PROMPTS)?;
+                }
             }
         }
         if let Some(prompt) = prompt {

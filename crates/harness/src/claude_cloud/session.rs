@@ -2,46 +2,58 @@
 //! stream. It mirrors the session into agent events until the turn's
 //! `result`, ends the turn with `Done`, and stays up for the next message.
 //!
-//! Every command goes to the session as an event whose `uuid` the provider
-//! dedupes, so a command executed twice (another host, a retry) acts once:
+//! Zeron sends the session only what the person sent (design §7). Every
+//! command goes as an event whose `uuid` the provider dedupes, so a command
+//! executed twice (another host, a retry) acts once, and a send whose
+//! delivery is uncertain is retried under its original uuid, a bounded
+//! number of times with backoff, honouring `Retry-After`:
 //!
 //! - A message (a follow-up, or a steer during a turn) goes at once under
 //!   its Zeron message id ([`zeron_proto::provider_cloud::event_uuid`]). The
 //!   worker reads a steer at its next step boundary, or runs it as its own
 //!   turn right after (the turn's `result` then counts it in
 //!   `queued_turn_count`, and the mirror doesn't end the turn there).
-//! - A changed model, permission mode or plan mode rides the message that
-//!   carries it, as `set_model` / `set_permission_mode` control requests
-//!   ahead of it, under ids derived from the message's
-//!   ([`zeron_proto::provider_cloud::control_uuid`]); the mapping is the
-//!   local Claude Code harness's (`model_arg`, `permission_mode`).
-//! - Stop ([`RunControls::interrupt`]) sends `interrupt` (with
-//!   `cancel_queued`) under the Stop command's id
-//!   ([`crate::TurnControl::take_stop_command`]), then waits, bounded, for
-//!   the turn's own interrupted `result`. Closing the stream alone never
-//!   stops anything at the provider.
+//! - A model, permission mode or plan mode the person changed here rides the
+//!   message that carries it, as `set_model` / `set_permission_mode` control
+//!   requests ahead of it, under ids derived from the message's
+//!   ([`zeron_proto::provider_cloud::control_uuid`]). Only a setting that
+//!   changed here and that the session, as its last `system/init` says, isn't
+//!   already in goes ([`changes`]); none goes while either is unknown, or for
+//!   a message with no id.
+//! - The person's Stop ([`RunControls::interrupt`] with the Stop command
+//!   noted, [`crate::TurnControl::take_stop_command`]) sends `interrupt` (with
+//!   `cancel_queued`) under the Stop command's id, then waits, bounded, for
+//!   the turn's own interrupted `result`. Every other teardown (shutdown,
+//!   sign-out, a replaced runtime) only closes the stream: the session keeps
+//!   working at the provider.
 //! - A prompt (`can_use_tool`: a permission prompt or AskUserQuestion) is
-//!   asked the way the local Claude Code harness asks it, through
-//!   [`RunControls::request_input`] and the same access-mode rules. Its
-//!   answer goes under a UUIDv5 of the prompt's `request_id`
-//!   ([`zeron_proto::provider_cloud::answer_uuid`]), and only while the
-//!   mirrored history has no `control_response` for it: once another client
-//!   answers, the question closes here and nothing is sent (the provider
-//!   keeps the first answer anyway).
+//!   decided the way the local Claude Code harness decides it
+//!   ([`decide_prompt`]). It is surfaced or answered only once the history
+//!   after it shows no `control_response` for it (a replay brings prompts
+//!   long answered), and its answer goes under a UUIDv5 of its `request_id`
+//!   ([`zeron_proto::provider_cloud::answer_uuid`]) only while the mirrored
+//!   history still has no response: once another client answers, the
+//!   question closes here and nothing is sent (the provider keeps the first
+//!   answer anyway). A question whose answer couldn't be delivered stays
+//!   answerable.
 //!
-//! A person's message, from this device or elsewhere (claude.ai, the
-//! phone), rides its event's marker ([`AgentEvent::ProviderEvent`]), which
-//! the run sends after everything each stored event mapped to: the engine
-//! writes the message unless the transcript has it, and advances the
-//! chat's replay watermark. A fresh run picks up from the chat document
-//! ([`crate::provider_cloud::ProviderResume`]); a `result` stored before
-//! the run's opening message belongs to an earlier turn and doesn't end
-//! this one. A dropped stream is reconnected a bounded number of times with
-//! backoff ([`RECONNECTS`]), then the run ends errored.
+//! Every stored event the run mirrors is followed by its marker
+//! ([`AgentEvent::ProviderEvent`]), which the engine uses to stamp entries,
+//! advance the chat's replay watermark and track open prompts. A person's
+//! message, from this device or elsewhere (claude.ai, the phone), rides its
+//! marker: the engine writes it unless the transcript already has it (it
+//! matches by transcript ids, so this survives restarts). A fresh run picks
+//! up where the chat document says the transcript got to
+//! ([`crate::provider_cloud::ProviderResume`]). A run started with no
+//! message ([`RunSession::idle`], a host resuming the chat) sends nothing and
+//! mirrors whatever the session does. A dropped stream is reconnected a
+//! bounded number of times with backoff ([`RECONNECTS`]), then the run ends
+//! errored.
 //!
 //! Not here (later tickets): takeover checks before each request (#12).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,19 +61,16 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use zeron_proto::provider_cloud::{answer_uuid, control_uuid, event_uuid};
 use zeron_proto::{AgentEvent, DoneStatus, ProviderSession, RunRequest};
 
-use super::api::{ApiError, CloudClient, EventAck, StreamItem};
+use super::api::{ApiError, CloudClient, StreamItem};
 use super::credentials::ClaudeAccount;
 use super::mirror::{Control, Mirror};
-use super::{Applied, Bindings};
-use crate::approval;
-use crate::claude::wire::{ControlRequestBody, allow_response, deny_response, exit_plan_response};
-use crate::claude::{
-    APPROVAL_DENIED, QUESTIONS_DISMISSED, access, access_permission_mode, approval_question,
-    model_arg, parse_questions, permission_mode, updated_input_with_answers,
-};
+use super::{Bindings, PermissionMode, Settings};
+use crate::claude::wire::ControlRequestBody;
+use crate::claude::{PromptDecision, decide_prompt, model_arg, permission_mode};
 use crate::{HarnessError, RunControls, SteerMessage};
 
 type Events = mpsc::Sender<Result<AgentEvent, HarnessError>>;
@@ -78,6 +87,16 @@ const RECONNECTS: u32 = 5;
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(100);
 const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
+/// Tries a send (or a history read) gets when the failure may pass: the
+/// first, then retries after a doubling delay from [`SEND_BACKOFF`].
+const SEND_ATTEMPTS: u32 = 4;
+const SEND_BACKOFF: Duration = Duration::from_millis(200);
+/// The longest single wait, `Retry-After` included.
+const LONGEST_WAIT: Duration = Duration::from_secs(10);
+
+/// History pages read past a prompt for its answer.
+const HISTORY_PAGES: usize = 20;
+
 const CONNECTION_LOST: &str = "The connection to the Claude cloud session was lost.";
 
 pub(crate) struct RunSession {
@@ -87,14 +106,18 @@ pub(crate) struct RunSession {
     /// The opening prompt and its event uuid; `None` when the session
     /// already has it (it rode the create request).
     pub opening: Option<(String, String)>,
-    /// Control requests that go before the opening prompt ([`changes`]).
-    pub opening_controls: Vec<Value>,
+    /// Setting changes that go before the opening prompt, and the settings
+    /// the session is in once they apply ([`changes`]).
+    pub opening_changes: (Vec<Value>, Option<Settings>),
     pub mirror: Mirror,
-    /// The configuration the session is in, as this run put it.
+    /// The configuration the run works in (what the person chose).
     pub config: RunRequest,
     pub stream: BoxStream<'static, Result<StreamItem, ApiError>>,
     pub controls: RunControls,
     pub events: Events,
+    /// Started with no message (a host resuming the chat): no turn is known
+    /// to be running until the session shows one.
+    pub idle: bool,
 }
 
 pub(crate) fn account_of(session: &ProviderSession) -> ClaudeAccount {
@@ -145,39 +168,52 @@ pub(crate) fn answer_payload(request_id: &str, response: Value) -> Value {
     })
 }
 
-/// What a session in `applied` needs to be in `next`'s configuration: the
-/// control requests, under ids derived from `command` (the message they
-/// ride).
-pub(crate) fn changes(command: &str, applied: &Applied, next: &RunRequest) -> Vec<Value> {
-    let mut out = Vec::new();
-    let model = model_arg(next);
-    let model_differs = match &applied.model {
-        Some(have) => *have != model,
-        None => model.is_some(),
+/// The settings a run in `request` asks for (the local Claude Code
+/// harness's mapping: `model_arg`, `permission_mode`).
+pub(crate) fn settings_of(request: &RunRequest) -> Settings {
+    Settings {
+        model: model_arg(request),
+        mode: PermissionMode::from_wire(permission_mode(request))
+            .unwrap_or(PermissionMode::Default),
+    }
+}
+
+/// The control requests that put the session in `next`, under ids derived
+/// from `command` (the message they ride), and the settings it is in once
+/// they apply. A setting goes only when the person changed it here (it
+/// differs from `previous`, what this device last asked for) and the
+/// session isn't already in it (`actual`, from its `system/init`): a change
+/// made on claude.ai stands, and nothing goes while either is unknown or the
+/// message has no id.
+pub(crate) fn changes(
+    command: Option<&str>,
+    previous: Option<&Settings>,
+    actual: Option<&Settings>,
+    next: &Settings,
+) -> (Vec<Value>, Option<Settings>) {
+    let (Some(command), Some(previous), Some(actual)) = (command, previous, actual) else {
+        return (Vec::new(), None);
     };
-    if model_differs {
+    let mut out = Vec::new();
+    let mut after = actual.clone();
+    if next.model != previous.model && next.model != actual.model {
         out.push(control_request(
             &control_uuid(command, "set_model"),
             "set-model",
-            json!({ "subtype": "set_model", "model": model }),
+            json!({ "subtype": "set_model", "model": next.model }),
         ));
+        after.model = next.model.clone();
     }
-    let mode = permission_mode(next);
-    if applied.mode != mode {
+    if next.mode != previous.mode && next.mode != actual.mode {
         out.push(control_request(
             &control_uuid(command, "set_permission_mode"),
             "set-mode",
-            json!({ "subtype": "set_permission_mode", "mode": mode }),
+            json!({ "subtype": "set_permission_mode", "mode": next.mode.as_wire() }),
         ));
+        after.mode = next.mode;
     }
-    out
-}
-
-fn applied_by(config: &RunRequest) -> Applied {
-    Applied {
-        model: Some(model_arg(config)),
-        mode: permission_mode(config).to_owned(),
-    }
+    let after = (!out.is_empty()).then_some(after);
+    (out, after)
 }
 
 async fn send(events: &Events, event: AgentEvent) -> bool {
@@ -193,9 +229,6 @@ fn done(status: DoneStatus, error: Option<String>) -> AgentEvent {
     }
 }
 
-/// A prompt's answer, from the task that asked the person.
-type Answer = (String, Value);
-
 /// End the run errored: the error shown (when `shown`), then `Done`.
 async fn fail(events: &Events, message: String, shown: bool) {
     if shown {
@@ -210,31 +243,128 @@ async fn fail(events: &Events, message: String, shown: bool) {
     let _ = send(events, done(DoneStatus::Errored, Some(message))).await;
 }
 
+/// The wait before retry number `attempt` (from 0): doubling from `base`,
+/// or longer when the server asked, never above [`LONGEST_WAIT`].
+fn backoff(base: Duration, attempt: u32, asked: Option<Duration>) -> Duration {
+    (base * 2u32.saturating_pow(attempt))
+        .max(asked.unwrap_or_default())
+        .min(LONGEST_WAIT)
+}
+
+/// When the next reconnect is due, spending one of the budget; `None` when
+/// the budget is spent.
+fn next_reconnect(reconnects: &mut u32, asked: Option<Duration>) -> Option<Instant> {
+    if *reconnects >= RECONNECTS {
+        return None;
+    }
+    let at = Instant::now() + backoff(RECONNECT_BACKOFF, *reconnects, asked);
+    *reconnects += 1;
+    Some(at)
+}
+
+/// `call`, tried again while its failure may pass ([`ApiError::is_transient`]).
+async fn with_retries<T, F: Future<Output = Result<T, ApiError>>>(
+    mut call: impl FnMut() -> F,
+) -> Result<T, ApiError> {
+    let mut attempt = 0;
+    loop {
+        match call().await {
+            Err(error) if error.is_transient() && attempt + 1 < SEND_ATTEMPTS => {
+                tokio::time::sleep(backoff(SEND_BACKOFF, attempt, error.retry_after())).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Send `payloads` to the session (retried under the same uuids), noting
+/// each as delivered by this device.
+async fn post(
+    client: &CloudClient,
+    bindings: &Bindings,
+    session: &ProviderSession,
+    payloads: Vec<Value>,
+) -> Result<(), ApiError> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    let account = account_of(session);
+    let acks = with_retries(|| client.send_events(&account, &session.session_id, payloads.clone()))
+        .await?;
+    if acks.iter().any(|ack| ack.duplicate) {
+        tracing::info!(target: "zeron_harness::claude_cloud", "already delivered (duplicate uuid)");
+    }
+    for payload in &payloads {
+        if let Some(uuid) = payload.get("uuid").and_then(Value::as_str) {
+            bindings.mark_delivered(&session.session_id, uuid);
+        }
+    }
+    Ok(())
+}
+
+/// Whether the session's history after `seq` holds a `control_response` for
+/// prompt `request_id` (the history pages by sequence number). A prompt with
+/// no sequence number has nothing stored after it to read.
+async fn answered_in_history(
+    client: &CloudClient,
+    session: &ProviderSession,
+    request_id: &str,
+    seq: Option<u64>,
+) -> Result<bool, ApiError> {
+    let Some(seq) = seq else {
+        return Ok(false);
+    };
+    let account = account_of(session);
+    let mut cursor = seq.to_string();
+    for _ in 0..HISTORY_PAGES {
+        let page =
+            with_retries(|| client.history(&account, &session.session_id, Some(&cursor))).await?;
+        let answered = page.data.iter().any(|event| {
+            event.payload.get("type").and_then(Value::as_str) == Some("control_response")
+                && event
+                    .payload
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+                    == Some(request_id)
+        });
+        if answered {
+            return Ok(true);
+        }
+        match page.resume_cursor {
+            Some(next) if !page.data.is_empty() && next != cursor => cursor = next,
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// A prompt's answer, from the task that asked the person (or at once).
+type Answer = (String, Value);
+
+/// A prompt surfaced and not yet answered in the history.
+struct OpenPrompt {
+    request: ControlRequestBody,
+    /// The person's question, while it is up; `None` for a prompt the
+    /// access mode answered.
+    asking: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Close every question still up (their answers can't be sent now).
+fn close_all(open: &mut HashMap<String, OpenPrompt>) {
+    for (_, prompt) in open.drain() {
+        if let Some(task) = prompt.asking {
+            task.abort();
+        }
+    }
+}
+
 impl RunSession {
-    async fn post(&mut self, payloads: Vec<Value>) -> Result<Vec<EventAck>, ApiError> {
-        if payloads.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uuids: Vec<String> = payloads
-            .iter()
-            .filter_map(|p| p.get("uuid").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        let account = account_of(&self.session);
-        let acks = self
-            .client
-            .send_events(&account, &self.session.session_id, payloads)
-            .await?;
-        if acks.iter().any(|ack| ack.duplicate) {
-            tracing::info!(target: "zeron_harness::claude_cloud", "already delivered (duplicate uuid)");
-        }
-        for uuid in uuids {
-            self.bindings
-                .mark_delivered(&self.session.session_id, &uuid);
-        }
-        Ok(acks)
+    async fn post(&mut self, payloads: Vec<Value>) -> Result<(), ApiError> {
+        post(&self.client, &self.bindings, &self.session, payloads).await
     }
 
-    /// Send `message` now (with any configuration it carries ahead of it),
+    /// Send `message` now (with the settings it changed ahead of it),
     /// starting a new assistant message after it.
     async fn deliver(&mut self, message: SteerMessage) -> Result<(), String> {
         let (prev, next) = self.mirror.rotate_for_steer();
@@ -253,178 +383,157 @@ impl RunSession {
             Some(id) => event_uuid(id),
             None => uuid::Uuid::new_v4().to_string(),
         };
-        let mut payloads = Vec::new();
-        if let Some(next) = message.config {
-            payloads = changes(&uuid, &applied_by(&self.config), &next);
-            self.config = *next;
-        }
+        let (mut payloads, after) = match message.config {
+            Some(next) => {
+                let found = changes(
+                    message.message_id.as_ref().map(|_| uuid.as_str()),
+                    Some(&settings_of(&self.config)),
+                    self.bindings.actual(&self.session.session_id).as_ref(),
+                    &settings_of(&next),
+                );
+                self.config = *next;
+                found
+            }
+            None => (Vec::new(), None),
+        };
         payloads.push(user_payload(
             &uuid,
             &self.session.session_id,
             &message.prompt,
         ));
         self.post(payloads).await.map_err(|e| e.to_string())?;
+        let session_id = &self.session.session_id;
+        if let Some(after) = after {
+            self.bindings.note_actual(session_id, after);
+        }
         self.bindings
-            .note_applied(&self.session.session_id, applied_by(&self.config));
+            .note_ran_with(session_id, settings_of(&self.config));
         Ok(())
     }
 
-    /// Send the run's opening (its settings controls, then its prompt).
-    /// Returns the prompt's sequence number: a turn end stored before it is
-    /// an earlier turn's (a replay, or turns run elsewhere meanwhile).
-    async fn open(&mut self, opening: Vec<Value>) -> Result<Option<u64>, ApiError> {
-        let prompt = opening.iter().any(|p| p["type"] == "user");
-        let acks = self.post(opening).await?;
-        Ok(prompt
-            .then(|| acks.last().and_then(|ack| ack.sequence_num))
-            .flatten())
-    }
-
-    /// Ask the person what prompt `request_id` asks, the way the local
-    /// Claude Code harness does; the answer comes back on `answers`. A
-    /// prompt the access mode already allows is answered at once.
+    /// Decide prompt `request_id` the way the local Claude Code harness
+    /// does; the answer comes back on `answers`, at once when the access
+    /// mode allows it, else once the person answers. Returns the question
+    /// while it is up.
     fn ask(
         &self,
         request_id: String,
         request: ControlRequestBody,
         answers: &mpsc::UnboundedSender<Answer>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let answers = answers.clone();
-        if request.tool_name == "AskUserQuestion" {
-            let input = request.input;
-            let questions = parse_questions(&input);
-            let picked = (self.controls.request_input)(questions.clone());
-            return Some(tokio::spawn(async move {
-                // No answers (closed, or the run stopped waiting): a decline.
-                let picked = picked.await.unwrap_or_default();
-                let response = if picked.is_empty() {
-                    deny_response(QUESTIONS_DISMISSED)
-                } else {
-                    allow_response(updated_input_with_answers(&input, &questions, &picked))
-                };
+        match decide_prompt(request, &self.config) {
+            PromptDecision::Answer(response) => {
                 let _ = answers.send((request_id, response));
-            }));
-        }
-        // Approving the plan leaves plan mode for the run's access mode.
-        let after_plan = access_permission_mode(&self.config);
-        let exit_plan = request.tool_name == "ExitPlanMode";
-        let allow = move |input: Value| {
-            if exit_plan {
-                exit_plan_response(input, after_plan)
-            } else {
-                allow_response(input)
+                None
             }
-        };
-        let question = approval_question(
-            &request.tool_name,
-            request.display_name.as_deref(),
-            request.description.as_deref(),
-            &request.input,
-            access(&self.config),
-        );
-        let Some(question) = question else {
-            let _ = answers.send((request_id, allow(request.input)));
-            return None;
-        };
-        let picked = (self.controls.request_input)(vec![question.clone()]);
-        let input = request.input;
-        Some(tokio::spawn(async move {
-            let picked = picked.await.unwrap_or_default();
-            let response = if approval::approved(&question, &picked) {
-                allow(input)
-            } else {
-                deny_response(APPROVAL_DENIED)
-            };
-            let _ = answers.send((request_id, response));
-        }))
+            PromptDecision::Ask { questions, answer } => {
+                let picked = (self.controls.request_input)(questions);
+                let answers = answers.clone();
+                Some(tokio::spawn(async move {
+                    // No answers (closed, or the run stopped waiting): a
+                    // decline, as `answer` says.
+                    let picked = picked.await.unwrap_or_default();
+                    let _ = answers.send((request_id, answer(picked)));
+                }))
+            }
+        }
     }
 
     pub async fn run(mut self) {
         let session_id = self.session.session_id.clone();
-        let mut opening = std::mem::take(&mut self.opening_controls);
+        let (mut opening, opening_actual) = std::mem::take(&mut self.opening_changes);
         if let Some((uuid, prompt)) = self.opening.take() {
             opening.push(user_payload(&uuid, &session_id, &prompt));
         }
-        // A turn end stored before the opening prompt isn't this turn's.
-        let mut floor = 0u64;
-        if !opening.is_empty() {
-            match self.open(opening).await {
-                Ok(seq) => floor = seq.unwrap_or(0),
-                Err(error) => {
-                    fail(&self.events, error.to_string(), true).await;
-                    return;
-                }
-            }
-            self.bindings
-                .note_applied(&session_id, applied_by(&self.config));
+        if let Err(error) = self.post(opening).await {
+            fail(&self.events, error.to_string(), true).await;
+            return;
         }
+        if let Some(actual) = opening_actual {
+            self.bindings.note_actual(&session_id, actual);
+        }
+        self.bindings
+            .note_ran_with(&session_id, settings_of(&self.config));
         let interrupt = self.controls.interrupt.clone();
         let (answer_tx, mut answer_rx) = mpsc::unbounded_channel::<Answer>();
-        // Prompts asked of the person and not yet answered, by request id.
-        let mut open: HashMap<String, Option<tokio::task::JoinHandle<()>>> = HashMap::new();
+        // Prompts surfaced and not yet answered, by request id.
+        let mut open: HashMap<String, OpenPrompt> = HashMap::new();
         // Request ids with a `control_response` in the mirrored history.
         let mut responded: HashSet<String> = HashSet::new();
-        let mut turn_active = true;
+        let mut turn_active = !self.idle;
         let mut steering_open = true;
-        let mut stop_deadline: Option<tokio::time::Instant> = None;
+        let mut stop_deadline: Option<Instant> = None;
         // Reconnects spent, when the stream last came up, and when the next
         // reconnect is due (the stream is down until then).
         let mut reconnects = 0u32;
-        let mut connected_at = tokio::time::Instant::now();
-        let mut reconnect_at: Option<tokio::time::Instant> = None;
+        let mut connected_at = Instant::now();
+        let mut reconnect_at: Option<Instant> = None;
         'main: loop {
+            // Biased, in this order. The interrupt must stay ahead of the
+            // answers: a Stop unparks the open questions with no answers,
+            // which decide as a deny, and posting that deny first would use
+            // the prompt up for every device (the first answer wins). The
+            // stream goes before steers, so what the session produced before
+            // a steer is sent stays ahead of its boundary.
             tokio::select! {
                 biased;
                 _ = self.events.closed() => break 'main,
                 _ = interrupt.cancelled(), if stop_deadline.is_none() => {
-                    let command = self.controls.turn.take_stop_command();
-                    // No Stop behind it (the engine shutting down, the run
-                    // replaced): the session goes on at the provider, and a
-                    // later run picks it back up.
-                    if command.is_none() {
+                    // Only the person's Stop reaches the session. Any other
+                    // teardown closes the stream; the session works on.
+                    let Some(command) = self.controls.turn.take_stop_command() else {
+                        let _ = send(&self.events, done(DoneStatus::Interrupted, None)).await;
                         break 'main;
-                    }
+                    };
                     if !turn_active {
                         let _ = send(&self.events, done(DoneStatus::Interrupted, None)).await;
                         break 'main;
                     }
-                    let uuid = command
-                        .map(|id| event_uuid(&id))
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    if let Err(error) = self.post(vec![interrupt_payload(&uuid)]).await {
-                        tracing::warn!(target: "zeron_harness::claude_cloud", %error, "interrupt not sent");
-                        let _ = send(&self.events, done(DoneStatus::Interrupted, None)).await;
+                    if let Err(error) = self.post(vec![interrupt_payload(&event_uuid(&command))]).await {
+                        let message = format!(
+                            "The stop didn't reach the Claude cloud session, so it may still be working: {error}"
+                        );
+                        fail(&self.events, message, true).await;
                         break 'main;
                     }
                     // The stopped turn's questions can't be answered now.
-                    for (_, task) in open.drain() {
-                        if let Some(task) = task {
-                            task.abort();
-                        }
-                    }
+                    close_all(&mut open);
                     self.mirror.set_interrupted();
-                    stop_deadline = Some(tokio::time::Instant::now() + STOP_GRACE);
+                    stop_deadline = Some(Instant::now() + STOP_GRACE);
                 }
-                _ = tokio::time::sleep_until(stop_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                _ = tokio::time::sleep_until(stop_deadline.unwrap_or_else(Instant::now)),
                     if stop_deadline.is_some() => {
                     let _ = send(&self.events, done(DoneStatus::Interrupted, None)).await;
                     break 'main;
                 }
                 Some((request_id, response)) = answer_rx.recv(), if stop_deadline.is_none() => {
                     // Only while the prompt is still open in the history.
-                    if responded.contains(&request_id) || open.remove(&request_id).is_none() {
+                    if responded.contains(&request_id) || !open.contains_key(&request_id) {
                         continue 'main;
                     }
-                    if let Err(error) = self.post(vec![answer_payload(&request_id, response)]).await {
-                        let message = format!("Your answer didn't reach the Claude cloud session: {error}");
-                        if !send(&self.events, AgentEvent::Error { message }).await {
-                            break 'main;
+                    match self.post(vec![answer_payload(&request_id, response)]).await {
+                        Ok(()) => {
+                            open.remove(&request_id);
+                            responded.insert(request_id);
                         }
-                        continue 'main;
+                        Err(error) => {
+                            // Not delivered: the question stays answerable.
+                            let reasked = open.get(&request_id).filter(|p| p.asking.is_some()).map(|p| p.request.clone());
+                            let message = match &reasked {
+                                Some(_) => format!("Your answer didn't reach the Claude cloud session ({error}). Answer again."),
+                                None => format!("Claude's request couldn't be answered: {error}"),
+                            };
+                            if !send(&self.events, AgentEvent::Error { message }).await {
+                                break 'main;
+                            }
+                            if let Some(request) = reasked {
+                                let asking = self.ask(request_id.clone(), request.clone(), &answer_tx);
+                                open.insert(request_id, OpenPrompt { request, asking });
+                            }
+                        }
                     }
-                    responded.insert(request_id);
                 }
-                _ = tokio::time::sleep_until(reconnect_at.unwrap_or_else(tokio::time::Instant::now)),
+                _ = tokio::time::sleep_until(reconnect_at.unwrap_or_else(Instant::now)),
                     if reconnect_at.is_some() => {
                     // Reconnect from where the mirror got to (the stream
                     // replays strictly after it). Ticket #8 owns the durable
@@ -434,16 +543,15 @@ impl RunSession {
                     match self.client.stream(&account, &session_id, self.mirror.last_seq()).await {
                         Ok(stream) => {
                             self.stream = stream;
-                            connected_at = tokio::time::Instant::now();
+                            connected_at = Instant::now();
                         }
                         Err(error) => {
                             tracing::warn!(target: "zeron_harness::claude_cloud", %error, "session stream reconnect failed");
-                            if reconnects >= RECONNECTS {
+                            reconnect_at = next_reconnect(&mut reconnects, error.retry_after());
+                            if reconnect_at.is_none() {
                                 fail(&self.events, CONNECTION_LOST.into(), turn_active).await;
                                 break 'main;
                             }
-                            reconnect_at = Some(tokio::time::Instant::now() + RECONNECT_BACKOFF * 2u32.pow(reconnects));
-                            reconnects += 1;
                         }
                     }
                 }
@@ -451,46 +559,77 @@ impl RunSession {
                     Some(Ok(item)) => {
                         let mapped = self.mirror.map(item);
                         self.bindings.note_seq(&session_id, self.mirror.last_seq());
-                        for control in mapped.controls {
-                            match control {
-                                Control::Prompt { request_id, request } => {
-                                    if stop_deadline.is_some()
-                                        || responded.contains(&request_id)
-                                        || open.contains_key(&request_id)
-                                    {
-                                        continue;
-                                    }
-                                    let task = self.ask(request_id.clone(), request, &answer_tx);
-                                    open.insert(request_id, task);
-                                }
-                                Control::Responded { request_id } => {
-                                    // Answered (here or by another client):
-                                    // a question still up closes unanswered.
-                                    if let Some(Some(task)) = open.remove(&request_id) {
-                                        task.abort();
-                                    }
-                                    responded.insert(request_id);
-                                }
-                                // A person's message: its marker below
-                                // carries it to the transcript. One sent from
-                                // elsewhere (claude.ai, the phone) starts a
-                                // turn.
-                                Control::UserMessage { uuid, .. } => {
-                                    if !self.bindings.was_delivered(&session_id, &uuid) {
-                                        turn_active = true;
-                                    }
-                                }
-                            }
+                        if let Some(settings) = mapped.settings {
+                            self.bindings.note_actual(&session_id, settings);
                         }
-                        // An earlier turn's end (stored before this run's
-                        // opening prompt) doesn't end this run's turn.
-                        let earlier = mapped.seq.is_some_and(|seq| seq < floor);
+                        // The stored event's marker goes after everything it
+                        // mapped to (and after a prompt is up).
                         let mark = mapped.mark;
+                        match mapped.control {
+                            Some(Control::Prompt { request_id, request, seq }) => {
+                                if stop_deadline.is_some()
+                                    || responded.contains(&request_id)
+                                    || open.contains_key(&request_id)
+                                {
+                                    if let Some(mark) = mark
+                                        && !send(&self.events, mark).await
+                                    {
+                                        break 'main;
+                                    }
+                                    continue 'main;
+                                }
+                                turn_active = true;
+                                // A replay brings prompts long answered: the
+                                // history past this one says.
+                                match answered_in_history(&self.client, &self.session, &request_id, seq).await {
+                                    Ok(true) => {
+                                        responded.insert(request_id);
+                                    }
+                                    Ok(false) => {
+                                        let asking = self.ask(request_id.clone(), request.clone(), &answer_tx);
+                                        open.insert(request_id, OpenPrompt { request, asking });
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(target: "zeron_harness::claude_cloud", %error, "prompt state unknown");
+                                        let message = format!("Couldn't read whether Claude's request was already answered: {error}");
+                                        if !send(&self.events, AgentEvent::Error { message }).await {
+                                            break 'main;
+                                        }
+                                    }
+                                }
+                                if let Some(mark) = mark
+                                    && !send(&self.events, mark).await
+                                {
+                                    break 'main;
+                                }
+                                continue 'main;
+                            }
+                            Some(Control::Responded { request_id }) => {
+                                // Answered (here or by another client): a
+                                // question still up closes unanswered.
+                                if let Some(prompt) = open.remove(&request_id)
+                                    && let Some(task) = prompt.asking
+                                {
+                                    task.abort();
+                                }
+                                responded.insert(request_id);
+                                if let Some(mark) = mark
+                                    && !send(&self.events, mark).await
+                                {
+                                    break 'main;
+                                }
+                                continue 'main;
+                            }
+                            None => {}
+                        }
+                        // A person's message (from here or elsewhere) rides
+                        // its marker: the engine writes it unless the
+                        // transcript has it. Either way a turn runs.
+                        if mapped.person.is_some() {
+                            turn_active = true;
+                        }
                         for mut event in mapped.events {
                             let turn_over = matches!(event, AgentEvent::Done { .. });
-                            if turn_over && earlier {
-                                continue;
-                            }
                             if turn_over && stop_deadline.is_some()
                                 && let AgentEvent::Done { status, .. } = &mut event
                             {
@@ -500,6 +639,7 @@ impl RunSession {
                                 break 'main;
                             }
                             if !turn_over {
+                                turn_active = true;
                                 continue;
                             }
                             turn_active = false;
@@ -525,17 +665,15 @@ impl RunSession {
                         if connected_at.elapsed() >= STABLE_CONNECTION {
                             reconnects = 0;
                         }
-                        if reconnects >= RECONNECTS {
+                        // The stream is down until the reconnect.
+                        self.stream = futures::stream::pending().boxed();
+                        reconnect_at = next_reconnect(&mut reconnects, None);
+                        if reconnect_at.is_none() {
                             fail(&self.events, CONNECTION_LOST.into(), turn_active).await;
                             break 'main;
                         }
-                        // The stream is down until the reconnect.
-                        self.stream = futures::stream::pending().boxed();
-                        reconnect_at = Some(tokio::time::Instant::now() + RECONNECT_BACKOFF * 2u32.pow(reconnects));
-                        reconnects += 1;
                     }
                 },
-                // After the stream: what the session produced before a steer is sent stays ahead of its boundary.
                 steer = self.controls.steering.recv(), if steering_open && stop_deadline.is_none() => match steer {
                     Some(message) => {
                         if let Err(error) = self.deliver(message).await {
@@ -556,10 +694,6 @@ impl RunSession {
             }
         }
         // Questions still up close with the run.
-        for (_, task) in open.drain() {
-            if let Some(task) = task {
-                task.abort();
-            }
-        }
+        close_all(&mut open);
     }
 }

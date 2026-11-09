@@ -793,9 +793,28 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
         Some("acceptEdits")
     );
 
+    // A message with no id carries no setting change, even a changed one.
+    let mut back = request(&cwd, "No id");
+    back.model = Some("claude-haiku-5".into());
+    rig.fake.queue_turn(Turn::text_zulu());
+    steer
+        .send(SteerMessage {
+            prompt: "No id".into(),
+            message_id: None,
+            attachments: Vec::new(),
+            config: Some(Box::new(back)),
+        })
+        .await
+        .unwrap();
+    turn(&mut stream).await;
+    let sent = payloads_of(event_posts(&rig).last().unwrap());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["type"], "user");
+
     // The plan command executed again by a device that knows nothing of the
-    // session (another host, or this one after a restart) sends the same
-    // uuids, and the provider ignores every repeat.
+    // session (another host, or this one after a restart) doesn't know the
+    // person changed anything, so it sends no setting: only the message,
+    // under the same uuid, which the provider ignores.
     let stored = rig.fake.stored_events(&sid).len();
     let posts = event_posts(&rig).len();
     let other = ClaudeCloudHarness::new(ClaudeCloudConfig {
@@ -813,14 +832,7 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     wait("the repeat sent", || event_posts(&rig).len() > posts).await;
     let sent = payloads_of(event_posts(&rig).last().unwrap());
     let uuids: Vec<&str> = sent.iter().map(|p| p["uuid"].as_str().unwrap()).collect();
-    assert_eq!(
-        uuids,
-        vec![
-            control_uuid(SECOND, "set_model").as_str(),
-            control_uuid(SECOND, "set_permission_mode").as_str(),
-            SECOND,
-        ]
-    );
+    assert_eq!(uuids, vec![SECOND]);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(rig.fake.stored_events(&sid).len(), stored);
     assert_eq!(
@@ -927,6 +939,7 @@ async fn a_stream_that_keeps_dropping_is_reconnected_a_bounded_number_of_times_w
         path_contains: "/events/stream".into(),
         status: 503,
         times: 100,
+        retry_after: None,
     });
     let dropped_at = tokio::time::Instant::now();
     rig.fake.drop_streams(&sid);
@@ -1009,4 +1022,227 @@ async fn an_account_without_a_cloud_environment_is_told_so() {
         .unwrap_err();
     assert!(error.to_string().contains("claude.ai/code"), "{error}");
     assert!(fake.created_sessions().is_empty());
+}
+
+// ---- Controls: review fixes ----
+
+fn fault(
+    method: &'static str,
+    path: &str,
+    status: u16,
+    times: usize,
+) -> zeron_provider_fake::Fault {
+    zeron_provider_fake::Fault {
+        method: Some(method),
+        path_contains: path.into(),
+        status,
+        times,
+        retry_after: None,
+    }
+}
+
+/// A fresh run with its turn held after the first text delta.
+async fn held_turn(
+    rig: &Rig,
+) -> (
+    ProviderSession,
+    Stream,
+    mpsc::Sender<SteerMessage>,
+    CancellationToken,
+    zeron_harness::TurnControl,
+    zeron_provider_fake::Gate,
+) {
+    let session = create(rig, "Run uname -a", FIRST).await;
+    let cwd = zeron_proto::provider_cloud::claude_cwd(&session.session_id);
+    let (controls, steer, interrupt) = controls();
+    let turn_control = controls.turn.clone();
+    let mut stream = start(
+        rig,
+        &session,
+        FIRST,
+        request(&cwd, "Run uname -a"),
+        controls,
+    )
+    .await;
+    turn(&mut stream).await;
+    let (held, gate) = Turn::text_zulu().hold_after(is_text_delta);
+    rig.fake.queue_turn(held);
+    steer
+        .send(message(SECOND, "Reply with the single word ZULU."))
+        .await
+        .unwrap();
+    gate.reached().await;
+    (session, stream, steer, interrupt, turn_control, gate)
+}
+
+#[tokio::test]
+async fn a_teardown_with_no_stop_behind_it_leaves_the_session_working() {
+    let rig = rig().await;
+    let (session, mut stream, _steer, interrupt, _turn, gate) = held_turn(&rig).await;
+    let sid = session.session_id.clone();
+    // Shutdown, sign-out, a replaced runtime: no Stop command was noted.
+    interrupt.cancel();
+    let events = turn(&mut stream).await;
+    assert_eq!(done_status(&events), Some(DoneStatus::Interrupted));
+    assert!(of_type(posted(&rig), "control_request").is_empty());
+    // The session works on, and finishes the turn at the provider.
+    assert!(rig.fake.turn_playing(&sid));
+    gate.release();
+    wait("the turn finished at the provider", || {
+        !rig.fake.turn_playing(&sid)
+    })
+    .await;
+    let last = rig.fake.stored_events(&sid).pop().unwrap();
+    assert_eq!(last.payload["subtype"], "success");
+}
+
+#[tokio::test]
+async fn a_stop_that_cant_be_delivered_is_an_error_not_a_stop() {
+    let rig = rig().await;
+    let (session, mut stream, _steer, interrupt, turn_control, gate) = held_turn(&rig).await;
+    rig.fake.inject(fault("POST", "/events", 400, 1));
+    turn_control.note_stop_command(STOP);
+    interrupt.cancel();
+    let events = turn(&mut stream).await;
+    assert_eq!(done_status(&events), Some(DoneStatus::Errored));
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Error { message } if message.contains("may still be working"))));
+    assert!(rig.fake.turn_playing(&session.session_id));
+    gate.release();
+}
+
+#[tokio::test]
+async fn a_replayed_prompt_already_answered_is_neither_shown_nor_answered() {
+    let rig = rig().await;
+    let session = create_playing(&rig, Turn::prompts(), "Try the tools", FIRST).await;
+    let sid = session.session_id.clone();
+    // Another device answered both prompts; the turn finished.
+    for _ in 0..2 {
+        wait("a prompt", || !rig.fake.open_prompts(&sid).is_empty()).await;
+        let request_id = rig.fake.open_prompts(&sid)[0].clone();
+        rig.fake.post_as_client(
+            &sid,
+            json!({
+                "uuid": uuid::Uuid::new_v4().to_string(),
+                "type": "control_response",
+                "response": {"subtype": "success", "request_id": request_id,
+                             "response": {"behavior": "allow", "updatedInput": {}}},
+            }),
+        );
+    }
+    wait("the turn over", || !rig.fake.turn_playing(&sid)).await;
+
+    // A device that knows nothing of the session reads it from the start,
+    // in either access mode: nothing is asked, nothing answered.
+    for access in [AccessMode::Supervised, AccessMode::FullAccess] {
+        let other = ClaudeCloudHarness::new(ClaudeCloudConfig {
+            base_url: rig.fake.base_url().to_owned(),
+            login: ClaudeConfigDir::at(rig.login.dir()),
+            claude_executable: Some(rig.stub.path().to_owned()),
+        })
+        .expect("harness builds");
+        other.provider_cloud().unwrap().bind_run(RunBinding {
+            session: session.clone(),
+            prompt_uuid: Some(FIRST.into()),
+        });
+        let (controls, _interrupt, asked) = asking_controls();
+        let mut replay = request(
+            &zeron_proto::provider_cloud::claude_cwd(&sid),
+            "Try the tools",
+        );
+        replay.access = access;
+        let mut stream = other.run(replay, controls).await.unwrap();
+        let events = turn(&mut stream).await;
+        assert_eq!(done_status(&events), Some(DoneStatus::Completed));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "{access:?}: a question showed"
+        );
+        assert!(
+            of_type(posted(&rig), "control_response").is_empty(),
+            "{access:?}: an answer went"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_that_fails_is_retried_then_asked_again() {
+    let rig = rig().await;
+    let session = create_playing(&rig, Turn::prompts(), "Try the tools", FIRST).await;
+    let sid = session.session_id.clone();
+    let cwd = zeron_proto::provider_cloud::claude_cwd(&sid);
+    let (controls, _interrupt, asked) = asking_controls();
+    let mut supervised = request(&cwd, "Try the tools");
+    supervised.access = AccessMode::Supervised;
+    let mut stream = start(&rig, &session, FIRST, supervised, controls).await;
+    let collect = tokio::spawn(async move { turn(&mut stream).await });
+
+    // A busy server: the answer goes again, under the same uuid.
+    let (questions, answer) = next_question(&asked).await;
+    rig.fake.inject(zeron_provider_fake::Fault {
+        retry_after: Some(0),
+        ..fault("POST", "/events", 503, 1)
+    });
+    answer.send(pick(&questions, "Yes")).unwrap();
+    let permission = rig.fake.prompts(&sid)[0].clone();
+    wait("the answer delivered", || {
+        rig.fake.answer(&sid, &permission).is_some()
+    })
+    .await;
+    let tries: Vec<Value> = of_type(posted(&rig), "control_response");
+    assert_eq!(tries.len(), 2);
+    assert!(tries.iter().all(|p| p["uuid"] == answer_uuid(&permission)));
+
+    // A refused answer: the question comes back, and the next answer goes.
+    let (questions, answer) = next_question(&asked).await;
+    rig.fake.inject(fault("POST", "/events", 400, 1));
+    answer.send(pick(&questions, "red")).unwrap();
+    let (questions, answer) = next_question(&asked).await;
+    assert_eq!(questions[0].question, PROMPTS_QUESTION);
+    answer.send(pick(&questions, "blue")).unwrap();
+    let events = collect.await.unwrap();
+    assert_eq!(done_status(&events), Some(DoneStatus::Completed));
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Error { message } if message.contains("Answer again"))));
+    let question = rig.fake.prompts(&sid)[1].clone();
+    assert_eq!(
+        rig.fake.answer(&sid, &question).unwrap()["updatedInput"]["answers"][PROMPTS_QUESTION],
+        "blue"
+    );
+}
+
+#[tokio::test]
+async fn a_reconnect_waits_as_long_as_retry_after_asks() {
+    let rig = rig().await;
+    let (session, mut stream, _steer, _interrupt, _turn, gate) = held_turn(&rig).await;
+    let sid = session.session_id.clone();
+    let streams = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|r| r.method == "GET" && r.path.ends_with("/events/stream"))
+            .count()
+    };
+    let before = streams(&rig);
+    rig.fake.inject(zeron_provider_fake::Fault {
+        retry_after: Some(1),
+        ..fault("GET", "/events/stream", 503, 1)
+    });
+    let dropped = tokio::time::Instant::now();
+    rig.fake.drop_streams(&sid);
+    wait("the refused reconnect", || streams(&rig) == before + 1).await;
+    let refused = tokio::time::Instant::now();
+    wait("the reconnect after Retry-After", || {
+        streams(&rig) == before + 2
+    })
+    .await;
+    assert!(
+        refused.elapsed() >= Duration::from_millis(900),
+        "waited {:?}",
+        refused.elapsed()
+    );
+    assert!(dropped.elapsed() >= Duration::from_secs(1));
+    gate.release();
+    let events = turn(&mut stream).await;
+    assert_eq!(done_status(&events), Some(DoneStatus::Completed));
 }
