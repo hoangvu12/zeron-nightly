@@ -17,9 +17,9 @@ label = "v3"
 
 [[patch]]
 name = "windows-prerelease-versions"
-file = "patches/0001-windows-prerelease-versions.patch"
+file = "patches/0001-windows-prerelease-versions-zgx.patch"
 required = true
-note = "Lets the Windows updater and packaging take prerelease versions."
+note = "The updater part of 0001, for zeron/zgx: the Windows updater takes prerelease versions (0.2.137-v3.N), not only a beta's. zeron/zgx rewrote the lines 0001 changes (valid_version, package-windows.ps1, zeron.iss), so one file can't apply on both lists; v3 packages with its own script and installer, so it needs no packaging part."
 
 [[patch]]
 name = "v3-windows-install-layout"

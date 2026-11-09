@@ -1,4 +1,4 @@
-From 534ee7d652621da6618c7945f376f88119d1e3b0 Mon Sep 17 00:00:00 2001
+From ddb826160e2cc90032cd0349267cd69a783ad079 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 06:29:50 +0700
 Subject: [PATCH] Windows: updates by installer for an install of more than
@@ -15,13 +15,13 @@ rest behind.
   engine on disk is newer. On Windows nothing else restarts the engine, so
   it restarts an idle one at once and offers Restart to update when busy.
 ---
- apps/zgx/src/engine/manager.rs | 11 ++++
+ apps/zgx/src/engine/manager.rs | 11 +++++
  apps/zgx/src/engine_update.rs  |  6 ++-
- crates/update/src/windows.rs   | 95 ++++++++++++++++++++++++++++++++++
- 3 files changed, 110 insertions(+), 2 deletions(-)
+ crates/update/src/windows.rs   | 87 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 102 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/engine/manager.rs b/apps/zgx/src/engine/manager.rs
-index 316c40c9..36668986 100644
+index 316c40c94d0e391c6143f0fa9a9b2d1cedca1aae..366689861b72fac71c71b59aa351d238d254a581 100644
 --- a/apps/zgx/src/engine/manager.rs
 +++ b/apps/zgx/src/engine/manager.rs
 @@ -328,6 +328,17 @@ impl Spawner {
@@ -43,7 +43,7 @@ index 316c40c9..36668986 100644
          &zeron_launch::LaunchConfig {
              data_dir: config.data_dir.clone(),
 diff --git a/apps/zgx/src/engine_update.rs b/apps/zgx/src/engine_update.rs
-index 929df56d..63dddc6e 100644
+index 929df56d5017fa8f0455f9dfe6696a9862785aaf..63dddc6e872dee752ac732dcd8ddabe57a3b5a5c 100644
 --- a/apps/zgx/src/engine_update.rs
 +++ b/apps/zgx/src/engine_update.rs
 @@ -170,8 +170,10 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
@@ -60,10 +60,10 @@ index 929df56d..63dddc6e 100644
              }
              let running = info["build"].as_str().map(str::to_owned);
 diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
-index ecf79829..fc107b99 100644
+index f35f63e6b863d77a1601e1969f3a748c7ef80ae5..dbc7af598e956aae1fb5f64710780930fec77ad8 100644
 --- a/crates/update/src/windows.rs
 +++ b/crates/update/src/windows.rs
-@@ -32,6 +32,25 @@ const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstal
+@@ -41,6 +41,25 @@ const PACKAGE: &str = "package";
  #[derive(serde::Deserialize)]
  struct Config {
      releases_url: String,
@@ -89,17 +89,17 @@ index ecf79829..fc107b99 100644
  }
  
  pub(super) fn is_managed(exe: &Path) -> bool {
-@@ -76,6 +95,9 @@ pub async fn stage(
-                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+@@ -215,6 +234,9 @@ pub async fn stage(
+         valid_version(&manifest.version),
          "invalid Windows release version"
      );
 +    if installer_updates(directory) {
 +        return stage_installer(edge_url, manifest, directory).await;
 +    }
-     let file = artifact(&manifest.version);
-     let expected = manifest
-         .files
-@@ -114,6 +136,76 @@ pub async fn stage(
+     if manifest.channel == super::Channel::Beta {
+         return stage_package(edge_url, manifest, directory).await;
+     }
+@@ -233,6 +255,68 @@ pub async fn stage(
      Ok(staged)
  }
  
@@ -112,15 +112,7 @@ index ecf79829..fc107b99 100644
 +    directory: &Path,
 +) -> anyhow::Result<PathBuf> {
 +    let file = installer_artifact(&manifest.version);
-+    let expected = manifest
-+        .files
-+        .get(&file)
-+        .and_then(|meta| meta.sha256.as_deref())
-+        .context("Windows updates require a SHA-256 checksum")?;
-+    ensure!(
-+        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
-+        "invalid SHA-256 checksum"
-+    );
++    let expected = expected_checksum(manifest, &file)?;
 +    if let Ok(entries) = std::fs::read_dir(directory) {
 +        for entry in entries.flatten() {
 +            if entry.file_name().to_string_lossy().starts_with(".zeron-update-")
@@ -176,7 +168,7 @@ index ecf79829..fc107b99 100644
  fn verify(staged: &Path) -> anyhow::Result<()> {
      let expected = std::fs::read_to_string(staged.with_file_name("sha256"))?;
      verify_digest(staged, expected.trim())
-@@ -148,6 +240,9 @@ fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
+@@ -271,6 +355,9 @@ fn digest(path: &Path) -> anyhow::Result<String> {
  /// and [`Self::recover_from_backup`] cover the leftovers of a hard crash
  /// between the two renames.
  pub fn apply(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {

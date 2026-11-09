@@ -1,4 +1,4 @@
-From ee1d25ae7eb2dd8473d747e209d927c11460ffda Mon Sep 17 00:00:00 2001
+From 69fd99dea0bedc12d30c8e9659db8c3dd6a20746 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 5 Nov 2026 23:19:58 +0700
 Subject: [PATCH] Markdown images in replies: any local folder, kept when the
@@ -44,7 +44,7 @@ a_finished_replys_images_outlive_their_files, zeron-mcp (59).
  create mode 100644 crates/engine/src/reply_images.rs
 
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 84e79d3e2e99fb92fc24b96d0951e8ab837cff2b..2624b63465314eb84c5643dbce24c1378b4f9bad 100644
+index dd161981cdcc3ce0060cc8e9c85aa5b66e081166..d32409b879688e5c91f921c0761f8863b868f341 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -62,6 +62,7 @@ pub mod profile;
@@ -677,10 +677,10 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index f7260706af936183a5a7968230690a5ce975dd7b..451a924429cdb39a468613748e13da1d83fb4fcb 100644
+index 874348dac1d9f6d1a8589fed0291fc95a6cbc768..f18a0b575a69e4574ba426a99abe5e5210b4c443 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -2554,6 +2554,27 @@ impl Inner {
+@@ -2669,6 +2669,27 @@ impl Inner {
          }
      }
  
@@ -708,7 +708,7 @@ index f7260706af936183a5a7968230690a5ce975dd7b..451a924429cdb39a468613748e13da1d
      /// Record the chat's harness-native session id (and its cwd): live-process
      /// cache plus the durable workspace chat row — the row is what survives an
      /// engine restart (zeron sessions.ts:1039).
-@@ -4633,7 +4654,9 @@ async fn drive_run(
+@@ -4846,7 +4867,9 @@ async fn drive_run(
                          ) {
                              tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
                          }
@@ -719,7 +719,7 @@ index f7260706af936183a5a7968230690a5ce975dd7b..451a924429cdb39a468613748e13da1d
                      }
                      folded.clear();
                      dirty = false;
-@@ -5190,7 +5213,9 @@ async fn drive_run(
+@@ -5407,7 +5430,9 @@ async fn drive_run(
              ) {
                  tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
              }
@@ -730,7 +730,7 @@ index f7260706af936183a5a7968230690a5ce975dd7b..451a924429cdb39a468613748e13da1d
              folded.clear();
              dirty = false;
              entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
-@@ -5329,7 +5354,9 @@ async fn drive_run(
+@@ -5546,7 +5571,9 @@ async fn drive_run(
                  ) {
                      tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
                  }

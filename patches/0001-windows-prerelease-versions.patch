@@ -1,4 +1,4 @@
-From d1dd6c62feecf03f7574f2bd9954251b0730040c Mon Sep 17 00:00:00 2001
+From 5cc5678b8ff585c732f4ce5a75a92fabcf58ea4f Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 4 Nov 2026 23:06:11 +0700
 Subject: [PATCH] Windows: accept prerelease versions in the updater and
@@ -19,10 +19,10 @@ package-windows.ps1 and zeron.iss only read X.Y.Z. A prerelease build
  3 files changed, 43 insertions(+), 7 deletions(-)
 
 diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
-index 717b6876c..1be2061cc 100644
+index 07cc82dd613f80817eda0d4bae6af435f483ecd8..ecf79829ac8d14db4e55e3e49fe64d1574a8261d 100644
 --- a/crates/update/src/windows.rs
 +++ b/crates/update/src/windows.rs
-@@ -61,11 +61,15 @@ pub async fn stage(
+@@ -65,11 +65,15 @@ pub async fn stage(
      manifest: &super::Manifest,
      directory: &Path,
  ) -> anyhow::Result<PathBuf> {
@@ -42,7 +42,7 @@ index 717b6876c..1be2061cc 100644
          "invalid Windows release version"
      );
      let file = artifact(&manifest.version);
-@@ -483,6 +487,31 @@ mod tests {
+@@ -505,6 +509,31 @@ mod tests {
          assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
      }
  
@@ -75,7 +75,7 @@ index 717b6876c..1be2061cc 100644
      async fn corrupt_download_preserves_install_and_removes_staging() {
          use std::io::Write;
 diff --git a/dist/windows/zeron.iss b/dist/windows/zeron.iss
-index 703c979db..c309ea46d 100644
+index 703c979dbf4e3a20b83c03794aa6e74db6e4e967..c309ea46d08b81e3c62460e3a6b36a90bdfcb684 100644
 --- a/dist/windows/zeron.iss
 +++ b/dist/windows/zeron.iss
 @@ -14,6 +14,10 @@
@@ -99,7 +99,7 @@ index 703c979db..c309ea46d 100644
  DefaultDirName={autopf}\Zeron
  DisableProgramGroupPage=yes
 diff --git a/scripts/package-windows.ps1 b/scripts/package-windows.ps1
-index 4c5e12211..8c729670c 100644
+index 4c5e12211d2aa66f576f107ec3f8693c1080952c..8c729670ca1f380fbebadbb213e65d3a53e979f2 100644
 --- a/scripts/package-windows.ps1
 +++ b/scripts/package-windows.ps1
 @@ -61,11 +61,14 @@ try {
@@ -127,3 +127,6 @@ index 4c5e12211..8c729670c 100644
          "/DPackageDir=$([IO.Path]::GetFullPath($stage))" `
          "/DOutputDir=$([IO.Path]::GetFullPath($out))" `
          ([IO.Path]::GetFullPath((Join-Path $root 'dist/windows/zeron.iss')))
+-- 
+2.55.0.windows.2
+

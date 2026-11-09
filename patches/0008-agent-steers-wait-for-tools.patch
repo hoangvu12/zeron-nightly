@@ -1,4 +1,4 @@
-From 02a26849865118535e5e161f3f8d56bc0c21d164 Mon Sep 17 00:00:00 2001
+From a9cd0fc44652439992c983a20d693b949270826e Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 9 Nov 2026 11:46:29 +0700
 Subject: [PATCH] An agent's message to a busy chat waits for the command it
@@ -53,7 +53,7 @@ written `next`, with no interrupt before it.
  20 files changed, 322 insertions(+), 29 deletions(-)
 
 diff --git a/crates/client/src/demo/mod.rs b/crates/client/src/demo/mod.rs
-index 553afd3e3..94c5137db 100644
+index 553afd3e37dd14a479b2788c2ff908e750d7eca4..94c5137dbd16ce5a49f85d929120fbcf23e5b1d8 100644
 --- a/crates/client/src/demo/mod.rs
 +++ b/crates/client/src/demo/mod.rs
 @@ -353,7 +353,7 @@ impl DemoHost {
@@ -66,7 +66,7 @@ index 553afd3e3..94c5137db 100644
                      let steps = self.reply_for(&prompt);
                      let id = message_id.unwrap_or_else(crate::new_id);
 diff --git a/crates/client/src/session/mod.rs b/crates/client/src/session/mod.rs
-index 14425f5e5..ac4750235 100644
+index 14425f5e5f5b737654195eddfcf653378482fd86..ac47502357211bbc5649325236b0c60f6001dfb9 100644
 --- a/crates/client/src/session/mod.rs
 +++ b/crates/client/src/session/mod.rs
 @@ -748,6 +748,7 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
@@ -86,7 +86,7 @@ index 14425f5e5..ac4750235 100644
                  )?;
                  SendOutcome::Steered { message_id }
 diff --git a/crates/doc/examples/gen_fixture.rs b/crates/doc/examples/gen_fixture.rs
-index 7678b31ae..bc82b62ae 100644
+index 7678b31ae2e8fc40ca5ba941e91d6646a9549a71..bc82b62ae7c0563ca04600fcabc1d35f1a87f516 100644
 --- a/crates/doc/examples/gen_fixture.rs
 +++ b/crates/doc/examples/gen_fixture.rs
 @@ -74,6 +74,7 @@ fn main() {
@@ -98,7 +98,7 @@ index 7678b31ae..bc82b62ae 100644
          issued_by: "device-rust".into(),
          issued_at: 1_700_000_002_000,
 diff --git a/crates/doc/src/commands.rs b/crates/doc/src/commands.rs
-index c7d4d9004..1fbfa3d88 100644
+index c7d4d900440360a32be59336dbbd1dd6736b6369..1fbfa3d88407ab017ac788c0257b7aa39c837f34 100644
 --- a/crates/doc/src/commands.rs
 +++ b/crates/doc/src/commands.rs
 @@ -43,10 +43,17 @@ pub enum SessionCommandPayload {
@@ -175,7 +175,7 @@ index c7d4d9004..1fbfa3d88 100644
      fn composer_cancel_rules() {
          let e = steer("c1", 1_000);
 diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
-index e1ead668a..c8fd30eab 100644
+index e1ead668a5903390be40feb5abdcb316c3387c67..c8fd30eab60e9bdd6931814f43d5fc0f281c2cda 100644
 --- a/crates/doc/src/schema.rs
 +++ b/crates/doc/src/schema.rs
 @@ -2578,6 +2578,7 @@ mod tests {
@@ -187,7 +187,7 @@ index e1ead668a..c8fd30eab 100644
              issued_by: "dev-b".into(),
              issued_at: 10,
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index fe43ae17a..67c2efcc9 100644
+index fe43ae17ae036a631ad7388035833b26c5374c6b..67c2efcc99c5974863b579d069060faceafff79f 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
 @@ -5730,13 +5730,18 @@ impl DocHost {
@@ -255,7 +255,7 @@ index fe43ae17a..67c2efcc9 100644
                  handle.queue_paused.store(false, Ordering::Release);
                  Ok((SessionCommandStatus::Applied, None))
 diff --git a/crates/engine/src/plugin_agents.rs b/crates/engine/src/plugin_agents.rs
-index e78ead4dd..5ae01a0d8 100644
+index e78ead4dddc073f88ab20a0ebf5822f998fbc655..5ae01a0d8d3cd0d274235a51931f09a7806e9288 100644
 --- a/crates/engine/src/plugin_agents.rs
 +++ b/crates/engine/src/plugin_agents.rs
 @@ -100,7 +100,7 @@ impl AgentHost for EngineAgentHost {
@@ -268,7 +268,7 @@ index e78ead4dd..5ae01a0d8 100644
                  Ok(id)
              }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 54b5e34da..ca6c2f924 100644
+index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c95564ab52 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -167,6 +167,9 @@ struct RunHandle {
@@ -281,7 +281,7 @@ index 54b5e34da..ca6c2f924 100644
      /// A steer is stopping this turn ([`SessionsEngine::steer_now`]): the
      /// steers the stop cancels go to `redeliver` instead of being dropped.
      redeliver_on_stop: Arc<std::sync::atomic::AtomicBool>,
-@@ -1208,6 +1211,7 @@ impl SessionsEngine {
+@@ -1227,6 +1230,7 @@ impl SessionsEngine {
                      && harness.stops_turn_in_place()
                      && harness.steer_stops_tool(),
                  open_tools: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -289,7 +289,7 @@ index 54b5e34da..ca6c2f924 100644
                  redeliver_on_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                  redeliver: Arc::new(Mutex::new(Vec::new())),
                  turn: turn.clone(),
-@@ -1418,6 +1422,21 @@ impl SessionsEngine {
+@@ -1437,6 +1441,21 @@ impl SessionsEngine {
          attachments: Vec<String>,
          message_id: Option<String>,
          issued_at: i64,
@@ -311,7 +311,7 @@ index 54b5e34da..ca6c2f924 100644
      ) -> Result<SteerOutcome, EngineError> {
          let target = lock(&self.inner.runs)
              .get(chat_id)
-@@ -1440,6 +1459,11 @@ impl SessionsEngine {
+@@ -1459,6 +1478,11 @@ impl SessionsEngine {
          let user_id = message_id.unwrap_or_else(new_id);
          let bootstrap = self.warm_fork_history(chat_id, harness_id, prompt, &history_sent);
          let delivered = bootstrap.as_deref().unwrap_or(prompt);
@@ -323,7 +323,7 @@ index 54b5e34da..ca6c2f924 100644
          // A steer runs on the configuration live now; record it with the
          // message so a re-dispatch keeps it.
          let sent_with = self.last_request(chat_id).map(|mut request| {
-@@ -1540,6 +1564,10 @@ impl SessionsEngine {
+@@ -1559,6 +1583,10 @@ impl SessionsEngine {
      /// under their own ids. Otherwise, or when the stop doesn't settle, it
      /// is an ordinary steer ([`Self::steer_at`]), read at the next step
      /// boundary. Nothing here tears a runtime down.
@@ -334,7 +334,7 @@ index 54b5e34da..ca6c2f924 100644
      pub(crate) async fn steer_now(
          &self,
          chat_id: &str,
-@@ -1548,7 +1576,17 @@ impl SessionsEngine {
+@@ -1567,7 +1595,17 @@ impl SessionsEngine {
          message_id: Option<String>,
          issued_at: i64,
      ) -> Result<SteerOutcome, EngineError> {
@@ -353,7 +353,7 @@ index 54b5e34da..ca6c2f924 100644
              let earlier = lock(&self.inner.runs)
                  .get(chat_id)
                  .map(|h| std::mem::take(&mut *lock(&h.redeliver)))
-@@ -1573,7 +1611,7 @@ impl SessionsEngine {
+@@ -1592,7 +1630,7 @@ impl SessionsEngine {
                  }
              }
          }
@@ -362,7 +362,7 @@ index 54b5e34da..ca6c2f924 100644
              .await
      }
  
-@@ -3437,6 +3475,42 @@ fn revival_prompt(original: &str) -> String {
+@@ -3456,6 +3494,42 @@ fn revival_prompt(original: &str) -> String {
  /// The note a turn the engine's own shutdown cut off ends with.
  const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
  
@@ -405,7 +405,7 @@ index 54b5e34da..ca6c2f924 100644
  /// The note a reply opens with when the provider no longer had the session
  /// the run asked to resume.
  const FRESH_START_NOTICE: &str = "The provider no longer has this chat's earlier session, \
-@@ -4087,18 +4161,19 @@ async fn drive_run(
+@@ -4106,18 +4180,19 @@ async fn drive_run(
      // folding the echo would mint an orphan chip mid-text in the NEXT
      // segment — the mid-word transcript splits.
      let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -431,7 +431,7 @@ index 54b5e34da..ca6c2f924 100644
      };
      let mut seen_images = std::collections::HashSet::new();
      for entry in doc_ref.read_entries().unwrap_or_default() {
-@@ -5274,16 +5349,18 @@ async fn drive_run(
+@@ -5293,16 +5368,18 @@ async fn drive_run(
              _ => {}
          }
          match &event {
@@ -454,7 +454,7 @@ index 54b5e34da..ca6c2f924 100644
                  }
              }
 diff --git a/crates/engine/tests/acp_lifecycle.rs b/crates/engine/tests/acp_lifecycle.rs
-index bde651c63..f9dfee6c8 100644
+index bde651c636c3d20ad35e75bbcd8b6fd0aafe30d5..f9dfee6c804406e6db3b7ec933ef2be2df1842f8 100644
 --- a/crates/engine/tests/acp_lifecycle.rs
 +++ b/crates/engine/tests/acp_lifecycle.rs
 @@ -102,6 +102,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
@@ -474,7 +474,7 @@ index bde651c63..f9dfee6c8 100644
      );
      wait_for(|| {
 diff --git a/crates/engine/tests/cursor_live.rs b/crates/engine/tests/cursor_live.rs
-index 0030a3e41..848273654 100644
+index 0030a3e41b00954db90ef103b213b42d6d4dc5ae..84827365453d1e7b4832fea6470ce37a48beed17 100644
 --- a/crates/engine/tests/cursor_live.rs
 +++ b/crates/engine/tests/cursor_live.rs
 @@ -136,7 +136,7 @@ async fn remote_steer_batch_reaches_real_muse_with_every_message() {
@@ -487,7 +487,7 @@ index 0030a3e41..848273654 100644
              based_on: None, expires_at: None, status: zeron_doc::SessionCommandStatus::Pending, resolution: None,
          }).unwrap();
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 0e6b7ba1f..74470d437 100644
+index 0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2..74470d4379147e1a51b39b1701c87ea466d3a4f7 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
 @@ -305,6 +305,7 @@ async fn update_deferred_steering_preserves_the_active_turn_and_queued_prompt()
@@ -523,7 +523,7 @@ index 0e6b7ba1f..74470d437 100644
      );
      wait_for(
 diff --git a/crates/engine/tests/message_queue.rs b/crates/engine/tests/message_queue.rs
-index dd81433f7..0a00573d0 100644
+index dd81433f7e4077fc5d4ef5863e3fb1f3aecc9a15..0a00573d0fc0cfd29b968eb64f787e3127853488 100644
 --- a/crates/engine/tests/message_queue.rs
 +++ b/crates/engine/tests/message_queue.rs
 @@ -563,6 +563,7 @@ async fn a_steer_command_for_a_turn_boundary_agent_waits_in_the_queue_for_the_tu
@@ -551,7 +551,7 @@ index dd81433f7..0a00573d0 100644
                  issued_by: "remote-device".into(),
                  issued_at: now + i as i64,
 diff --git a/crates/engine/tests/queue_order_live.rs b/crates/engine/tests/queue_order_live.rs
-index 8fbf16bb2..fbcff78b6 100644
+index 8fbf16bb2daeacc5008b97a2b727b5814ac4869f..fbcff78b6bbdb0d676f881d232b9b6d64b31c94b 100644
 --- a/crates/engine/tests/queue_order_live.rs
 +++ b/crates/engine/tests/queue_order_live.rs
 @@ -331,6 +331,7 @@ async fn scenario(name: &str, which: &str) {
@@ -563,7 +563,7 @@ index 8fbf16bb2..fbcff78b6 100644
                  )
                  .unwrap();
 diff --git a/crates/engine/tests/restart_resume.rs b/crates/engine/tests/restart_resume.rs
-index d4acca07a..70466ec2c 100644
+index d4acca07afb34e1fc1af841437a00bb3cc0bc2af..70466ec2c2270db98a2ec23f33a136e3543d943c 100644
 --- a/crates/engine/tests/restart_resume.rs
 +++ b/crates/engine/tests/restart_resume.rs
 @@ -1412,6 +1412,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
@@ -575,7 +575,7 @@ index d4acca07a..70466ec2c 100644
          )
          .expect("queue steer command");
 diff --git a/crates/engine/tests/steer_now.rs b/crates/engine/tests/steer_now.rs
-index 806c1a18e..34aba352c 100644
+index 806c1a18e9c1e5cbfee4d2562dc0814d9085a57b..34aba352cc14eb5485dbbc94903f2474671c8a16 100644
 --- a/crates/engine/tests/steer_now.rs
 +++ b/crates/engine/tests/steer_now.rs
 @@ -4,7 +4,9 @@
@@ -685,7 +685,7 @@ index 806c1a18e..34aba352c 100644
  }
  
 diff --git a/crates/engine/tests/steering_live.rs b/crates/engine/tests/steering_live.rs
-index 665fc649a..f8ecabdc1 100644
+index 665fc649afe8caa3786461746ef649f07872b0d9..f8ecabdc18bfd3b3297c01f3c316469e0d2d02b3 100644
 --- a/crates/engine/tests/steering_live.rs
 +++ b/crates/engine/tests/steering_live.rs
 @@ -128,7 +128,7 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
@@ -698,7 +698,7 @@ index 665fc649a..f8ecabdc1 100644
      // Regular queued messages must remain held until the steered work finishes.
      for i in 0..2 {
 diff --git a/crates/harness/tests/claude.rs b/crates/harness/tests/claude.rs
-index d2e54ae9d..a32faa3be 100644
+index d2e54ae9d2cdf28ce5851537fbbadb8e5c5a7898..a32faa3be413f5695eb3db8bf226326212bc2030 100644
 --- a/crates/harness/tests/claude.rs
 +++ b/crates/harness/tests/claude.rs
 @@ -1550,6 +1550,53 @@ async fn a_typed_fork_settles_before_a_message_waiting_on_it_splits_the_turn() {
@@ -756,7 +756,7 @@ index d2e54ae9d..a32faa3be 100644
  /// Done waits for the stop to settle, so the replacement prompt — sent the
  /// moment that Done arrives — runs to its own end, never settled by the
 diff --git a/crates/harness/tests/fixtures/fake-claude.sh b/crates/harness/tests/fixtures/fake-claude.sh
-index 3a6ba5950..30b5b9bcd 100755
+index 3a6ba5950a405d137fef6081dd1893b18133e7c4..30b5b9bcd9e1a0c132000e3bb6380e075917497a 100755
 --- a/crates/harness/tests/fixtures/fake-claude.sh
 +++ b/crates/harness/tests/fixtures/fake-claude.sh
 @@ -273,6 +273,24 @@ case "$first" in
@@ -785,7 +785,7 @@ index 3a6ba5950..30b5b9bcd 100755
    # "Send now" while a turn's result is held for a queued steer: the CLI is
    # slow to answer the stop, had already begun the steer's turn, and that
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 8991b315f..d5d52d28d 100644
+index 8991b315f0e2e2d4218c32b521bd83dc45040ee6..d5d52d28dfbd0b5d4cabf5814d0fa801542a66df 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -162,7 +162,7 @@ fn catalog() -> Vec<ToolDef> {
@@ -835,7 +835,7 @@ index 8991b315f..d5d52d28d 100644
  
      #[tokio::test]
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 673a116a9..8c5c5dfeb 100644
+index 673a116a9ee42a8cf2f2a5d086d513fd62386506..8c5c5dfeb164ce06045b116cad5ed7951bd69b5d 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -179,9 +179,14 @@ transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

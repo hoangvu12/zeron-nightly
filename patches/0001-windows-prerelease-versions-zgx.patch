@@ -1,0 +1,66 @@
+From 055c85686ecaf98bafac797193bab3a0994172f1 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 4 Nov 2026 23:06:11 +0700
+Subject: [PATCH] Windows: accept prerelease versions in the updater
+
+The updater part of 0001, for zeron/zgx. Its Windows updater only staged
+x.y.z and a beta's x.y.z-beta.n, so a prerelease build (0.2.137-v3.N,
+0.2.137-nightly.N) could not be updated to.
+
+- windows.rs: valid_version takes any prerelease of dot-separated
+  letters, digits and hyphens after the dotted numbers (it names the
+  downloaded file and a beta's folder); no v prefix, no path characters.
+---
+ crates/update/src/windows.rs | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
+index c9f06a4c9e398386db539989376163a64cde0902..f35f63e6b863d77a1601e1969f3a748c7ef80ae5 100644
+--- a/crates/update/src/windows.rs
++++ b/crates/update/src/windows.rs
+@@ -71,15 +71,19 @@ fn package(version: &str) -> String {
+     format!("zeron-{version}-windows-{}.zip", std::env::consts::ARCH)
+ }
+ 
+-/// `x.y.z`, or a beta's `x.y.z-beta.n`: digits and dots only, since it names
++/// `x.y.z`, or a prerelease's `x.y.z-beta.n` (`-nightly.n`, `-v3.n`): dotted
++/// numbers, then dot-separated letters, digits and hyphens, since it names
+ /// files and folders.
+ fn valid_version(version: &str) -> bool {
+     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+-    let (core, beta) = match version.split_once("-beta.") {
+-        Some((core, beta)) => (core, Some(beta)),
++    let identifier = |part: &str| {
++        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
++    };
++    let (core, pre) = match version.split_once('-') {
++        Some((core, pre)) => (core, Some(pre)),
+         None => (version, None),
+     };
+-    core.split('.').all(digits) && beta.is_none_or(digits)
++    core.split('.').all(digits) && pre.is_none_or(|pre| pre.split('.').all(identifier))
+ }
+ 
+ /// The manifest's mandatory checksum for `file`.
+@@ -538,7 +542,17 @@ mod tests {
+     fn a_beta_s_version_names_files_and_nothing_else_does() {
+         assert!(valid_version("0.2.137"));
+         assert!(valid_version("0.2.137-beta.1"));
+-        for bad in ["", "0.2.", "0.2.137-beta.", "0.2.137-rc.1", r"..\..\evil", "0.2.137-beta.1/x"] {
++        for bad in ["", "0.2.", "0.2.137-beta.", r"..\..\evil", "0.2.137-beta.1/x"] {
++            assert!(!valid_version(bad), "{bad}");
++        }
++    }
++
++    #[test]
++    fn prerelease_versions_stage_and_unsafe_ones_are_rejected() {
++        for good in ["0.2.137-nightly.202611041900", "0.2.137-v3.202611091930", "0.2.137-rc.1"] {
++            assert!(valid_version(good), "{good}");
++        }
++        for bad in ["v0.2.137", "0.2.137+build", "0.2.137-../x", "0.2.137/x", "0.2.137-", "0.2.137-v3..1"] {
+             assert!(!valid_version(bad), "{bad}");
+         }
+     }
+-- 
+2.55.0.windows.2
+

@@ -1,4 +1,4 @@
-From 702d7aed5fcda17fa42b763147bb33cd1bd27ecd Mon Sep 17 00:00:00 2001
+From 2efb8f4343e418be1c82dec085b6b11e66d497f0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:03:38 +0700
 Subject: [PATCH] Images from another device load in a few round trips, not one

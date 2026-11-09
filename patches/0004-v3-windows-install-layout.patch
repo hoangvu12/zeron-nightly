@@ -1,4 +1,4 @@
-From 87180fe1eb1cef52d9b2e52b572df555b1aadcc2 Mon Sep 17 00:00:00 2001
+From bc2b3f453ecf87b19f5d002c8fa06da2400f7c18 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:38:38 +0700
 Subject: [PATCH] zgx on Windows: no console window, and the ui folder beside
@@ -11,44 +11,33 @@ install on Windows keeps ui and plugins-builtin beside zeron.exe.
 - The beta build uses the windows subsystem, as apps/zeron does.
 - bundled_ui reads the ui folder beside the exe on Windows.
 ---
- apps/zgx/src/main.rs | 12 ++++++++++--
- 1 file changed, 10 insertions(+), 2 deletions(-)
+ apps/zgx/src/main.rs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
-index 0c5706d3b..8a50b2636 100644
+index 8d4cde9ec2bf93e5e762d282c97f5140f52423c0..93490af9d1b6dddc36a0a190b384962874adb522 100644
 --- a/apps/zgx/src/main.rs
 +++ b/apps/zgx/src/main.rs
-@@ -25,6 +25,9 @@
- //! `ZERON_ZGX_REPLAY=1` shows every page, as if none were finished.
- //! `--inspect` (or `ZGX_INSPECT_SOCKET=1`) serves devtools to `zgx inspect`.
- 
-+// The Zeron app on Windows opens no console window, as apps/zeron's.
-+#![cfg_attr(all(windows, feature = "beta"), windows_subsystem = "windows")]
-+
- mod about;
- mod acp_registry;
- mod agents;
-@@ -1197,13 +1200,18 @@ fn ui_dir() -> PathBuf {
-     }
- }
- 
--/// `Contents/Resources/ui` of the bundle this executable runs from, if any.
-+/// `Contents/Resources/ui` of the bundle this executable runs from, if any;
-+/// on Windows, the `ui` beside the executable (an install's folder).
+@@ -1256,7 +1256,8 @@ fn ui_dir() -> PathBuf {
+ /// The packaged scripts of the install this executable runs from, if any:
+ /// `Contents/Resources/ui` of a macOS bundle, `ui` beside it on Linux (the
+ /// tarball's, scripts/package-linux.sh), `beta\<version>\ui` beside it on
+-/// Windows (scripts/package-windows.ps1).
++/// Windows (scripts/package-windows.ps1), else there the `ui` beside it (an
++/// install that has its folder to itself).
  fn bundled_ui() -> Option<PathBuf> {
      static BUNDLED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
      BUNDLED
-         .get_or_init(|| {
-             let exe = std::env::current_exe().ok()?;
--            let ui = exe.parent()?.parent()?.join("Resources").join("ui");
-+            let ui = if cfg!(windows) {
-+                exe.parent()?.join("ui")
-+            } else {
-+                exe.parent()?.parent()?.join("Resources").join("ui")
-+            };
-             ui.join("app.luau").is_file().then_some(ui)
-         })
-         .clone()
+@@ -1266,7 +1267,8 @@ fn bundled_ui() -> Option<PathBuf> {
+             let ui = if cfg!(target_os = "macos") {
+                 dir.parent()?.join("Resources").join("ui")
+             } else if cfg!(windows) {
+-                dir.join("beta").join(about::APP_VERSION).join("ui")
++                let beta = dir.join("beta").join(about::APP_VERSION).join("ui");
++                if beta.join("app.luau").is_file() { beta } else { dir.join("ui") }
+             } else {
+                 dir.join("ui")
+             };
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 
