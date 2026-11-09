@@ -434,6 +434,7 @@ async fn only_a_successful_request_clears_sign_in_again() {
             path_contains: "/v1/code/sessions".into(),
             status,
             times: 1,
+            retry_after: None,
         });
         assert!(rig.create().await.is_err());
         assert_eq!(
