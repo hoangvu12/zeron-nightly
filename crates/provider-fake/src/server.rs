@@ -253,10 +253,16 @@ impl FakeSessionServer {
     }
 
     pub fn seed_session(&self, seed: SeedSession) {
+        self.seed_session_of_kind(seed, "anthropic_cloud");
+    }
+
+    /// [`Self::seed_session`] in an environment of another kind (a
+    /// self-hosted `byoc` one, say).
+    pub fn seed_session_of_kind(&self, seed: SeedSession, environment_kind: &str) {
         let info = json!({
             "id": seed.id,
             "environment_id": seed.environment_id,
-            "environment_kind": "anthropic_cloud",
+            "environment_kind": environment_kind,
             "status": seed.status,
             "title": "seeded session",
             "created_at": seed.last_event_at,

@@ -818,7 +818,7 @@ pub fn registry_for_platform(platform: &str) -> HarnessRegistry {
         && let Some(config) = zeron_harness::claude_cloud::ClaudeCloudConfig::device_default()
     {
         // Provider-run chats (Claude cloud sessions): off unless switched on
-        // (docs/design/provider-run-chats.md; the setting is ticket #4's).
+        // (docs/design/provider-run-chats.md).
         registry.register(Arc::new(zeron_harness::ClaudeCloudHarness::new(config)));
     }
     registry

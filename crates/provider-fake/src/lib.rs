@@ -13,9 +13,8 @@
 //! - [`ClaudeLogin`]: a CLI login folder (`.credentials.json` +
 //!   `.claude.json`) with fake values.
 //!
-//! Growth points for later tickets are marked `#N` (first answer wins per
-//! `request_id` (#5), more injected failures (#7, #15), list-driven
-//! discovery (#9)).
+//! Room to grow: first answer wins per `request_id`, more injected failures,
+//! list-driven discovery.
 
 mod login;
 mod server;

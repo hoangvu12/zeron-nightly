@@ -4,8 +4,8 @@
 //! which arrives through the steering mailbox and is sent to the session
 //! under the Zeron message id's event uuid (the provider ignores repeats).
 //!
-//! Not here yet (later tickets): interrupts and prompt answers (#5), the
-//! durable replay watermark (#8), takeover checks before each request (#12).
+//! Not here yet: interrupts and prompt answers, the durable replay
+//! watermark, takeover checks before each request.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -137,7 +137,7 @@ impl RunSession {
                 _ = self.events.closed() => break 'main,
                 _ = interrupt.cancelled() => {
                     // Closing the stream never interrupts the session at the
-                    // provider; stopping the turn there is ticket #5's.
+                    // provider; stopping the turn there isn't done here.
                     let _ = send(&self.events, done(DoneStatus::Interrupted, None)).await;
                     break 'main;
                 }
@@ -190,8 +190,8 @@ impl RunSession {
                     }
                     ended => {
                         // One reconnect, from where the mirror got to (the
-                        // stream replays strictly after it). Ticket #8 owns
-                        // backoff and the durable watermark.
+                        // stream replays strictly after it). No backoff or
+                        // durable watermark yet.
                         if let Some(Err(error)) = &ended {
                             tracing::warn!(target: "zeron_harness::claude_cloud", %error, "session stream failed");
                         }

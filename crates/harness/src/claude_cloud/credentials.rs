@@ -15,7 +15,7 @@
 //! CLI's own refresh by running `claude auth status --json` in the folder
 //! (single-flight per folder, 10 s timeout), then the files are read again.
 //! The sign-in states built on that (expired, logged out, mismatched status)
-//! belong to ticket #7; this module keeps the hook minimal.
+//! live elsewhere; this module keeps the hook minimal.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
