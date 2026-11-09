@@ -114,8 +114,8 @@ impl Mirror {
             StreamItem::Ephemeral(payload) => (payload, None),
             StreamItem::Other { .. } => return Mapped::default(),
         };
-        let control = control(&payload)
-            .or_else(|| user_message(&payload, source.as_deref()).map(Some));
+        let control =
+            control(&payload).or_else(|| user_message(&payload, source.as_deref()).map(Some));
         match control {
             Some(control) => Mapped {
                 events: Vec::new(),
@@ -251,14 +251,11 @@ fn control(payload: &Value) -> Option<Option<Control>> {
     match payload.get("type").and_then(Value::as_str)? {
         "control_request" => {
             let frame: ControlRequestFrame = serde_json::from_value(payload.clone()).ok()?;
-            Some(
-                (frame.request.subtype == "can_use_tool" && !frame.request_id.is_empty()).then(
-                    || Control::Prompt {
-                        request_id: frame.request_id,
-                        request: frame.request,
-                    },
-                ),
-            )
+            let prompt = frame.request.subtype == "can_use_tool" && !frame.request_id.is_empty();
+            Some(prompt.then_some(Control::Prompt {
+                request_id: frame.request_id,
+                request: frame.request,
+            }))
         }
         "control_response" => {
             let response = payload.get("response");

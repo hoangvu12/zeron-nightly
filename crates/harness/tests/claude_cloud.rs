@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use serde_json::{Value, json};
 use futures::stream::BoxStream;
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use zeron_harness::claude_cloud::credentials::ClaudeConfigDir;
 use zeron_harness::claude_cloud::{ClaudeCloudConfig, ClaudeCloudHarness};
@@ -345,7 +345,14 @@ const STOP: &str = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
 type Stream = BoxStream<'static, Result<AgentEvent, HarnessError>>;
 
 /// Questions the run asked, each with the sender that answers it.
-type Asked = Arc<Mutex<Vec<(Vec<UserInputQuestion>, oneshot::Sender<Vec<UserInputAnswer>>)>>>;
+type Asked = Arc<
+    Mutex<
+        Vec<(
+            Vec<UserInputQuestion>,
+            oneshot::Sender<Vec<UserInputAnswer>>,
+        )>,
+    >,
+>;
 
 fn asking_controls() -> (RunControls, CancellationToken, Asked) {
     let (mut controls, _steer, token) = controls();
@@ -373,7 +380,10 @@ async fn wait(what: &str, mut ready: impl FnMut() -> bool) {
 /// The next question the run asks, with the sender that answers it.
 async fn next_question(
     asked: &Asked,
-) -> (Vec<UserInputQuestion>, oneshot::Sender<Vec<UserInputAnswer>>) {
+) -> (
+    Vec<UserInputQuestion>,
+    oneshot::Sender<Vec<UserInputAnswer>>,
+) {
     wait("a question", || !asked.lock().unwrap().is_empty()).await;
     asked.lock().unwrap().remove(0)
 }
@@ -452,7 +462,14 @@ async fn a_steer_mid_turn_reaches_the_session_at_once_and_its_turn_ends_the_turn
     let session = create(&rig, "Run uname -a", FIRST).await;
     let cwd = zeron_proto::provider_cloud::claude_cwd(&session.session_id);
     let (controls, steer, _interrupt) = controls();
-    let mut stream = start(&rig, &session, FIRST, request(&cwd, "Run uname -a"), controls).await;
+    let mut stream = start(
+        &rig,
+        &session,
+        FIRST,
+        request(&cwd, "Run uname -a"),
+        controls,
+    )
+    .await;
     turn(&mut stream).await;
 
     let (held, gate) = Turn::text_zulu().hold_after(is_text_delta);
@@ -503,7 +520,14 @@ async fn stop_interrupts_the_turn_under_the_stop_commands_id_and_a_repeat_is_a_n
     let cwd = zeron_proto::provider_cloud::claude_cwd(&sid);
     let (controls, steer, interrupt) = controls();
     let turn_control = controls.turn.clone();
-    let mut stream = start(&rig, &session, FIRST, request(&cwd, "Run uname -a"), controls).await;
+    let mut stream = start(
+        &rig,
+        &session,
+        FIRST,
+        request(&cwd, "Run uname -a"),
+        controls,
+    )
+    .await;
     turn(&mut stream).await;
 
     let (held, _gate) = Turn::text_zulu().hold_after(is_text_delta);
@@ -552,7 +576,14 @@ async fn stop_interrupts_the_turn_under_the_stop_commands_id_and_a_repeat_is_a_n
     rig.fake.queue_turn(held);
     let (controls, _steer, interrupt) = crate::controls();
     let turn_control = controls.turn.clone();
-    let mut stream = start(&rig, &session, FOURTH, request(&cwd, "ZULU once more"), controls).await;
+    let mut stream = start(
+        &rig,
+        &session,
+        FOURTH,
+        request(&cwd, "ZULU once more"),
+        controls,
+    )
+    .await;
     gate.reached().await;
     let stored_before = rig.fake.stored_events(&sid).len();
     turn_control.note_stop_command(STOP);
@@ -619,12 +650,16 @@ async fn prompt_answers_reach_the_session_and_the_turn_completes_with_them() {
         rig.fake
             .stored_events(&sid)
             .iter()
-            .any(|e| e.source == "worker" && e.payload.to_string().contains(&picked.replace('"', "\\\""))),
+            .any(|e| e.source == "worker"
+                && e.payload.to_string().contains(&picked.replace('"', "\\\""))),
         "no tool result with the answer"
     );
     let results = count(&events, |e| matches!(e, AgentEvent::ToolResult { .. }));
     let calls = count(&events, |e| matches!(e, AgentEvent::ToolCall { .. }));
-    assert!(results >= calls && calls >= 4, "{calls} calls, {results} results");
+    assert!(
+        results >= calls && calls >= 4,
+        "{calls} calls, {results} results"
+    );
 }
 
 #[tokio::test]
@@ -694,7 +729,14 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     let sid = session.session_id.clone();
     let cwd = zeron_proto::provider_cloud::claude_cwd(&sid);
     let (controls, steer, _interrupt) = controls();
-    let mut stream = start(&rig, &session, FIRST, request(&cwd, "Run uname -a"), controls).await;
+    let mut stream = start(
+        &rig,
+        &session,
+        FIRST,
+        request(&cwd, "Run uname -a"),
+        controls,
+    )
+    .await;
     turn(&mut stream).await;
 
     // Plan mode on a different model.
@@ -745,7 +787,10 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     assert_eq!(sent[0]["uuid"], control_uuid(THIRD, "set_permission_mode"));
     assert_eq!(sent[0]["request"]["mode"], "acceptEdits");
     assert_eq!(sent[1]["uuid"], THIRD);
-    assert_eq!(rig.fake.permission_mode(&sid).as_deref(), Some("acceptEdits"));
+    assert_eq!(
+        rig.fake.permission_mode(&sid).as_deref(),
+        Some("acceptEdits")
+    );
 
     // The plan command executed again by a device that knows nothing of the
     // session (another host, or this one after a restart) sends the same
@@ -776,7 +821,10 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(rig.fake.stored_events(&sid).len(), stored);
-    assert_eq!(rig.fake.permission_mode(&sid).as_deref(), Some("acceptEdits"));
+    assert_eq!(
+        rig.fake.permission_mode(&sid).as_deref(),
+        Some("acceptEdits")
+    );
     assert!(!rig.fake.turn_playing(&sid));
     drop(again);
 }
@@ -788,7 +836,14 @@ async fn a_message_sent_from_elsewhere_shows_and_this_devices_own_echoes_dont() 
     let sid = session.session_id.clone();
     let cwd = zeron_proto::provider_cloud::claude_cwd(&sid);
     let (controls, steer, _interrupt) = controls();
-    let mut stream = start(&rig, &session, FIRST, request(&cwd, "Run uname -a"), controls).await;
+    let mut stream = start(
+        &rig,
+        &session,
+        FIRST,
+        request(&cwd, "Run uname -a"),
+        controls,
+    )
+    .await;
     let first = turn(&mut stream).await;
     // The opening prompt's echo (it rode the create request) shows nothing.
     assert_eq!(
@@ -834,7 +889,14 @@ async fn a_stream_that_keeps_dropping_is_reconnected_a_bounded_number_of_times_w
     let sid = session.session_id.clone();
     let cwd = zeron_proto::provider_cloud::claude_cwd(&sid);
     let (controls, steer, _interrupt) = controls();
-    let mut stream = start(&rig, &session, FIRST, request(&cwd, "Run uname -a"), controls).await;
+    let mut stream = start(
+        &rig,
+        &session,
+        FIRST,
+        request(&cwd, "Run uname -a"),
+        controls,
+    )
+    .await;
     turn(&mut stream).await;
     // A held turn: the stream drops while it runs.
     let (held, gate) = Turn::text_zulu().hold_after(is_text_delta);

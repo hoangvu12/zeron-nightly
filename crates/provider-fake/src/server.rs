@@ -618,7 +618,7 @@ fn post_events(state: &State, id: &str, body: Value) -> Response<Body> {
     }
     match accept_events(state, &mut inner, id, payloads) {
         Ok(results) => json_response(StatusCode::OK, json!({ "results": results })),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -631,11 +631,11 @@ fn accept_events(
     inner: &mut Inner,
     id: &str,
     payloads: Vec<Value>,
-) -> Result<Vec<Value>, Response<Body>> {
+) -> Result<Vec<Value>, Box<Response<Body>>> {
     let mut results = Vec::new();
     for payload in payloads {
         let Some(session) = inner.session(id) else {
-            return Err(not_found());
+            return Err(Box::new(not_found()));
         };
         let uuid = payload
             .get("uuid")
@@ -674,8 +674,10 @@ fn accept_events(
                     .cloned()
                     .unwrap_or(Value::Null);
                 // The first answer wins; a later one is stored and dropped.
-                if !session.answers.contains_key(&request_id) {
-                    session.answers.insert(request_id, answer);
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    session.answers.entry(request_id)
+                {
+                    slot.insert(answer);
                     session.answered.notify_waiters();
                 }
             }

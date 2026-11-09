@@ -71,7 +71,11 @@ pub fn event_uuid(message_id: &str) -> String {
 /// ignores the repeat. A Stop is its own command: its interrupt goes under
 /// [`event_uuid`] of the command id.
 pub fn control_uuid(command_id: &str, kind: &str) -> String {
-    uuid::Uuid::new_v5(&NAMESPACE, format!("control:{kind}:{command_id}").as_bytes()).to_string()
+    uuid::Uuid::new_v5(
+        &NAMESPACE,
+        format!("control:{kind}:{command_id}").as_bytes(),
+    )
+    .to_string()
 }
 
 /// The provider event `uuid` of the answer to a prompt (a `control_request`

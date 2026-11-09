@@ -224,7 +224,8 @@ impl RunSession {
             tracing::info!(target: "zeron_harness::claude_cloud", "already delivered (duplicate uuid)");
         }
         for uuid in uuids {
-            self.bindings.mark_delivered(&self.session.session_id, &uuid);
+            self.bindings
+                .mark_delivered(&self.session.session_id, &uuid);
         }
         Ok(())
     }
@@ -397,23 +398,6 @@ impl RunSession {
                     }
                     responded.insert(request_id);
                 }
-                steer = self.controls.steering.recv(), if steering_open && stop_deadline.is_none() => match steer {
-                    Some(message) => {
-                        if let Err(error) = self.deliver(message).await {
-                            if !error.is_empty() {
-                                fail(&self.events, error, true).await;
-                            }
-                            break 'main;
-                        }
-                        turn_active = true;
-                    }
-                    None => {
-                        steering_open = false;
-                        if !turn_active {
-                            break 'main;
-                        }
-                    }
-                },
                 _ = tokio::time::sleep_until(reconnect_at.unwrap_or_else(tokio::time::Instant::now)),
                     if reconnect_at.is_some() => {
                     // Reconnect from where the mirror got to (the stream
@@ -510,6 +494,24 @@ impl RunSession {
                         self.stream = futures::stream::pending().boxed();
                         reconnect_at = Some(tokio::time::Instant::now() + RECONNECT_BACKOFF * 2u32.pow(reconnects));
                         reconnects += 1;
+                    }
+                },
+                // After the stream: what the session produced before a steer is sent stays ahead of its boundary.
+                steer = self.controls.steering.recv(), if steering_open && stop_deadline.is_none() => match steer {
+                    Some(message) => {
+                        if let Err(error) = self.deliver(message).await {
+                            if !error.is_empty() {
+                                fail(&self.events, error, true).await;
+                            }
+                            break 'main;
+                        }
+                        turn_active = true;
+                    }
+                    None => {
+                        steering_open = false;
+                        if !turn_active {
+                            break 'main;
+                        }
                     }
                 },
             }
