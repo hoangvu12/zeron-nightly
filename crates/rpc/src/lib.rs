@@ -81,6 +81,12 @@ pub mod methods {
     /// (`{enabled, cloud}`; set with `{enabled}`).
     pub const GET_COMMIT_CREDIT: &str = "GetCommitCredit";
     pub const SET_COMMIT_CREDIT: &str = "SetCommitCredit";
+    /// This device's "Claude cloud sessions" setting (provider-run chats):
+    /// `{settings: {enabled, deviceLogin}, active, forced, available,
+    /// accounts}`; set with a partial `{enabled?, deviceLogin?}`. This
+    /// device only (it creates the sessions), never forwarded.
+    pub const GET_CLAUDE_CLOUD_SESSIONS: &str = "GetClaudeCloudSessions";
+    pub const SET_CLAUDE_CLOUD_SESSIONS: &str = "SetClaudeCloudSessions";
     /// Which providers on this device run without their own subagents
     /// (`{switchable, off}`; set with `{harness, enabled}`).
     pub const GET_NATIVE_SUBAGENTS: &str = "GetNativeSubagents";

@@ -444,14 +444,20 @@ impl Shell {
         }
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (chat, device, glyph, presence, project, branch) = {
+        let (chat, device, glyph, presence, project, branch, remote) = {
             let state = self.state.read(cx);
             let chat = state.selected_chat_row()?.clone();
-            let device: SharedString = state
-                .device_name(&chat.device_id)
-                .unwrap_or("Unknown device")
-                .to_owned()
-                .into();
+            // A provider-run chat runs at Anthropic, whichever device hosts it.
+            let remote = state.chat_remote_workspace(&chat.id);
+            let device: SharedString = if remote {
+                crate::pickers::PROVIDER_CLOUD_LABEL.into()
+            } else {
+                state
+                    .device_name(&chat.device_id)
+                    .unwrap_or("Unknown device")
+                    .to_owned()
+                    .into()
+            };
             let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
             let cloud = state.is_cloud_session_device(&chat.device_id)
                 || state
@@ -461,7 +467,9 @@ impl Shell {
                     .is_some_and(|d| {
                         crate::cloud::is_cloud(d) || crate::cloud::is_cloud_account(d)
                     });
-            let glyph = if cloud {
+            let glyph = if remote {
+                icons::CLAUDE_CLOUD_MARK
+            } else if cloud {
                 icons::CLOUD
             } else if local {
                 icons::LAPTOP
@@ -483,7 +491,7 @@ impl Shell {
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
-            (chat, device, glyph, presence, project, branch)
+            (chat, device, glyph, presence, project, branch, remote)
         };
 
         // ── Where it runs.
@@ -562,7 +570,9 @@ impl Shell {
         // ── What runs alongside it.
         // It stops at half the window's height, however much runs.
         let lanes_height = self.viewport_height / 2.0;
-        let lanes = self.render_session_lanes(&chat, !docked, lanes_height, &theme, cx);
+        // A provider-run chat has no side chats or forks.
+        let lanes = (!remote)
+            .then(|| self.render_session_lanes(&chat, !docked, lanes_height, &theme, cx));
 
         let body = div()
             .id("session-info-body")
@@ -633,7 +643,7 @@ impl Shell {
                 })
                 .child(frosted(card.into_any_element()))
                 .children(ports.map(frosted))
-                .child(frosted(lanes))
+                .children(lanes.map(frosted))
                 .into_any_element(),
         )
     }

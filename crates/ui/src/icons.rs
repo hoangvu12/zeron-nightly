@@ -224,6 +224,9 @@ icon_assets![
     (ZERON_LOGO, "zeron-logo"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
+    // Provider-run chats (Claude cloud sessions): the Claude mark inside a
+    // cloud, in place of the harness mark. Tinted Claude's orange.
+    (CLAUDE_CLOUD_MARK, "claude-cloud-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
     (DEVIN_MARK, "devin-mark"),

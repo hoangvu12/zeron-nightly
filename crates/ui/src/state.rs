@@ -978,6 +978,14 @@ pub struct AppState {
     /// device whose projects the project picker lists. `None` falls back to
     /// the local device.
     pub selected_device: Option<String>,
+    /// Harnesses whose descriptors say their chats work in a remote
+    /// workspace (`remote_workspace`, provider-run chats), learned from every
+    /// harness catalog the app loads. Gates the files, diff, terminal,
+    /// background processes, fork and side chats of their chats.
+    remote_workspace_harnesses: HashSet<HarnessId>,
+    /// Provider-run chats' sign-in states (`providerState` on the chat
+    /// document, carried by its transcript watch), by chat id.
+    provider_chat_states: HashMap<String, zeron_proto::provider_cloud::ProviderChatState>,
     /// The new-session canvas's own target, set aside while a chat is open
     /// (a chat implies ITS project/device) and put back on return, so the
     /// canvas always reopens where the user left it.
@@ -1172,6 +1180,8 @@ impl AppState {
             selected_space: None,
             no_project: false,
             selected_device: None,
+            remote_workspace_harnesses: HashSet::new(),
+            provider_chat_states: HashMap::new(),
             canvas_target: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -3478,6 +3488,71 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// Note which harnesses of a loaded catalog work in a remote workspace.
+    /// Learned flags are kept: harness ids mean the same on every device.
+    pub(crate) fn learn_harness_catalog(
+        &mut self,
+        list: &[zeron_engine::registry::HarnessDescriptor],
+    ) -> bool {
+        let mut changed = false;
+        for descriptor in list.iter().filter(|d| d.remote_workspace) {
+            changed |= self.remote_workspace_harnesses.insert(descriptor.id);
+        }
+        changed
+    }
+
+    /// Whether `harness`'s chats work in a remote workspace, per its
+    /// descriptor (never its slug).
+    pub(crate) fn harness_remote_workspace(&self, harness: HarnessId) -> bool {
+        self.remote_workspace_harnesses.contains(&harness)
+    }
+
+    /// Whether a chat works in a remote workspace (a provider-run chat): the
+    /// host's files, diffs, terminals and background processes don't apply,
+    /// and it has no forks or side chats.
+    pub(crate) fn chat_remote_workspace(&self, chat_id: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.config.as_ref())
+            .is_some_and(|config| self.harness_remote_workspace(config.harness))
+    }
+
+    /// Record a provider-run chat's sign-in state (`None` clears it).
+    pub(crate) fn set_provider_chat_state(
+        &mut self,
+        chat_id: &str,
+        state: Option<zeron_proto::provider_cloud::ProviderChatState>,
+    ) -> bool {
+        match state {
+            Some(state) => self.provider_chat_states.insert(chat_id.to_owned(), state.clone())
+                != Some(state),
+            None => self.provider_chat_states.remove(chat_id).is_some(),
+        }
+    }
+
+    /// What a provider-run chat shows while its login can't act for it
+    /// ("Sign in again", "Sign in as <email> to continue").
+    pub(crate) fn provider_chat_state(
+        &self,
+        chat_id: &str,
+    ) -> Option<&zeron_proto::provider_cloud::ProviderChatState> {
+        self.provider_chat_states.get(chat_id)
+    }
+
+    /// Whether this device can start provider-run chats ("Anthropic cloud"
+    /// in the place chip): its registry row advertises `provider-run-v1`,
+    /// which it does while "Claude cloud sessions" is on with a login enabled.
+    pub(crate) fn provider_run_eligible(&self) -> bool {
+        let Some(local) = self.local_device_id.as_deref() else {
+            return false;
+        };
+        self.devices
+            .iter()
+            .find(|device| device.id == local)
+            .is_some_and(|device| device.supports(zeron_proto::capabilities::PROVIDER_RUN_V1))
+    }
+
     /// The chat the Archive session shortcut acts on: the selected one, unless
     /// it is already archived. The shortcut archives and never unarchives, so
     /// an archived chat is left alone. Pure.
@@ -4756,6 +4831,25 @@ fn spawn_transcript_watch(
                     .get("historyPending")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // A provider-run chat's sign-in state: present when it
+                // changed (null = cleared), absent when it didn't.
+                let provider_state = value.get("providerState").map(|state| {
+                    serde_json::from_value::<Option<zeron_proto::provider_cloud::ProviderChatState>>(
+                        state.clone(),
+                    )
+                    .ok()
+                    .flatten()
+                });
+                if let Some(provider_state) = provider_state {
+                    let alive = this.update(cx, |state, cx| {
+                        if state.set_provider_chat_state(&chat_id, provider_state) {
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                }
                 let decoded = cx
                     .background_executor()
                     .spawn(async move {
@@ -7622,6 +7716,82 @@ mod tests {
         assert_eq!(rows, ["parent"]);
         // The child row itself is still addressable (deep links, tabs).
         assert!(state.chats.iter().any(|c| c.id == "child"));
+    }
+
+    #[test]
+    fn remote_workspace_follows_the_harness_descriptor_not_the_slug() {
+        let mut state = AppState::new();
+        let with_harness = |id: &str, harness: HarnessId| {
+            let mut row = chat(id, 0, None);
+            row.config = Some(zeron_proto::ChatConfig {
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
+            });
+            row
+        };
+        state.apply_chats(vec![
+            with_harness("cloud", HarnessId::ClaudeCodeCloud),
+            with_harness("local", HarnessId::ClaudeCode),
+        ]);
+        // No catalog says so yet: the slug alone hides nothing.
+        assert!(!state.chat_remote_workspace("cloud"));
+        let descriptor = |id: HarnessId, remote_workspace: bool| {
+            serde_json::from_value::<zeron_engine::registry::HarnessDescriptor>(serde_json::json!({
+                "id": id, "name": "x", "supportsSteering": false,
+                "steeringMode": "turn-boundary", "reasoningLevels": [],
+                "remoteWorkspace": remote_workspace,
+            }))
+            .unwrap()
+        };
+        assert!(state.learn_harness_catalog(&[
+            descriptor(HarnessId::ClaudeCode, false),
+            descriptor(HarnessId::ClaudeCodeCloud, true),
+        ]));
+        assert!(state.chat_remote_workspace("cloud"));
+        assert!(!state.chat_remote_workspace("local"));
+        // A later catalog without it (the setting went off) forgets nothing.
+        assert!(!state.learn_harness_catalog(&[descriptor(HarnessId::ClaudeCode, false)]));
+        assert!(state.chat_remote_workspace("cloud"));
+    }
+
+    #[test]
+    fn provider_chat_states_are_kept_per_chat_and_cleared() {
+        use zeron_proto::provider_cloud::ProviderChatState;
+        let mut state = AppState::new();
+        let again = ProviderChatState::SignInAgain {
+            email: "a@example.test".into(),
+        };
+        assert!(state.set_provider_chat_state("cloud", Some(again.clone())));
+        assert!(!state.set_provider_chat_state("cloud", Some(again.clone())));
+        assert_eq!(state.provider_chat_state("cloud").map(|s| s.label()), Some("Sign in again".into()));
+        assert!(state.provider_chat_state("other").is_none());
+        assert!(state.set_provider_chat_state("cloud", None));
+        assert!(state.provider_chat_state("cloud").is_none());
+    }
+
+    #[test]
+    fn provider_run_eligibility_rides_the_local_device_row() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("mac".into());
+        let device = |id: &str, capabilities: &[&str]| -> Device {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "platform": "macos", "lastSeenAt": null,
+                "capabilities": capabilities,
+            }))
+            .unwrap()
+        };
+        state.devices = vec![device("mac", &[]), device("pc", &["provider-run-v1"])];
+        assert!(!state.provider_run_eligible(), "another device's capability");
+        state.devices = vec![device("mac", &[zeron_proto::capabilities::PROVIDER_RUN_V1])];
+        assert!(state.provider_run_eligible());
+        // Zeron Cloud's session capability is a different thing.
+        state.devices = vec![device("mac", &[zeron_proto::CLOUD_SESSION_CAPABILITY])];
+        assert!(!state.provider_run_eligible());
     }
 
     #[test]

@@ -91,6 +91,10 @@ impl Shell {
         if self.state.read(cx).engine().is_none() {
             return;
         }
+        // A provider-run chat has no forks (its session is the record).
+        if self.state.read(cx).chat_remote_workspace(&source.id) {
+            return;
+        }
         let chat = draft_child_row(&source, parent_id.clone());
         let params = serde_json::json!({
             "chatId": chat.id,
@@ -201,6 +205,10 @@ impl Shell {
             self.show_side_chat_error("Start a conversation before creating a side chat.", cx);
             return;
         };
+        // Nor side chats.
+        if self.state.read(cx).chat_remote_workspace(&parent.id) {
+            return;
+        }
         let key = self.panel_key(cx);
         let chat = draft_child_row(&parent, parent.id.clone());
         self.open_side_chat_tab(chat, key, true, cx);

@@ -564,22 +564,25 @@ impl Shell {
                             // second one on the slot stacked on the same
                             // pixels and read lighter than the seam beneath
                             // it (user report).
-                            .child(
-                                header_icon_button(
-                                    "toggle-files-panel",
-                                    icons::FOLDER_TREE,
-                                    files_panel_label,
-                                    &theme,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.toggle_files_panel(window, cx)
+                            // A provider-run chat has no files here.
+                            .when(!self.active_chat_remote_workspace(cx), |slot| {
+                                slot.child(
+                                    header_icon_button(
+                                        "toggle-files-panel",
+                                        icons::FOLDER_TREE,
+                                        files_panel_label,
+                                        &theme,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.toggle_files_panel(window, cx)
+                                        }),
+                                    )
+                                    .role(gpui::Role::Button)
+                                    .aria_label(files_panel_label)
+                                    .when(self.files_panel_open(cx) && fit.files, |button| {
+                                        button.bg(crate::theme::wash(0.09))
                                     }),
                                 )
-                                .role(gpui::Role::Button)
-                                .aria_label(files_panel_label)
-                                .when(self.files_panel_open(cx) && fit.files, |button| {
-                                    button.bg(crate::theme::wash(0.09))
-                                }),
-                            )
+                            })
                             .child(header_icon_button_with(
                                 "toggle-changes",
                                 icons::sidebar_glyph(

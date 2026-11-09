@@ -37,6 +37,10 @@ const MAX_REF_ROWS: usize = 300;
 
 const FOOTER_CHIP_RADIUS: f32 = 6.0;
 
+/// The place chip's name for provider-run chats on Anthropic's Claude Code
+/// cloud (docs/design/provider-run-chats.md §6).
+pub const PROVIDER_CLOUD_LABEL: &str = "Anthropic cloud";
+
 /// Both sides of the composer handoff share one leading-aligned workspace
 /// cluster. Available width belongs after the pair, never between its labels.
 fn workspace_footer_row() -> gpui::Div {
@@ -107,6 +111,9 @@ pub struct DraftConfig {
     /// The picked access mode; `None` = the remembered one.
     pub access: Option<AccessMode>,
     pub plan: bool,
+    /// "Anthropic cloud" is the place: a provider-run chat, created on this
+    /// device with no project, run by the catalog's remote-workspace harness.
+    pub provider_cloud: bool,
 }
 
 /// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
@@ -758,6 +765,8 @@ struct DeviceRow {
     /// Cloud: the session gets a machine of its own (not a device the
     /// project lives on).
     cloud: bool,
+    /// "Anthropic cloud": a provider-run chat, created on this device.
+    provider_cloud: bool,
 }
 
 /// What names the selected model, shared by the composer chip and the
@@ -1196,6 +1205,20 @@ impl Pickers {
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
             }
+            // "Anthropic cloud" holds for a project-less draft on this device
+            // while the device stays eligible (the setting can go off).
+            if this.config.provider_cloud {
+                let s = state.read(cx);
+                let keep = s.selected_space_row().is_none()
+                    && s.effective_device_id() == s.local_device_id
+                    && s.provider_run_eligible();
+                if !keep {
+                    this.config.provider_cloud = false;
+                    this.config.model = None;
+                    this.config.reasoning = None;
+                    this.catalog_rev += 1;
+                }
+            }
             // Catalogs are per-DEVICE (fetched from the host that runs the
             // agents), so a project switch on the same device keeps them. A
             // device switch revalidates against the new host with the loaded
@@ -1377,6 +1400,44 @@ impl Pickers {
         &self.config
     }
 
+    /// "Anthropic cloud" is the new-chat canvas's place: the next send starts
+    /// a provider-run chat on this device.
+    pub fn provider_cloud_draft(&self, cx: &App) -> bool {
+        self.title.is_none()
+            && self.config.provider_cloud
+            && self.state.read(cx).selected_chat.is_none()
+    }
+
+    /// Whether `harness`'s loaded descriptor works in a remote workspace.
+    fn remote_workspace(&self, harness: HarnessId) -> bool {
+        self.harnesses
+            .ready()
+            .and_then(|list| list.iter().find(|d| d.id == harness))
+            .is_some_and(|d| d.remote_workspace)
+    }
+
+    /// The device menu's "Anthropic cloud" row: this device, no project, the
+    /// remote-workspace harness. A Zeron Cloud pick is left behind.
+    fn pick_provider_cloud(&mut self, cx: &mut Context<Self>) {
+        if self.config.checkout == CheckoutKind::Cloud {
+            self.switch_cloud(CheckoutKind::Local, cx);
+        }
+        let local = self.state.read(cx).local_device_id.clone();
+        self.state.update(cx, |s, cx| {
+            s.auto_selected = true;
+            if let Some(local) = local {
+                s.select_device(local, cx);
+            }
+            s.select_space(None, cx);
+        });
+        self.config.provider_cloud = true;
+        self.config.model = None;
+        self.config.reasoning = None;
+        self.catalog_rev += 1;
+        self.remember_target(cx);
+        self.close(cx);
+    }
+
     /// A chat can change provider between turns — the engine hands the new
     /// harness the transcript — but not while a turn is running or its first
     /// send is still in flight.
@@ -1388,6 +1449,10 @@ impl Pickers {
     /// The harnesses this picker offers: runnable ones for the composer,
     /// narrowed to title-capable agents when bound to thread naming.
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
+        // On the new-chat canvas only (`draft_owner` tracks the open chat).
+        if self.title.is_none() && self.config.provider_cloud && self.draft_owner.is_none() {
+            return provider_cloud_harnesses(list);
+        }
         let mut offered = offered_harnesses(list);
         if self.title.is_some() {
             offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
@@ -1441,6 +1506,14 @@ impl Pickers {
 
     /// Effective harness: picked, or the chat's config, or the first listed.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+        // "Anthropic cloud" on the new-chat canvas: the catalog's
+        // remote-workspace harness, whatever was picked before.
+        if self.provider_cloud_draft(cx) {
+            return self
+                .harnesses
+                .ready()
+                .and_then(|list| provider_cloud_harnesses(list).first().map(|d| d.id));
+        }
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -2032,7 +2105,15 @@ impl Pickers {
                 pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => Loadable::Ready(list),
+                        Ok(list) => {
+                            // Chats gate their panels on these flags.
+                            pickers.state.update(cx, |s, cx| {
+                                if s.learn_harness_catalog(&list) {
+                                    cx.notify();
+                                }
+                            });
+                            Loadable::Ready(list)
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -2137,8 +2218,13 @@ impl Pickers {
                 if pickers.target_generation != generation {
                     return;
                 }
+                let remote = pickers.remote_workspace(harness);
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
+                        // A provider-run chat runs Claude models only.
+                        Ok(models) if remote => Loadable::Ready(provider_cloud_models(
+                            normalize_model_rows(harness, models),
+                        )),
                         // Display hygiene for catalogs from older engines
                         // (`default` alias rows, orphan `[1m]` variants,
                         // version-less alias labels).
@@ -2510,7 +2596,8 @@ impl Pickers {
             self.config.reasoning = None;
         }
         self.config.harness = Some(harness);
-        if self.title.is_none() {
+        // Anthropic cloud is a place, not the remembered default provider.
+        if self.title.is_none() && !self.remote_workspace(harness) {
             self.defaults.harness = Some(harness);
             self.save_defaults();
         }
@@ -2729,8 +2816,10 @@ impl Pickers {
         {
             descriptors.insert(0, descriptor.clone());
         }
-        if self.harness_locked(cx) {
-            let effective = self.effective_harness(cx);
+        // A provider-run chat stays on its provider (its session is the
+        // record), and no other chat moves onto one.
+        let effective = self.effective_harness(cx);
+        if self.harness_locked(cx) || effective.is_some_and(|h| self.remote_workspace(h)) {
             descriptors.retain(|d| Some(d.id) == effective);
         }
         descriptors
@@ -3119,6 +3208,11 @@ impl Pickers {
     /// [`Self::project_rows`] matching the search query, ranked
     /// (`popover::filter_indices`).
     fn filtered_project_rows(&self, cx: &App) -> Vec<ProjectRow> {
+        // Anthropic cloud offers "No project" alone for now (GitHub projects
+        // are a later ticket's).
+        if self.config.provider_cloud {
+            return Vec::new();
+        }
         let query = self.search.read(cx).text().to_string();
         let rows = self.project_rows(cx);
         let names: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
@@ -3131,6 +3225,9 @@ impl Pickers {
     /// Current project row on an unsearched open, or the final opt-out row.
     /// An implicit empty selection has no highlight until the user navigates.
     fn selected_project_index(&self, cx: &App) -> usize {
+        if self.config.provider_cloud {
+            return 0;
+        }
         if self.state.read(cx).no_project {
             return self.project_rows(cx).len();
         }
@@ -3259,6 +3356,7 @@ impl Pickers {
                         space: Some((*member).clone()),
                         detail: shared.then(|| member.path.clone()),
                         cloud: false,
+                        provider_cloud: false,
                     }
                 })
                 .chain(
@@ -3269,8 +3367,12 @@ impl Pickers {
                         space: None,
                         detail: None,
                         cloud: true,
+                        provider_cloud: false,
                     }),
                 )
+                // Anthropic cloud starts with no project (GitHub projects
+                // come later): picking it leaves this project.
+                .chain(Self::provider_cloud_row(state))
                 .collect();
         }
         // Cloud's per-session machines are not pickable.
@@ -3282,16 +3384,40 @@ impl Pickers {
                 d.id.clone(),
             )
         });
-        devices
-            .into_iter()
+        let mut rows: Vec<DeviceRow> = devices
+            .iter()
             .map(|device| DeviceRow {
                 device_id: device.id.clone(),
                 name: device.name.clone(),
                 space: None,
                 detail: None,
                 cloud: false,
+                provider_cloud: false,
             })
-            .collect()
+            .collect();
+        // Anthropic cloud sits under Zeron Cloud (else last).
+        if let Some(row) = Self::provider_cloud_row(state) {
+            let at = devices
+                .iter()
+                .position(|d| crate::cloud::is_cloud(d))
+                .map_or(rows.len(), |ix| ix + 1);
+            rows.insert(at, row);
+        }
+        rows
+    }
+
+    /// The device menu's "Anthropic cloud" row, on a device that can start
+    /// provider-run chats.
+    fn provider_cloud_row(state: &AppState) -> Option<DeviceRow> {
+        let local = state.local_device_id.clone()?;
+        state.provider_run_eligible().then(|| DeviceRow {
+            device_id: local,
+            name: PROVIDER_CLOUD_LABEL.to_string(),
+            space: None,
+            detail: None,
+            cloud: false,
+            provider_cloud: true,
+        })
     }
 
     /// [`Self::device_rows`] filtered by the search box (same ranked
@@ -3314,6 +3440,7 @@ impl Pickers {
 
     fn selected_device_index(&self, cx: &App) -> usize {
         let on_cloud = self.runs_on_cloud(cx);
+        let on_provider = self.config.provider_cloud;
         let (selected, effective) = {
             let state = self.state.read(cx);
             (
@@ -3324,6 +3451,7 @@ impl Pickers {
         self.device_rows(cx)
             .iter()
             .position(|row| match &row.space {
+                _ if on_provider || row.provider_cloud => on_provider && row.provider_cloud,
                 _ if on_cloud || row.cloud => on_cloud && row.cloud,
                 Some(space) => selected.as_deref() == Some(space.id.as_str()),
                 None => effective.as_deref() == Some(row.device_id.as_str()),
@@ -3335,6 +3463,16 @@ impl Pickers {
     /// project — the device itself. Cloud runs the session on a machine of
     /// its own.
     fn pick_device_row(&mut self, row: DeviceRow, cx: &mut Context<Self>) {
+        if row.provider_cloud {
+            self.pick_provider_cloud(cx);
+            return;
+        }
+        if self.config.provider_cloud {
+            self.config.provider_cloud = false;
+            self.config.model = None;
+            self.config.reasoning = None;
+            self.catalog_rev += 1;
+        }
         if row.cloud {
             self.switch_cloud(CheckoutKind::Cloud, cx);
             self.close(cx);
@@ -3357,6 +3495,7 @@ impl Pickers {
         let now = chrono::Utc::now();
         let rows = self.filtered_device_rows(cx);
         let on_cloud = self.runs_on_cloud(cx);
+        let on_provider = self.config.provider_cloud;
         let (selected_space, effective, local, presence, out_of_credits): (
             Option<String>,
             Option<String>,
@@ -3371,7 +3510,7 @@ impl Pickers {
                 state.local_device_id.clone(),
                 rows.iter()
                     .map(|row| {
-                        if row.cloud {
+                        if row.cloud || row.provider_cloud {
                             crate::cloud::Presence::Available
                         } else {
                             state.device_presence(&row.device_id, now)
@@ -3405,9 +3544,14 @@ impl Pickers {
                         .max_h(px(self.list_budget(64.0)))
                         .children(rows.into_iter().zip(presence).enumerate().map(
                             |(ix, (row, presence))| {
-                                let is_local = local.as_deref() == Some(row.device_id.as_str());
+                                let is_local = !row.provider_cloud
+                                    && local.as_deref() == Some(row.device_id.as_str());
                                 let label: SharedString = row.name.clone().into();
+                                let provider_mark = row.provider_cloud;
                                 let is_selected = match &row.space {
+                                    _ if on_provider || row.provider_cloud => {
+                                        on_provider && row.provider_cloud
+                                    }
                                     _ if on_cloud || row.cloud => on_cloud && row.cloud,
                                     Some(space) => {
                                         selected_space.as_deref() == Some(space.id.as_str())
@@ -3429,6 +3573,14 @@ impl Pickers {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_device_row(row.clone(), cx);
                                 }))
+                                .when(provider_mark, |el| {
+                                    el.child(
+                                        crate::icons::icon(crate::icons::CLAUDE_CLOUD_MARK)
+                                            .size(px(14.0))
+                                            .flex_none()
+                                            .text_color(crate::icons::claude_brand()),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .flex_1()
@@ -3634,6 +3786,14 @@ impl Pickers {
                     .truncate()
                     .child(SharedString::from("New project")),
             );
+        if self.config.provider_cloud {
+            return div()
+                .flex()
+                .flex_col()
+                .p(px(2.0))
+                .child(no_project)
+                .into_any_element();
+        }
         div()
             .flex()
             .flex_col()
@@ -4264,7 +4424,14 @@ impl Pickers {
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
                 .into();
-            if on_cloud {
+            if self.config.provider_cloud {
+                (
+                    SharedString::from(PROVIDER_CLOUD_LABEL),
+                    project_label,
+                    false,
+                    crate::icons::CLAUDE_CLOUD_MARK,
+                )
+            } else if on_cloud {
                 (
                     SharedString::from(crate::cloud::CLOUD_LABEL),
                     project_label,
@@ -6738,8 +6905,7 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
 
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
-        // (Provider-run chats share the Claude mark for now.)
-        HarnessId::ClaudeCode | HarnessId::ClaudeCodeCloud | HarnessId::Mock => (
+        HarnessId::ClaudeCode | HarnessId::Mock => (
             crate::icons::CLAUDE_MARK,
             Some(crate::icons::claude_brand()),
         ),
@@ -6757,6 +6923,11 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
         HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
+        // Provider-run chats: the Claude-cloud mark in place of Claude Code's.
+        HarnessId::ClaudeCodeCloud => (
+            crate::icons::CLAUDE_CLOUD_MARK,
+            Some(crate::icons::claude_brand()),
+        ),
         // An agent added from the ACP registry (in another app): no mark of
         // its own here.
         HarnessId::Registry(_) => (crate::icons::BOT, None),
@@ -6783,15 +6954,42 @@ pub fn visible_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
 }
 
 fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
+    // A remote-workspace harness (provider-run chats) is a place, picked in
+    // the place chip as "Anthropic cloud": never a provider tab or row.
+    let list: Vec<HarnessDescriptor> = list
+        .iter()
+        .filter(|d| !d.remote_workspace)
+        .cloned()
+        .collect();
     if allow_mock {
-        return list.to_vec();
+        return list;
     }
     let real: Vec<HarnessDescriptor> = list
         .iter()
         .filter(|d| d.id != HarnessId::Mock)
         .cloned()
         .collect();
-    if real.is_empty() { list.to_vec() } else { real }
+    if real.is_empty() { list } else { real }
+}
+
+/// The harnesses "Anthropic cloud" runs: the catalog's remote-workspace ones
+/// that are installed and enabled.
+pub fn provider_cloud_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
+    list.iter()
+        .filter(|d| {
+            d.remote_workspace && d.installed && zeron_engine::registry::descriptor_enabled(d)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The models a provider-run chat may pick: Claude's only (the session runs
+/// at Anthropic), whatever else its catalog lists.
+pub fn provider_cloud_models(models: Vec<Model>) -> Vec<Model> {
+    models
+        .into_iter()
+        .filter(|m| m.id.trim().to_ascii_lowercase().starts_with("claude"))
+        .collect()
 }
 
 /// What the composer actually offers: [`visible_harnesses`] narrowed to the
@@ -8415,6 +8613,250 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    fn provider_run_device(eligible: bool) -> zeron_proto::Device {
+        let capabilities: Vec<&str> = if eligible {
+            vec![zeron_proto::capabilities::PROVIDER_RUN_V1]
+        } else {
+            Vec::new()
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": "mac", "name": "Studio", "platform": "macos", "lastSeenAt": null,
+            "capabilities": capabilities,
+        }))
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn anthropic_cloud_is_a_place_on_an_eligible_device_only(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let project = Space {
+            id: "app".into(),
+            device_id: "mac".into(),
+            path: "/code/app".into(),
+            name: None,
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: None,
+            github_repo: None,
+            icon: None,
+            created_at: chrono::Utc::now(),
+        };
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("mac".into());
+                state.devices = vec![provider_run_device(false)];
+                state.spaces = vec![project];
+                state.selected_space = Some("app".into());
+                state
+            });
+            Pickers::new(state, cx)
+        });
+        let cloud = HarnessDescriptor {
+            remote_workspace: true,
+            ..descriptor(HarnessId::ClaudeCodeCloud, "Claude Code cloud")
+        };
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.harnesses = Loadable::Ready(vec![
+                    descriptor(HarnessId::ClaudeCode, "Claude Code"),
+                    descriptor(HarnessId::Codex, "Codex"),
+                    cloud.clone(),
+                ]);
+                let rows = |pickers: &Pickers, cx: &App| {
+                    pickers
+                        .device_rows(cx)
+                        .into_iter()
+                        .map(|row| (row.name, row.provider_cloud))
+                        .collect::<Vec<_>>()
+                };
+                // Setting off (no capability): nothing about it shows, and
+                // the remote-workspace harness is never a provider tab.
+                assert_eq!(rows(pickers, cx), [("Studio".to_string(), false)]);
+                assert!(
+                    pickers
+                        .rail_descriptors(cx)
+                        .iter()
+                        .all(|d| d.id != HarnessId::ClaudeCodeCloud)
+                );
+                assert_ne!(pickers.effective_harness(cx), Some(HarnessId::ClaudeCodeCloud));
+                // On: "Anthropic cloud" under the device rows.
+                pickers
+                    .state
+                    .update(cx, |state, _| state.devices = vec![provider_run_device(true)]);
+                assert_eq!(
+                    rows(pickers, cx),
+                    [
+                        ("Studio".to_string(), false),
+                        (PROVIDER_CLOUD_LABEL.to_string(), true)
+                    ]
+                );
+                let row = pickers.device_rows(cx).pop().unwrap();
+                pickers.pick_device_row(row, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |pickers, _, cx| {
+                // This device, no project, the remote-workspace harness alone.
+                assert!(pickers.provider_cloud_draft(cx));
+                let state = pickers.state.read(cx);
+                assert!(state.selected_space_row().is_none());
+                assert!(state.no_project);
+                assert_eq!(state.effective_device_id().as_deref(), Some("mac"));
+                assert_eq!(pickers.effective_harness(cx), Some(HarnessId::ClaudeCodeCloud));
+                let rail: Vec<_> = pickers.rail_descriptors(cx).iter().map(|d| d.id).collect();
+                assert_eq!(rail, [HarnessId::ClaudeCodeCloud]);
+                assert_eq!(
+                    pickers.selected_device_index(cx),
+                    pickers.device_rows(cx).len() - 1
+                );
+                // The Project menu offers "No project" alone.
+                assert!(pickers.filtered_project_rows(cx).is_empty());
+                assert_eq!(
+                    pickers.resolved(cx).chat_config().map(|c| c.harness),
+                    Some(HarnessId::ClaudeCodeCloud)
+                );
+                // Picking the device back leaves Anthropic cloud.
+                let mac = pickers.device_rows(cx).remove(0);
+                pickers.pick_device_row(mac, cx);
+                assert!(!pickers.provider_cloud_draft(cx));
+                assert_ne!(pickers.effective_harness(cx), Some(HarnessId::ClaudeCodeCloud));
+            })
+            .unwrap();
+        // Turning the setting off drops a standing pick.
+        handle
+            .update(cx, |pickers, _, cx| {
+                let row = pickers.device_rows(cx).pop().unwrap();
+                pickers.pick_device_row(row, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |pickers, _, cx| {
+                assert!(pickers.provider_cloud_draft(cx));
+                pickers.state.update(cx, |state, cx| {
+                    state.devices = vec![provider_run_device(false)];
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |pickers, _, cx| {
+                assert!(!pickers.provider_cloud_draft(cx));
+                assert_eq!(pickers.device_rows(cx).len(), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_provider_run_chat_keeps_its_harness_and_claude_models(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("mac".into());
+                state.devices = vec![provider_run_device(true)];
+                let mut chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+                    "id": "cloud-chat", "deviceId": "mac", "archived": false,
+                    "createdAt": "2026-11-01T00:00:00Z",
+                }))
+                .unwrap();
+                chat.config = Some(ChatConfig {
+                    harness: HarnessId::ClaudeCodeCloud,
+                    model: Some("claude-opus-5-5".into()),
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    access: AccessMode::default(),
+                    plan: false,
+                });
+                state.chats = vec![chat];
+                state.selected_chat = Some("cloud-chat".into());
+                state
+            });
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.harnesses = Loadable::Ready(vec![
+                    descriptor(HarnessId::ClaudeCode, "Claude Code"),
+                    descriptor(HarnessId::Codex, "Codex"),
+                    HarnessDescriptor {
+                        remote_workspace: true,
+                        ..descriptor(HarnessId::ClaudeCodeCloud, "Claude Code cloud")
+                    },
+                ]);
+                pickers.models.insert(
+                    HarnessId::ClaudeCodeCloud,
+                    Loadable::Ready(provider_cloud_models(vec![
+                        bare_model("claude-opus-5-5", "Claude Opus 5.5"),
+                        bare_model("gpt-6", "GPT-6"),
+                        bare_model("claude-sonnet-5", "Claude Sonnet 5"),
+                    ])),
+                );
+                pickers.models.insert(
+                    HarnessId::Codex,
+                    Loadable::Ready(vec![bare_model("gpt-6", "GPT-6")]),
+                );
+                pickers.catalog_rev += 1;
+                // No switching a provider-run chat onto a local provider.
+                let rail: Vec<_> = pickers.rail_descriptors(cx).iter().map(|d| d.id).collect();
+                assert_eq!(rail, [HarnessId::ClaudeCodeCloud]);
+                // Even a search across providers lists Claude's models only.
+                pickers
+                    .search
+                    .update(cx, |search, cx| search.set_text("g", cx));
+                let ids: Vec<_> = pickers
+                    .model_rows(cx)
+                    .iter()
+                    .map(|row| (row.harness, row.model.id.clone()))
+                    .collect();
+                assert!(
+                    ids.iter()
+                        .all(|(harness, id)| *harness == HarnessId::ClaudeCodeCloud
+                            && id.starts_with("claude")),
+                    "{ids:?}"
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_workspace_harnesses_are_a_place_not_a_provider() {
+        let cloud = HarnessDescriptor {
+            remote_workspace: true,
+            ..descriptor(HarnessId::ClaudeCodeCloud, "Claude Code cloud")
+        };
+        let list = vec![descriptor(HarnessId::ClaudeCode, "Claude Code"), cloud.clone()];
+        let visible: Vec<_> = visible_harnesses_impl(&list, false).iter().map(|d| d.id).collect();
+        assert_eq!(visible, [HarnessId::ClaudeCode]);
+        let offered: Vec<_> = offered_harnesses_impl(&list, true).iter().map(|d| d.id).collect();
+        assert_eq!(offered, [HarnessId::ClaudeCode]);
+        let place: Vec<_> = provider_cloud_harnesses(&list).iter().map(|d| d.id).collect();
+        assert_eq!(place, [HarnessId::ClaudeCodeCloud]);
+        // Not installed or switched off: no place either.
+        let off = HarnessDescriptor {
+            enabled: Some(false),
+            ..cloud
+        };
+        assert!(provider_cloud_harnesses(&[off]).is_empty());
+    }
+
+    #[test]
+    fn provider_cloud_models_keep_claude_only() {
+        let models = provider_cloud_models(vec![
+            bare_model("claude-opus-5-5", "Claude Opus 5.5"),
+            bare_model("gpt-6", "GPT-6"),
+            bare_model("Claude-Haiku-5", "Claude Haiku 5"),
+            bare_model("sonnet", "Sonnet alias"),
+        ]);
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["claude-opus-5-5", "Claude-Haiku-5"]);
     }
 
     #[gpui::test]
