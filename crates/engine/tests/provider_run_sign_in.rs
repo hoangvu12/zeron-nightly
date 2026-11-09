@@ -37,6 +37,19 @@ struct Rig {
     client: zeron_rpc::RpcClient,
 }
 
+/// The device's "Claude cloud sessions" setting, turned on before the engine
+/// starts, so it keeps the fake-backed harness the rig registered.
+fn claude_cloud_sessions_on(data_dir: &std::path::Path) {
+    use zeron_engine::claude_cloud_sessions::{ClaudeCloudSessions, ClaudeCloudSettings};
+    std::fs::create_dir_all(data_dir).unwrap();
+    ClaudeCloudSessions::open(data_dir)
+        .save(ClaudeCloudSettings {
+            enabled: true,
+            ..ClaudeCloudSettings::default()
+        })
+        .expect("setting saves");
+}
+
 impl Rig {
     async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
@@ -58,6 +71,7 @@ impl Rig {
         );
         let registry = HarnessRegistry::new();
         registry.register(harness.clone());
+        claude_cloud_sessions_on(&tmp.path().join("data"));
         let core = EngineCore::assemble(
             &tmp.path().join("data"),
             Arc::new(registry),
