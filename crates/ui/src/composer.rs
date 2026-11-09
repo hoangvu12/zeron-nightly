@@ -9234,6 +9234,143 @@ impl Composer {
         }
     }
 
+    /// Start a provider-run chat ("Anthropic cloud" in the place chip): this
+    /// device creates the Claude cloud session with the first message, and
+    /// the engine names the chat after the session and queues that message
+    /// as its first run. The chat opens once it exists; a failure hands the
+    /// message back to the canvas.
+    fn send_provider_cloud(
+        &mut self,
+        engine: crate::state::EngineHandle,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sending {
+            return;
+        }
+        if !self.staged().is_empty() || !self.staged_appshots().is_empty() {
+            self.failure =
+                Some("Anthropic cloud chats can't take attachments yet: remove them to send.".into());
+            self.failure_key = Some(self.current_key.clone());
+            cx.notify();
+            return;
+        }
+        let resolved = self.pickers.read(cx).resolved(cx);
+        let Some(config) = resolved.chat_config() else {
+            self.failure = Some("Anthropic cloud is still loading on this device.".into());
+            self.failure_key = Some(self.current_key.clone());
+            cx.notify();
+            return;
+        };
+        let Some(device_id) = self.state.read(cx).local_device_id.clone() else {
+            self.failure = Some("This device isn't registered yet.".into());
+            self.failure_key = Some(self.current_key.clone());
+            cx.notify();
+            return;
+        };
+        let key = self.current_key.clone();
+        let comments = self.state.update(cx, |state, cx| {
+            let taken = state.take_review_comments(&key);
+            if !taken.is_empty() {
+                cx.notify();
+            }
+            taken
+        });
+        let typed = text.clone();
+        let prompt = crate::comments::with_comments(
+            &zeron_proto::attachment_mentions::demote_unattached_mentions(&text, &[]),
+            &comments,
+        );
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.preview = None;
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&key);
+        self.failure = None;
+        self.failure_key = None;
+        self.sending = true;
+        cx.notify();
+        let mutate = serde_json::json!({
+            "op": "createChat",
+            // The engine names the chat after its session; this id is unused.
+            "chatId": uuid::Uuid::new_v4().to_string(),
+            "deviceId": device_id,
+            "config": config,
+            "prompt": prompt,
+            "messageId": message_id,
+        });
+        self.send_task = Some(cx.spawn(async move |this, cx| {
+            // Creation lists the account's sessions, then creates one: a few
+            // seconds. Exactly one attempt (it isn't idempotent).
+            let result = attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                methods::MUTATE,
+                mutate,
+                std::time::Duration::from_secs(90),
+            )
+            .await
+            .and_then(|reply| {
+                reply
+                    .get("chatId")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| "The engine didn't name the new chat.".to_string())
+            });
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok(chat_id) => {
+                        let echo = SessionMessageEntry {
+                            id: message_id.clone(),
+                            role: zeron_doc::MessageRole::User,
+                            parts: vec![MessagePart::Text {
+                                id: "t0".into(),
+                                text: prompt.clone(),
+                            }],
+                            created_at: chrono::Utc::now().timestamp_millis(),
+                            device_id: "local".into(),
+                            status: None,
+                            continuation_of: None,
+                            duration_ms: None,
+                        };
+                        composer.launching_new_chat = true;
+                        cx.emit(ComposerEvent::NewThreadTransitionStarted);
+                        composer.state.update(cx, |s, cx| {
+                            s.select_chat(Some(chat_id.clone()), cx);
+                            s.push_echo(&chat_id, echo);
+                            s.begin_first_send(&chat_id, &message_id, chrono::Utc::now());
+                            cx.notify();
+                        });
+                        cx.emit(ComposerEvent::Sent {
+                            chat_id,
+                            message_id: message_id.clone(),
+                        });
+                    }
+                    Err(message) => {
+                        composer.failure = Some(message.into());
+                        composer.failure_key = Some(key.clone());
+                        composer.state.update(cx, |s, cx| {
+                            for comment in &comments {
+                                s.add_review_comment(&key, comment.clone());
+                            }
+                            cx.notify();
+                        });
+                        if composer.current_key == key {
+                            composer
+                                .input
+                                .update(cx, |input, cx| input.set_text(typed.clone(), cx));
+                        } else {
+                            composer.drafts.insert(key.clone(), typed.clone());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Queue a Run doc command with an optimistic echo — or, with the agent
     /// busy, park the message on the chat's pending queue instead. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
@@ -9249,6 +9386,13 @@ impl Composer {
             cx.notify();
             return;
         };
+        // "Anthropic cloud": a provider-run chat, created on this device.
+        if self.state.read(cx).selected_chat.is_none()
+            && self.pickers.read(cx).provider_cloud_draft(cx)
+        {
+            self.send_provider_cloud(engine, text, cx);
+            return;
+        }
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {

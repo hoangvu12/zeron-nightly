@@ -25,6 +25,11 @@ pub struct FilesRequestContext {
 
 impl FilesRequestContext {
     pub fn for_chat(state: &AppState, chat_id: &str) -> Option<Self> {
+        // A provider-run chat's working copy is in the provider cloud: no
+        // device has its files.
+        if state.chat_remote_workspace(chat_id) {
+            return None;
+        }
         let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
         let cwd = chat
             .cwd

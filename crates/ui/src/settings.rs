@@ -22,6 +22,7 @@ pub mod accounts;
 pub mod appearance;
 pub mod archived;
 pub mod billing;
+pub mod claude_cloud;
 pub mod cloud;
 pub mod composer;
 pub mod devices;

@@ -3476,7 +3476,14 @@ impl Shell {
     /// Does the selected space's folder have git? Owner-stamped and synced —
     /// gates the Changes pane, its toggle, and Cmd-B with zero RPCs.
     fn space_git_detected(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_space_git()
+        self.state.read(cx).selected_space_git() && !self.active_chat_remote_workspace(cx)
+    }
+
+    /// The open chat works in a remote workspace (a provider-run chat, per
+    /// its harness descriptor): no files, diff, terminal, background
+    /// processes, forks or side chats for it.
+    pub(super) fn active_chat_remote_workspace(&self, cx: &App) -> bool {
+        !self.active_chat.is_empty() && self.state.read(cx).chat_remote_workspace(&self.active_chat)
     }
 
     /// The current chat's changes-pane flag (per-session, in-memory), gated on
@@ -3509,7 +3516,7 @@ impl Shell {
 
     /// The current chat's terminal flag (per-session, in-memory).
     fn terminal_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.panel_key(cx)).terminal_open
+        self.panels.get(&self.panel_key(cx)).terminal_open && !self.active_chat_remote_workspace(cx)
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -4243,7 +4250,7 @@ impl Shell {
     /// A Diff tab opened on *Branch changes* (the session card's totals),
     /// opening the pane when it is closed.
     fn add_branch_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() {
+        if self.active_chat.is_empty() || self.active_chat_remote_workspace(cx) {
             return;
         }
         self.set_surfaces_open(true, cx);
@@ -4279,7 +4286,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_chat.is_empty() || owner.0.is_empty() {
+        if self.active_chat.is_empty()
+            || owner.0.is_empty()
+            || owner.1.read(cx).chat_remote_workspace(&owner.0)
+        {
             return;
         }
         let (owner_chat, owner_state) = owner;
@@ -4529,6 +4539,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A remote workspace has no diff here.
+        if self.active_chat_remote_workspace(cx) {
+            return;
+        }
         self.diff_seq += 1;
         let id = self.diff_seq;
         let sub =
@@ -4564,6 +4578,9 @@ impl Shell {
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
+        if self.active_chat_remote_workspace(cx) {
+            return;
+        }
         let panel = self.right_terminal_panel(cx);
         let opened = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
@@ -5089,6 +5106,10 @@ impl Shell {
     /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
     /// The flag is per chat (zeron `sessionPanels`).
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A provider-run chat's workspace is remote: no terminal here.
+        if self.active_chat_remote_workspace(cx) {
+            return;
+        }
         let from = self.terminal_geometry.get().height;
         let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
@@ -12599,13 +12620,16 @@ impl Shell {
                             |this, _, window, cx| this.add_browser_surface(None, window, cx),
                         )),
                     )
-                    .child(
-                        row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.add_terminal_surface(cx);
-                            }),
-                        ),
-                    )
+                    // No terminal for a provider-run chat's remote workspace.
+                    .when(!self.active_chat_remote_workspace(cx), |el| {
+                        el.child(
+                            row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.add_terminal_surface(cx);
+                                }),
+                            ),
+                        )
+                    })
                     // Git surfaces only where there IS git — the pane itself
                     // no longer gates on it (terminals work anywhere).
                     .when(self.space_git_detected(cx), |el| {
@@ -13055,6 +13079,8 @@ impl Shell {
                     .text_color(theme.text_muted),
             );
         if plus_open {
+            // A provider-run chat's workspace is remote: no Files or Terminal.
+            let local_workspace = !self.active_chat_remote_workspace(cx);
             let closing = self.right_plus.closing_since();
             let menu = popover::popover_card(&theme)
                 .w(px(168.0))
@@ -13064,20 +13090,22 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
-                        .child(
-                            popover::menu_row(&theme, false, "right-plus-files")
-                                .id("right-plus-files-row")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_files_surface(window, cx);
-                                    this.close_right_plus(cx);
-                                }))
-                                .child(
-                                    icon(icons::FOLDER_WITH_FILES)
-                                        .size(px(13.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Files")),
-                        )
+                        .when(local_workspace, |menu| {
+                            menu.child(
+                                popover::menu_row(&theme, false, "right-plus-files")
+                                    .id("right-plus-files-row")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_files_surface(window, cx);
+                                        this.close_right_plus(cx);
+                                    }))
+                                    .child(
+                                        icon(icons::FOLDER_WITH_FILES)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(SharedString::from("Files")),
+                            )
+                        })
                         .child(
                             popover::menu_row(&theme, false, "right-plus-browser")
                                 .id("right-plus-browser-row")
@@ -13092,20 +13120,22 @@ impl Shell {
                                 )
                                 .child(SharedString::from("Browser")),
                         )
-                        .child(
-                            popover::menu_row(&theme, false, "right-plus-terminal")
-                                .id("right-plus-terminal-row")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_terminal_surface(cx);
-                                    this.close_right_plus(cx);
-                                }))
-                                .child(
-                                    icon(icons::TERMINAL)
-                                        .size(px(13.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Terminal")),
-                        )
+                        .when(local_workspace, |menu| {
+                            menu.child(
+                                popover::menu_row(&theme, false, "right-plus-terminal")
+                                    .id("right-plus-terminal-row")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_terminal_surface(cx);
+                                        this.close_right_plus(cx);
+                                    }))
+                                    .child(
+                                        icon(icons::TERMINAL)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(SharedString::from("Terminal")),
+                            )
+                        })
                         .when(self.space_git_detected(cx), |menu| {
                             menu.child(
                                 popover::menu_row(&theme, false, "right-plus-diff")

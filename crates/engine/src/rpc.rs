@@ -3144,6 +3144,39 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&status)
             }
+            methods::GET_CLAUDE_CLOUD_SESSIONS => {
+                let store = self.registry.claude_cloud().ok_or_else(|| {
+                    RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
+                })?;
+                let status =
+                    crate::claude_cloud_sessions::status(&self.registry, store.settings()).await;
+                RpcReply::value(&status)
+            }
+            methods::SET_CLAUDE_CLOUD_SESSIONS => {
+                let change: crate::claude_cloud_sessions::ClaudeCloudChange =
+                    parse_params(params)?;
+                let store = self.registry.claude_cloud().ok_or_else(|| {
+                    RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
+                })?;
+                if crate::runner::is_cloud_platform() {
+                    return Err(RpcError::Failed(
+                        "Cloud machines don't offer Claude cloud sessions.".into(),
+                    ));
+                }
+                let next = store.settings().with(&change);
+                store
+                    .save(next.clone())
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let active = crate::claude_cloud_sessions::apply(&self.registry, &next);
+                if let Err(error) = self
+                    .workspace
+                    .set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, active)
+                {
+                    tracing::warn!(%error, "provider-run capability update failed");
+                }
+                let status = crate::claude_cloud_sessions::status(&self.registry, next).await;
+                RpcReply::value(&status)
+            }
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
                 self.registry

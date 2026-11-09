@@ -81,6 +81,8 @@ settings_index! {
         "folder directory path checkout branches"),
     (CommitCredit, General, Some("Git"), "Credit Zeron in commits",
         "co-author coauthor attribution bot commit message"),
+    (ClaudeCloudSessions, General, None, "Claude cloud sessions",
+        "anthropic cloud provider-run claude.ai code remote sessions account login"),
     (ColorScheme, Appearance, None, "Color scheme",
         "system light dark mode"),
     (LightTheme, Appearance, None, "Light theme",

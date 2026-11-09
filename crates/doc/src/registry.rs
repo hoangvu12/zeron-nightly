@@ -1108,6 +1108,25 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Replace a device's advertised capabilities (field-only update; writer
+    /// discipline: callers pass their OWN device). `false` when no such row.
+    pub fn set_device_capabilities(
+        &mut self,
+        device_id: &str,
+        capabilities: &[String],
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_DEVICES, device_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_DEVICES,
+            device_id,
+            OpKind::Update,
+            fields([("capabilities", json!(capabilities))]),
+        );
+        Ok(true)
+    }
+
     /// Stamp `lastSeenAt` on an existing device row (boot/shutdown only —
     /// periodic liveness rides presence frames, never rows).
     pub fn set_device_last_seen(

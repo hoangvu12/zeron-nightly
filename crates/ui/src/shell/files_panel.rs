@@ -74,6 +74,7 @@ impl Shell {
         matches!(self.route, Route::Chat)
             && !self.active_chat.is_empty()
             && self.panels.get(&self.panel_key(cx)).files_open
+            && !self.active_chat_remote_workspace(cx)
     }
 
     fn files_layout(&self, visible: f32, cx: &App) -> FilesPanelLayout {
@@ -263,7 +264,7 @@ impl Shell {
     }
 
     pub(super) fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() {
+        if self.active_chat.is_empty() || self.active_chat_remote_workspace(cx) {
             return;
         }
         let key = self.panel_key(cx);

@@ -1468,6 +1468,26 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_cwd(chat_id, cwd))?)
     }
 
+    /// Advertise (`on`) or withdraw one capability on this device's own row.
+    /// Writes only when the row's list changes. `Ok(false)`: nothing to do.
+    pub fn set_own_capability(&self, capability: &str, on: bool) -> Result<bool, EngineError> {
+        let device_id = self.inner.config.device_id.clone();
+        Ok(self.mutate(|doc| -> Result<bool, zeron_doc::DocError> {
+            let Some(device) = doc.read_devices()?.into_iter().find(|d| d.id == device_id)
+            else {
+                return Ok(false);
+            };
+            let mut capabilities = device.capabilities;
+            let has = capabilities.iter().any(|c| c == capability);
+            match (on, has) {
+                (true, false) => capabilities.push(capability.to_string()),
+                (false, true) => capabilities.retain(|c| c != capability),
+                _ => return Ok(false),
+            }
+            doc.set_device_capabilities(&device_id, &capabilities)
+        })?)
+    }
+
     /// Record a provider-run chat's provider session (`providerSession`, a
     /// field-only update written once). `false`: no row, or the row already
     /// names another session.

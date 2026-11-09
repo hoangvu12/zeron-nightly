@@ -978,6 +978,11 @@ pub struct AppState {
     /// device whose projects the project picker lists. `None` falls back to
     /// the local device.
     pub selected_device: Option<String>,
+    /// Harnesses whose descriptors say their chats work in a remote
+    /// workspace (`remote_workspace`, provider-run chats), learned from every
+    /// harness catalog the app loads. Gates the files, diff, terminal,
+    /// background processes, fork and side chats of their chats.
+    remote_workspace_harnesses: HashSet<HarnessId>,
     /// The new-session canvas's own target, set aside while a chat is open
     /// (a chat implies ITS project/device) and put back on return, so the
     /// canvas always reopens where the user left it.
@@ -1172,6 +1177,7 @@ impl AppState {
             selected_space: None,
             no_project: false,
             selected_device: None,
+            remote_workspace_harnesses: HashSet::new(),
             canvas_target: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -3476,6 +3482,56 @@ impl AppState {
     pub fn selected_chat_row(&self) -> Option<&Chat> {
         let id = self.selected_chat.as_deref()?;
         self.chats.iter().find(|c| c.id == id)
+    }
+
+    /// Note which harnesses of a loaded catalog work in a remote workspace.
+    /// Learned flags are kept: harness ids mean the same on every device.
+    pub(crate) fn learn_harness_catalog(
+        &mut self,
+        list: &[zeron_engine::registry::HarnessDescriptor],
+    ) -> bool {
+        let mut changed = false;
+        for descriptor in list.iter().filter(|d| d.remote_workspace) {
+            changed |= self.remote_workspace_harnesses.insert(descriptor.id);
+        }
+        changed
+    }
+
+    /// Whether `harness`'s chats work in a remote workspace, per its
+    /// descriptor (never its slug).
+    pub(crate) fn harness_remote_workspace(&self, harness: HarnessId) -> bool {
+        self.remote_workspace_harnesses.contains(&harness)
+    }
+
+    /// Whether a chat works in a remote workspace (a provider-run chat): the
+    /// host's files, diffs, terminals and background processes don't apply,
+    /// and it has no forks or side chats.
+    pub(crate) fn chat_remote_workspace(&self, chat_id: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.config.as_ref())
+            .is_some_and(|config| self.harness_remote_workspace(config.harness))
+    }
+
+    /// [`Self::chat_remote_workspace`] for the selected chat.
+    pub(crate) fn selected_chat_remote_workspace(&self) -> bool {
+        self.selected_chat
+            .as_deref()
+            .is_some_and(|id| self.chat_remote_workspace(id))
+    }
+
+    /// Whether this device can start provider-run chats ("Anthropic cloud"
+    /// in the place chip): its registry row advertises `provider-run-v1`,
+    /// which it does while "Claude cloud sessions" is on with a login enabled.
+    pub(crate) fn provider_run_eligible(&self) -> bool {
+        let Some(local) = self.local_device_id.as_deref() else {
+            return false;
+        };
+        self.devices
+            .iter()
+            .find(|device| device.id == local)
+            .is_some_and(|device| device.supports(zeron_proto::capabilities::PROVIDER_RUN_V1))
     }
 
     /// The chat the Archive session shortcut acts on: the selected one, unless
