@@ -6,6 +6,10 @@
 //! [`Tracker::refresh`] re-decodes only those maps (plus newly inserted ones
 //! when the list itself changed). Per streamed token the work is one entry's
 //! decode + one joined-entry rebuild; every other entry keeps its `Arc`.
+//!
+//! A provider-run chat's duplicates (two entries for one provider event,
+//! before the host's sweep removes them) never show: the view keeps the
+//! copy every device keeps ([`zeron_doc::duplicate_positions`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -69,6 +73,8 @@ struct Slot {
     /// Bumped on every re-decode of this raw entry.
     raw_rev: u64,
     entry: Option<Arc<SessionMessageEntry>>,
+    /// The provider event the entry mirrors (provider-run chats).
+    provider_uuid: Option<String>,
 }
 
 /// Joined-transcript change produced by one refresh. Snapshots diff by `Arc`
@@ -90,6 +96,8 @@ pub(crate) struct Tracker {
     by_root: HashMap<ContainerID, (Vec<u64>, Arc<Entry>)>,
     next_rev: u64,
     initialized: bool,
+    /// The document is a provider-run chat's: duplicates are hidden.
+    provider_run: bool,
     /// Raw entry decodes performed (perf tests assert O(changed)).
     pub decodes: u64,
 }
@@ -115,6 +123,7 @@ impl Tracker {
             by_root: HashMap::new(),
             next_rev: 0,
             initialized: false,
+            provider_run: false,
             decodes: 0,
         }
     }
@@ -153,17 +162,26 @@ impl Tracker {
             cid,
             raw_rev,
             entry,
+            provider_uuid: zeron_doc::provider_uuid_of(map),
         }
     }
 
     /// Apply the dirty set. `None` when the joined transcript did not change.
     pub fn refresh(&mut self, doc: &LoroDoc, dirty: &Dirty) -> Option<TranscriptChange> {
         let first = !self.initialized;
-        if !first && !dirty.list && dirty.entries.is_empty() {
+        // Becoming a provider-run chat's document changes what shows.
+        let provider_run = if first || dirty.meta {
+            zeron_doc::is_provider_run(doc)
+        } else {
+            self.provider_run
+        };
+        let became = provider_run != self.provider_run;
+        self.provider_run = provider_run;
+        if !first && !became && !dirty.list && dirty.entries.is_empty() {
             return None;
         }
         self.initialized = true;
-        let mut touched = first || dirty.list;
+        let mut touched = first || became || dirty.list;
         if first || dirty.list {
             let list = doc.get_list("messages");
             let mut old: HashMap<ContainerID, Slot> = self
@@ -227,9 +245,24 @@ impl Tracker {
     /// Regroup continuations onto their roots; reuse every joined entry whose
     /// constituent raw revisions are unchanged.
     fn rejoin(&mut self, reset: bool) -> TranscriptChange {
+        let hidden: HashSet<usize> = if self.provider_run {
+            zeron_doc::duplicate_positions(self.slots.iter().map(|slot| {
+                (
+                    slot.provider_uuid.as_deref(),
+                    zeron_doc::element_of_id(&slot.cid),
+                )
+            }))
+            .into_iter()
+            .collect()
+        } else {
+            HashSet::new()
+        };
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut root_group: HashMap<&str, usize> = HashMap::new();
         for (i, slot) in self.slots.iter().enumerate() {
+            if hidden.contains(&i) {
+                continue;
+            }
             let Some(entry) = &slot.entry else { continue };
             match entry
                 .continuation_of
@@ -448,5 +481,71 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].message.parts.len(), 2);
         assert!(rig.tracker.contains_id("c1"));
+    }
+
+    #[test]
+    fn a_provider_events_two_copies_synced_in_show_once() {
+        let mut rig = Rig::new();
+        rig.doc.doc().set_peer_id(9).unwrap();
+        rig.doc
+            .doc()
+            .get_map("meta")
+            .insert(zeron_doc::PROVIDER_SESSION, "{}")
+            .unwrap();
+        rig.doc.doc().commit();
+        rig.doc.push_message(&user("before", "hi")).unwrap();
+        // Two devices, both briefly hosting, mirror the same provider event.
+        let other = SessionDoc::init("chat").unwrap();
+        other.doc().set_peer_id(2).unwrap();
+        other
+            .doc()
+            .import(&rig.doc.doc().export(loro::ExportMode::all_updates()).unwrap())
+            .unwrap();
+        rig.doc
+            .push_provider_message(&user("copy-here", "typed"), "evt-1", 4)
+            .unwrap();
+        rig.refresh();
+        other
+            .push_provider_message(&user("copy-there", "typed"), "evt-1", 4)
+            .unwrap();
+        rig.doc
+            .doc()
+            .import(&other.doc().export(loro::ExportMode::all_updates()).unwrap())
+            .unwrap();
+        rig.refresh();
+        let shown = |rig: &Rig| -> Vec<String> {
+            rig.tracker
+                .entries()
+                .iter()
+                .map(|e| e.message.id.clone())
+                .collect()
+        };
+        // The copy every device keeps (lowest element id: peer 2's), once.
+        assert_eq!(shown(&rig), vec!["before".to_owned(), "copy-there".to_owned()]);
+        let read: Vec<String> = rig
+            .doc
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(shown(&rig), read);
+        // The host's sweep leaves the view as it was.
+        assert_eq!(rig.doc.sweep_provider_duplicates().unwrap(), 1);
+        rig.refresh();
+        assert_eq!(shown(&rig), vec!["before".to_owned(), "copy-there".to_owned()]);
+    }
+
+    #[test]
+    fn a_chat_that_isnt_provider_run_shows_every_entry() {
+        let mut rig = Rig::new();
+        rig.doc
+            .push_provider_message(&user("a", "x"), "evt", 1)
+            .unwrap();
+        rig.doc
+            .push_provider_message(&user("b", "x"), "evt", 1)
+            .unwrap();
+        rig.refresh();
+        assert_eq!(rig.tracker.entries().len(), 2);
     }
 }

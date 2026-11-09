@@ -34,6 +34,9 @@ use crate::schema::{DocError, SessionDoc, SessionMessageEntry};
 pub const PROVIDER_UUID: &str = "providerUuid";
 /// Entry field: that event's `sequence_num`.
 pub const PROVIDER_SEQ: &str = "providerSeq";
+/// Chat document metadata: the provider session a provider-run chat is
+/// tied to (also what marks a document as a provider-run chat's).
+pub const PROVIDER_SESSION: &str = "providerSession";
 const WATERMARK: &str = "providerWatermark";
 const TURN: &str = "providerTurn";
 const PROMPTS: &str = "providerPrompts";
@@ -91,10 +94,55 @@ fn number_of(map: &LoroMap, key: &str) -> Option<u64> {
 }
 
 fn element_of(map: &LoroMap) -> (u64, i32) {
-    match map.id() {
-        ContainerID::Normal { peer, counter, .. } => (peer, counter),
+    element_of_id(&map.id())
+}
+
+/// An entry map's Loro element id (peer, counter), what the keep-rule
+/// orders by.
+pub fn element_of_id(id: &ContainerID) -> (u64, i32) {
+    match id {
+        ContainerID::Normal { peer, counter, .. } => (*peer, *counter),
         ContainerID::Root { .. } => (u64::MAX, i32::MAX),
     }
+}
+
+/// The provider uuid an entry map carries, if any.
+pub fn provider_uuid_of(map: &LoroMap) -> Option<String> {
+    string_of(map, PROVIDER_UUID)
+}
+
+/// The keep-rule over entries given in list order as (provider uuid,
+/// element id): for each uuid, every entry but the one with the lowest
+/// element id is dropped, the same choice on every device. Returns the
+/// dropped positions, ascending. Every view of a provider-run chat's
+/// transcript filters with this.
+pub fn duplicate_positions<'a>(
+    entries: impl IntoIterator<Item = (Option<&'a str>, (u64, i32))>,
+) -> Vec<usize> {
+    let mut kept: HashMap<&'a str, ((u64, i32), usize)> = HashMap::new();
+    let mut dropped = Vec::new();
+    for (index, (uuid, element)) in entries.into_iter().enumerate() {
+        let Some(uuid) = uuid else {
+            continue;
+        };
+        match kept.get_mut(uuid) {
+            None => {
+                kept.insert(uuid, (element, index));
+            }
+            Some(keep) if element < keep.0 => {
+                dropped.push(keep.1);
+                *keep = (element, index);
+            }
+            Some(_) => dropped.push(index),
+        }
+    }
+    dropped.sort_unstable();
+    dropped
+}
+
+/// Whether a chat document is a provider-run chat's.
+pub fn is_provider_run(doc: &loro::LoroDoc) -> bool {
+    doc.get_map("meta").get(PROVIDER_SESSION).is_some()
 }
 
 impl SessionDoc {
@@ -254,28 +302,21 @@ impl SessionDoc {
         Ok(false)
     }
 
-    /// The entries the keep-rule drops: for each provider uuid, all but the
-    /// one with the lowest element id. Positions, ascending.
+    /// The entries the keep-rule drops ([`duplicate_positions`]): for each
+    /// provider uuid, all but the one with the lowest element id. Positions
+    /// in the `messages` list, ascending.
     pub fn provider_duplicates(&self) -> Vec<usize> {
-        let mut kept: HashMap<String, ((u64, i32), usize)> = HashMap::new();
-        let mut dropped = Vec::new();
-        for entry in self.provider_entries() {
-            let Some(uuid) = entry.provider_uuid else {
-                continue;
-            };
-            match kept.get_mut(&uuid) {
-                None => {
-                    kept.insert(uuid, (entry.element, entry.index));
-                }
-                Some(keep) if entry.element < keep.0 => {
-                    dropped.push(keep.1);
-                    *keep = (entry.element, entry.index);
-                }
-                Some(_) => dropped.push(entry.index),
-            }
-        }
-        dropped.sort_unstable();
-        dropped
+        // Positions here are over every list item; `provider_entries` skips
+        // non-map items, so map back through its `index`.
+        let entries = self.provider_entries();
+        duplicate_positions(
+            entries
+                .iter()
+                .map(|e| (e.provider_uuid.as_deref(), e.element)),
+        )
+        .into_iter()
+        .map(|i| entries[i].index)
+        .collect()
     }
 
     /// Delete [`Self::provider_duplicates`] (the host's sweep). Returns how
@@ -296,7 +337,7 @@ impl SessionDoc {
     /// Positions [`Self::read_entries`] leaves out: duplicates by provider
     /// uuid, in a provider-run chat's document only.
     pub(crate) fn hidden_duplicates(&self) -> HashSet<usize> {
-        if self.doc().get_map("meta").get("providerSession").is_none() {
+        if !is_provider_run(self.doc()) {
             return HashSet::new();
         }
         self.provider_duplicates().into_iter().collect()
@@ -330,7 +371,7 @@ mod tests {
         doc.doc().set_peer_id(peer).unwrap();
         doc.doc()
             .get_map("meta")
-            .insert("providerSession", "{}")
+            .insert(PROVIDER_SESSION, "{}")
             .unwrap();
         doc.doc().commit();
         doc

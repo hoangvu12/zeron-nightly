@@ -153,24 +153,7 @@ pub(crate) async fn create_chat(
         .queue_command(
             &chat_id,
             SessionCommandPayload::Run {
-                request: RunRequest {
-                    prompt,
-                    harness: Some(HarnessId::ClaudeCodeCloud),
-                    model: new.config.model.clone(),
-                    reasoning: new.config.reasoning,
-                    model_options: new.config.model_options.clone(),
-                    cwd: cwd.clone(),
-                    sandbox: new.config.sandbox,
-                    auto_approve: false,
-                    access: new.config.access,
-                    plan: new.config.plan,
-                    resume: None,
-                    attachments: Vec::new(),
-                    worktree: None,
-                    mcp: None,
-                    extra_mcp: Vec::new(),
-                    env: Default::default(),
-                },
+                request: run_request(&new.config, cwd.clone(), prompt),
                 message_id: message_id.clone(),
             },
         )
@@ -278,13 +261,24 @@ pub(crate) async fn resume_as_host(
             access: Default::default(),
             plan: false,
         });
-    let request = RunRequest {
-        prompt: String::new(),
+    let request = run_request(
+        &config,
+        zeron_proto::provider_cloud::claude_cwd(&session.session_id),
+        String::new(),
+    );
+    sessions.start_provider_resume(chat_id, request).await?;
+    Ok(true)
+}
+
+/// A provider-run chat's run in configuration `config`.
+fn run_request(config: &ChatConfig, cwd: String, prompt: String) -> RunRequest {
+    RunRequest {
+        prompt,
         harness: Some(HarnessId::ClaudeCodeCloud),
-        model: config.model,
+        model: config.model.clone(),
         reasoning: config.reasoning,
-        model_options: config.model_options,
-        cwd: zeron_proto::provider_cloud::claude_cwd(&session.session_id),
+        model_options: config.model_options.clone(),
+        cwd,
         sandbox: config.sandbox,
         auto_approve: false,
         access: config.access,
@@ -295,9 +289,31 @@ pub(crate) async fn resume_as_host(
         mcp: None,
         extra_mcp: Vec::new(),
         env: Default::default(),
+    }
+}
+
+/// Commit provider event `sequence_num` (its turn and prompt bookkeeping,
+/// and the replay watermark), then, when `sweep`, the host's duplicate
+/// sweep. `false` when the commit failed (the watermark stays put).
+pub(crate) fn commit_marker(
+    doc: &SessionDoc,
+    chat_id: &str,
+    sequence_num: u64,
+    turn: zeron_doc::TurnUpdate,
+    prompt: Option<&zeron_proto::ProviderPrompt>,
+    sweep: bool,
+) -> bool {
+    let committed = match doc.commit_provider_event(sequence_num, turn, prompt) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(chat = %chat_id, error = %err, "replay watermark write failed");
+            false
+        }
     };
-    sessions.start_provider_resume(chat_id, request).await?;
-    Ok(true)
+    if sweep && let Err(err) = doc.sweep_provider_duplicates() {
+        tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
+    }
+    committed
 }
 
 /// Whether a provider-run chat's document shows the session mid-way: a turn
