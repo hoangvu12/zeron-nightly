@@ -33,8 +33,8 @@ note = "v3 updates itself on Windows: it downloads the release's installer and r
 [[patch]]
 name = "large-plain-folder-index"
 pr = 1196
-sha = "44d08d24675660638e957b0ef42c638188e70bce"
-note = "Walk-based index for large plain folders, kept current with a watch. Stacked on #1184."
+sha = "82a0a07bbe01b51521340a97c7e656741c0953c1"
+note = "Walk-based index for large plain folders, kept current with a watch; disk roots refused. Stacked on #1184."
 
 [[patch]]
 name = "dead-run-shimmer"
@@ -69,8 +69,8 @@ note = "PR watches start Git off the runtime workers, so slow Windows process la
 [[patch]]
 name = "revived-turn-zeron-tools"
 pr = 1285
-sha = "f365aadfac10ce2c878fcd09ebc36cb76b0a37bd"
-note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts. child-chats-report-back is rebased on this pin; moving it to the PR's head (0b2674d9) makes that one conflict in sessions.rs until it is rebased too."
+sha = "0b2674d93839f081e9a41c95dc59987a12cee080"
+note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts. child-chats-report-back is rebased on this pin: move them together."
 
 [[patch]]
 name = "markdown-reply-images"

@@ -1,4 +1,4 @@
-From 8ede81a41860551ee879ce08c4bba0e85f11b1ea Mon Sep 17 00:00:00 2001
+From 17c63916d6e7d0ba53804c1c706a303f94805f16 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
@@ -5256,7 +5256,7 @@ index 000000000..6292ed6c9
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index ca6c2f924..e971ee445 100644
+index cdacf745b..24bf189ed 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -29,6 +29,7 @@ use zeron_doc::{
@@ -5292,7 +5292,7 @@ index ca6c2f924..e971ee445 100644
      /// Loopback IPC port this engine serves, once known (0 = not serving):
      /// what the injected `zeron mcp` server dials back into.
      ipc_port: std::sync::atomic::AtomicU16,
-@@ -334,6 +346,9 @@ struct Inner {
+@@ -337,6 +349,9 @@ struct Inner {
      turn_listener: OnceLock<TurnListener>,
      /// Plugins whose native MCP servers local runs get (absent in bare tests).
      plugins: OnceLock<crate::plugins::Plugins>,
@@ -5302,7 +5302,7 @@ index ca6c2f924..e971ee445 100644
  }
  
  /// Turn-start hook: called with `(chat_id, cwd)`.
-@@ -364,6 +379,8 @@ impl SessionsEngine {
+@@ -367,6 +382,8 @@ impl SessionsEngine {
                  revivals: Mutex::new(HashMap::new()),
                  cancelled_sends: Mutex::new(HashMap::new()),
                  user_stops: Mutex::new(HashMap::new()),
@@ -5310,8 +5310,8 @@ index ca6c2f924..e971ee445 100644
 +                steer_stops: Mutex::new(std::collections::HashSet::new()),
                  ipc_port: std::sync::atomic::AtomicU16::new(0),
                  ipc_ready: tokio::sync::Notify::new(),
-                 ipc_token_file: Mutex::new(None),
-@@ -385,6 +402,7 @@ impl SessionsEngine {
+                 ipc_none: std::sync::atomic::AtomicBool::new(false),
+@@ -389,6 +406,7 @@ impl SessionsEngine {
                  scratch_root: OnceLock::new(),
                  turn_listener: OnceLock::new(),
                  plugins: OnceLock::new(),
@@ -5319,7 +5319,7 @@ index ca6c2f924..e971ee445 100644
              }),
          }
      }
-@@ -440,6 +458,31 @@ impl SessionsEngine {
+@@ -459,6 +477,31 @@ impl SessionsEngine {
          let _ = self.inner.plugins.set(plugins);
      }
  
@@ -5351,7 +5351,7 @@ index ca6c2f924..e971ee445 100644
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -522,6 +565,11 @@ impl SessionsEngine {
+@@ -541,6 +584,11 @@ impl SessionsEngine {
              .is_some_and(HarnessDescriptor::steers_mid_turn)
      }
  
@@ -5363,7 +5363,7 @@ index ca6c2f924..e971ee445 100644
      /// Whether this chat has a turn in flight — streaming, or parked on a
      /// question it is still owed an answer to (see [`is_active`]). A persistent
      /// session parked BETWEEN turns is not: it holds a warm child with nothing
-@@ -1640,8 +1688,10 @@ impl SessionsEngine {
+@@ -1659,8 +1707,10 @@ impl SessionsEngine {
          if !self.turn_in_flight(chat_id) {
              return false;
          }
@@ -5375,7 +5375,7 @@ index ca6c2f924..e971ee445 100644
          redeliver_on_stop.store(true, Release);
          turn.stop_turn();
          let deadline = tokio::time::Instant::now() + STOP_SETTLE;
-@@ -1680,6 +1730,7 @@ impl SessionsEngine {
+@@ -1699,6 +1749,7 @@ impl SessionsEngine {
      /// models never come here: they keep the runtime and its work.)
      pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
          self.note_user_stop(chat_id);
@@ -5383,7 +5383,7 @@ index ca6c2f924..e971ee445 100644
          self.terminate(chat_id).await
      }
  
-@@ -1706,6 +1757,12 @@ impl SessionsEngine {
+@@ -1725,6 +1776,12 @@ impl SessionsEngine {
          }
      }
  
@@ -5396,7 +5396,7 @@ index ca6c2f924..e971ee445 100644
      /// End the in-flight turn so another prompt can take its place ("send
      /// now"), keeping the runtime and its background work. Its streaming
      /// entry is stamped `aborted`; this waits (bounded) for that settlement
-@@ -1720,6 +1777,7 @@ impl SessionsEngine {
+@@ -1739,6 +1796,7 @@ impl SessionsEngine {
      pub async fn stop_turn(&self, chat_id: &str) -> Result<bool, EngineError> {
          const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
          self.note_user_stop(chat_id);
@@ -5404,7 +5404,7 @@ index ca6c2f924..e971ee445 100644
          let target = lock(&self.inner.runs)
              .get(chat_id)
              .filter(|h| {
-@@ -2420,6 +2478,7 @@ impl Inner {
+@@ -2439,6 +2497,7 @@ impl Inner {
          outcome: Option<DoneStatus>,
      ) {
          let now = Utc::now();
@@ -5412,7 +5412,7 @@ index ca6c2f924..e971ee445 100644
          let session = {
              let mut statuses = lock(&self.statuses);
              let entry = statuses
-@@ -2507,6 +2566,75 @@ impl Inner {
+@@ -2526,6 +2585,75 @@ impl Inner {
          {
              tracing::warn!(chat = %chat_id, %error, "couldn't wake a sleeping chat");
          }
@@ -5488,7 +5488,7 @@ index ca6c2f924..e971ee445 100644
      }
  
      /// Publish what `chat_id`'s agent waits on after its turn ended (`None`:
-@@ -2600,9 +2728,18 @@ impl Inner {
+@@ -2619,9 +2747,18 @@ impl Inner {
      /// A message the user already sent follows the turn that is ending
      /// (see [`crate::doc_host::ChatDocHandle::continues_with_sent_message`]).
      fn continues_with_sent_message(&self, chat_id: &str) -> bool {
@@ -5510,7 +5510,7 @@ index ca6c2f924..e971ee445 100644
      }
  
      /// Whether a run of `chat_id` launches without its provider's own
-@@ -4520,6 +4657,10 @@ async fn drive_run(
+@@ -4539,6 +4676,10 @@ async fn drive_run(
      let mut waiting_on = turn.watch_waiting();
      let mut wait: Option<ParkedWait> = None;
      let wake_grace = wake_grace();
@@ -5521,7 +5521,7 @@ index ca6c2f924..e971ee445 100644
      // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
      // steerable harness parks here instead of ending the run — the child and
      // its steering mailbox stay warm, and the next user message (dispatch
-@@ -4698,9 +4839,23 @@ async fn drive_run(
+@@ -4717,9 +4858,23 @@ async fn drive_run(
                      continue;
                  }
                  // What a parked wait waits on changed: shown as it is; once
@@ -5548,7 +5548,7 @@ index ca6c2f924..e971ee445 100644
                      if let Some(parked) = wait.as_mut() {
                          parked.grace = if on.is_empty() {
                              parked.grace.or_else(|| Some(tokio::time::Instant::now() + wake_grace))
-@@ -5723,8 +5878,9 @@ async fn drive_run(
+@@ -5742,8 +5897,9 @@ async fn drive_run(
                  let outcome = (!pending_steer && turn_was_active).then_some(*status);
                  // A finished turn whose agent waits on background work that
                  // will wake it parks into a wait: Waiting, its completion
@@ -5560,7 +5560,7 @@ index ca6c2f924..e971ee445 100644
                  if completed_turn.is_some() && !on.is_empty() {
                      let since = Utc::now();
                      wait = Some(ParkedWait {
-@@ -7269,4 +7425,1148 @@ mod tests {
+@@ -7320,4 +7476,1148 @@ mod tests {
          sessions.ipc_port_ready(limit).await;
          assert_eq!(start.elapsed(), Duration::ZERO);
      }

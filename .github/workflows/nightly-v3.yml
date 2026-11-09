@@ -44,7 +44,7 @@ jobs:
       head: ${{ steps.assemble.outputs.head }}
       build: ${{ steps.changed.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: tools
       - name: clone upstream
@@ -77,7 +77,7 @@ jobs:
       - name: bundle the nightly commits
         if: steps.changed.outputs.build == 'true'
         run: git -C src bundle create ../nightly.bundle nightly ^refs/nightly/upstream
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.changed.outputs.build == 'true'
         with:
           name: source
@@ -99,10 +99,10 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: tools
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
           path: source
@@ -134,7 +134,7 @@ jobs:
         run: cargo test --locked -p zeron-update
       - name: package installer and portable zip
         run: ./tools/scripts/package-v3-windows.ps1 -Src src -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:FEED_TAG"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -152,7 +152,7 @@ jobs:
       VERSION: ${{ needs.assemble.outputs.version }}
       PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

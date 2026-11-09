@@ -26,8 +26,8 @@ note = "Lets the Windows updater and packaging take 0.2.137-nightly.N versions. 
 [[patch]]
 name = "large-plain-folder-index"
 pr = 1196
-sha = "44d08d24675660638e957b0ef42c638188e70bce"
-note = "Walk-based index for large plain folders, kept current with a watch. Stacked on #1184."
+sha = "82a0a07bbe01b51521340a97c7e656741c0953c1"
+note = "Walk-based index for large plain folders, kept current with a watch; disk roots refused. Stacked on #1184."
 
 [[patch]]
 name = "dead-run-shimmer"
@@ -59,6 +59,12 @@ name = "warm-chats-parked-cap"
 pr = 1101
 sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
 note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min (ZERON_PARKED_SESSION_CAP=0 disables); reuses laid-out transcripts on chat switch; model catalogs stay fresh for 10 min. Its conflict with main's parked waits in sessions.rs replays from rerere/, which also keeps the cap off a chat waiting for its wake turn."
+
+[[patch]]
+name = "revived-turn-zeron-tools"
+pr = 1285
+sha = "0b2674d93839f081e9a41c95dc59987a12cee080"
+note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts."
 
 [[patch]]
 name = "markdown-reply-images"

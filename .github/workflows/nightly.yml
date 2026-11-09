@@ -36,7 +36,7 @@ jobs:
       head: ${{ steps.assemble.outputs.head }}
       build: ${{ steps.changed.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: tools
       - name: clone upstream
@@ -64,7 +64,7 @@ jobs:
       - name: bundle the nightly commits
         if: steps.changed.outputs.build == 'true'
         run: git -C src bundle create ../nightly.bundle nightly ^refs/nightly/upstream
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.changed.outputs.build == 'true'
         with:
           name: source
@@ -87,7 +87,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
           path: source
@@ -115,7 +115,7 @@ jobs:
       - name: package installer, portable zip and updater exe
         working-directory: src
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -133,7 +133,7 @@ jobs:
       VERSION: ${{ needs.assemble.outputs.version }}
       PUSH_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
