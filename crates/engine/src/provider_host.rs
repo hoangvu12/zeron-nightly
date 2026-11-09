@@ -48,6 +48,9 @@ const CLAIM_TTL: Duration = Duration::from_secs(60);
 /// A claim's clock is at least this far ahead of now
 /// (docs/design/provider-run-chats.md §4).
 const CLAIM_LEAD: chrono::Duration = chrono::Duration::seconds(5);
+/// How long a device whose claim was echoed waits for a competing claim to
+/// land before it starts work (see `became_host`).
+const CLAIM_SETTLE: Duration = Duration::from_secs(5);
 
 /// Whether a device is online, as the relay sees it: its `host_offline`
 /// signal (no ping for 75 s). Tests stand in a fake relay.
@@ -116,7 +119,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl ProviderHosting {
-    pub(crate) fn new(sessions: SessionsEngine, doc_host: DocHost, workspace: WorkspaceHost) -> Self {
+    pub(crate) fn new(
+        sessions: SessionsEngine,
+        doc_host: DocHost,
+        workspace: WorkspaceHost,
+    ) -> Self {
         let presence: Arc<dyn HostPresence> = Arc::new(RelayPresence {
             workspace: workspace.clone(),
         });
@@ -168,7 +175,9 @@ impl ProviderHosting {
             tracing::warn!(%error, "couldn't advertise provider-run hosting");
         }
         let hosting = self.clone();
-        self.inner.doc_host.spawn_worker(async move { hosting.follow_hosts().await });
+        self.inner
+            .doc_host
+            .spawn_worker(async move { hosting.follow_hosts().await });
     }
 
     /// The person opened or sent to `chat_id` on this device: take it over
@@ -215,6 +224,7 @@ impl ProviderHosting {
             return;
         }
         if let Some(claim) = lock(&self.inner.claims).get(chat_id)
+            && claim.from == host
             && claim.at.elapsed() < CLAIM_TTL
         {
             return; // waiting for the room's echo
@@ -316,9 +326,10 @@ impl ProviderHosting {
                 if chat.provider_session.is_none() && !workspace.is_provider_chat(&chat.id) {
                     continue;
                 }
-                let host = workspace.is_host(&chat.id).then(|| me.clone()).or_else(|| {
-                    workspace.provider_chat_host(&chat.id)
-                });
+                let host = workspace
+                    .is_host(&chat.id)
+                    .then(|| me.clone())
+                    .or_else(|| workspace.provider_chat_host(&chat.id));
                 seen.insert(chat.id.clone(), host);
             }
             // Chats whose row went away while hosted here: not host now.
@@ -339,16 +350,18 @@ impl ProviderHosting {
                     if !first && (before.is_some() || claimed.is_some()) {
                         self.became_host(chat, before, claimed);
                     }
-                } else if hosted_before && !hosts_now {
+                } else if !hosts_now && (hosted_before || self.inner.sessions.has_run(chat)) {
+                    // Lost it, or a run outlived the loss (it started as the
+                    // demotion landed).
                     self.demoted(chat, host.clone());
-                } else if !hosts_now
-                    && let Some(host) = host
-                {
-                    // Another device won (or still holds) the chat.
+                } else if !hosts_now {
+                    // A claim the room never made good on is forgotten in
+                    // time (another device may hold the chat only for a
+                    // moment, so not sooner).
                     let mut claims = lock(&self.inner.claims);
                     if claims
                         .get(chat)
-                        .is_some_and(|c| c.from != *host || c.at.elapsed() >= CLAIM_TTL)
+                        .is_some_and(|c| c.at.elapsed() >= CLAIM_TTL)
                     {
                         claims.remove(chat);
                     }
@@ -372,6 +385,23 @@ impl ProviderHosting {
         self.inner.doc_host.spawn_worker(async move {
             let inner = &hosting.inner;
             let workspace = &inner.workspace;
+            // Devices that claimed at the same moment converge within the
+            // room's round trip: this device acts as host (drains, sends)
+            // only once that has passed with it still host
+            // (`WorkspaceHost::is_host`), so the losing claimant never
+            // starts work it then may not finish.
+            let deadline = tokio::time::Instant::now() + CLAIM_SETTLE;
+            loop {
+                if workspace.is_host(&chat) {
+                    break;
+                }
+                let still_ours =
+                    workspace.provider_chat_host(&chat).as_deref() == Some(workspace.device_id());
+                if !still_ours || tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             if workspace.chat_host_unavailable(&chat).is_some()
                 && let Err(error) = workspace.set_chat_host_unavailable(&chat, None)
             {
@@ -387,14 +417,24 @@ impl ProviderHosting {
             {
                 tracing::warn!(chat = %chat, %error, "couldn't clear the sign-in state");
             }
+            // The note goes in before anything runs here, so it sits ahead of
+            // what this device mirrors.
             if let Some(claim) = &claim {
                 hosting.note_takeover(&handle, claim);
             }
             inner.doc_host.drain_commands(&handle).await;
-            if let Err(error) =
-                crate::provider_run::resume_as_host(&inner.sessions, &inner.doc_host, &chat).await
+            if workspace.is_host(&chat)
+                && let Err(error) =
+                    crate::provider_run::resume_as_host(&inner.sessions, &inner.doc_host, &chat)
+                        .await
             {
                 tracing::warn!(chat = %chat, %error, "couldn't resume the provider-run chat");
+            }
+            if !workspace.is_host(&chat) {
+                // Another claim won meanwhile (two devices claimed at once):
+                // whatever started here stops.
+                hosting.demoted(&chat, workspace.provider_chat_host(&chat));
+                return;
             }
         });
     }

@@ -72,6 +72,12 @@ const RELAY_PROBE_INTERVAL_MS: u64 = 30_000;
 const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Debounce window for local snapshot saves after a change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+/// How long a provider-run chat that moved to this device waits before this
+/// device acts as its host (`WorkspaceHost::settled_host`).
+pub(crate) const PROVIDER_HOST_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// See `WorkspaceHostInner::provider_hosts`.
+type ProviderHosts =
+    Mutex<std::collections::HashMap<String, (String, Option<std::time::Instant>)>>;
 
 /// Initial-join retry backoff (base, cap). A first registry-room join that
 /// fails must not strand the device offline until an app restart — retry until
@@ -222,6 +228,9 @@ struct WorkspaceHostInner {
     /// missing row or a failed read means "not host", never "claimable"
     /// (docs/design/provider-run-chats.md §4, "Failing closed").
     provider_chats: Mutex<std::collections::HashSet<String>>,
+    /// Each provider-run chat's echoed host as last seen, and since when,
+    /// when it moved there from another device (`settled_host`).
+    provider_hosts: ProviderHosts,
     /// A registry room was attached (the edge, or the test seam): rows read
     /// before it synced may be stale.
     room_expected: std::sync::atomic::AtomicBool,
@@ -382,6 +391,7 @@ impl WorkspaceHost {
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
                 provider_chats: Mutex::new(provider_chats),
+                provider_hosts: Mutex::default(),
                 room_expected: std::sync::atomic::AtomicBool::new(false),
             }),
         };
@@ -867,13 +877,35 @@ impl WorkspaceHost {
         match row {
             Ok(Some(chat)) if chat.provider_session.is_some() || self.is_provider_chat(chat_id) => {
                 self.note_provider_chat(chat_id);
-                acked.as_deref().unwrap_or(chat.device_id.as_str()) == me
+                let host = acked.as_deref().unwrap_or(chat.device_id.as_str());
+                self.settled_host(chat_id, host)
             }
             Ok(Some(chat)) => chat.device_id == *me,
             Ok(None) => !self.is_provider_chat(chat_id),
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
                 !self.is_provider_chat(chat_id)
+            }
+        }
+    }
+
+    /// Whether `host`, a provider-run chat's echoed host, makes this device
+    /// its host. A device the chat just moved to from another one hosts it
+    /// only once [`PROVIDER_HOST_SETTLE`] has passed with it still host:
+    /// devices that claimed at the same moment converge within that, so the
+    /// claimant that loses never starts work it then may not finish.
+    fn settled_host(&self, chat_id: &str, host: &str) -> bool {
+        let me = host == self.inner.config.device_id;
+        let mut seen = lock(&self.inner.provider_hosts);
+        match seen.get(chat_id) {
+            Some((last, since)) if last == host => {
+                me && since.is_none_or(|at| at.elapsed() >= PROVIDER_HOST_SETTLE)
+            }
+            previous => {
+                // First sight (boot, a new chat): as it is. A move: from now.
+                let since = previous.is_some().then(std::time::Instant::now);
+                seen.insert(chat_id.to_owned(), (host.to_owned(), since));
+                me && since.is_none()
             }
         }
     }

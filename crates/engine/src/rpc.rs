@@ -3317,6 +3317,10 @@ impl RpcService for EngineRpc {
                 // A provider-run chat's workspace is at the provider: no
                 // fork, whoever asks (older clients included).
                 if source.provider_session.is_some()
+                    || source
+                        .config
+                        .as_ref()
+                        .is_some_and(|c| c.harness.runs_in_provider_cloud())
                     || self.workspace.is_provider_chat(&p.source_chat_id)
                 {
                     return Err(RpcError::Failed(PROVIDER_RUN_NO_SIDE_CHATS.into()));
@@ -4034,7 +4038,13 @@ impl RpcService for EngineRpc {
                             .chat(parent)
                             .ok()
                             .flatten()
-                            .is_some_and(|chat| chat.provider_session.is_some()))
+                            .is_some_and(|chat| {
+                                chat.provider_session.is_some()
+                                    || chat
+                                        .config
+                                        .as_ref()
+                                        .is_some_and(|c| c.harness.runs_in_provider_cloud())
+                            }))
                 {
                     return Err(RpcError::Failed(PROVIDER_RUN_NO_SIDE_CHATS.into()));
                 }
