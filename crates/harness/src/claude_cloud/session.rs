@@ -37,13 +37,20 @@
 //!   answer anyway). A question whose answer couldn't be delivered stays
 //!   answerable.
 //!
-//! A message someone sent the session from elsewhere (claude.ai, the phone)
-//! comes out as an untagged [`AgentEvent::UserMessage`]; echoes of what this
-//! device sent show nothing. A dropped stream is reconnected a bounded
-//! number of times with backoff ([`RECONNECTS`]), then the run ends errored.
+//! Every stored event the run mirrors is followed by its marker
+//! ([`AgentEvent::ProviderEvent`]), which the engine uses to stamp entries,
+//! advance the chat's replay watermark and track open prompts. A person's
+//! message, from this device or elsewhere (claude.ai, the phone), rides its
+//! marker: the engine writes it unless the transcript already has it (it
+//! matches by transcript ids, so this survives restarts). A fresh run picks
+//! up where the chat document says the transcript got to
+//! ([`crate::provider_cloud::ProviderResume`]). A run started with no
+//! message ([`RunSession::idle`], a host resuming the chat) sends nothing and
+//! mirrors whatever the session does. A dropped stream is reconnected a
+//! bounded number of times with backoff ([`RECONNECTS`]), then the run ends
+//! errored.
 //!
-//! Not here (later tickets): the durable replay watermark (#8), takeover
-//! checks before each request (#12).
+//! Not here (later tickets): takeover checks before each request (#12).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -58,7 +65,7 @@ use tokio::time::Instant;
 use zeron_proto::provider_cloud::{answer_uuid, control_uuid, event_uuid};
 use zeron_proto::{AgentEvent, DoneStatus, ProviderSession, RunRequest};
 
-use super::api::{ApiError, CloudClient, StreamItem};
+use super::api::{ApiError, CloudClient, EventAck, StreamItem};
 use super::credentials::ClaudeAccount;
 use super::mirror::{Control, Mirror};
 use super::{Bindings, PermissionMode, Settings};
@@ -108,6 +115,9 @@ pub(crate) struct RunSession {
     pub stream: BoxStream<'static, Result<StreamItem, ApiError>>,
     pub controls: RunControls,
     pub events: Events,
+    /// Started with no message (a host resuming the chat): no turn is known
+    /// to be running until the session shows one.
+    pub idle: bool,
 }
 
 pub(crate) fn account_of(session: &ProviderSession) -> ClaudeAccount {
@@ -275,9 +285,9 @@ async fn post(
     bindings: &Bindings,
     session: &ProviderSession,
     payloads: Vec<Value>,
-) -> Result<(), ApiError> {
+) -> Result<Vec<EventAck>, ApiError> {
     if payloads.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let account = account_of(session);
     let acks = with_retries(|| client.send_events(&account, &session.session_id, payloads.clone()))
@@ -290,7 +300,7 @@ async fn post(
             bindings.mark_delivered(&session.session_id, uuid);
         }
     }
-    Ok(())
+    Ok(acks)
 }
 
 /// Whether the session's history after `seq` holds a `control_response` for
@@ -351,7 +361,9 @@ fn close_all(open: &mut HashMap<String, OpenPrompt>) {
 
 impl RunSession {
     async fn post(&mut self, payloads: Vec<Value>) -> Result<(), ApiError> {
-        post(&self.client, &self.bindings, &self.session, payloads).await
+        post(&self.client, &self.bindings, &self.session, payloads)
+            .await
+            .map(drop)
     }
 
     /// Send `message` now (with the settings it changed ahead of it),
@@ -432,13 +444,22 @@ impl RunSession {
     pub async fn run(mut self) {
         let session_id = self.session.session_id.clone();
         let (mut opening, opening_actual) = std::mem::take(&mut self.opening_changes);
+        let prompted = self.opening.is_some();
         if let Some((uuid, prompt)) = self.opening.take() {
             opening.push(user_payload(&uuid, &session_id, &prompt));
         }
-        if let Err(error) = self.post(opening).await {
-            fail(&self.events, error.to_string(), true).await;
-            return;
-        }
+        // A turn whose end is stored before this run's opening prompt is an
+        // earlier one (a replay catching the transcript up, or turns run
+        // elsewhere meanwhile): its end closes its own entry (its marker)
+        // and doesn't end this run's turn.
+        let floor = match post(&self.client, &self.bindings, &self.session, opening).await {
+            Ok(acks) if prompted => acks.last().and_then(|ack| ack.sequence_num).unwrap_or(0),
+            Ok(_) => 0,
+            Err(error) => {
+                fail(&self.events, error.to_string(), true).await;
+                return;
+            }
+        };
         if let Some(actual) = opening_actual {
             self.bindings.note_actual(&session_id, actual);
         }
@@ -450,7 +471,7 @@ impl RunSession {
         let mut open: HashMap<String, OpenPrompt> = HashMap::new();
         // Request ids with a `control_response` in the mirrored history.
         let mut responded: HashSet<String> = HashSet::new();
-        let mut turn_active = true;
+        let mut turn_active = !self.idle;
         let mut steering_open = true;
         let mut stop_deadline: Option<Instant> = None;
         // Reconnects spent, when the stream last came up, and when the next
@@ -552,14 +573,24 @@ impl RunSession {
                         if let Some(settings) = mapped.settings {
                             self.bindings.note_actual(&session_id, settings);
                         }
+                        // The stored event's marker goes after everything it
+                        // mapped to (and after a prompt is up).
+                        let mark = mapped.mark;
+                        let earlier = mapped.seq.is_some_and(|seq| seq < floor);
                         match mapped.control {
                             Some(Control::Prompt { request_id, request, seq }) => {
                                 if stop_deadline.is_some()
                                     || responded.contains(&request_id)
                                     || open.contains_key(&request_id)
                                 {
+                                    if let Some(mark) = mark
+                                        && !send(&self.events, mark).await
+                                    {
+                                        break 'main;
+                                    }
                                     continue 'main;
                                 }
+                                turn_active = true;
                                 // A replay brings prompts long answered: the
                                 // history past this one says.
                                 match answered_in_history(&self.client, &self.session, &request_id, seq).await {
@@ -578,6 +609,11 @@ impl RunSession {
                                         }
                                     }
                                 }
+                                if let Some(mark) = mark
+                                    && !send(&self.events, mark).await
+                                {
+                                    break 'main;
+                                }
                                 continue 'main;
                             }
                             Some(Control::Responded { request_id }) => {
@@ -589,24 +625,26 @@ impl RunSession {
                                     task.abort();
                                 }
                                 responded.insert(request_id);
+                                if let Some(mark) = mark
+                                    && !send(&self.events, mark).await
+                                {
+                                    break 'main;
+                                }
                                 continue 'main;
                             }
                             None => {}
                         }
-                        // A message someone sent from elsewhere (claude.ai,
-                        // the phone) shows as theirs; this device's own were
-                        // written already.
-                        if let Some(person) = mapped.person {
-                            if self.bindings.was_delivered(&session_id, &person.uuid) {
-                                continue 'main;
-                            }
-                            if !send(&self.events, AgentEvent::UserMessage { text: person.text }).await {
-                                break 'main;
-                            }
+                        // A person's message (from here or elsewhere) rides
+                        // its marker: the engine writes it unless the
+                        // transcript has it. Either way a turn runs.
+                        if mapped.person.is_some() {
                             turn_active = true;
                         }
                         for mut event in mapped.events {
                             let turn_over = matches!(event, AgentEvent::Done { .. });
+                            if turn_over && earlier {
+                                continue;
+                            }
                             if turn_over && stop_deadline.is_some()
                                 && let AgentEvent::Done { status, .. } = &mut event
                             {
@@ -616,13 +654,23 @@ impl RunSession {
                                 break 'main;
                             }
                             if !turn_over {
+                                turn_active = true;
                                 continue;
                             }
                             turn_active = false;
                             reconnects = 0;
                             if stop_deadline.is_some() || !steering_open {
+                                // The turn's end is committed with its marker.
+                                if let Some(mark) = mark {
+                                    let _ = send(&self.events, mark).await;
+                                }
                                 break 'main;
                             }
+                        }
+                        if let Some(mark) = mark
+                            && !send(&self.events, mark).await
+                        {
+                            break 'main;
                         }
                     }
                     ended => {

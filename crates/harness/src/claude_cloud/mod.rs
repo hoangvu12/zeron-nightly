@@ -35,7 +35,9 @@ use zeron_proto::{
     SteeringMode,
 };
 
-use crate::provider_cloud::{CreateSession, ProviderCloud, ProviderCloudError, RunBinding};
+use crate::provider_cloud::{
+    CreateSession, ProviderCloud, ProviderCloudError, ProviderResume, RunBinding,
+};
 use crate::{Harness, HarnessError, RunControls};
 use api::{ApiError, CloudClient};
 use credentials::{ClaudeConfigDir, CredentialError, Credentials};
@@ -89,9 +91,11 @@ struct SessionState {
     prompt_uuid: Option<String>,
     /// Event uuids this device already delivered to the session.
     delivered: HashSet<String>,
-    /// The highest stored sequence number mirrored so far. `None` after a
-    /// restart, until a durable watermark replaces this.
+    /// The highest stored sequence number mirrored so far in this process.
     last_seq: Option<u64>,
+    /// Where the next fresh run picks up, from the chat document (the
+    /// engine's [`RunBinding::resume`]); wins over `last_seq`.
+    resume: Option<ProviderResume>,
     /// The settings the session is in, as its last `system/init` (or this
     /// device's acknowledged change) said; `None` until known.
     actual: Option<Settings>,
@@ -147,8 +151,8 @@ pub(crate) struct RunStart {
     pub prompt_uuid: Option<String>,
     /// Whether the session already has the opening prompt.
     pub delivered: bool,
-    /// Where the stream starts.
-    pub from_seq: u64,
+    /// Where the stream starts, and what the transcript already has.
+    pub resume: ProviderResume,
     pub actual: Option<Settings>,
     pub ran_with: Option<Settings>,
 }
@@ -172,6 +176,7 @@ impl Bindings {
                 prompt_uuid: None,
                 delivered: HashSet::from([prompt_uuid]),
                 last_seq: Some(0),
+                resume: None,
                 // Every session starts in `default` (each recorded
                 // `system/init`), on the model it was created with.
                 actual: Some(Settings {
@@ -190,6 +195,7 @@ impl Bindings {
             Some(state) => {
                 state.session = binding.session;
                 state.prompt_uuid = binding.prompt_uuid;
+                state.resume = binding.resume;
             }
             None => {
                 sessions.insert(
@@ -199,6 +205,7 @@ impl Bindings {
                         prompt_uuid: binding.prompt_uuid,
                         delivered: HashSet::new(),
                         last_seq: None,
+                        resume: binding.resume,
                         actual: None,
                         ran_with: None,
                     },
@@ -212,11 +219,20 @@ impl Bindings {
         let mut sessions = self.lock();
         let state = sessions.get_mut(session_id)?;
         let uuid = state.prompt_uuid.take();
+        let resume = state.resume.take().unwrap_or_else(|| {
+            let seq = state.last_seq.unwrap_or(0);
+            ProviderResume {
+                from_sequence_num: seq,
+                mirrored_through: seq,
+                watermark: seq,
+                open_prompts: Vec::new(),
+            }
+        });
         Some(RunStart {
             session: state.session.clone(),
             delivered: uuid.as_ref().is_some_and(|u| state.delivered.contains(u)),
             prompt_uuid: uuid,
-            from_seq: state.last_seq.unwrap_or(0),
+            resume,
             actual: state.actual.clone(),
             ran_with: state.ran_with.clone(),
         })
@@ -247,13 +263,6 @@ impl Bindings {
         if let Some(state) = self.lock().get_mut(session_id) {
             state.delivered.insert(uuid.to_owned());
         }
-    }
-
-    /// Whether this device sent the event `uuid` to the session.
-    pub(crate) fn was_delivered(&self, session_id: &str, uuid: &str) -> bool {
-        self.lock()
-            .get(session_id)
-            .is_some_and(|state| state.delivered.contains(uuid))
     }
 
     pub(crate) fn note_seq(&self, session_id: &str, seq: u64) {
@@ -455,6 +464,29 @@ impl Harness for ClaudeCloudHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.start(request, controls, false).await
+    }
+
+    /// A host resuming the chat with no message (after a restart, or taking
+    /// it over): the run sends nothing, catches the transcript up from where
+    /// its document says it got to, asks again the prompts still open, and
+    /// mirrors whatever the session does next.
+    async fn start_idle(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.start(request, controls, true).await
+    }
+}
+
+impl ClaudeCloudHarness {
+    async fn start(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+        idle: bool,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let session_id = zeron_proto::provider_cloud::claude_session_from_cwd(&request.cwd)
             .ok_or_else(|| {
                 HarnessError::Protocol(
@@ -473,7 +505,7 @@ impl Harness for ClaudeCloudHarness {
         let account = session::account_of(&start.session);
         let stream = self
             .client
-            .stream(&account, &session_id, start.from_seq)
+            .stream(&account, &session_id, start.resume.from_sequence_num)
             .await
             .map_err(harness_error)?;
         let (events, receiver) = mpsc::channel(256);
@@ -487,7 +519,12 @@ impl Harness for ClaudeCloudHarness {
             &session::settings_of(&request),
         );
         // A message with no id is a new one: its own uuid is minted here.
-        let opening = (!start.delivered && !request.prompt.trim().is_empty()).then(|| {
+        let opening_changes = if idle {
+            (Vec::new(), None)
+        } else {
+            opening_changes
+        };
+        let opening = (!idle && !start.delivered && !request.prompt.trim().is_empty()).then(|| {
             (
                 start
                     .prompt_uuid
@@ -502,11 +539,12 @@ impl Harness for ClaudeCloudHarness {
                 session: start.session,
                 opening,
                 opening_changes,
-                mirror: mirror::Mirror::new(request.cwd.clone(), start.from_seq),
+                mirror: mirror::Mirror::new(request.cwd.clone(), start.resume),
                 config: request,
                 stream,
                 controls,
                 events,
+                idle,
             }
             .run(),
         );

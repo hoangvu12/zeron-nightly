@@ -689,9 +689,14 @@ impl SessionDoc {
             .get_deep_value()
             .to_json_value();
         let raw: Vec<serde_json::Value> = serde_json::from_value(messages)?;
+        // A provider-run chat's duplicates (by provider uuid) never show,
+        // even before the host's sweep deletes them.
+        let hidden = self.hidden_duplicates();
         Ok(raw
             .into_iter()
-            .filter_map(|v| match entry_from_json(v) {
+            .enumerate()
+            .filter(|(index, _)| !hidden.contains(index))
+            .filter_map(|(_, v)| match entry_from_json(v) {
                 Ok(entry) => Some(entry),
                 Err(err) => {
                     tracing::warn!(
@@ -1433,6 +1438,14 @@ pub struct SegmentWriter<'a> {
     /// What `durationMs` counts from: `created_at`, or an earlier moment the
     /// turn really began ([`Self::count_duration_from`]).
     duration_from: i64,
+    /// The entry's map, held by container id: an entry deleted above it
+    /// (a provider-run chat's duplicate sweep) never redirects the writes.
+    map: Option<LoroMap>,
+    /// Rebuilding a provider-run chat's cut-off entry
+    /// ([`Self::rebuild`]): writes wait until [`Self::release`].
+    held: bool,
+    /// The next write replaces every part the entry has.
+    replace: bool,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -1467,7 +1480,41 @@ impl<'a> SegmentWriter<'a> {
             written: Vec::new(),
             created_at,
             duration_from: created_at,
+            map: Some(map),
+            held: false,
+            replace: false,
         })
+    }
+
+    /// Write a provider-run chat's cut-off entry at `entry_index` over
+    /// again from a replay of its provider events: nothing is written until
+    /// [`Self::release`], so the entry shows what it had (its open question
+    /// included) meanwhile; the first write after replaces all its parts and
+    /// makes it `streaming` again.
+    pub fn rebuild(doc: &'a SessionDoc, entry_index: usize) -> Self {
+        let mut writer = Self::resume(doc, entry_index, Vec::new());
+        writer.held = true;
+        writer.replace = true;
+        writer
+    }
+
+    /// The replay caught up: the next write replaces the entry's parts.
+    pub fn release(&mut self) {
+        self.held = false;
+    }
+
+    /// Whether writes still wait for [`Self::release`].
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Stamp the entry with the provider event it starts from
+    /// (`providerUuid`, `providerSeq`).
+    pub fn set_provider(&self, uuid: &str, sequence_num: u64) -> Result<(), DocError> {
+        let map = self.entry_map()?;
+        crate::provider_mirror::stamp_provider(&map, uuid, sequence_num)?;
+        self.doc.doc.commit();
+        Ok(())
     }
 
     /// Count this entry's `durationMs` from `started_at` (ms) rather than its
@@ -1494,12 +1541,19 @@ impl<'a> SegmentWriter<'a> {
             }
             _ => 0,
         };
+        let map = match doc.doc.get_list("messages").get(entry_index) {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Some(map),
+            _ => None,
+        };
         Self {
             doc,
             entry_index,
             written,
             created_at,
             duration_from: created_at,
+            map,
+            held: false,
+            replace: false,
         }
     }
 
@@ -1509,6 +1563,9 @@ impl<'a> SegmentWriter<'a> {
     }
 
     fn entry_map(&self) -> Result<LoroMap, DocError> {
+        if let Some(map) = &self.map {
+            return Ok(map.clone());
+        }
         let messages = self.doc.doc.get_list("messages");
         match messages.get(self.entry_index) {
             Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Ok(map),
@@ -1527,8 +1584,21 @@ impl<'a> SegmentWriter<'a> {
 
     /// Diff `folded` (the full folded segment so far) into the doc.
     pub fn sync(&mut self, folded: &[MessagePart]) -> Result<(), DocError> {
+        if self.held {
+            return Ok(());
+        }
         let parts = self.parts_list()?;
         let mut dirty = false;
+        if self.replace {
+            self.replace = false;
+            if !parts.is_empty() {
+                parts.delete(0, parts.len())?;
+            }
+            self.written.clear();
+            self.entry_map()?
+                .insert("status", status_str(MessageStatus::Streaming))?;
+            dirty = true;
+        }
 
         for (i, part) in folded.iter().enumerate() {
             match self.written.get(i) {
@@ -1596,6 +1666,7 @@ impl<'a> SegmentWriter<'a> {
     /// Finish the stream: sync final parts, stamp a terminal status, and
     /// record how long the turn ran (`now - createdAt`).
     pub fn finish(mut self, folded: &[MessagePart], status: MessageStatus) -> Result<(), DocError> {
+        self.held = false;
         self.sync(folded)?;
         let map = self.entry_map()?;
         map.insert("status", status_str(status))?;

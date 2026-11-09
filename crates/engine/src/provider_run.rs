@@ -23,16 +23,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use zeron_doc::SessionCommandPayload;
+use zeron_doc::{SessionCommandPayload, SessionDoc};
 use zeron_harness::provider_cloud::{
     AccountLogin, CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus,
-    RunBinding,
+    ProviderResume, RunBinding,
 };
 use zeron_proto::{Chat, ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
 
 use crate::EngineError;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
+use crate::sessions::SessionsEngine;
 use crate::workspace_host::WorkspaceHost;
 
 /// A `createChat` for a provider-run chat.
@@ -215,11 +216,154 @@ pub(crate) fn bind_run(
     let cloud = resolved
         .provider_cloud()
         .ok_or_else(|| refused("Claude cloud sessions are off on this device."))?;
+    let resume = doc_host
+        .open(chat_id)
+        .map(|handle| resume_point(handle.doc()))
+        .map_err(|e| refused(format!("This chat's transcript couldn't be read: {e}")))?;
     cloud.bind_run(RunBinding {
         session,
         prompt_uuid: message_id.map(zeron_proto::provider_cloud::event_uuid),
+        resume: Some(resume),
     });
     Ok(())
+}
+
+/// Resume a provider-run chat as its host, with no message: the entry point
+/// a device uses once it hosts the chat (after a restart, or having taken it
+/// over; ticket #12 calls it once its claim is echoed). Before connecting,
+/// duplicates go (the takeover sweep) and the harness is bound to the
+/// chat's session with the document's resume point: the replay starts at
+/// the lower of the watermark and just before the oldest prompt still open,
+/// so those prompts are asked again, and a turn cut off mid-way is written
+/// over again. The run then mirrors whatever the session does, and the
+/// chat's next message goes to it.
+///
+/// `Ok(false)`: a run is already live for the chat (nothing to do).
+/// Refused for a chat with no provider session, or when provider-run chats
+/// are off here. Whether this device should host the chat is the caller's
+/// call.
+pub(crate) async fn resume_as_host(
+    sessions: &SessionsEngine,
+    doc_host: &DocHost,
+    chat_id: &str,
+) -> Result<bool, EngineError> {
+    if sessions.has_run(chat_id) {
+        return Ok(false);
+    }
+    let workspace = doc_host.workspace();
+    let session = chat_session(workspace, doc_host, chat_id)
+        .ok_or_else(|| refused("This chat has no Claude cloud session, so it can't run."))?;
+    let handle = doc_host.open(chat_id)?;
+    handle
+        .doc()
+        .sweep_provider_duplicates()
+        .map_err(|e| refused(format!("This chat's transcript couldn't be cleaned up: {e}")))?;
+    bind_run(
+        sessions.registry(),
+        workspace,
+        doc_host,
+        HarnessId::ClaudeCodeCloud,
+        chat_id,
+        None,
+    )?;
+    let config = workspace
+        .and_then(|ws| ws.chat(chat_id).ok().flatten())
+        .and_then(|chat| chat.config)
+        .unwrap_or_else(|| ChatConfig {
+            harness: HarnessId::ClaudeCodeCloud,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            access: Default::default(),
+            plan: false,
+        });
+    let request = RunRequest {
+        prompt: String::new(),
+        harness: Some(HarnessId::ClaudeCodeCloud),
+        model: config.model,
+        reasoning: config.reasoning,
+        model_options: config.model_options,
+        cwd: zeron_proto::provider_cloud::claude_cwd(&session.session_id),
+        sandbox: config.sandbox,
+        auto_approve: false,
+        access: config.access,
+        plan: config.plan,
+        resume: None,
+        attachments: Vec::new(),
+        worktree: None,
+        mcp: None,
+        extra_mcp: Vec::new(),
+        env: Default::default(),
+    };
+    sessions.start_provider_resume(chat_id, request).await?;
+    Ok(true)
+}
+
+/// Whether a provider-run chat's document shows the session mid-way: a turn
+/// cut off before its end was mirrored, or a prompt still open.
+pub(crate) fn mirror_unfinished(doc: &SessionDoc) -> bool {
+    doc.provider_turn().is_some() || !doc.provider_open_prompts().is_empty()
+}
+
+/// On boot: resume every provider-run chat this device hosts whose
+/// transcript was cut off mid-turn or has a prompt open ([`resume_as_host`]),
+/// so the transcript catches up and the prompt is asked again without
+/// waiting for the next message. Idle chats catch up on their next message.
+pub(crate) fn resume_hosted_chats(sessions: &SessionsEngine, doc_host: &DocHost) {
+    let Ok(harness) = sessions.registry().resolve(HarnessId::ClaudeCodeCloud) else {
+        return;
+    };
+    if harness.provider_cloud().is_none() {
+        return;
+    }
+    let Some(workspace) = doc_host.workspace().cloned() else {
+        return;
+    };
+    let (sessions, host) = (sessions.clone(), doc_host.clone());
+    doc_host.spawn_worker(async move {
+        let chats = workspace.read_chats().unwrap_or_default();
+        for chat in chats {
+            if chat.device_id != host.device_id() || chat.provider_session.is_none() {
+                continue;
+            }
+            let unfinished = host
+                .open(&chat.id)
+                .is_ok_and(|handle| mirror_unfinished(handle.doc()));
+            if !unfinished {
+                continue;
+            }
+            if let Err(error) = resume_as_host(&sessions, &host, &chat.id).await {
+                tracing::warn!(chat = %chat.id, %error, "couldn't resume the provider-run chat");
+            }
+        }
+    });
+}
+
+/// Where a fresh run of a provider-run chat picks up, from its document
+/// (docs/design/provider-run-chats.md §5, "Replay watermark"): replay from
+/// the lower of the watermark and just before the oldest prompt still open,
+/// and write over again a turn that was cut off mid-way (from just before
+/// the first event that can have written to its entry).
+pub(crate) fn resume_point(doc: &SessionDoc) -> ProviderResume {
+    let watermark = doc.provider_watermark();
+    let mirrored_through = doc
+        .provider_turn()
+        .filter(|turn| doc.entry_index(&turn.entry_id).is_some())
+        .map_or(watermark, |turn| {
+            turn.from_seq.saturating_sub(1).min(watermark)
+        });
+    let open = doc.provider_open_prompts();
+    let from_sequence_num = open
+        .values()
+        .map(|seq| seq.saturating_sub(1))
+        .fold(mirrored_through, u64::min);
+    ProviderResume {
+        from_sequence_num,
+        mirrored_through,
+        watermark,
+        open_prompts: open.into_keys().collect(),
+    }
 }
 
 /// Record the harness's sign-in states in the chats this device hosts (see
@@ -296,4 +440,51 @@ fn record_states(
         }
     }
     written.retain(|chat, _| hosted.contains(chat.as_str()));
+}
+
+/// A provider-run chat's run in the engine's event loop: what the mirror
+/// bookkeeping (docs/design/provider-run-chats.md §5) needs between events.
+/// The loop itself applies each [`zeron_proto::AgentEvent::ProviderEvent`]
+/// (see `drive_run`).
+#[derive(Debug, Default)]
+pub(crate) struct MirrorState {
+    /// The replay watermark, as last committed.
+    pub watermark: u64,
+    /// The first provider event that can have written the current segment.
+    pub segment_floor: u64,
+    /// The entry the document's `providerTurn` names.
+    pub turn_entry: Option<String>,
+    /// The entry already stamped with the provider event it starts from.
+    pub stamped: Option<String>,
+    /// A cut-off entry being written over again holds its writes until a
+    /// marker at or past this sequence number (what it showed is replayed).
+    pub catch_up: Option<u64>,
+    /// A person's message on its way to the transcript: (uuid, seq).
+    pub pending_user: Option<(String, u64)>,
+}
+
+impl MirrorState {
+    pub fn new(doc: &SessionDoc) -> Self {
+        let watermark = doc.provider_watermark();
+        Self {
+            watermark,
+            segment_floor: watermark + 1,
+            turn_entry: doc.provider_turn().map(|turn| turn.entry_id),
+            ..Self::default()
+        }
+    }
+
+    /// The entry of a turn that was cut off mid-way (a restart, a dropped
+    /// run, another host's), to be written over again from the replay:
+    /// (entry id, position). [`resume_point`] replays from just before its
+    /// first event.
+    pub fn rebuild_target(&mut self, doc: &SessionDoc) -> Option<(String, usize)> {
+        let turn = doc.provider_turn()?;
+        let index = doc.entry_index(&turn.entry_id)?;
+        self.segment_floor = turn.from_seq;
+        self.stamped = None;
+        self.turn_entry = Some(turn.entry_id.clone());
+        self.catch_up = (turn.from_seq <= self.watermark).then_some(self.watermark);
+        Some((turn.entry_id, index))
+    }
 }

@@ -1194,6 +1194,41 @@ pub enum AgentEvent {
         parent_tool_use_id: String,
         event: Box<AgentEvent>,
     },
+    /// A provider-run chat's mirror passed one stored provider event
+    /// (docs/design/provider-run-chats.md §5): every event it mapped to came
+    /// before this marker, possibly none. The engine stamps the entry that
+    /// event wrote with its `uuid` and `sequence_num`, writes the person's
+    /// message the event is (unless the transcript has it already: this
+    /// device's own send, or a replay) under the `uuid`, and advances the
+    /// chat's replay watermark once that is committed. Engine-internal:
+    /// never published or journaled.
+    #[serde(rename_all = "camelCase")]
+    ProviderEvent {
+        uuid: String,
+        sequence_num: u64,
+        /// The event is a person's message, sent to the session by some
+        /// client: its text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// The event ended a turn (a `result` with nothing queued behind
+        /// it), whether or not the run passed that end on as a `Done`.
+        #[serde(default)]
+        turn_end: bool,
+        /// The event asked a prompt, or answered one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<ProviderPrompt>,
+    },
+}
+
+/// A prompt the session asked (a `control_request` `can_use_tool`) or
+/// answered (any `control_response`), by its provider `request_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProviderPrompt {
+    #[serde(rename_all = "camelCase")]
+    Asked { request_id: String },
+    #[serde(rename_all = "camelCase")]
+    Answered { request_id: String },
 }
 
 #[cfg(test)]

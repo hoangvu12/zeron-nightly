@@ -353,6 +353,12 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         provider_run::follow_sign_in_states(&registry, &doc_host);
+        // Provider-run chats this device hosts that a shutdown or crash cut
+        // off mid-turn (or with a prompt open) catch up now. Like recovery,
+        // not while a new version is on trial.
+        if !zeron_update::transaction::in_trial() {
+            provider_run::resume_hosted_chats(&sessions, &doc_host);
+        }
         let repos = Repos::new(data_dir, &device_id);
         sessions.set_scratch_root(repos.scratch_root());
         doc_host.set_repos(repos.clone());
@@ -678,6 +684,19 @@ impl EngineCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|cloud| cloud.broker().clone())
+    }
+
+    /// Resume provider-run chat `chat_id` as its host, with no message
+    /// (docs/design/provider-run-chats.md §5): duplicates are swept, the
+    /// replay picks up from the document's watermark (or just before the
+    /// oldest prompt still open, which is asked again), a turn cut off
+    /// mid-way is written over again, and the session's activity is
+    /// mirrored from then on. For a device that has just become the chat's
+    /// host (takeover, ticket #12) or restarted. `Ok(false)` when a run is
+    /// already live for the chat. Deciding whether this device should host
+    /// it is the caller's job.
+    pub async fn resume_provider_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
+        provider_run::resume_as_host(&self.sessions, &self.doc_host, chat_id).await
     }
 
     pub async fn shutdown(&self) {
