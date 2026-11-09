@@ -77,3 +77,5 @@ tar = "0.4"
 flate2 = "1"
 # In-process registry server for the two-engine workspace integration tests.
 zeron-sync = { workspace = true, features = ["mock-server"] }
+# Fake Claude Code session server + stub `claude` (provider-run chats).
+zeron-provider-fake.workspace = true

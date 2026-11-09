@@ -50,6 +50,11 @@ pub struct HarnessDescriptor {
     /// pickers (built-in agents have marks of their own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// The harness's chats work in a remote workspace (a provider cloud):
+    /// files, diff, terminal, background processes, forks and side chats
+    /// don't apply to them. Absent (false) from engines predating it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_workspace: bool,
 }
 
 impl HarnessDescriptor {
@@ -96,6 +101,7 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         access_modes: harness.access_modes().to_vec(),
         supports_plan: harness.supports_plan(),
         icon: None,
+        remote_workspace: harness.remote_workspace(),
     }
 }
 
@@ -808,6 +814,12 @@ pub fn registry_for_platform(platform: &str) -> HarnessRegistry {
     let registry = full_registry();
     if platform == zeron_proto::CLOUD_PLATFORM {
         registry.retain(|id| id == HarnessId::Mock || CLOUD_HARNESS_IDS.contains(&id));
+    } else if zeron_harness::claude_cloud::enabled()
+        && let Some(config) = zeron_harness::claude_cloud::ClaudeCloudConfig::device_default()
+    {
+        // Provider-run chats (Claude cloud sessions): off unless switched on
+        // (docs/design/provider-run-chats.md; the setting is ticket #4's).
+        registry.register(Arc::new(zeron_harness::ClaudeCloudHarness::new(config)));
     }
     registry
 }
@@ -866,6 +878,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::ClaudeCode,
             name: "Claude Code".into(),
             supports_steering: true,
@@ -897,6 +910,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Codex,
             name: "Codex".into(),
             supports_steering: true,
@@ -925,6 +939,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Cursor,
             name: "Cursor".into(),
             supports_steering: true,
@@ -946,6 +961,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Devin,
             name: "Devin".into(),
             supports_steering: true,
@@ -967,6 +983,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Grok,
             name: "Grok".into(),
             supports_steering: true,
@@ -992,6 +1009,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Hermes,
             name: "Hermes".into(),
             supports_steering: true,
@@ -1009,6 +1027,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Fx,
             name: "fx".into(),
             supports_steering: true,
@@ -1027,6 +1046,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
@@ -1049,6 +1069,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Opencode,
             name: "OpenCode".into(),
             supports_steering: true,
@@ -1076,6 +1097,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Antigravity,
             name: "Antigravity".into(),
             supports_steering: true,
@@ -1095,6 +1117,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Muse,
             name: "Muse Code".into(),
             supports_steering: true,
@@ -1120,6 +1143,7 @@ mod tests {
     fn mid_turn_steering_requires_support_and_a_step_boundary() {
         let mut descriptor = HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: HarnessId::Mock,
             name: "Mock".into(),
             supports_steering: true,
@@ -1150,6 +1174,7 @@ mod tests {
         registry.register_lazy(
             HarnessDescriptor {
                 icon: None,
+                remote_workspace: false,
                 id: HarnessId::Mock,
                 name: "Lazy Mock".into(),
                 supports_steering: true,
@@ -1319,6 +1344,7 @@ mod tests {
         registry.register_lazy(
             HarnessDescriptor {
                 icon: None,
+                remote_workspace: false,
                 id,
                 name: format!("{id:?}"),
                 supports_steering: true,
@@ -1405,6 +1431,7 @@ mod tests {
         registry.register_lazy(
             HarnessDescriptor {
                 icon: None,
+                remote_workspace: false,
                 id: HarnessId::Grok,
                 name: "Grok".into(),
                 supports_steering: true,

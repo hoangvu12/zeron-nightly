@@ -346,6 +346,11 @@ pub struct SessionsEngine {
 }
 
 impl SessionsEngine {
+    /// The harnesses this engine runs.
+    pub(crate) fn registry(&self) -> &Arc<HarnessRegistry> {
+        &self.inner.registry
+    }
+
     pub fn new(
         device_id: String,
         journal: Arc<RunJournal>,
@@ -2633,7 +2638,10 @@ impl Inner {
         cwd: &str,
         harness: HarnessId,
     ) {
-        if session_id.is_empty() {
+        // A provider-run chat's session is its `providerSession`, never a
+        // local resume id: older engines would resume `harnessSessionId` as
+        // a local Claude Code session.
+        if session_id.is_empty() || harness.runs_in_provider_cloud() {
             return;
         }
         lock(&self.harness_sessions).insert(

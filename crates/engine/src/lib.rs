@@ -62,6 +62,7 @@ mod plugin_agents;
 pub mod plugins;
 pub mod profile;
 pub mod project_actions;
+mod provider_run;
 pub mod registry;
 pub mod remote_terminals;
 pub mod repos;

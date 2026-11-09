@@ -6005,6 +6005,19 @@ impl DocHost {
         request: zeron_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        // A provider-run chat has no checkout here: tell its harness which
+        // session (and account) the run acts for instead.
+        if harness.runs_in_provider_cloud() {
+            crate::provider_run::bind_run(
+                sessions.registry(),
+                self.workspace(),
+                self,
+                harness,
+                chat_id,
+                message_id.as_deref(),
+            )?;
+            return sessions.dispatch(chat_id, harness, request, message_id).await;
+        }
         if let Some(workspace) = self.workspace()
             && let Some(context) = self.capture_source_context(&request.cwd).await
             && let Err(err) = workspace.set_chat_source_context(chat_id, &context)

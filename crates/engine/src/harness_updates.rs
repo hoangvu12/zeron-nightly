@@ -545,7 +545,9 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "",
         },
-        HarnessId::Mock => ProviderSpec {
+        // Provider-run chats run at the provider: nothing on this device to
+        // update (their logins' CLI is Claude Code's own row).
+        HarnessId::Mock | HarnessId::ClaudeCodeCloud => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Manual,
             update_args: None,

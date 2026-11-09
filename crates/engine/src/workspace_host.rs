@@ -1117,6 +1117,7 @@ impl WorkspaceHost {
                 child_kind: child_kind.filter(|_| parent.is_some()),
                 parent_chat_id: parent,
                 sleep: None,
+                provider_session: None,
             })
         })?;
         Ok(())
@@ -1465,6 +1466,17 @@ impl WorkspaceHost {
     /// worktree). Resume is cwd-scoped — the next run there starts fresh.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_cwd(chat_id, cwd))?)
+    }
+
+    /// Record a provider-run chat's provider session (`providerSession`, a
+    /// field-only update written once). `false`: no row, or the row already
+    /// names another session.
+    pub fn set_chat_provider_session(
+        &self,
+        chat_id: &str,
+        session: &zeron_proto::ProviderSession,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_provider_session(chat_id, session))?)
     }
 
     /// Canonical checkout identity for the chat's cwd (diff grouping key).

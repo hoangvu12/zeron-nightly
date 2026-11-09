@@ -130,7 +130,7 @@ pub(super) fn default_hermes_home() -> PathBuf {
 /// The CLI a user would run for `harness` (named in reasons and errors).
 pub(super) fn cli_name(harness: HarnessId) -> &'static str {
     match harness {
-        HarnessId::ClaudeCode => "claude",
+        HarnessId::ClaudeCode | HarnessId::ClaudeCodeCloud => "claude",
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "Cursor",
         HarnessId::Grok => "grok",
