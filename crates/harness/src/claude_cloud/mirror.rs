@@ -8,10 +8,13 @@
 //!   assistant message whose text never streamed has it taken from the
 //!   stored message instead.
 //! - The session stores every person's message as a `user` event from a
-//!   client. The mirror hands those to the run ([`Control::UserMessage`]),
-//!   which drops the ones this device sent (it wrote them already) and shows
-//!   the rest: messages typed on claude.ai or the phone. The worker's own
-//!   plain `user` events (`[Request interrupted by user]`) show nothing.
+//!   client. The mirror hands those to the run ([`PersonMessage`]), which
+//!   drops the ones this device sent (it wrote them already) and shows the
+//!   rest: messages typed on claude.ai or the phone. The worker's own plain
+//!   `user` events (`[Request interrupted by user]`) show nothing.
+//! - Each turn's `system/init` says the session's model and permission mode
+//!   ([`Mapped::settings`]), which is how the run knows what a setting change
+//!   would change.
 //! - A stored event already seen (a reconnect replaying from an earlier
 //!   number) shows nothing again.
 //! - `SessionStarted` names this harness and the chat's pseudo `cwd`, and no
@@ -30,30 +33,51 @@ use serde_json::Value;
 use zeron_proto::{AgentEvent, HarnessId};
 
 use super::api::StreamItem;
+use super::{PermissionMode, Settings};
 use crate::claude::normalize::Normalizer;
 use crate::claude::wire::{ControlRequestBody, ControlRequestFrame, parse_frame};
 
 /// What the session's control traffic means for the run.
 #[derive(Debug)]
 pub(crate) enum Control {
-    /// The session asks: a permission prompt or AskUserQuestion.
+    /// The session asks: a permission prompt or AskUserQuestion, stored at
+    /// sequence number `seq`.
     Prompt {
         request_id: String,
         request: ControlRequestBody,
+        seq: Option<u64>,
     },
     /// A `control_response` for `request_id` is in the history: a prompt's
     /// answer (from any client), or the worker's reply to a control request.
     Responded { request_id: String },
-    /// A person's message, sent to the session by some client: this
-    /// device's own (an echo) or another's.
-    UserMessage { uuid: String, text: String },
+}
+
+/// A person's message, sent to the session by some client: this device's
+/// own (an echo) or another's.
+#[derive(Debug)]
+pub(crate) struct PersonMessage {
+    pub uuid: String,
+    pub text: String,
 }
 
 /// One stream item, mapped.
 #[derive(Debug, Default)]
 pub(crate) struct Mapped {
     pub events: Vec<AgentEvent>,
-    pub controls: Vec<Control>,
+    pub control: Option<Control>,
+    pub person: Option<PersonMessage>,
+    /// The session's settings, from a `system/init`.
+    pub settings: Option<Settings>,
+}
+
+/// What a payload is, as far as control traffic goes.
+enum Traffic {
+    /// Not control traffic: mirrored as events.
+    Other,
+    /// Control traffic that means nothing to the run (a client's own
+    /// request as the history stores it).
+    Ignored,
+    Control(Control),
 }
 
 /// Which kinds of delta streamed for one API message.
@@ -101,7 +125,7 @@ impl Mirror {
     }
 
     pub fn map(&mut self, item: StreamItem) -> Mapped {
-        let (payload, source) = match item {
+        let (payload, source, seq) = match item {
             StreamItem::Stored(stored) => {
                 if let Some(seq) = stored.sequence_num {
                     if seq <= self.last_seq {
@@ -109,22 +133,32 @@ impl Mirror {
                     }
                     self.last_seq = seq;
                 }
-                (stored.payload, stored.source)
+                (stored.payload, stored.source, stored.sequence_num)
             }
-            StreamItem::Ephemeral(payload) => (payload, None),
+            StreamItem::Ephemeral(payload) => (payload, None, None),
             StreamItem::Other { .. } => return Mapped::default(),
         };
-        let control =
-            control(&payload).or_else(|| user_message(&payload, source.as_deref()).map(Some));
-        match control {
-            Some(control) => Mapped {
-                events: Vec::new(),
-                controls: control.into_iter().collect(),
-            },
-            None => Mapped {
-                events: self.map_payload(payload),
-                controls: Vec::new(),
-            },
+        match traffic(&payload, seq) {
+            Traffic::Control(control) => {
+                return Mapped {
+                    control: Some(control),
+                    ..Mapped::default()
+                };
+            }
+            Traffic::Ignored => return Mapped::default(),
+            Traffic::Other => {}
+        }
+        if let Some(person) = person_message(&payload, source.as_deref()) {
+            return Mapped {
+                person: Some(person),
+                ..Mapped::default()
+            };
+        }
+        let settings = init_settings(&payload);
+        Mapped {
+            events: self.map_payload(payload),
+            settings,
+            ..Mapped::default()
         }
     }
 
@@ -141,7 +175,7 @@ impl Mirror {
                 .is_some_and(|n| n > 0);
         match kind {
             // A plain `user` event that isn't a person's message (those are
-            // [`Control::UserMessage`]s): the worker's own markers.
+            // [`PersonMessage`]s): the worker's own markers.
             "user" if main_feed && !carries_tool_results(&payload) => return out,
             "stream_event" => {
                 if let Some(message) = payload.get("api_message_id").and_then(Value::as_str) {
@@ -243,21 +277,25 @@ impl Mirror {
     }
 }
 
-/// The session's control traffic: `Some` for every `control_request` and
-/// `control_response` (with what it means, if anything), `None` for the rest.
-/// Only `can_use_tool` is a prompt; any other control request is a client's
-/// own (an interrupt, a mode change) as the history stores them.
-fn control(payload: &Value) -> Option<Option<Control>> {
-    match payload.get("type").and_then(Value::as_str)? {
-        "control_request" => {
-            let frame: ControlRequestFrame = serde_json::from_value(payload.clone()).ok()?;
-            let prompt = frame.request.subtype == "can_use_tool" && !frame.request_id.is_empty();
-            Some(prompt.then_some(Control::Prompt {
+/// What `payload` (stored at `seq`) is as control traffic. Only
+/// `can_use_tool` is a prompt; any other control request is a client's own
+/// (an interrupt, a mode change) as the history stores them.
+fn traffic(payload: &Value, seq: Option<u64>) -> Traffic {
+    match payload.get("type").and_then(Value::as_str) {
+        Some("control_request") => {
+            let Ok(frame) = serde_json::from_value::<ControlRequestFrame>(payload.clone()) else {
+                return Traffic::Ignored;
+            };
+            if frame.request.subtype != "can_use_tool" || frame.request_id.is_empty() {
+                return Traffic::Ignored;
+            }
+            Traffic::Control(Control::Prompt {
                 request_id: frame.request_id,
                 request: frame.request,
-            }))
+                seq,
+            })
         }
-        "control_response" => {
+        Some("control_response") => {
             let response = payload.get("response");
             let field = |key: &str| {
                 response
@@ -274,15 +312,30 @@ fn control(payload: &Value) -> Option<Option<Control>> {
                 );
             }
             let request_id = field("request_id").to_owned();
-            Some((!request_id.is_empty()).then_some(Control::Responded { request_id }))
+            if request_id.is_empty() {
+                return Traffic::Ignored;
+            }
+            Traffic::Control(Control::Responded { request_id })
         }
-        _ => None,
+        _ => Traffic::Other,
     }
+}
+
+/// The session's settings, from a `system/init`.
+fn init_settings(payload: &Value) -> Option<Settings> {
+    let field = |key: &str| payload.get(key).and_then(Value::as_str);
+    if field("type") != Some("system") || field("subtype") != Some("init") {
+        return None;
+    }
+    Some(Settings {
+        model: field("model").map(str::to_owned),
+        mode: PermissionMode::from_wire(field("permissionMode")?)?,
+    })
 }
 
 /// A person's message: a main-feed `user` event a client sent (not the
 /// worker's), with text and no tool results.
-fn user_message(payload: &Value, source: Option<&str>) -> Option<Control> {
+fn person_message(payload: &Value, source: Option<&str>) -> Option<PersonMessage> {
     if payload.get("type").and_then(Value::as_str) != Some("user")
         || source == Some("worker")
         || !payload.get("parent_tool_use_id").is_none_or(Value::is_null)
@@ -304,7 +357,7 @@ fn user_message(payload: &Value, source: Option<&str>) -> Option<Control> {
         return None;
     }
     let uuid = payload.get("uuid").and_then(Value::as_str)?.to_owned();
-    Some(Control::UserMessage { uuid, text })
+    Some(PersonMessage { uuid, text })
 }
 
 /// Whether a `user` payload carries tool results (the worker's own

@@ -51,12 +51,14 @@ async fn rig_with(enabled: bool, prepare: impl FnOnce(&ClaudeLogin, &StubClaude)
     prepare(&login, &stub);
     let registry = HarnessRegistry::new();
     if enabled {
-        registry.register(Arc::new(ClaudeCloudHarness::new(ClaudeCloudConfig {
-            base_url: fake.base_url().to_owned(),
-            login: ClaudeConfigDir::at(login.dir()),
-            claude_executable: Some(stub.path().to_owned()),
-        })
-        .expect("harness builds")));
+        registry.register(Arc::new(
+            ClaudeCloudHarness::new(ClaudeCloudConfig {
+                base_url: fake.base_url().to_owned(),
+                login: ClaudeConfigDir::at(login.dir()),
+                claude_executable: Some(stub.path().to_owned()),
+            })
+            .expect("harness builds"),
+        ));
     }
     let core = EngineCore::assemble(
         &tmp.path().join("data"),
@@ -771,4 +773,40 @@ async fn a_message_typed_on_claude_ai_shows_as_the_persons() {
         1
     );
     rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutting_the_engine_down_mid_turn_leaves_the_session_working() {
+    let rig = rig().await;
+    let (chat, cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    let (held, gate) = Turn::text_zulu().hold_after(is_text_delta);
+    rig.fake.queue_turn(held);
+    rig.send(&chat, &cwd, SECOND, SECOND_PROMPT);
+    gate.reached().await;
+    wait_for("the streamed text", || {
+        rig.assistants(&chat, MessageStatus::Streaming)
+            .iter()
+            .any(|e| text_of(e).contains("ZULU"))
+    })
+    .await;
+
+    // Quitting Zeron is not a Stop: nothing goes to the session.
+    rig.core.shutdown().await;
+    let controls: Vec<_> = rig
+        .posted_payloads()
+        .into_iter()
+        .filter(|p| p["type"] == "control_request")
+        .collect();
+    assert!(controls.is_empty(), "{controls:?}");
+    // The session works on with every device off, and finishes the turn.
+    assert!(rig.fake.turn_playing(&sid));
+    gate.release();
+    wait_for("the turn finished at the provider", || {
+        !rig.fake.turn_playing(&sid)
+    })
+    .await;
+    let last = rig.fake.stored_events(&sid).pop().unwrap();
+    assert_eq!(last.payload["subtype"], "success");
 }

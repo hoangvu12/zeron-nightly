@@ -64,6 +64,8 @@ pub struct Fault {
     pub path_contains: String,
     pub status: u16,
     pub times: usize,
+    /// A `Retry-After` (seconds) on the failure.
+    pub retry_after: Option<u64>,
 }
 
 /// A session that exists before the test starts (another device's, or one
@@ -487,7 +489,13 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             fault.times -= 1;
             let status =
                 StatusCode::from_u16(fault.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            return Ok(error(status, "injected_error", "injected by the test"));
+            let mut response = error(status, "injected_error", "injected by the test");
+            if let Some(seconds) = fault.retry_after {
+                response
+                    .headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, seconds.into());
+            }
+            return Ok(response);
         }
     }
     let token = recorded

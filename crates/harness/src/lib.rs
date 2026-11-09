@@ -88,7 +88,9 @@ pub struct TurnControl {
 impl TurnControl {
     /// Host: the Zeron command (a Stop) behind the next stop or interrupt,
     /// noted before it is signalled. Drivers whose provider dedupes by event
-    /// id send the stop under it, so a re-executed Stop is one stop.
+    /// id send the stop under it, so a re-executed Stop is one stop. A stop
+    /// with none noted is the host's own teardown (shutdown, sign-out, a
+    /// replaced runtime): a provider-run session is left working.
     pub fn note_stop_command(&self, command_id: &str) {
         *self
             .stop_command

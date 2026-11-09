@@ -46,7 +46,12 @@ pub enum ApiError {
     #[error(transparent)]
     Credentials(#[from] CredentialError),
     #[error("Claude cloud returned {status}: {message}")]
-    Status { status: u16, message: String },
+    Status {
+        status: u16,
+        message: String,
+        /// How long the server asked to wait (`Retry-After`), if it did.
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("Claude cloud could not be reached: {0}")]
     Transport(String),
     #[error("Claude cloud sent a response Zeron can't read: {0}")]
@@ -54,6 +59,38 @@ pub enum ApiError {
     /// The feature turned itself off on this device (why).
     #[error("{0}")]
     Disabled(String),
+}
+
+impl ApiError {
+    /// Whether trying again later can work: the server couldn't be reached,
+    /// was busy (429) or failed (5xx). Never a refusal or a login problem.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Status { status, .. } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
+
+    /// How long the server asked to wait before trying again.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// A `Retry-After` in seconds (the API's form; a date isn't read).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
 }
 
 /// A sequence number, which the API writes as a string.
@@ -269,6 +306,7 @@ impl CloudClient {
         response: reqwest::Response,
     ) -> Result<T, ApiError> {
         let status = response.status();
+        let wait = retry_after(response.headers());
         let body = response
             .bytes()
             .await
@@ -277,6 +315,7 @@ impl CloudClient {
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 message: error_message(&body),
+                retry_after: wait,
             });
         }
         serde_json::from_slice(&body).map_err(|e| ApiError::Decode(e.to_string()))
@@ -412,10 +451,12 @@ impl CloudClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
+            let wait = retry_after(response.headers());
             let body = response.bytes().await.unwrap_or_default();
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 message: error_message(&body),
+                retry_after: wait,
             });
         }
         let bytes = response.bytes_stream().boxed();
