@@ -62,6 +62,7 @@ mod plugin_agents;
 pub mod plugins;
 pub mod profile;
 pub mod project_actions;
+mod provider_host;
 mod provider_run;
 pub mod registry;
 pub mod remote_terminals;
@@ -98,6 +99,7 @@ pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use project_actions::ProjectActionsStore;
+pub use provider_host::{HostPresence, ProviderHosting};
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -195,6 +197,8 @@ pub struct EngineCore {
     pub local_import: Option<local_import::LocalImporter>,
     /// Plugins under `{data}/plugins/` (the plugins contract).
     pub plugins: plugins::Plugins,
+    /// Hosting provider-run chats across devices (takeover on use).
+    pub provider_hosting: ProviderHosting,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -353,6 +357,13 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         provider_run::follow_sign_in_states(&registry, &doc_host);
+        let provider_hosting =
+            ProviderHosting::new(sessions.clone(), doc_host.clone(), workspace.clone());
+        {
+            let hosting = provider_hosting.clone();
+            doc_host.set_used_hook(Arc::new(move |chat_id: &str| hosting.used(chat_id)));
+        }
+        provider_hosting.start();
         // Provider-run chats this device hosts that a shutdown or crash cut
         // off mid-turn (or with a prompt open) catch up now. Like recovery,
         // not while a new version is on trial.
@@ -483,6 +494,7 @@ impl EngineCore {
             device_id,
             local_import,
             plugins,
+            provider_hosting,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),

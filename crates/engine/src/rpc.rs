@@ -95,6 +95,9 @@ use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+/// Why a provider-run chat has no forks or side chats.
+const PROVIDER_RUN_NO_SIDE_CHATS: &str =
+    "A Claude cloud chat's workspace is at Anthropic, so it has no forks or side chats.";
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 
 #[derive(Debug, Deserialize)]
@@ -3311,6 +3314,13 @@ impl RpcService for EngineRpc {
                     .chat(&p.source_chat_id)
                     .map_err(failed)?
                     .ok_or_else(|| RpcError::Failed("Source chat no longer exists".into()))?;
+                // A provider-run chat's workspace is at the provider: no
+                // fork, whoever asks (older clients included).
+                if source.provider_session.is_some()
+                    || self.workspace.is_provider_chat(&p.source_chat_id)
+                {
+                    return Err(RpcError::Failed(PROVIDER_RUN_NO_SIDE_CHATS.into()));
+                }
                 if source.device_id != self.doc_host.device_id() {
                     return Err(RpcError::Failed(
                         "Fork must be created on the source device".into(),
@@ -4010,6 +4020,24 @@ impl RpcService for EngineRpc {
                     }
                     other => other,
                 };
+                // No side chat of a provider-run chat (its workspace is at
+                // the provider), whoever asks.
+                if let MutateParams::CreateChat {
+                    parent_chat_id: Some(parent),
+                    child_kind,
+                    ..
+                } = &p
+                    && *child_kind != Some(zeron_proto::ChildKind::Subagent)
+                    && (self.workspace.is_provider_chat(parent)
+                        || self
+                            .workspace
+                            .chat(parent)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|chat| chat.provider_session.is_some()))
+                {
+                    return Err(RpcError::Failed(PROVIDER_RUN_NO_SIDE_CHATS.into()));
+                }
                 if let MutateParams::CreateChat {
                     chat_id,
                     space_id,

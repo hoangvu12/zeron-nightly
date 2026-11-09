@@ -50,7 +50,11 @@
 //! bounded number of times with backoff ([`RECONNECTS`]), then the run ends
 //! errored.
 //!
-//! Not here (later tickets): takeover checks before each request (#12).
+//! Before every request it sends, and before reconnecting, the run asks
+//! whether this device still hosts the chat
+//! ([`crate::provider_cloud::ProviderCloud::check_host`]); once another
+//! device does, it sends nothing more and ends quietly, the session working
+//! on (design §4, "Demotion").
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -339,6 +343,12 @@ async fn answered_in_history(
     Ok(false)
 }
 
+/// End the run quietly: another device hosts the chat now, and the session
+/// works on there.
+async fn demoted(events: &Events) {
+    let _ = send(events, done(DoneStatus::Interrupted, None)).await;
+}
+
 /// A prompt's answer, from the task that asked the person (or at once).
 type Answer = (String, Value);
 
@@ -360,7 +370,12 @@ fn close_all(open: &mut HashMap<String, OpenPrompt>) {
 }
 
 impl RunSession {
+    /// Send `payloads`, while this device still hosts the chat (asked
+    /// before every request; design §4).
     async fn post(&mut self, payloads: Vec<Value>) -> Result<(), ApiError> {
+        if !payloads.is_empty() && !self.bindings.hosts(&self.session.session_id) {
+            return Err(ApiError::NotHost);
+        }
         post(&self.client, &self.bindings, &self.session, payloads).await
     }
 
@@ -401,7 +416,13 @@ impl RunSession {
             &self.session.session_id,
             &message.prompt,
         ));
-        self.post(payloads).await.map_err(|e| e.to_string())?;
+        if let Err(error) = self.post(payloads).await {
+            if matches!(error, ApiError::NotHost) {
+                demoted(&self.events).await;
+                return Err(String::new());
+            }
+            return Err(error.to_string());
+        }
         let session_id = &self.session.session_id;
         if let Some(after) = after {
             self.bindings.note_actual(session_id, after);
@@ -446,7 +467,11 @@ impl RunSession {
             opening.push(user_payload(&uuid, &session_id, &prompt));
         }
         if let Err(error) = self.post(opening).await {
-            fail(&self.events, error.to_string(), true).await;
+            if matches!(error, ApiError::NotHost) {
+                demoted(&self.events).await;
+            } else {
+                fail(&self.events, error.to_string(), true).await;
+            }
             return;
         }
         if let Some(actual) = opening_actual {
@@ -490,6 +515,10 @@ impl RunSession {
                         break 'main;
                     }
                     if let Err(error) = self.post(vec![interrupt_payload(&event_uuid(&command))]).await {
+                        if matches!(error, ApiError::NotHost) {
+                            demoted(&self.events).await;
+                            break 'main;
+                        }
                         let message = format!(
                             "The stop didn't reach the Claude cloud session, so it may still be working: {error}"
                         );
@@ -516,6 +545,10 @@ impl RunSession {
                             open.remove(&request_id);
                             responded.insert(request_id);
                         }
+                        Err(ApiError::NotHost) => {
+                            demoted(&self.events).await;
+                            break 'main;
+                        }
                         Err(error) => {
                             // Not delivered: the question stays answerable.
                             let reasked = open.get(&request_id).filter(|p| p.asking.is_some()).map(|p| p.request.clone());
@@ -539,6 +572,10 @@ impl RunSession {
                     // replays strictly after it). Ticket #8 owns the durable
                     // watermark.
                     reconnect_at = None;
+                    if !self.bindings.hosts(&session_id) {
+                        demoted(&self.events).await;
+                        break 'main;
+                    }
                     let account = account_of(&self.session);
                     match self.client.stream(&account, &session_id, self.mirror.last_seq()).await {
                         Ok(stream) => {

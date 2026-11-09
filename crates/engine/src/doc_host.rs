@@ -313,6 +313,9 @@ struct DocHostInner {
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
+    /// Told when the person opens or sends to a chat on this device
+    /// (provider-run chats take over on use, `crate::provider_host`).
+    used: OnceLock<UsedHook>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -321,6 +324,9 @@ struct DocHostInner {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// See `DocHostInner::used`.
+pub(crate) type UsedHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The queued-attachment transfers a command's `pending://` refs imply —
 /// shared by the retry escort and the retry re-issue.
@@ -1090,6 +1096,7 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
+                used: OnceLock::new(),
                 http: reqwest::Client::builder()
                     .pool_max_idle_per_host(2)
                     .pool_idle_timeout(std::time::Duration::from_secs(10))
@@ -1521,6 +1528,19 @@ impl DocHost {
         });
     }
 
+    /// Be told whenever the person opens or sends to a chat on this device
+    /// (first wins).
+    pub(crate) fn set_used_hook(&self, hook: UsedHook) {
+        let _ = self.inner.used.set(hook);
+    }
+
+    /// The person opened or sent to `chat_id` here.
+    fn note_used(&self, chat_id: &str) {
+        if let Some(hook) = self.inner.used.get() {
+            hook(chat_id);
+        }
+    }
+
     /// The workspace host, once wired (tests may assemble a DocHost without one).
     pub fn workspace(&self) -> Option<&WorkspaceHost> {
         self.inner.workspace.get()
@@ -1541,6 +1561,7 @@ impl DocHost {
     /// Explicit viewport navigation; automatic watch retries and MCP reads use
     /// `open` instead. The sequence also orders focuses in the same millisecond.
     pub fn focus_chat(&self, chat_id: &str) -> Result<(), EngineError> {
+        self.note_used(chat_id);
         let handle = self.open_local(chat_id)?;
         let focus = self.inner.focus_clock.fetch_add(1, Ordering::AcqRel) + 1;
         handle.last_focus.fetch_max(focus, Ordering::AcqRel);
@@ -3648,6 +3669,7 @@ impl DocHost {
         // are ACKed. Persist that wake independently and recover it on restart.
         self.nudge_remote_host(chat_id);
         self.spawn_command_delivery(chat_id, entry, transfers);
+        self.note_used(chat_id);
         Ok(id)
     }
 
@@ -3705,6 +3727,7 @@ impl DocHost {
         // Same reasoning as a command: the user is acting in this chat again.
         self.unarchive_on_send(chat_id);
         self.nudge_remote_host(chat_id);
+        self.note_used(chat_id);
         Ok(id)
     }
 
@@ -5187,7 +5210,18 @@ impl DocHost {
     /// wired workspace host (bare-DocHost tests) every open chat is ours — M2's
     /// behavior, now the degenerate case.
     fn is_host(&self, chat_id: &str) -> bool {
-        self.workspace().is_none_or(|ws| ws.is_host(chat_id))
+        let Some(ws) = self.workspace() else {
+            return true;
+        };
+        // A provider-run chat's document says so even when its row is gone
+        // (deleted, or never synced here): then it isn't ours to claim.
+        if !ws.is_provider_chat(chat_id) {
+            let handle = lock(&self.inner.handles).get(chat_id).cloned();
+            if handle.is_some_and(|h| h.doc.provider_run_session().is_some()) {
+                ws.note_provider_chat(chat_id);
+            }
+        }
+        ws.is_host(chat_id)
     }
 
     /// Chat-config harness when the workspace row carries one, else the default.
