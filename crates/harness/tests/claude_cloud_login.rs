@@ -1,4 +1,4 @@
-//! `claude-code-cloud` logins (ticket #7): renewal through the stub `claude`
+//! `claude-code-cloud` logins: renewal through the stub `claude`
 //! (`auth status --json`), single-flight per folder, the 401 retry, the
 //! sign-in states and the kill switch, the torn-file re-read, and that Zeron
 //! never writes the login folder.

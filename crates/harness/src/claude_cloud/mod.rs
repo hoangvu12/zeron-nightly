@@ -40,13 +40,18 @@ use api::{ApiError, CloudClient};
 use credentials::{ClaudeConfigDir, CredentialError, Credentials};
 
 /// The switch that turns provider-run chats on for this device, until the
-/// "Claude cloud sessions" setting (ticket #4) replaces it.
+/// "Claude cloud sessions" setting replaces it.
 pub const ENABLE_ENV: &str = "ZERON_CLAUDE_CLOUD_SESSIONS";
 
 /// Whether provider-run chats are on: off unless [`ENABLE_ENV`] is `1`.
 pub fn enabled() -> bool {
     std::env::var(ENABLE_ENV).is_ok_and(|v| v.trim() == "1")
 }
+
+/// Session-list pages read, at most, looking for the account's cloud
+/// environment before concluding it has none.
+const ENVIRONMENT_PAGES: usize = 10;
+const ENVIRONMENT_PAGE_SIZE: usize = 50;
 
 /// Where and as whom the harness talks to the session API.
 #[derive(Debug, Clone)]
@@ -84,7 +89,7 @@ struct SessionState {
     /// Event uuids this device already delivered to the session.
     delivered: HashSet<String>,
     /// The highest stored sequence number mirrored so far. `None` after a
-    /// restart: ticket #8's durable watermark replaces this.
+    /// restart, until a durable watermark replaces this.
     last_seq: Option<u64>,
 }
 
@@ -224,17 +229,25 @@ impl ProviderCloud for ClaudeCloudHarness {
             .map_err(|e| provider_error(ApiError::Credentials(e)))?;
         // Zeron never calls the environment endpoints: a new session goes in
         // the account's existing cloud environment, the one its sessions use.
-        let page = self
-            .client
-            .list_sessions(&account, 50, None)
-            .await
-            .map_err(provider_error)?;
-        let environment = page
-            .data
-            .iter()
-            .find(|s| s.environment_kind.as_deref() == Some("anthropic_cloud"))
-            .and_then(|s| s.environment_id.clone())
-            .ok_or_else(|| {
+        let mut environment = None;
+        let mut cursor: Option<String> = None;
+        for _ in 0..ENVIRONMENT_PAGES {
+            let page = self
+                .client
+                .list_sessions(&account, ENVIRONMENT_PAGE_SIZE, cursor.as_deref())
+                .await
+                .map_err(provider_error)?;
+            environment = page
+                .data
+                .iter()
+                .find(|s| s.environment_kind.as_deref() == Some("anthropic_cloud"))
+                .and_then(|s| s.environment_id.clone());
+            cursor = page.next_cursor.filter(|c| !c.is_empty());
+            if environment.is_some() || cursor.is_none() {
+                break;
+            }
+        }
+        let environment = environment.ok_or_else(|| {
                 ProviderCloudError::Other(
                     "This Claude account has no cloud environment yet. Open claude.ai/code once, then try again."
                         .into(),
@@ -313,7 +326,7 @@ impl Harness for ClaudeCloudHarness {
         Ok(None)
     }
     /// The session runs whatever model its account's cloud offers; the picker
-    /// (ticket #4) lists Claude models only. No model means the default.
+    /// lists Claude models only. No model means the default.
     fn fallback_models(&self) -> Vec<Model> {
         vec![Model {
             id: "claude-opus-5-5".into(),

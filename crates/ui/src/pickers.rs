@@ -6738,7 +6738,7 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
 
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
-        // (Provider-run chats get a Claude-cloud mark of their own in #4.)
+        // (Provider-run chats share the Claude mark for now.)
         HarnessId::ClaudeCode | HarnessId::ClaudeCodeCloud | HarnessId::Mock => (
             crate::icons::CLAUDE_MARK,
             Some(crate::icons::claude_brand()),

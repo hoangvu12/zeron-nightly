@@ -553,6 +553,37 @@ fn provider_session_is_written_once_and_survives_whole_row_writes() {
 }
 
 #[test]
+fn a_provider_run_row_carries_its_session_in_the_op_that_creates_it() {
+    let session = zeron_proto::ProviderSession {
+        provider: "claude".into(),
+        session_id: "cse_fake0001".into(),
+        account_uuid: "acct-a".into(),
+        account_email: "a@example.test".into(),
+        org_id: "org-a".into(),
+    };
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.apply_state(0, true, 0, Vec::new());
+    let mut row = chat("chat-1", "dev-a");
+    row.provider_session = Some(session.clone());
+    doc.upsert_chat(&row).unwrap();
+    let batches = doc.take_pushable();
+    let ops: Vec<&RowOp> = batches.iter().flat_map(|b| b.ops.iter()).collect();
+    assert_eq!(ops.len(), 1, "one row op");
+    assert_eq!(
+        ops[0].set.as_ref().unwrap()["providerSession"],
+        serde_json::to_value(&session).unwrap()
+    );
+    // Written once: a whole-row write naming another session leaves it.
+    let mut other = row.clone();
+    other.provider_session = Some(zeron_proto::ProviderSession {
+        session_id: "cse_fake0002".into(),
+        ..session.clone()
+    });
+    doc.upsert_chat(&other).unwrap();
+    assert_eq!(doc.chat("chat-1").unwrap().unwrap().provider_session, Some(session));
+}
+
+#[test]
 fn broadcast_seq_gap_applies_rows_but_holds_the_cursor() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.apply_state(10, true, 0, Vec::new());

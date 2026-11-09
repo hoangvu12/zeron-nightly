@@ -1,6 +1,6 @@
-//! Provider-run chats whose Claude login needs renewing or a sign-in
-//! (ticket #7), through the engine's public request surface, against the
-//! fake session server and the stub `claude`.
+//! Provider-run chats whose Claude login needs renewing or a sign-in,
+//! through the engine's public request surface, against the fake session
+//! server and the stub `claude`.
 //!
 //! Asserted from outside only: what the fake server received, how many times
 //! the stub ran, the chat document's `providerState` (what the chat shows),

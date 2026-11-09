@@ -13,15 +13,12 @@
 //! - [`bind_run`]: before every fresh dispatch, the harness is told which
 //!   session and account the run acts for. A chat without a provider session
 //!   refuses to run.
-//!
 //! - [`follow_sign_in_states`]: what the harness learns about its logins
 //!   ("Sign in again", "Sign in as <email> to continue") is recorded in the
 //!   chat document of every chat this device hosts for that account
 //!   (`providerState`), and cleared once a request for it works again.
-//!
-//! Seams for later tickets: GitHub projects (#6), creation uncertainty (#11),
-//! hosting/takeover (#12, which adds the host check here before binding and
-//! publishes `hostUnavailable` for a chat whose account has no login here).
+//!   Publishing `hostUnavailable` for a chat whose account has no login here
+//!   belongs with hosting and takeover.
 
 use std::collections::HashMap;
 
@@ -78,18 +75,18 @@ pub(crate) async fn create_chat(
     let device_id = workspace.device_id().to_owned();
     if new.space_id.is_some() {
         return Err(refused(
-            "Anthropic cloud chats start with no project for now.",
+            "Provider-run chats start with no project for now.",
         ));
     }
     if new.device_id.as_deref().is_some_and(|d| d != device_id) {
         return Err(refused(
-            "An Anthropic cloud chat is created on the device you're using.",
+            "A provider-run chat is created on the device you're using.",
         ));
     }
     let prompt = new
         .prompt
         .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| refused("An Anthropic cloud chat starts with its first message."))?;
+        .ok_or_else(|| refused("A provider-run chat starts with its first message."))?;
     let harness = registry
         .resolve(HarnessId::ClaudeCodeCloud)
         .map_err(|_| refused("Claude cloud sessions are off on this device."))?;
@@ -105,7 +102,7 @@ pub(crate) async fn create_chat(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| zeron_proto::provider_cloud::title_from_prompt(&prompt));
     // Not idempotent: exactly one attempt. A failure here created nothing
-    // Zeron knows about; what an uncertain outcome shows is ticket #11's.
+    // Zeron knows about.
     let session = cloud
         .create_session(CreateSession {
             prompt: prompt.clone(),
@@ -126,20 +123,23 @@ pub(crate) async fn create_chat(
         ))
     };
     workspace
-        .create_chat_hosted(
+        .create_provider_run_chat(
             &chat_id,
-            None,
-            Some(&device_id),
-            Some(&device_id),
-            Some(new.config.clone()),
-            Some(cwd.clone()),
+            new.config.clone(),
+            cwd.clone(),
             new.parent_chat_id,
             new.child_kind,
+            &session,
         )
         .map_err(recorded)?;
-    workspace
+    // A row that already existed (the same session, imported) gets the
+    // field now if it lacked it; one naming another session is refused.
+    if !workspace
         .set_chat_provider_session(&chat_id, &session)
-        .map_err(recorded)?;
+        .map_err(recorded)?
+    {
+        return Err(recorded(refused("the chat names another provider session")));
+    }
     workspace.rename_chat(&chat_id, &title).map_err(recorded)?;
     let handle = doc_host.open(&chat_id).map_err(recorded)?;
     handle
