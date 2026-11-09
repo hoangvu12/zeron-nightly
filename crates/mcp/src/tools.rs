@@ -1264,7 +1264,7 @@ impl Tools {
         {
             mutate["branch"] = json!(branch);
         }
-        // A provider-run chat (Anthropic cloud): its session is created with
+        // A provider-run chat (Claude Code cloud): its session is created with
         // the first message, and the engine names the chat after it.
         let provider_run = harness.runs_in_provider_cloud();
         let provider_message = provider_run.then(|| uuid::Uuid::new_v4().to_string());
@@ -1273,7 +1273,7 @@ impl Tools {
                 .prompt
                 .as_deref()
                 .filter(|p| !p.trim().is_empty())
-                .context("An Anthropic cloud chat starts with its first message: pass a prompt")?;
+                .context("A provider-run chat starts with its first message: pass a prompt")?;
             mutate["prompt"] = json!(prompt);
             mutate["messageId"] = json!(message_id);
             if let Some(title) = args.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -1330,7 +1330,7 @@ impl Tools {
             created["chatId"]
                 .as_str()
                 .map(str::to_owned)
-                .context("the engine didn't name the Anthropic cloud chat")?
+                .context("the engine didn't name the provider-run chat")?
         } else {
             chat_id
         };

@@ -224,6 +224,8 @@ struct Inner {
     requests: Vec<RecordedRequest>,
     turns: VecDeque<Turn>,
     faults: Vec<Fault>,
+    /// Bearer tokens the server refuses with 401 (revoked or expired).
+    rejected_tokens: std::collections::HashSet<String>,
 }
 
 impl Inner {
@@ -290,10 +292,16 @@ impl FakeSessionServer {
     }
 
     pub fn seed_session(&self, seed: SeedSession) {
+        self.seed_session_of_kind(seed, "anthropic_cloud");
+    }
+
+    /// [`Self::seed_session`] in an environment of another kind (a
+    /// self-hosted `byoc` one, say).
+    pub fn seed_session_of_kind(&self, seed: SeedSession, environment_kind: &str) {
         let info = json!({
             "id": seed.id,
             "environment_id": seed.environment_id,
-            "environment_kind": "anthropic_cloud",
+            "environment_kind": environment_kind,
             "status": seed.status,
             "title": "seeded session",
             "created_at": seed.last_event_at,
@@ -316,6 +324,13 @@ impl FakeSessionServer {
 
     pub fn inject(&self, fault: Fault) {
         lock(&self.state).faults.push(fault);
+    }
+
+    /// From now on, every request carrying `token` gets a 401
+    /// `authentication_error`, as the real API answers a revoked or expired
+    /// token.
+    pub fn reject_token(&self, token: &str) {
+        lock(&self.state).rejected_tokens.insert(token.to_owned());
     }
 
     /// Every request received so far, in order.
@@ -475,15 +490,23 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             return Ok(error(status, "injected_error", "injected by the test"));
         }
     }
-    let authorized = recorded
+    let token = recorded
         .header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| !t.trim().is_empty());
-    if !authorized {
+        .map(str::trim)
+        .unwrap_or_default();
+    if token.is_empty() {
         return Ok(error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "missing bearer token",
+        ));
+    }
+    if lock(&state).rejected_tokens.contains(token) {
+        return Ok(error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "OAuth token has expired",
         ));
     }
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();

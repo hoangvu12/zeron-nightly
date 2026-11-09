@@ -1250,8 +1250,30 @@ impl RegistryDoc {
     // ── chats ───────────────────────────────────────────────────────────────
 
     pub fn upsert_chat(&mut self, chat: &Chat) -> Result<(), DocError> {
-        let set = Self::chat_fields(chat)?;
+        let mut set = Self::chat_fields(chat)?;
+        self.add_provider_session(chat, &mut set)?;
         self.write(KIND_CHATS, &chat.id, OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// A provider-run chat's `providerSession` rides the same row op as the
+    /// row (it is never written without it), but only as a value, never a
+    /// null, and only while the row names no other session: it is written
+    /// once. A chat without one leaves the field alone, as older engines do.
+    fn add_provider_session(
+        &self,
+        chat: &Chat,
+        set: &mut BTreeMap<String, Value>,
+    ) -> Result<(), DocError> {
+        let Some(session) = &chat.provider_session else {
+            return Ok(());
+        };
+        let recorded = self
+            .chat(&chat.id)?
+            .and_then(|existing| existing.provider_session);
+        if recorded.is_none_or(|recorded| recorded == *session) {
+            set.insert("providerSession".into(), serde_json::to_value(session)?);
+        }
         Ok(())
     }
 
@@ -1261,7 +1283,8 @@ impl RegistryDoc {
     /// write creates a truly missing row and nothing else: each field loses
     /// to any real write, and the row to a newer delete's tombstone.
     pub fn upsert_chat_at(&mut self, chat: &Chat, at: DateTime<Utc>) -> Result<(), DocError> {
-        let set = Self::chat_fields(chat)?;
+        let mut set = Self::chat_fields(chat)?;
+        self.add_provider_session(chat, &mut set)?;
         let hlc = self.hlc_at(at);
         let clocks = set.keys().map(|k| (k.clone(), hlc.clone())).collect();
         self.enqueue_ops(vec![RowOp {
@@ -1604,10 +1627,11 @@ impl RegistryDoc {
     }
 
     /// Record the provider cloud session a provider-run chat is tied to: a
-    /// field-only update of `providerSession`, written once. `upsert_chat`
-    /// never writes the field, so a later whole-row write (ours or an older
-    /// engine's) leaves it alone. `false` when there is no such row, or when
-    /// the row already names a different session (it never changes).
+    /// field-only update of `providerSession`, written once (a new chat
+    /// gets it in the row op that creates it, [`Self::upsert_chat`]). A
+    /// whole-row write of a chat without one (ours or an older engine's)
+    /// leaves it alone. `false` when there is no such row, or when the row
+    /// already names a different session (it never changes).
     pub fn set_chat_provider_session(
         &mut self,
         chat_id: &str,

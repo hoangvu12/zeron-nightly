@@ -8,6 +8,12 @@
 //!   account was checked against the one the request acts for;
 //! - calls only the session endpoints (list, create, events, stream,
 //!   history, archive). Never the environment or settings endpoints.
+//!
+//! A 401 has the CLI renew the login once, then the request is sent once
+//! more with the token read after it. A 401 to that retry turns the whole
+//! feature off on this device, saying why, and the chat's account shows
+//! "Sign in again". Every request's outcome for its account is published in
+//! [`CloudClient::status`].
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,9 +22,14 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use super::credentials::{ClaudeAccount, CredentialError, Credentials};
 use super::sse::SseDecoder;
+use crate::provider_cloud::{ProviderChatState, ProviderCloudStatus};
+
+/// Why the feature turns itself off after a 401 survives a renewal.
+pub const REJECTED_AFTER_RENEWAL: &str = "Claude cloud sessions turned off on this device: Claude refused the login even after the Claude CLI renewed it.";
 
 /// The production API.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -40,6 +51,9 @@ pub enum ApiError {
     Transport(String),
     #[error("Claude cloud sent a response Zeron can't read: {0}")]
     Decode(String),
+    /// The feature turned itself off on this device (why).
+    #[error("{0}")]
+    Disabled(String),
 }
 
 /// A sequence number, which the API writes as a string.
@@ -125,50 +139,135 @@ pub struct CloudClient {
     http: reqwest::Client,
     base: String,
     credentials: Arc<Credentials>,
+    /// The accounts' sign-in states and the kill switch.
+    status: watch::Sender<ProviderCloudStatus>,
 }
 
 impl CloudClient {
-    pub fn new(base_url: &str, credentials: Arc<Credentials>) -> Self {
+    /// Fails rather than fall back to a client without Zeron's
+    /// `User-Agent`: no request may go out unnamed.
+    pub fn new(base_url: &str, credentials: Arc<Credentials>) -> Result<Self, ApiError> {
         let base = base_url.trim_end_matches('/').to_owned();
         let mut builder = reqwest::Client::builder().user_agent(user_agent());
         // A loopback base (tests) must never go through a system proxy.
         if is_loopback(&base) {
             builder = builder.no_proxy();
         }
-        Self {
-            http: builder.build().unwrap_or_else(|_| reqwest::Client::new()),
+        let http = builder.build().map_err(|e| {
+            ApiError::Transport(format!("the HTTP client couldn't be set up ({e})"))
+        })?;
+        Ok(Self {
+            http,
             base,
             credentials,
-        }
+            status: watch::Sender::new(ProviderCloudStatus::default()),
+        })
     }
 
     pub fn credentials(&self) -> &Arc<Credentials> {
         &self.credentials
     }
 
-    async fn request(
+    /// The accounts' sign-in states and the kill switch, as they change.
+    pub fn status(&self) -> watch::Receiver<ProviderCloudStatus> {
+        self.status.subscribe()
+    }
+
+    /// Why the feature turned itself off on this device, if it did.
+    pub fn disabled(&self) -> Option<String> {
+        self.status.borrow().disabled.clone()
+    }
+
+    /// Record what `account`'s chats show now (`None`: its login works).
+    fn note(&self, account: &ClaudeAccount, state: Option<ProviderChatState>) {
+        self.status.send_if_modified(|status| {
+            if status.accounts.get(&account.account_uuid) == Some(&state) {
+                return false;
+            }
+            status.accounts.insert(account.account_uuid.clone(), state);
+            true
+        });
+    }
+
+    fn note_failure(&self, account: &ClaudeAccount, error: &CredentialError) {
+        if let Some(state) = error.chat_state(&account.email) {
+            self.note(account, Some(state));
+        }
+    }
+
+    /// Turn the feature off on this device, saying why.
+    fn trip(&self, reason: &str) {
+        tracing::error!(target: "zeron_harness::claude_cloud", reason, "Claude cloud sessions turned off");
+        self.status.send_if_modified(|status| {
+            if status.disabled.is_some() {
+                return false;
+            }
+            status.disabled = Some(reason.to_owned());
+            true
+        });
+    }
+
+    /// Send one request acting for `account`, `build` adding its query and
+    /// body. The token is read for this request only and dropped once it's
+    /// sent; a 401 has the CLI renew the login, then the request goes once
+    /// more (see the module docs).
+    async fn execute(
         &self,
         method: reqwest::Method,
         path: &str,
         account: &ClaudeAccount,
-    ) -> Result<reqwest::RequestBuilder, ApiError> {
-        // Read for this request only; dropped when the request is built.
-        let token = self.credentials.token_for(account).await?;
-        Ok(self
-            .http
-            .request(method, format!("{}{path}", self.base))
-            .header(reqwest::header::AUTHORIZATION, token.bearer())
-            .header("anthropic-version", API_VERSION))
+        build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ApiError> {
+        if let Some(reason) = self.disabled() {
+            return Err(ApiError::Disabled(reason));
+        }
+        let url = format!("{}{path}", self.base);
+        let mut token = match self.credentials.token_for(account).await {
+            Ok(token) => token,
+            Err(error) => {
+                self.note_failure(account, &error);
+                return Err(error.into());
+            }
+        };
+        let mut retry = false;
+        loop {
+            let sent = token.fingerprint();
+            let request = build(
+                self.http
+                    .request(method.clone(), &url)
+                    .header(reqwest::header::AUTHORIZATION, token.authorization())
+                    .header("anthropic-version", API_VERSION),
+            );
+            drop(token);
+            let response = request
+                .send()
+                .await
+                .map_err(|e| ApiError::Transport(without_url(&e)))?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                self.note(account, None);
+                return Ok(response);
+            }
+            if retry {
+                let error = CredentialError::Rejected;
+                self.note_failure(account, &error);
+                self.trip(REJECTED_AFTER_RENEWAL);
+                return Err(error.into());
+            }
+            retry = true;
+            token = match self.credentials.renew_rejected(account, sent).await {
+                Ok(token) => token,
+                Err(error) => {
+                    self.note_failure(account, &error);
+                    return Err(error.into());
+                }
+            };
+        }
     }
 
     async fn send_json<T: serde::de::DeserializeOwned>(
         &self,
-        request: reqwest::RequestBuilder,
+        response: reqwest::Response,
     ) -> Result<T, ApiError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport(without_url(&e)))?;
         let status = response.status();
         let body = response
             .bytes()
@@ -194,11 +293,12 @@ impl CloudClient {
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor.to_owned()));
         }
-        let request = self
-            .request(reqwest::Method::GET, "/v1/code/sessions", account)
-            .await?
-            .query(&query);
-        self.send_json(request).await
+        let response = self
+            .execute(reqwest::Method::GET, "/v1/code/sessions", account, |r| {
+                r.query(&query)
+            })
+            .await?;
+        self.send_json(response).await
     }
 
     /// `POST /v1/code/sessions`. Not idempotent: never retried here.
@@ -213,11 +313,12 @@ impl CloudClient {
             #[serde(default)]
             id: Option<String>,
         }
-        let request = self
-            .request(reqwest::Method::POST, "/v1/code/sessions", account)
-            .await?
-            .json(body);
-        let created: Created = self.send_json(request).await?;
+        let response = self
+            .execute(reqwest::Method::POST, "/v1/code/sessions", account, |r| {
+                r.json(body)
+            })
+            .await?;
+        let created: Created = self.send_json(response).await?;
         match created {
             Created {
                 session: Some(session),
@@ -248,15 +349,16 @@ impl CloudClient {
             .into_iter()
             .map(|payload| json!({ "payload": payload }))
             .collect();
-        let request = self
-            .request(
+        let body = json!({ "events": events });
+        let response = self
+            .execute(
                 reqwest::Method::POST,
                 &format!("/v1/code/sessions/{}/events", path_segment(session_id)),
                 account,
+                |r| r.json(&body),
             )
-            .await?
-            .json(&json!({ "events": events }));
-        let acks: Acks = self.send_json(request).await?;
+            .await?;
+        let acks: Acks = self.send_json(response).await?;
         Ok(acks.results)
     }
 
@@ -271,15 +373,15 @@ impl CloudClient {
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor.to_owned()));
         }
-        let request = self
-            .request(
+        let response = self
+            .execute(
                 reqwest::Method::GET,
                 &format!("/v1/code/sessions/{}/events", path_segment(session_id)),
                 account,
+                |r| r.query(&query),
             )
-            .await?
-            .query(&query);
-        self.send_json(request).await
+            .await?;
+        self.send_json(response).await
     }
 
     /// `GET /v1/code/sessions/{id}/events/stream?from_sequence_num=N`: the
@@ -290,24 +392,24 @@ impl CloudClient {
         session_id: &str,
         from_sequence_num: u64,
     ) -> Result<BoxStream<'static, Result<StreamItem, ApiError>>, ApiError> {
-        let mut request = self
-            .request(
+        let response = self
+            .execute(
                 reqwest::Method::GET,
                 &format!(
                     "/v1/code/sessions/{}/events/stream",
                     path_segment(session_id)
                 ),
                 account,
+                |r| {
+                    let r = r.header(reqwest::header::ACCEPT, "text/event-stream");
+                    if from_sequence_num > 0 {
+                        r.query(&[("from_sequence_num", from_sequence_num.to_string())])
+                    } else {
+                        r
+                    }
+                },
             )
-            .await?
-            .header(reqwest::header::ACCEPT, "text/event-stream");
-        if from_sequence_num > 0 {
-            request = request.query(&[("from_sequence_num", from_sequence_num.to_string())]);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport(without_url(&e)))?;
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();

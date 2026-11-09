@@ -3969,53 +3969,47 @@ impl RpcService for EngineRpc {
                 let p: MutateParams = parse_params(params)?;
                 // A provider-run chat: its session is created here, now, and
                 // names the chat (crate::provider_run).
-                if let MutateParams::CreateChat {
-                    config: Some(config),
-                    ..
-                } = &p
-                    && config.harness.runs_in_provider_cloud()
-                {
-                    let MutateParams::CreateChat {
+                let p = match p {
+                    MutateParams::CreateChat {
                         space_id,
                         device_id,
-                        config,
+                        config: Some(config),
                         parent_chat_id,
                         child_kind,
                         prompt,
                         message_id,
                         title,
                         ..
-                    } = p
-                    else {
-                        unreachable!("matched above")
-                    };
-                    let created = crate::provider_run::create_chat(
-                        &self.registry,
-                        &self.workspace,
-                        &self.doc_host,
-                        crate::provider_run::NewProviderChat {
-                            device_id,
-                            space_id,
-                            config: config.expect("matched above"),
-                            prompt,
-                            message_id,
-                            title,
-                            parent_chat_id: parent_chat_id
-                                .filter(|parent| !zeron_proto::voice::is_orchestrator_chat(parent)),
-                            child_kind,
-                        },
-                    )
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    return RpcReply::value(&serde_json::json!({
-                        "ok": true,
-                        "chatId": created.chat_id,
-                        "deviceId": created.device_id,
-                        "cwd": created.cwd,
-                        "messageId": created.message_id,
-                        "providerSession": created.session,
-                    }));
-                }
+                    } if config.harness.runs_in_provider_cloud() => {
+                        let created = crate::provider_run::create_chat(
+                            &self.registry,
+                            &self.workspace,
+                            &self.doc_host,
+                            crate::provider_run::NewProviderChat {
+                                device_id,
+                                space_id,
+                                config,
+                                prompt,
+                                message_id,
+                                title,
+                                parent_chat_id: parent_chat_id
+                                    .filter(|parent| !zeron_proto::voice::is_orchestrator_chat(parent)),
+                                child_kind,
+                            },
+                        )
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        return RpcReply::value(&serde_json::json!({
+                            "ok": true,
+                            "chatId": created.chat_id,
+                            "deviceId": created.device_id,
+                            "cwd": created.cwd,
+                            "messageId": created.message_id,
+                            "providerSession": created.session,
+                        }));
+                    }
+                    other => other,
+                };
                 if let MutateParams::CreateChat {
                     chat_id,
                     space_id,

@@ -44,7 +44,8 @@ async fn rig() -> Rig {
         base_url: fake.base_url().to_owned(),
         login: ClaudeConfigDir::at(login.dir()),
         claude_executable: Some(stub.path().to_owned()),
-    });
+    })
+    .expect("harness builds");
     Rig {
         _dir: dir,
         fake,
@@ -801,7 +802,8 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
         base_url: rig.fake.base_url().to_owned(),
         login: ClaudeConfigDir::at(rig.login.dir()),
         claude_executable: Some(rig.stub.path().to_owned()),
-    });
+    })
+    .expect("harness builds");
     other.provider_cloud().unwrap().bind_run(RunBinding {
         session: session.clone(),
         prompt_uuid: Some(SECOND.into()),
@@ -946,4 +948,65 @@ async fn a_stream_that_keeps_dropping_is_reconnected_a_bounded_number_of_times_w
         AgentEvent::Error { message } if message.contains("connection to the Claude cloud session was lost"))));
     assert_eq!(done_status(&events), Some(DoneStatus::Errored));
     gate.release();
+}
+
+#[tokio::test]
+async fn the_cloud_environment_is_found_past_the_first_page_of_sessions() {
+    let rig = rig().await;
+    // 60 newer sessions in another kind of environment push the account's
+    // cloud environment (seeded by `rig`, oldest) onto the second page.
+    for n in 0..60 {
+        rig.fake.seed_session_of_kind(
+            SeedSession {
+                id: format!("cse_fake_byoc{n:03}"),
+                environment_id: "env_fake_byoc".into(),
+                status: "active".into(),
+                last_event_at: format!("2026-11-09T10:{:02}:00.000000Z", n % 60),
+            },
+            "byoc",
+        );
+    }
+    create(&rig, "Run uname -a", FIRST).await;
+    let lists: Vec<_> = rig
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "GET" && r.path == "/v1/code/sessions")
+        .collect();
+    assert_eq!(lists.len(), 2, "followed next_cursor once");
+    assert_eq!(lists[0].query_param("cursor"), None);
+    assert!(lists[1].query_param("cursor").is_some());
+    let created = rig
+        .fake
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path == "/v1/code/sessions")
+        .unwrap();
+    assert_eq!(created.body["environment_id"], "env_fake0001");
+}
+
+#[tokio::test]
+async fn an_account_without_a_cloud_environment_is_told_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeSessionServer::start().await;
+    let login = ClaudeLogin::create(dir.path().join("login"), &FakeAccount::a(), "token-a-1");
+    let harness = ClaudeCloudHarness::new(ClaudeCloudConfig {
+        base_url: fake.base_url().to_owned(),
+        login: ClaudeConfigDir::at(login.dir()),
+        claude_executable: None,
+    })
+    .expect("harness builds");
+    let error = harness
+        .provider_cloud()
+        .unwrap()
+        .create_session(CreateSession {
+            prompt: "hello".into(),
+            prompt_uuid: FIRST.into(),
+            model: None,
+            title: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("claude.ai/code"), "{error}");
+    assert!(fake.created_sessions().is_empty());
 }
