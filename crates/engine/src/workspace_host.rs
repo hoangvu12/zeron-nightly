@@ -195,6 +195,9 @@ struct WorkspaceHostInner {
     spaces_tx: watch::Sender<Vec<Space>>,
     sidebar_preferences_tx: watch::Sender<SidebarPreferencesState>,
     room: Mutex<Option<Arc<RegistryClient>>>,
+    /// A registry room was asked for (joined, or still trying to join): the
+    /// local table is no longer the whole truth until it syncs.
+    joining: std::sync::atomic::AtomicBool,
     /// Bumped on every registry change (local mutation or applied server
     /// frame) — drives republish + the snapshot debounce in `workspace_task`.
     changed_tx: watch::Sender<u64>,
@@ -361,6 +364,7 @@ impl WorkspaceHost {
                 spaces_tx,
                 sidebar_preferences_tx,
                 room: Mutex::new(None),
+                joining: std::sync::atomic::AtomicBool::new(false),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 claimed: Mutex::default(),
@@ -416,6 +420,9 @@ impl WorkspaceHost {
         // A room will ack from here on (the test seam joins edge-less
         // hosts): queue writes again, re-seeding any folded local-only ones.
         self.mutate(|doc| doc.set_local_only(false));
+        self.inner
+            .joining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
@@ -717,6 +724,25 @@ impl WorkspaceHost {
     /// The chat row as currently known (overlay view).
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, EngineError> {
         Ok(self.read(|doc| doc.chat(chat_id))?)
+    }
+
+    /// Whether `chat_id`'s row was deleted here (a tombstone), not merely
+    /// unknown.
+    pub fn chat_deleted(&self, chat_id: &str) -> bool {
+        self.read(|doc| doc.chat_deleted(chat_id))
+    }
+
+    /// Whether this replica's registry can be trusted to name a chat's host:
+    /// it has heard from the relay since it connected (or it has no relay).
+    /// A room that exists but hasn't synced yet may be arbitrarily behind.
+    pub fn registry_current(&self) -> bool {
+        match lock(&self.inner.room).as_ref() {
+            Some(room) => room.stats().synced,
+            None => {
+                self.inner.config.edge.is_none()
+                    && !self.inner.joining.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
     }
 
     /// Whether `chat_id`'s parent is unknown here yet: this host claimed its

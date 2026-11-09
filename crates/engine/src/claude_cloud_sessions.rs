@@ -114,6 +114,8 @@ impl ClaudeCloudSettings {
 pub struct ClaudeCloudSessions {
     path: PathBuf,
     stored: Mutex<ClaudeCloudSettings>,
+    /// The sidebar's session list: its throttle and latest read.
+    discovery: crate::provider_discovery::ProviderDiscovery,
 }
 
 impl ClaudeCloudSessions {
@@ -128,7 +130,12 @@ impl ClaudeCloudSessions {
         Self {
             path,
             stored: Mutex::new(stored),
+            discovery: Default::default(),
         }
+    }
+
+    pub(crate) fn discovery(&self) -> &crate::provider_discovery::ProviderDiscovery {
+        &self.discovery
     }
 
     pub fn settings(&self) -> ClaudeCloudSettings {
