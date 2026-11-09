@@ -93,9 +93,14 @@ file = "patches/0003-relay-image-reads.patch"
 note = "Images from a chat on another device load in a few relay round trips. Applies on top of markdown-reply-images."
 
 [[patch]]
+name = "agent-steers-wait-for-tools"
+file = "patches/0008-agent-steers-wait-for-tools.patch"
+note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it lands at the next step. mode 'steer' and the person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. Applies on top of relay-image-reads."
+
+[[patch]]
 name = "child-chats-report-back"
 file = "patches/0007-child-chats-report-back.patch"
-note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. Applies on top of relay-image-reads."
+note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Applies on top of agent-steers-wait-for-tools."
 
 # Not on v3: zeron/zgx has its own new app icon.
 [[patch]]

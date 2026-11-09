@@ -1,4 +1,4 @@
-From 58510a2522027b7e9ba4a411370c3eaab7ba9562 Mon Sep 17 00:00:00 2001
+From 8ede81a41860551ee879ce08c4bba0e85f11b1ea Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
@@ -7,75 +7,84 @@ When an agent hands work to subagents or side chats, each child's answer
 comes back to it on its own when the child's turn ends. The parent never
 has to poll, and the person never has to nudge either side.
 
-- A report shows as a compact row on a card that opens the child. Reports
-  that land together share one card.
+- A report shows as a compact row on a card that opens the child, with the
+  first two lines of what it said when it finished or asks something.
+  Reports that land together share one card. A spawn of one chat sits on
+  the same card.
 - A parent that is free hears after a short window of 3 seconds, so
   children finishing together wake it once. A busy parent reads what came
   meanwhile as one message when its turn ends. Nothing waits on a slow or
   stuck sibling.
-- Under the reports, Zeron notes which children still work for the parent,
-  how long since each was asked and last did anything, a question waiting
-  on it, and long runs of back and forth with the person away.
+- Under the reports, for the agent only, Zeron notes which children still
+  work for the parent, how long since each was asked and last did
+  anything, a question waiting on it, and long runs of back and forth with
+  the person away.
 - A child that is asked something, fails, is stopped or sends a message
   mid task reaches the parent the same way, in order. A Stop says who made
-  it, so a stopped child never reads as finished.
-- Each report goes by a key kept in the parent's chat. A restart, a crash
-  or a child on another device loses none and repeats none. An archived
-  parent keeps its reports until restored.
+  it, so a stopped child never reads as finished, and only the person's
+  reads as theirs. A steer that stops a turn to be read at once is no
+  Stop: that turn goes on, and reports when it ends.
+- Each report goes by a key kept in the parent's chat, on the message its
+  turn answered (not a message sent after it). A stop's report has its own
+  key, so the end of the work it cut still reports. A report that couldn't
+  be queued goes on the next try. A restart, a crash or a child on another
+  device loses none and repeats none. An archived parent keeps its reports
+  until restored.
 - A parent reads Waiting while its children work, and its spawn rows take
-  how each child ended from its report.
+  how each child ended from its report. A child on another device that
+  has reported is never listed as "sent, not started".
 ---
- apps/zgx/src/chat.rs                         | 277 +++++-
- apps/zgx/src/sessions.rs                     |  40 +-
- apps/zgx/ui/account/sessions.luau            |   7 +-
- apps/zgx/ui/chat_fixture.luau                | 289 ++++++
- apps/zgx/ui/ds/activity.luau                 |  86 +-
- apps/zgx/ui/ds/composer_dock.luau            | 143 +--
- apps/zgx/ui/ds/init.luau                     |   4 +
- apps/zgx/ui/ds/locale_en.luau                |  33 +
- apps/zgx/ui/ds/spawn_group.luau              | 514 ++++++++++
- apps/zgx/ui/ds/status.luau                   |  11 +-
- apps/zgx/ui/ds/subagent_row.luau             | 265 ++++++
- apps/zgx/ui/ds/transcript.luau               | 410 +++++++-
- apps/zgx/ui/gallery.luau                     |  41 +
- apps/zgx/ui/locales/en.json                  |  26 +-
- apps/zgx/ui/locales/zh-Hans.json             |  31 +-
- apps/zgx/ui/panel_home_fixture.luau          |   6 +
- apps/zgx/ui/screens/chat/lanes.luau          |  83 +-
- apps/zgx/ui/screens/chat/session.luau        |  10 +
- apps/zgx/ui/screens/chat/shared.luau         |  22 +-
- apps/zgx/ui/screens/panel/home.luau          |  32 +-
- apps/zgx/ui/tests/panel_home.test.luau       |  14 +
- apps/zgx/ui/tests/subagent_reports.test.luau | 269 ++++++
- crates/client/src/demo/mod.rs                |   2 +-
- crates/client/src/session/mod.rs             |   2 +-
- crates/doc/src/commands.rs                   |  17 +-
- crates/doc/src/rebuild.rs                    |   2 +-
- crates/engine/src/doc_host.rs                | 333 ++++++-
- crates/engine/src/lib.rs                     |   1 +
- crates/engine/src/rpc.rs                     |   2 +-
- crates/engine/src/rpc/agent_gate.rs          |  66 +-
- crates/engine/src/run_journal.rs             |  19 +
- crates/engine/src/session_reports.rs         | 952 +++++++++++++++++++
- crates/engine/src/sessions.rs                | 916 +++++++++++++++++-
- crates/engine/tests/adapter_chaos_live.rs    |   2 +-
- crates/engine/tests/e2e.rs                   |   4 +-
- crates/engine/tests/message_queue.rs         |   6 +-
- crates/engine/tests/runtime_survival.rs      |  14 +-
- crates/engine/tests/runtime_survival_live.rs |   2 +-
- crates/engine/tests/unarchive_on_send.rs     |   2 +-
- crates/mcp/src/jsonrpc.rs                    |   8 +
- crates/mcp/src/tools.rs                      |  24 +-
- crates/proto/src/agent_messages.rs           | 422 +++++++-
- docs/mcp.md                                  |   8 +
- 43 files changed, 5225 insertions(+), 192 deletions(-)
+ apps/zgx/src/chat.rs                         |  270 +++-
+ apps/zgx/src/sessions.rs                     |   40 +-
+ apps/zgx/ui/account/sessions.luau            |    7 +-
+ apps/zgx/ui/chat_fixture.luau                |  299 ++++
+ apps/zgx/ui/ds/activity.luau                 |   86 +-
+ apps/zgx/ui/ds/composer_dock.luau            |  143 +-
+ apps/zgx/ui/ds/init.luau                     |    4 +
+ apps/zgx/ui/ds/locale_en.luau                |   33 +
+ apps/zgx/ui/ds/spawn_group.luau              |  535 +++++++
+ apps/zgx/ui/ds/status.luau                   |   11 +-
+ apps/zgx/ui/ds/subagent_row.luau             |  368 +++++
+ apps/zgx/ui/ds/transcript.luau               |  414 +++++-
+ apps/zgx/ui/gallery.luau                     |   41 +
+ apps/zgx/ui/locales/en.json                  |   26 +-
+ apps/zgx/ui/locales/zh-Hans.json             |   31 +-
+ apps/zgx/ui/panel_home_fixture.luau          |    6 +
+ apps/zgx/ui/screens/chat/lanes.luau          |   83 +-
+ apps/zgx/ui/screens/chat/session.luau        |   10 +
+ apps/zgx/ui/screens/chat/shared.luau         |   22 +-
+ apps/zgx/ui/screens/panel/home.luau          |   32 +-
+ apps/zgx/ui/tests/panel_home.test.luau       |   14 +
+ apps/zgx/ui/tests/subagent_reports.test.luau |  298 ++++
+ crates/client/src/demo/mod.rs                |    2 +-
+ crates/client/src/session/mod.rs             |    2 +-
+ crates/doc/src/commands.rs                   |   17 +-
+ crates/doc/src/rebuild.rs                    |    2 +-
+ crates/engine/src/doc_host.rs                |  333 ++++-
+ crates/engine/src/lib.rs                     |    1 +
+ crates/engine/src/rpc.rs                     |    2 +-
+ crates/engine/src/rpc/agent_gate.rs          |   66 +-
+ crates/engine/src/run_journal.rs             |   19 +
+ crates/engine/src/session_reports.rs         | 1135 +++++++++++++++
+ crates/engine/src/sessions.rs                | 1318 +++++++++++++++++-
+ crates/engine/tests/adapter_chaos_live.rs    |    2 +-
+ crates/engine/tests/e2e.rs                   |    4 +-
+ crates/engine/tests/message_queue.rs         |    6 +-
+ crates/engine/tests/runtime_survival.rs      |   14 +-
+ crates/engine/tests/runtime_survival_live.rs |    2 +-
+ crates/engine/tests/unarchive_on_send.rs     |    2 +-
+ crates/mcp/src/jsonrpc.rs                    |    8 +
+ crates/mcp/src/tools.rs                      |   24 +-
+ crates/proto/src/agent_messages.rs           |  422 +++++-
+ docs/mcp.md                                  |    8 +
+ 43 files changed, 5968 insertions(+), 194 deletions(-)
  create mode 100644 apps/zgx/ui/ds/spawn_group.luau
  create mode 100644 apps/zgx/ui/ds/subagent_row.luau
  create mode 100644 apps/zgx/ui/tests/subagent_reports.test.luau
  create mode 100644 crates/engine/src/session_reports.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index f9eb47936..8c20f030c 100644
+index f9eb47936..17b64c375 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
 @@ -3511,6 +3511,13 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
@@ -85,14 +94,14 @@ index f9eb47936..8c20f030c 100644
 +            // A child chat's report (several, merged, when they landed
 +            // together): not a bubble but its children's rows. (A report
 +            // also reads as a message from its child, so this comes first.)
++            // (Zeron's notes under them are the agent's: not shown.)
 +            if let Some(reports) = zeron_proto::agent_messages::child_reports(&text) {
-+                let notes = zeron_proto::agent_messages::report_notes(&text);
-+                return Some(report_message(id, entry, &reports, &notes));
++                return Some(report_message(id, entry, &reports));
 +            }
              // A message from another chat: its routing header is the agent's to
              // read; the transcript shows who sent it, over its words.
              let sender = zeron_proto::agent_messages::agent_message_sender(&text);
-@@ -3625,6 +3632,51 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -3625,6 +3632,44 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
      }
  }
  
@@ -100,15 +109,9 @@ index f9eb47936..8c20f030c 100644
 +/// ds/transcript's `report`: each child's chat, its title as the header
 +/// named it, how its turn ended (`finished`, `failed`, `stopped`,
 +/// `needsInput`) and its reply, one for a single report, several for a
-+/// merged one, and Zeron's notes under them (who still works for the chat,
-+/// a question waiting on it). Its text is the replies (what a selection
-+/// takes), and Copy copies them with who said each.
-+fn report_message(
-+    id: &str,
-+    entry: &Json,
-+    reports: &[zeron_proto::agent_messages::ChildReport<'_>],
-+    notes: &[&str],
-+) -> Value {
++/// merged one. Its text is the replies (what a selection takes), and Copy
++/// copies them with who said each.
++fn report_message(id: &str, entry: &Json, reports: &[zeron_proto::agent_messages::ChildReport<'_>]) -> Value {
 +    let status = |r: &zeron_proto::agent_messages::ChildReport<'_>| {
 +        serde_json::to_value(r.status).ok().and_then(|s| s.as_str().map(str::to_owned)).unwrap_or_default()
 +    };
@@ -135,7 +138,6 @@ index f9eb47936..8c20f030c 100644
 +        ("role", Value::from("report")),
 +        ("text", Value::from(text.as_str())),
 +        ("reports", Value::List(list.into())),
-+        ("notes", Value::List(notes.iter().map(|n| Value::from(*n)).collect::<Vec<_>>().into())),
 +        ("at", stamp(created as i64).map_or(Value::Nil, |at| Value::from(at.as_str()))),
 +        ("copy", copy_value(&copy)),
 +    ])
@@ -144,7 +146,7 @@ index f9eb47936..8c20f030c 100644
  /// A switch side's mark: its agent's, the mock drawn as Claude, as the
  /// shipping app's `harness_brand_icon`.
  fn switch_mark(harness: &str) -> Option<String> {
-@@ -3694,6 +3746,7 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+@@ -3694,6 +3739,7 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
              ("kind", Value::from("tools")),
              ("summary", Value::from(group_summary(group).as_str())),
              ("live", Value::Bool(streaming && group_last == last_ix)),
@@ -152,7 +154,7 @@ index f9eb47936..8c20f030c 100644
              ("tools", Value::List(tools.into())),
          ]));
          group.clear();
-@@ -4020,7 +4073,95 @@ fn is_agent(part: &Json) -> bool {
+@@ -4020,7 +4066,95 @@ fn is_agent(part: &Json) -> bool {
          Some("unknown") => call["name"].as_str(),
          _ => None,
      };
@@ -249,7 +251,7 @@ index f9eb47936..8c20f030c 100644
  }
  
  /// A group's line, as the shipping app writes it (crates/ui transcript.rs
-@@ -4168,7 +4309,9 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
+@@ -4168,7 +4302,9 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
                  "todo" => ("todo", "Updated the plan".into(), None),
                  "mcp" => {
                      let tool = s("tool").unwrap_or_default();
@@ -260,7 +262,7 @@ index f9eb47936..8c20f030c 100644
                          ("agent", "Ran a subagent".into(), tool.strip_prefix("Agent: ").map(Into::into))
                      } else {
                          ("exec", "Used".into(), Some(format!("{}.{tool}", s("server").unwrap_or_default())))
-@@ -4218,6 +4361,11 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
+@@ -4218,6 +4354,11 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
              ]),
          ));
      }
@@ -272,7 +274,7 @@ index f9eb47936..8c20f030c 100644
      // What its row opens to (src/tool_details.rs).
      fields.extend(crate::tool_details::tool_fields(part));
      let stats = part["diffStats"].as_array();
-@@ -4441,7 +4589,21 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -4441,7 +4582,21 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          .queue
          .iter()
          .map(|q| {
@@ -295,7 +297,7 @@ index f9eb47936..8c20f030c 100644
              let mine = open.editing.as_ref().is_some_and(|e| q["id"].as_str() == Some(&e.item));
              if mine {
                  fields.push(("editing", Value::Bool(true)));
-@@ -5635,6 +5797,115 @@ mod tests {
+@@ -5635,6 +5790,115 @@ mod tests {
          assert!(is(m.field("text"), typed));
      }
  
@@ -509,10 +511,10 @@ index 1eee655d1..91c96b5fd 100644
  -- `github`: its GitHub repository (`owner/name`), the one a Cloud chat of it
  -- clones.
 diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
-index 5723642a0..62ee7eb9f 100644
+index a2c00ad8c..6f24afe7d 100644
 --- a/apps/zgx/ui/chat_fixture.luau
 +++ b/apps/zgx/ui/chat_fixture.luau
-@@ -617,6 +617,295 @@ ui.command {
+@@ -644,6 +644,305 @@ ui.command {
  	end,
  }
  
@@ -589,6 +591,16 @@ index 5723642a0..62ee7eb9f 100644
 +		store.messages:push(report("rep2", "Sep 8, 2:16 PM", { said("kid-tests", "Fix flaky login tests", "failed", "cargo test exited 101: the fixture clock drifts past token expiry") }))
 +		store.messages:push(report("rep3", "Sep 8, 2:17 PM", { said("kid-docs", "Update auth docs", "stopped", "") }))
 +		store.messages:push(report("rep4", "Sep 8, 2:18 PM", { said("kid-migrate", "Write the session migration", "needsInput", "Drop the old sessions table now, or keep it for a release?") }))
++	end,
++}
++-- A report with Zeron's notes under it, as an older host handed them.
++ui.command {
++	id = "report_with_notes",
++	title = "A child reports, with Zeron's notes",
++	run = function()
++		local r = report("rep_notes", "Sep 8, 2:20 PM", { said("kid-index", "Index the docs", "finished", "Indexed 41 pages.") })
++		r.notes = { "Still working for you: zeron-sync (asked 2 min ago). Their reports reach you on their own." }
++		store.messages:push(r)
 +	end,
 +}
 +ui.command {
@@ -1230,10 +1242,10 @@ index 28ee23fad..bd7410d34 100644
  	["common.open"] = "Open",
 diff --git a/apps/zgx/ui/ds/spawn_group.luau b/apps/zgx/ui/ds/spawn_group.luau
 new file mode 100644
-index 000000000..0a0b82d39
+index 000000000..2da0da541
 --- /dev/null
 +++ b/apps/zgx/ui/ds/spawn_group.luau
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,535 @@
 +-- Children started together, as one block in the reply that started them: a
 +-- Zeron `create_chats` (or `create_chat`) call, or a harness's subagents
 +-- spawned side by side. In place of a tree of calls, the children
@@ -1245,7 +1257,12 @@ index 000000000..0a0b82d39
 +-- Its head says what kind they are ("3 subagents", "2 side chats", "2
 +-- subagents, 1 side chat"); with both kinds, each side chat's row says so.
 +-- Several that reported back together are the same block (`reported`: "3
-+-- subagents reported"), ds/transcript's.
++-- subagents reported"), ds/transcript's, each row with what its child said
++-- under its title (ds/subagent_row's `preview`).
++--
++-- Its head is the card's top, flush with its border: its top corners the
++-- card's, one border in (concentric), its bottom square where the list
++-- hangs under it, and the card's own while folded, when it stands alone.
 +--
 +--   SpawnGroup { list = function() return kids end, since = started, on_open = … }
 +
@@ -1297,6 +1314,9 @@ index 000000000..0a0b82d39
 +local STACK_OVERLAP, STACK_GAP = math.floor(STACK_MARK * 0.4), 1.5
 +-- How long its list takes to fold and open.
 +local FOLD = 200
++-- Its card's corner, and the corner inside its 1-point border.
++local RADIUS = "$radius.xl"
++local INNER = ui.raw(control.nest(RADIUS, 1), "the card's corner, one border in")
 +
 +-- The children in the order the list shows them (stable within a state).
 +function M.sorted(children: { Child }): { Child }
@@ -1414,8 +1434,9 @@ index 000000000..0a0b82d39
 +end
 +
 +-- One child alone, its row with its time going (ds/transcript's spawn of
-+-- one chat): a clock of its own, ticking while it works.
-+M.One = ui.component(function(props: { child: () -> Child, on_open: (() -> ())? }): Node
++-- one chat, on its card): a clock of its own, ticking while it works.
++-- `rounded`: its corner where it sits in a card's.
++M.One = ui.component(function(props: { child: () -> Child, on_open: (() -> ())?, rounded: any? }): Node
 +	local now = ui.use_state(os.time())
 +	ui.effect(function()
 +		if props.child().state ~= "working" then
@@ -1430,6 +1451,7 @@ index 000000000..0a0b82d39
 +		child = function(): Child
 +			return M.timed(props.child(), now:get())
 +		end,
++		rounded = props.rounded,
 +		on_open = props.on_open,
 +	}
 +end)
@@ -1642,6 +1664,16 @@ index 000000000..0a0b82d39
 +		selectable = false,
 +		w_full = true,
 +		p = "$space.3",
++		-- (A button's own corner is $radius.md: its bottom would round off
++		-- over the list.)
++		rounded_tl = INNER,
++		rounded_tr = INNER,
++		rounded_bl = function(): any
++			return if folded() then INNER else 0
++		end,
++		rounded_br = function(): any
++			return if folded() then INNER else 0
++		end,
 +		gap = ui.raw(10, "the mockup's head gap"),
 +		items = "center",
 +		bg = "$zeron.secondary.bg",
@@ -1692,7 +1724,7 @@ index 000000000..0a0b82d39
 +		role = "group",
 +		label = title,
 +		w_full = true,
-+		rounded = "$radius.xl",
++		rounded = RADIUS,
 +		border = 1,
 +		border_color = "$border.subtle",
 +		overflow = "hidden",
@@ -1718,6 +1750,7 @@ index 000000000..0a0b82d39
 +					return SubagentRow.SubagentRow {
 +						child = child,
 +						compact = true,
++						preview = props.reported,
 +						kind = function(): boolean
 +							return mixed:get()
 +						end,
@@ -1791,10 +1824,10 @@ index e47ebd94f..bfcb49b30 100644
  -- corner's room ("now", "5m", "3d"), in the locale's words (ds/locale).
 diff --git a/apps/zgx/ui/ds/subagent_row.luau b/apps/zgx/ui/ds/subagent_row.luau
 new file mode 100644
-index 000000000..4334b5d01
+index 000000000..4017ad2ed
 --- /dev/null
 +++ b/apps/zgx/ui/ds/subagent_row.luau
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,368 @@
 +-- A child's row: one chat working for this one, however it was made (a Zeron
 +-- chat an agent delegated to, a side chat, a harness's own subagent: Claude's
 +-- Task, Codex's), the one way each is drawn wherever children are listed: a
@@ -1806,12 +1839,14 @@ index 000000000..4334b5d01
 +--   input (indigo, the accent), finished (emerald), failed (red), stopped
 +--   (grey);
 +-- - its title as its chat is called now, and what kind of child it is;
++-- - a report's row (`preview`): under its title, the first two lines of what
++--   it said, as plain text, when it finished or asks something (a report
++--   then reads apart from a spawn, which has said nothing yet). Not when it
++--   failed or was stopped: a cut-off line of an error read as noise, and its
++--   state's glyph says it. No card of it on hover;
 +-- - its time, its state's glyph and a chevron; a child asking for the person
 +--   has Answer before them;
-+-- - a click opens it, beside this chat, where what it said is. (No line of
-+--   its reply under the title and no card of it on hover: a cut-off line of
-+--   an error read as noise, and the agent's own reply under it says it in
-+--   words.)
++-- - a click opens it, beside this chat, where all of what it said is.
 +--
 +--   SubagentRow { child = function() return { id, title, state = "done", … } end, on_open = … }
 +--
@@ -1847,6 +1882,8 @@ index 000000000..4334b5d01
 +	-- Its agent's mark (ds/mark's name), or a registry agent's icon.
 +	mark: string?,
 +	icon: string?,
++	-- What it said, in markdown (a report's reply).
++	said: string?,
 +}
 +
 +export type Props = {
@@ -1858,7 +1895,9 @@ index 000000000..4334b5d01
 +	-- Its height where a list fixes it (the tray's rows), and its corner
 +	-- where it sits in a container's (concentric with it).
 +	h: number?,
-+	rounded: string?,
++	rounded: any?,
++	-- A report's row: what its child said, under its title (see above).
++	preview: boolean?,
 +	on_open: (() -> ())?,
 +	-- What Answer does; without it, Answer opens the child, where the
 +	-- question is.
@@ -1890,6 +1929,59 @@ index 000000000..4334b5d01
 +-- Its state in a word ("Finished").
 +function M.word(state: State): string
 +	return locale.s(WORD[state])
++end
++
++-- Geist's ascent and descent, per point of its size (its em's 1005 and 295
++-- of 1000).
++local ASCENT, DESCENT = 1.005, 0.295
++
++-- The kind word's line box: zgx centres a line's glyphs in its box, so a
++-- line's baseline stands (box - (ascent + descent) * size) / 2 + descent *
++-- size above the box's bottom. On the title's bottom, the kind word, smaller,
++-- stands on the title's baseline in a box shorter than the title's by
++-- (ascent - descent) for each point it is smaller; in whole points, as zgx
++-- lays a line's box out (the shorter, so it never rides above the title's
++-- line: 16 for 11 under 13 on 18, which puts both 5 above the bottom).
++local function kind_line(): any
++	local size = function(name: string): number
++		return (ui.theme.get(name) :: number?) or 0
++	end
++	local line = size("font.line.md") - (ASCENT - DESCENT) * (size("font.size.md") - size("font.size.xs"))
++	return ui.raw(math.floor(line), "the title's line box less the smaller word's half-leading: one baseline")
++end
++
++-- Markdown as the words it says, on one line: no marks, fences, links'
++-- targets, headings' hashes or list bullets.
++function M.plain(md: string): string
++	local lines = {}
++	for line in string.gmatch(md, "[^\n]+") do
++		line = string.gsub(line, "^%s*```.*$", "")
++		line = string.gsub(line, "^%s*#+%s+", "")
++		line = string.gsub(line, "^%s*>%s?", "")
++		line = string.gsub(line, "^%s*[-*+]%s+%[[ xX]%]%s+", "")
++		line = string.gsub(line, "^%s*[-*+]%s+", "")
++		line = string.gsub(line, "^%s*%d+[.)]%s+", "")
++		table.insert(lines, line)
++	end
++	local text = table.concat(lines, " ")
++	text = string.gsub(text, "!%[([^%]]*)%]%b()", "%1")
++	text = string.gsub(text, "%[([^%]]*)%]%b()", "%1")
++	text = string.gsub(text, "`+", "")
++	text = string.gsub(text, "%*%*", "")
++	text = string.gsub(text, "__", "")
++	text = string.gsub(text, "~~", "")
++	text = string.gsub(text, "%f[%w%*]%*([^%*]+)%*", "%1")
++	text = string.gsub(text, "%s+", " ")
++	return (string.match(text, "^%s*(.-)%s*$") or "")
++end
++
++-- What a report's row shows of what its child said: for one that finished
++-- or asks, the words; nothing for the rest.
++function M.preview_of(child: Child): string
++	if child.state ~= "done" and child.state ~= "input" then
++		return ""
++	end
++	return M.plain(child.said or "")
 +end
 +
 +-- A child's state from what each source says of it: a report's status
@@ -1988,12 +2080,15 @@ index 000000000..4334b5d01
 +		p.on_click = open
 +	end
 +	table.insert(p, M.Avatar { child = child, size = if compact then MARK_COMPACT else MARK })
-+	-- Its title, and what kind of child it is (in a list, where it asks).
-+	table.insert(p, ui.row {
-+		grow = 1,
++	-- Its title, and what kind of child it is (in a list, where it asks), on
++	-- one baseline. zgx's text gives a row no baseline (`items = "baseline"`
++	-- lines up their bottoms), so both stand on the row's bottom, each in a
++	-- line box that puts its baseline as far above it (`kind_line`).
++	local head: { [any]: any } = {
++		w_full = true,
 +		min_w = 0,
 +		gap = ui.raw(6, "the mockup's title-to-kind gap"),
-+		items = "baseline",
++		items = "end",
 +		FadeText {
 +			function(): string
 +				return child().title
@@ -2001,12 +2096,53 @@ index 000000000..4334b5d01
 +			literal = true,
 +			shrink = 1,
 +			text_size = "$font.size.md",
++			line_height = "$font.line.md",
 +			weight = if compact then nil else "$font.weight.medium",
 +		},
-+		ui.show(function(): boolean
-+			return not compact or (props.kind ~= nil and props.kind())
-+		end, ui.text { kind_word, shrink = 0, text_size = "$font.size.xs", color = "$text.tertiary" }),
-+	})
++		ui.show(
++			function(): boolean
++				return not compact or (props.kind ~= nil and props.kind())
++			end,
++			ui.text {
++				kind_word,
++				shrink = 0,
++				text_size = "$font.size.xs",
++				line_height = kind_line,
++				color = "$text.tertiary",
++			}
++		),
++	}
++	if props.preview then
++		-- (Under the title, what it said: two lines at most, then an ellipsis.)
++		table.insert(p, ui.column {
++			grow = 1,
++			min_w = 0,
++			gap = ui.raw(2, "a title to the lines under it"),
++			ui.row(head),
++			ui.show(
++				function(): boolean
++					return M.preview_of(child()) ~= ""
++				end,
++				ui.text {
++					function(): string
++						return M.preview_of(child())
++					end,
++					class = "subagent-row-preview",
++					literal = true,
++					w_full = true,
++					wrap = true,
++					truncate = true,
++					lines = 2,
++					text_size = "$font.size.sm",
++					color = "$text.secondary",
++				}
++			),
++		})
++	else
++		head.grow = 1
++		head.w_full = nil
++		table.insert(p, ui.row(head))
++	end
 +	-- Asking for the person: Answer, which goes where the question is.
 +	table.insert(
 +		p,
@@ -2061,7 +2197,7 @@ index 000000000..4334b5d01
 +	end,
 +}) :: any
 diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
-index 68769995f..341791d6c 100644
+index e1c18842a..099eef271 100644
 --- a/apps/zgx/ui/ds/transcript.luau
 +++ b/apps/zgx/ui/ds/transcript.luau
 @@ -43,6 +43,7 @@
@@ -2092,17 +2228,15 @@ index 68769995f..341791d6c 100644
  	text: string,
  	-- A person's: what came with it.
  	attachments: { UserMessage.Attachment }?,
-@@ -103,7 +107,19 @@ export type Message = {
+@@ -103,7 +107,17 @@ export type Message = {
  	to_mark: Mark.Name?,
  	-- A person's that another chat sent: which, and its title when it was sent.
  	sender: { chat: string, title: string }?,
 +	-- A report's: each child's chat, its title when it reported, how its
 +	-- turn ended (`finished`, `failed`, `stopped`, `needsInput`) and its
-+	-- reply; several, when they landed together.
++	-- reply; several, when they landed together. (Zeron's notes under them
++	-- are its agent's, never shown.)
 +	reports: { Report }?,
-+	-- And Zeron's notes under them, one line each: who still works for
-+	-- this chat, a question waiting on it, two agents going on alone.
-+	notes: { string }?,
  }
 +export type Report = { chat: string, title: string, status: string, body: string }
 +-- A chat as it's listed now: its title and agent's mark, and for a child of
@@ -2112,7 +2246,7 @@ index 68769995f..341791d6c 100644
  
  export type Props = {
  	messages: State<{ Message }>,
-@@ -171,9 +187,16 @@ export type Props = {
+@@ -171,9 +185,16 @@ export type Props = {
  	open_link: ((target: string) -> ())?,
  	-- A chat as it's listed now: its title and agent's mark. Nil for one that
  	-- isn't listed, which a message from it can't open.
@@ -2130,7 +2264,7 @@ index 68769995f..341791d6c 100644
  	-- Those links' context menus where they aren't the web's (ds/markdown's
  	-- `link_menu`).
  	link_menu: ((target: string) -> { Markdown.LinkEntry }?)?,
-@@ -557,6 +580,16 @@ type View = {
+@@ -557,6 +578,16 @@ type View = {
  	open_subagent: ((sub: any) -> ())?,
  	-- A message text's find (its key: `<id>:u`, `<id>:<block>`, `<id>:r`).
  	find: ((key: string) -> any)?,
@@ -2147,23 +2281,10 @@ index 68769995f..341791d6c 100644
  }
  
  -- A reply's thought being written, for its row (ds/activity's `thought`): the
-@@ -576,36 +609,290 @@ local function thought_of(m: Message, now: () -> Message, draft: State<Draft>?):
+@@ -576,35 +607,293 @@ local function thought_of(m: Message, now: () -> Message, draft: State<Draft>?):
  	}
  end
  
--local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message, draft: State<Draft>?, view: View?): Node
--	local shown = ui.computed(list)
--	return ui.each(shown, function(b: Block, _i: number, brow: State<Block>): Node
--		if b.kind == "tools" or b.kind == "work" then
--			return Activity {
--				key = `{m.id}:{b.id}`,
--				open_subagent = if view then view.open_subagent else nil,
--				thought = thought_of(m, now, draft),
--				tools = function()
--					return brow:get().tools or {}
--				end,
--				live = function()
--					return brow:get().live == true
 +-- A message's time of day alone ("2:14 PM" of "Sep 8, 2:14 PM"), for a row
 +-- with room for little.
 +local function time_of(at: string?): string?
@@ -2173,15 +2294,36 @@ index 68769995f..341791d6c 100644
 +	return string.match(at, ",%s*([^,]+)$") or at
 +end
 +
++-- One child alone, its row on a card: a report's, or a spawn's of one. The
++-- card is a spawn's head's ground, so either reads as a spawn's block does;
++-- its row's corner sits one border and its inset in (concentric).
++local CARD_RADIUS = "$radius.xl"
++local CARD_INSET = "$space.1"
++local CARD_ROW_RADIUS = ui.raw(control.nest(CARD_RADIUS, 1, CARD_INSET), "the card's corner, its border and inset in")
++local function child_card(class: string, row: Node): Node
++	return ui.column {
++		class = `child-card {class}`,
++		w_full = true,
++		p = CARD_INSET,
++		rounded = CARD_RADIUS,
++		bg = "$zeron.secondary.bg",
++		border = 1,
++		border_color = "$border.subtle",
++		row,
++	}
++end
++
 +-- What child chats reported back as their turns ended (t3code's subagent
 +-- rows), on a card as a spawn's children are: one alone, its row on a card of
 +-- its own (ds/subagent_row: its title as its chat is called now, what kind,
-+-- how it ended), a click opening it beside this chat; several that landed
-+-- together, a spawn's block of them (ds/spawn_group: "3 subagents reported",
-+-- asking and failed first). No lane of time and Copy under it (the row says
-+-- when; what it said is the chat's, a click away). The same air either
-+-- side, 24: up into the empty top of the lane of the reply over it (its
-+-- time and Copy keep the 24 under that), and 24 over the turn it starts.
++-- how it ended, and the first lines of what it said when it finished or
++-- asks), a click opening it beside this chat; several that landed together,
++-- a spawn's block of them (ds/spawn_group: "3 subagents reported", asking and
++-- failed first). No lane of time and Copy under it (the row says when; all
++-- of what it said is the chat's, a click away). The same air either side,
++-- 24: up into the empty top of the lane of the reply over it (its time and
++-- Copy keep the 24 under that), and 24 over the turn it starts. (Zeron's
++-- notes under a report are its agent's: never shown.)
 +local function report(m: Message, state: State<Message>, props: Props): Node
 +	local function children(): { SubagentRow.Child }
 +		local out = {}
@@ -2199,6 +2341,7 @@ index 68769995f..341791d6c 100644
 +				at = time_of(now.at),
 +				mark = if live then live.mark else nil,
 +				icon = if live then live.icon else nil,
++				said = r.body,
 +			})
 +		end
 +		return SpawnGroup.sorted(out)
@@ -2214,24 +2357,17 @@ index 68769995f..341791d6c 100644
 +		return children()[1] or { id = "", title = "", state = "done" }
 +	end
 +	local body = if #(m.reports or {}) == 1
-+		then ui.column {
-+			class = "report-card",
-+			w_full = true,
-+			p = "$space.1",
-+			rounded = "$radius.xl",
-+			-- A spawn's head's ground: its row reads on it as a spawn's does.
-+			bg = "$zeron.secondary.bg",
-+			border = 1,
-+			border_color = "$border.subtle",
++		then child_card(
++			"report-card",
 +			SubagentRow.SubagentRow {
 +				child = one,
++				preview = true,
++				rounded = CARD_ROW_RADIUS,
 +				on_open = function()
 +					open(one())
- 				end,
--				summary = function()
--					return brow:get().summary
-+			},
-+		}
++				end,
++			}
++		)
 +		else SpawnGroup {
 +			key = m.id,
 +			list = children,
@@ -2250,24 +2386,6 @@ index 68769995f..341791d6c 100644
 +		mt = ui.raw(-LANE_TOP, "up into the lane's empty top over its 24-point line"),
 +		pb = ui.raw(LANE_TOP, "with the next message's 16, the 24 over it"),
 +		body,
-+		ui.show(
-+			function(): boolean
-+				return #(state:get().notes or {}) > 0
-+			end,
-+			ui.column {
-+				w_full = true,
-+				pt = "$space.2",
-+				px = "$space.1",
-+				ui.text {
-+					function(): string
-+						return table.concat(state:get().notes or {}, "\n")
-+					end,
-+					literal = true,
-+					text_size = "$font.size.sm",
-+					color = "$text.secondary",
-+				},
-+			}
-+		),
 +		waiting_line(state, props.on_retry),
 +	}
 +end
@@ -2372,34 +2490,29 @@ index 68769995f..341791d6c 100644
 +		end
 +		return out
 +	end
-+	-- One child is its row alone, as t3code draws it: a group of one says
-+	-- nothing its row doesn't. (It becomes a group as a second one joins.)
++	-- One child is its row alone on a card, as a report of one is: a group
++	-- of one says nothing its row doesn't. (It becomes a group as a second
++	-- one joins.)
 +	return ui.presence(function(): string
 +		return if #found() == 1 then "one" else "group"
 +	end, function(kind: string): Node
 +		if kind == "one" then
-+			return SpawnGroup.One {
-+				child = function(): SubagentRow.Child
-+					return list()[1] or { id = "", title = "", state = "working" }
- 				end,
--				body = if b.kind == "work"
--					then function(): Node
--						return ui.column {
--							w_full = true,
--							pt = "$space.2",
--							blocks_of(function(): { Block }
--								return brow:get().blocks or {}
--							end, m, now, draft, view),
--						}
-+				on_open = function()
-+					local c = list()[1]
-+					if c then
-+						open(c)
- 					end
--					else nil,
-+				end,
- 			}
- 		end
++			return child_card(
++				"spawn-card",
++				SpawnGroup.One {
++					child = function(): SubagentRow.Child
++						return list()[1] or { id = "", title = "", state = "working" }
++					end,
++					rounded = CARD_ROW_RADIUS,
++					on_open = function()
++						local c = list()[1]
++						if c then
++							open(c)
++						end
++					end,
++				}
++			)
++		end
 +		return SpawnGroup {
 +			key = `{m.id}:{brow:peek().id}`,
 +			list = list,
@@ -2433,9 +2546,35 @@ index 68769995f..341791d6c 100644
 +	}
 +end
 +
-+local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message, draft: State<Draft>?, view: View?): Node
-+	local shown = ui.computed(list)
-+	return ui.each(shown, function(b: Block, _i: number, brow: State<Block>): Node
+ local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message, draft: State<Draft>?, view: View?): Node
+ 	local shown = ui.computed(list)
+ 	return ui.each(shown, function(b: Block, _i: number, brow: State<Block>): Node
+-		if b.kind == "tools" or b.kind == "work" then
+-			return Activity {
+-				key = `{m.id}:{b.id}`,
+-				open_subagent = if view then view.open_subagent else nil,
+-				thought = thought_of(m, now, draft),
+-				tools = function()
+-					return brow:get().tools or {}
+-				end,
+-				live = function()
+-					return brow:get().live == true
+-				end,
+-				summary = function()
+-					return brow:get().summary
+-				end,
+-				body = if b.kind == "work"
+-					then function(): Node
+-						return ui.column {
+-							w_full = true,
+-							pt = "$space.2",
+-							blocks_of(function(): { Block }
+-								return brow:get().blocks or {}
+-							end, m, now, draft, view),
+-						}
+-					end
+-					else nil,
+-			}
 +		-- Children started together (a Zeron `create_chats`, a harness's
 +		-- subagents side by side): one block of them, live. (A group can
 +		-- become one as a second spawn joins it while the reply is written.)
@@ -2459,11 +2598,10 @@ index 68769995f..341791d6c 100644
 +					end, m, now, draft, view),
 +				}
 +			end)
-+		end
+ 		end
  		-- An agent's visual: built once, followed by the host (src/visuals.rs).
  		if b.kind == "visual" then
- 			return Visual { id = b.id, path = b.path, source = b.source, title = b.title, device = b.device }
-@@ -739,6 +1026,9 @@ local function reply(
+@@ -739,6 +1028,9 @@ local function reply(
  			Activity {
  				key = m.id,
  				open_subagent = if view then view.open_subagent else nil,
@@ -2473,7 +2611,7 @@ index 68769995f..341791d6c 100644
  				thought = thought_of(m, now, draft),
  				tools = function()
  					return now().tools or {}
-@@ -836,6 +1126,59 @@ local named_sending: { [string]: (push: () -> (), landing: string?) -> () } = {}
+@@ -836,6 +1128,59 @@ local named_sending: { [string]: (push: () -> (), landing: string?) -> () } = {}
  local function Transcript(props: Props): Node
  	opened_at = ui.now()
  	local messages = props.messages
@@ -2533,7 +2671,7 @@ index 68769995f..341791d6c 100644
  	-- (Its own kept states, by its name: a side chat's beside the chat
  	-- page's never shares the chat page's glide, runway or hover.)
  	local kept = if props.name then `.{props.name}` else ""
-@@ -1675,8 +2018,12 @@ local function Transcript(props: Props): Node
+@@ -1684,8 +2029,12 @@ local function Transcript(props: Props): Node
  			rows[m.id] = nil
  		end)
  		-- Zeron's gaps: a message opens 16 under the lane of the one before;
@@ -2547,7 +2685,7 @@ index 68769995f..341791d6c 100644
  			if mine and index:get() > 1 then
  				local prev = messages:at(index:get() - 1)
  				if prev and prev.role == "switch" then
-@@ -1761,6 +2108,7 @@ local function Transcript(props: Props): Node
+@@ -1770,6 +2119,7 @@ local function Transcript(props: Props): Node
  						end
  					end,
  				if m.role == "switch" then seam(m)
@@ -2555,7 +2693,7 @@ index 68769995f..341791d6c 100644
  					elseif mine then ui.column {
  						hook = "chat.message.prompt",
  						-- What it is, for a plugin's selector (and the
-@@ -1786,7 +2134,7 @@ local function Transcript(props: Props): Node
+@@ -1795,7 +2145,7 @@ local function Transcript(props: Props): Node
  						strip(m, state, hovered),
  						waiting_line(state, props.on_retry),
  					}
@@ -2717,10 +2855,10 @@ index f1b25995d..91d650bdb 100644
    },
    "settings": {
 diff --git a/apps/zgx/ui/panel_home_fixture.luau b/apps/zgx/ui/panel_home_fixture.luau
-index bd9f744ca..28d5da16a 100644
+index d9c75c399..354e4ef07 100644
 --- a/apps/zgx/ui/panel_home_fixture.luau
 +++ b/apps/zgx/ui/panel_home_fixture.luau
-@@ -228,6 +228,12 @@ ui.command { id = "many", title = "Many lanes", run = function()
+@@ -232,6 +232,12 @@ ui.command { id = "many", title = "Many lanes", run = function()
  	end
  	publish_messages()
  end }
@@ -2877,10 +3015,10 @@ index 206cd3f7f..229e622b3 100644
  								local s = which()
  								if s then
 diff --git a/apps/zgx/ui/screens/chat/shared.luau b/apps/zgx/ui/screens/chat/shared.luau
-index 5715f91f6..ddcd699ff 100644
+index 6382f09a4..9e3ba5541 100644
 --- a/apps/zgx/ui/screens/chat/shared.luau
 +++ b/apps/zgx/ui/screens/chat/shared.luau
-@@ -517,7 +517,7 @@ end
+@@ -571,7 +571,7 @@ end
  
  -- A chat as it's listed now, for what says who sent a message: its title (its
  -- short id, untitled) and its agent's mark. Nil for one that isn't listed.
@@ -2889,7 +3027,7 @@ index 5715f91f6..ddcd699ff 100644
  	local now = sessions.now:get()
  	local found: any = nil
  	for _, c in now.chats do
-@@ -551,7 +551,25 @@ function M.chat_of(id: string): { title: string, mark: string? }?
+@@ -605,7 +605,25 @@ function M.chat_of(id: string): { title: string, mark: string? }?
  		return nil
  	end
  	local title = string.match(string.gsub(found.title or "", "%s+", " "), "^%s*(.-)%s*$") or ""
@@ -2997,16 +3135,17 @@ index 72d2c5eb6..e2a3e4797 100644
  	app:command("many")
 diff --git a/apps/zgx/ui/tests/subagent_reports.test.luau b/apps/zgx/ui/tests/subagent_reports.test.luau
 new file mode 100644
-index 000000000..9f60b2e77
+index 000000000..3f9b052c7
 --- /dev/null
 +++ b/apps/zgx/ui/tests/subagent_reports.test.luau
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,298 @@
 +-- A chat's children, each drawn as one row wherever they're listed
 +-- (ds/subagent_row): what they reported back as their turns ended (one at a
 +-- time, or several that landed together), a spawn of Zeron chats or of a
 +-- harness's own subagents (ds/spawn_group), and the composer's Running tray.
 +-- On ui/chat_fixture.luau, whose child chats are listed under the open chat
-+-- (`children_listed`).
++-- (`children_listed`). A report's row says the first of what its child said;
++-- a spawn's and the tray's don't.
 +
 +local function open(command: string): any
 +	local app = mount("chat_fixture.luau")
@@ -3047,14 +3186,17 @@ index 000000000..9f60b2e77
 +	return (string.find(tree, word, 1, true) :: number?) or math.huge
 +end
 +
-+test("a child's report is its row on a card, not a bubble: its title as its chat is called now, how it ended, and no more", function()
++test("a child's report is its row on a card, not a bubble: its title as its chat is called now, how it ended, the first of what it said", function()
 +	local app = open("child_reports")
 +	local tree = app:tree("#transcript")
 +	expect(tree).to_contain("Review API compatibility")
 +	expect(string.find(tree, "Old API title", 1, true)).to_be(nil)
 +	expect(tree).to_contain("Finished")
-+	-- What it said is its chat's, a click away: no line of it, no card.
-+	expect(string.find(tree, "No breaking changes", 1, true)).to_be(nil)
++	-- What it said, under its title as plain words (the rest is its chat's,
++	-- a click away).
++	expect(app:has('.report-card >> .subagent-row-preview >> ~"No breaking changes to public endpoints"')).to_be(true)
++	expect(app:has('.report-card >> .subagent-row-preview >> ~"POST /session still accepts remember"')).to_be(true)
++	expect(string.find(tree, "`POST", 1, true)).to_be(nil)
 +	expect(app:has('.report-card >> role:button "Open Review API compatibility"')).to_be(true)
 +	-- The header is the agent's, never shown.
 +	expect(string.find(tree, "Report from", 1, true)).to_be(nil)
@@ -3068,9 +3210,13 @@ index 000000000..9f60b2e77
 +test("each way a turn ends has its word, and one asking for the person has Answer", function()
 +	local app = open("child_reports")
 +	expect(app:has('role:button "Open Fix flaky login tests" >> "Failed"')).to_be(true)
++	-- A failure's words are noise cut off: its glyph says it.
 +	expect(app:has('role:button "Open Fix flaky login tests" >> ~"cargo test exited 101"')).to_be(false)
 +	expect(app:has('role:button "Open Update auth docs" >> "Stopped"')).to_be(true)
++	expect(app:has('role:button "Open Update auth docs" >> .subagent-row-preview')).to_be(false)
 +	expect(app:has('role:button "Open Write the session migration" >> "Needs input"')).to_be(true)
++	-- One asking says what.
++	expect(app:has('role:button "Open Write the session migration" >> ~"Drop the old sessions table now"')).to_be(true)
 +	expect(app:has('role:button "Answer Write the session migration"')).to_be(true)
 +	expect(app:has('role:button "Answer Fix flaky login tests"')).to_be(false)
 +	expect(app:has('role:button "Answer Review API compatibility"')).to_be(false)
@@ -3101,6 +3247,10 @@ index 000000000..9f60b2e77
 +	expect(tree).to_contain("zeron-text")
 +	expect(tree).to_contain("zeron-rpc")
 +	expect(app:has('role:button "Answer Write the session migration"')).to_be(true)
++	-- Each row says the first of what its child said, but a failure's.
++	expect(app:has('role:button "Open zeron-text" >> .subagent-row-preview >> "Clean"')).to_be(true)
++	expect(app:has('role:button "Open Write the session migration" >> ~"Vendored acp code has 3 unwraps"')).to_be(true)
++	expect(string.find(tree, "cargo test hung", 1, true)).to_be(nil)
 +	-- Its head folds them away.
 +	app:click('role:button "5 subagents reported"')
 +	app:frames(40)
@@ -3130,10 +3280,11 @@ index 000000000..9f60b2e77
 +	expect(at(tree, "Write the session migration") < at(tree, "Fix flaky login tests")).to_be(true)
 +	expect(at(tree, "Fix flaky login tests") < at(tree, "zeron-sync")).to_be(true)
 +	expect(at(tree, "zeron-sync") < at(tree, "Review API compatibility")).to_be(true)
-+	-- In a list, a row is its title and how it stands: what it said last is
-+	-- the chat's, a click away.
++	-- In a spawn, a row is its title and how it stands: it has said nothing
++	-- yet, and what it says is the chat's, a click away.
 +	expect(app:has('role:button "Open zeron-sync" >> "Running"')).to_be(true)
 +	expect(string.find(tree, "Reading crates/sync/src/peer.rs", 1, true)).to_be(nil)
++	expect(app:has("#transcript >> .subagent-row-preview")).to_be(false)
 +	expect(app:has('role:button "Open zeron-doc" >> "Running"')).to_be(true)
 +	-- It follows its chats as they go.
 +	app:command("child_finishes")
@@ -3158,6 +3309,18 @@ index 000000000..9f60b2e77
 +	expect(app:error()).to_be(nil)
 +end)
 +
++test("Zeron's notes under a report are its agent's: none is shown", function()
++	local app = open("child_reports")
++	app:frames(5)
++	-- (As a host that still sent them would.)
++	app:command("report_with_notes")
++	app:frames(30)
++	local tree = app:tree("#transcript")
++	expect(tree).to_contain("Index the docs")
++	expect(string.find(tree, "Still working for you", 1, true)).to_be(nil)
++	expect(app:error()).to_be(nil)
++end)
++
 +test("children's messages are their rows too, standing as their chats do now", function()
 +	local app = open("child_messaged")
 +	local tree = app:tree("#transcript")
@@ -3165,9 +3328,10 @@ index 000000000..9f60b2e77
 +	-- A message says nothing of how a turn ends: one working runs.
 +	expect(app:has('role:button "Open zeron-sync" >> "Running"')).to_be(true)
 +	expect(app:has('role:button "Open Review API compatibility" >> "Finished"')).to_be(true)
-+	-- What they said is their chats', a click away.
++	-- What one at rest said is under its title; one still working says
++	-- nothing yet (its chat has the rest, a click away).
 +	expect(string.find(tree, "Halfway", 1, true)).to_be(nil)
-+	expect(string.find(tree, "Which branch", 1, true)).to_be(nil)
++	expect(app:has('role:button "Open Review API compatibility" >> .subagent-row-preview >> "Which branch should I base on?"')).to_be(true)
 +end)
 +
 +test("a message after a child's report doesn't change how its spawn says it ended", function()
@@ -3215,10 +3379,11 @@ index 000000000..9f60b2e77
 +	expect(app:error()).to_be(nil)
 +end)
 +
-+test("a spawn of one chat is its row alone, with no group around it", function()
++test("a spawn of one chat is its row alone on a card, as a report of one is, with no group around it", function()
 +	local app = open("spawned_one")
 +	expect(app:has('role:button "1 subagent"')).to_be(false)
-+	expect(app:has('role:button "Open Count crates" >> "Running"')).to_be(true)
++	expect(app:has('.spawn-card >> role:button "Open Count crates" >> "Running"')).to_be(true)
++	expect(app:has(".spawn-card >> .subagent-row-preview")).to_be(false)
 +	app:click('role:button "Open Count crates"')
 +	app:frames(40)
 +	expect(tabs(app, "side_chat", "Count crates")).to_be(1)
@@ -3257,6 +3422,8 @@ index 000000000..9f60b2e77
 +	-- Asking above those working.
 +	local tree = app:tree()
 +	expect(at(tree, 'button "Open Write the session migration"') < at(tree, 'button "Open zeron-sync"')).to_be(true)
++	-- No row says what its chat said: that's a report's.
++	expect(app:has(".subagent-row-preview")).to_be(false)
 +	-- The two that ended fold behind one row; a side chat at rest is the
 +	-- person's own, not running.
 +	expect(app:has('role:button "Show 2 finished"')).to_be(true)
@@ -3271,7 +3438,7 @@ index 000000000..9f60b2e77
 +	expect(app:error()).to_be(nil)
 +end)
 diff --git a/crates/client/src/demo/mod.rs b/crates/client/src/demo/mod.rs
-index 553afd3e3..0f67522f9 100644
+index 94c5137db..1afa04193 100644
 --- a/crates/client/src/demo/mod.rs
 +++ b/crates/client/src/demo/mod.rs
 @@ -364,7 +364,7 @@ impl DemoHost {
@@ -3284,10 +3451,10 @@ index 553afd3e3..0f67522f9 100644
                          token.cancel();
                      } else {
 diff --git a/crates/client/src/session/mod.rs b/crates/client/src/session/mod.rs
-index 14425f5e5..0dac5038d 100644
+index ac4750235..57ce7cb55 100644
 --- a/crates/client/src/session/mod.rs
 +++ b/crates/client/src/session/mod.rs
-@@ -1192,7 +1192,7 @@ impl SessionHandle {
+@@ -1194,7 +1194,7 @@ impl SessionHandle {
          let client = self.core.client()?;
          self.core.queue_command(
              &client.config.device_id,
@@ -3297,12 +3464,12 @@ index 14425f5e5..0dac5038d 100644
          client.after_command(&self.core, false);
          Ok(())
 diff --git a/crates/doc/src/commands.rs b/crates/doc/src/commands.rs
-index c7d4d9004..c47101b4f 100644
+index 1fbfa3d88..5461f5611 100644
 --- a/crates/doc/src/commands.rs
 +++ b/crates/doc/src/commands.rs
-@@ -48,7 +48,14 @@ pub enum SessionCommandPayload {
-         prompt: String,
-         message_id: Option<String>,
+@@ -55,7 +55,14 @@ pub enum SessionCommandPayload {
+         #[serde(default = "at_once", skip_serializing_if = "is_at_once")]
+         at_once: bool,
      },
 -    Interrupt {},
 +    /// A Stop. `stopped_by`: the chat whose agent stopped it (its parent),
@@ -3316,7 +3483,7 @@ index c7d4d9004..c47101b4f 100644
      #[serde(rename_all = "camelCase")]
      RespondInput {
          request_id: String,
-@@ -61,7 +68,7 @@ impl SessionCommandPayload {
+@@ -76,7 +83,7 @@ impl SessionCommandPayload {
          match self {
              SessionCommandPayload::Run { .. } => SessionCommandKind::Run,
              SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
@@ -3325,7 +3492,7 @@ index c7d4d9004..c47101b4f 100644
              SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
          }
      }
-@@ -282,8 +289,8 @@ mod tests {
+@@ -299,8 +306,8 @@ mod tests {
      #[test]
      fn newer_interrupt_still_supersedes_older_interrupt() {
          let entries = vec![
@@ -3336,7 +3503,7 @@ index c7d4d9004..c47101b4f 100644
          ];
          let context = cx(&entries, &NEVER, &NEVER, 3_000, None);
          assert_eq!(
-@@ -298,7 +305,7 @@ mod tests {
+@@ -315,7 +322,7 @@ mod tests {
  
      #[test]
      fn interrupt_for_past_turn_is_superseded() {
@@ -3359,7 +3526,7 @@ index 0ee8e47a6..778aecc31 100644
              issued_at: 9,
              based_on: None,
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index b4d1b2b38..ddde42a1e 100644
+index 67c2efcc9..48605551b 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
 @@ -108,6 +108,43 @@ const ATTACHMENT_WAIT_MAX_MS: i64 = ATTACHMENT_WAIT_MAX.as_millis() as i64;
@@ -3437,7 +3604,7 @@ index b4d1b2b38..ddde42a1e 100644
          lock(&self.inner.sessions).clone()
      }
  
-@@ -3623,10 +3668,15 @@ impl DocHost {
+@@ -3632,10 +3677,15 @@ impl DocHost {
              turn_id: Some(m.id.clone()),
              frontier: None,
          });
@@ -3457,7 +3624,7 @@ index b4d1b2b38..ddde42a1e 100644
          let entry = SessionCommandEntry {
              id: id.clone(),
              payload,
-@@ -4297,6 +4347,12 @@ impl DocHost {
+@@ -4306,6 +4356,12 @@ impl DocHost {
              if sessions.turn_in_flight(&handle.chat_id) {
                  return; // All queued messages wait, including rows from older clients.
              }
@@ -3470,7 +3637,7 @@ index b4d1b2b38..ddde42a1e 100644
              // A row from another device names its images by `pending://` ref
              // while the bytes chase it over the peer link. Hold it (in order)
              // until they land — UploadCommit re-drains — rather than handing
-@@ -4314,8 +4370,26 @@ impl DocHost {
+@@ -4323,8 +4379,26 @@ impl DocHost {
                  return;
              };
              lock(&handle.steered_rows).retain(|row| row != &item.id);
@@ -3498,7 +3665,7 @@ index b4d1b2b38..ddde42a1e 100644
                  tracing::warn!(chat = %handle.chat_id, error = %err, "queued send failed");
                  handle.queue_paused.store(true, Ordering::Release);
                  let _ = handle.doc.insert_queued(0, &item);
-@@ -5678,6 +5752,60 @@ impl DocHost {
+@@ -5687,6 +5761,60 @@ impl DocHost {
                  // A run on another provider than the live turn's (a stale
                  // client, another device's switch) waits for the turn: the
                  // provider never changes by killing a turn mid-flight.
@@ -3559,7 +3726,7 @@ index b4d1b2b38..ddde42a1e 100644
                  let other_provider = sessions.live_harness(chat_id).is_some_and(|live| live != harness);
                  if other_provider || sessions.defers_to_turn_end(chat_id, Some((harness, &request))) {
                      self.hold_until_turn_end(
-@@ -5717,8 +5845,11 @@ impl DocHost {
+@@ -5726,8 +5854,11 @@ impl DocHost {
                  .await?;
                  // A fresh user-authored turn is the deliberate action that
                  // thaws a queue frozen by Cancel. Clear only after dispatch
@@ -3572,8 +3739,8 @@ index b4d1b2b38..ddde42a1e 100644
 +                }
                  Ok((SessionCommandStatus::Applied, None))
              }
-             SessionCommandPayload::Steer { prompt, message_id } => {
-@@ -5731,7 +5862,7 @@ impl DocHost {
+             SessionCommandPayload::Steer {
+@@ -5745,7 +5876,7 @@ impl DocHost {
                  )
                  .await
              }
@@ -3582,7 +3749,7 @@ index b4d1b2b38..ddde42a1e 100644
                  self.await_earlier_prompts(sessions, handle, &entry.id)
                      .await;
                  *lock(&handle.stopped_by) = Some(entry.id.clone());
-@@ -5878,6 +6009,190 @@ impl DocHost {
+@@ -5892,6 +6023,190 @@ impl DocHost {
          Ok(())
      }
  
@@ -3949,10 +4116,10 @@ index 636da386f..43dcd248a 100644
      pub fn replay(
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
 new file mode 100644
-index 000000000..555dcf43c
+index 000000000..6292ed6c9
 --- /dev/null
 +++ b/crates/engine/src/session_reports.rs
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,1135 @@
 +//! A child chat reports back to its parent: when a turn its parent's agent
 +//! asked for settles (finished, failed, stopped, or asking the person), the
 +//! child's host writes the reply into the parent as a report
@@ -4017,17 +4184,41 @@ index 000000000..555dcf43c
 +        }
 +        entry.1.insert(stage.to_owned())
 +    }
++
++    /// Give back a claim whose report never went (it couldn't be built or
++    /// queued): a later settle, or the next start, sends it.
++    pub(super) fn release(&self, child: &str, message: &str, stage: &str) {
++        let mut reported = lock(&self.0);
++        if let Some(entry) = reported.get_mut(child)
++            && entry.0 == message
++        {
++            entry.1.remove(stage);
++        }
++    }
++}
++
++/// How close before a turn's settle a Stop must have been sent to be the
++/// one that ended it.
++const STOP_SETTLE_MS: i64 = 60 * 1000;
++
++#[cfg(test)]
++thread_local! {
++    /// How many of the next reports fail to queue, as a parent's doc that
++    /// can't be written would.
++    pub(super) static FAIL_QUEUE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 +}
 +
 +/// Report `child`'s settled turn to its parent, when its parent asked for it
 +/// and doesn't have the reply yet. Runs on the child's host, after the
-+/// status that settled it is published (its final segment is in the doc).
++/// status that settled it is published (its final segment is in the doc);
++/// `settled_at`: when that was.
 +pub(super) async fn report_turn_end(
 +    host: DocHost,
 +    journal: Arc<RunJournal>,
 +    reported: Arc<Reported>,
 +    child: String,
 +    status: ReportStatus,
++    settled_at: i64,
 +) {
 +    let Some(ws) = host.workspace().cloned() else {
 +        return;
@@ -4058,25 +4249,47 @@ index 000000000..555dcf43c
 +            entries = handle.doc().read_entries().unwrap_or_default();
 +        }
 +    }
-+    let Some(at) = request_message(&entries, &parent) else {
++    let commands = handle.doc().read_commands().unwrap_or_default();
++    // The Stop that ended a stopped turn, when one did (not a "send now").
++    let stop = (status == ReportStatus::Stopped)
++        .then(|| {
++            commands
++                .iter()
++                .filter(|c| matches!(c.payload, SessionCommandPayload::Interrupt { .. }))
++                .map(|c| c.issued_at)
++                .filter(|&at| at <= settled_at && settled_at - at <= STOP_SETTLE_MS)
++                .max()
++        })
++        .flatten();
++    // A stopped turn answered what was sent before its Stop (strictly: one
++    // sent in the same millisecond came with it, not before): the parent's
++    // next message, sent after it, may be in already, its turn not begun.
++    let cut = stop.map_or(settled_at, |at| at - 1);
++    let Some(at) = request_for_turn(&entries, &parent, cut) else {
 +        return; // the person's chat alone, or another chat's
 +    };
 +    let asked = entries[at].id.clone();
++    // Its answer runs up to the parent's next message, if one is in.
 +    let after = &entries[at + 1..];
++    let after = after
++        .iter()
++        .position(|e| e.role == MessageRole::User && from_parent(&text_of(&e.parts), &parent))
++        .map_or(after, |next| &after[..next]);
 +    let stage = match status {
 +        ReportStatus::NeedsInput => match open_question(after) {
 +            Some((request_id, _)) => format!("ask:{request_id}"),
 +            None => return,
 +        },
-+        _ => "end".to_owned(),
++        _ => end_stage(status).to_owned(),
 +    };
-+    // A stop that hands the turn to a message already on its way (a steer
-+    // read at once) is no end: that message's turn reports.
-+    if status == ReportStatus::Stopped && handle.continues_with_sent_message() {
++    // A stop that hands the turn to a message already on its way (the
++    // person's "send now") is no end: that message's turn reports. A Stop
++    // is one, whatever is sent after it.
++    if status == ReportStatus::Stopped && stop.is_none() && handle.continues_with_sent_message() {
 +        return;
 +    }
 +    // Its parent's agent stopped it: that's no news to it.
-+    if stopped_by_parent(&handle.doc().read_commands().unwrap_or_default(), &parent, entries[at].created_at) {
++    if stopped_by_parent(&commands, &parent, entries[at].created_at) {
 +        tracing::info!(chat = %child, %parent, "its parent stopped it: no report");
 +        return;
 +    }
@@ -4114,14 +4327,23 @@ index 000000000..555dcf43c
 +    }
 +    let body = match status {
 +        ReportStatus::NeedsInput => question_body(after, &child),
-+        // The person stopped it: what it wrote is from before the Stop,
-+        // however sure of itself it sounds.
++        // What it wrote is from before the stop, however sure of itself it
++        // sounds. Only a Stop nobody's agent sent is the person's.
 +        ReportStatus::Stopped => {
 +            let reply = reply_body(after, status);
-+            let said = if reply.is_empty() {
-+                "The person stopped it before it wrote anything.".to_owned()
-+            } else {
-+                format!("The person stopped it. What it wrote before the Stop, possibly unfinished:\n\n{reply}")
++            let by_person = commands.iter().any(|c| {
++                c.issued_at >= entries[at].created_at
++                    && matches!(c.payload, SessionCommandPayload::Interrupt { stopped_by: None })
++            });
++            let said = match (by_person, reply.is_empty()) {
++                (true, true) => "The person stopped it before it wrote anything.".to_owned(),
++                (true, false) => {
++                    format!("The person stopped it. What it wrote before the Stop, possibly unfinished:\n\n{reply}")
++                }
++                (false, true) => "Its turn was cut off before it wrote anything.".to_owned(),
++                (false, false) => {
++                    format!("Its turn was cut off before it finished. What it wrote, possibly unfinished:\n\n{reply}")
++                }
 +            };
 +            capped(said, &child)
 +        }
@@ -4138,12 +4360,32 @@ index 000000000..555dcf43c
 +    let text = agent_messages::child_report(&label, &child, status, &body);
 +    let Some(request) = host.request_from_chat_row(&parent, &text) else {
 +        tracing::warn!(chat = %child, %parent, "report not sent: the parent has no run config");
++        reported.release(&child, &asked, &stage);
 +        return;
 +    };
 +    let payload = SessionCommandPayload::Run { request, message_id: key };
++    #[cfg(test)]
++    if FAIL_QUEUE.with(|left| left.replace(left.get().saturating_sub(1))) > 0 {
++        tracing::warn!(chat = %child, %parent, "child report failed (test)");
++        reported.release(&child, &asked, &stage);
++        return;
++    }
 +    match host.queue_command(&parent, payload) {
 +        Ok(_) => tracing::info!(chat = %child, %parent, status = status.as_str(), "child reported to its parent"),
-+        Err(error) => tracing::warn!(chat = %child, %parent, %error, "child report failed"),
++        Err(error) => {
++            tracing::warn!(chat = %child, %parent, %error, "child report failed");
++            reported.release(&child, &asked, &stage);
++        }
++    }
++}
++
++/// The stage of the report a turn's end makes. A stop's is its own: a
++/// report of the stop never stands for the end of the work it cut (a turn
++/// on the same message can still finish, and report that).
++fn end_stage(status: ReportStatus) -> &'static str {
++    match status {
++        ReportStatus::Stopped => "stopped",
++        _ => "end",
 +    }
 +}
 +
@@ -4169,12 +4411,16 @@ index 000000000..555dcf43c
 +            let parent = child.parent_chat_id.clone()?;
 +            let handle = host.open(&child.id).ok()?;
 +            let entries = handle.doc().read_entries().unwrap_or_default();
-+            let at = request_message(&entries, &parent)?;
++            // Its turn ended when its last answer did.
++            let ended = entries
++                .iter()
++                .rev()
++                .find(|e| e.role == MessageRole::Assistant)
++                .map(|e| e.created_at + e.duration_ms.unwrap_or(0))?;
++            let at = request_for_turn(&entries, &parent, ended)?;
 +            let after = &entries[at + 1..];
 +            let last = after.iter().rev().find(|e| e.role == MessageRole::Assistant)?;
-+            if now - (last.created_at + last.duration_ms.unwrap_or(0)) > OWED_RECENT_MS
-+                || delivered(host, &parent, &child.id, &entries[at], "end")
-+            {
++            if now - (last.created_at + last.duration_ms.unwrap_or(0)) > OWED_RECENT_MS {
 +                return None;
 +            }
 +            let commands = handle.doc().read_commands().unwrap_or_default();
@@ -4196,6 +4442,9 @@ index 000000000..555dcf43c
 +            } else {
 +                ReportStatus::Finished
 +            };
++            if delivered(host, &parent, &child.id, &entries[at], end_stage(status)) {
++                return None;
++            }
 +            Some((child.id, status))
 +        })
 +        .collect()
@@ -4233,10 +4482,10 @@ index 000000000..555dcf43c
 +                return false;
 +            };
 +            let doc = handle.doc();
-+            if on_its_way(&doc.read_commands().unwrap_or_default(), parent) {
++            let entries = doc.read_entries().unwrap_or_default();
++            if on_its_way(host, &doc.read_commands().unwrap_or_default(), &entries, parent, &child.id, session) {
 +                return true;
 +            }
-+            let entries = doc.read_entries().unwrap_or_default();
 +            working
 +                && request_message(&entries, parent)
 +                    .is_some_and(|at| !delivered(host, parent, &child.id, &entries[at], "end"))
@@ -4352,20 +4601,21 @@ index 000000000..555dcf43c
 +            {
 +                return Some(format!("{label} (stop requested)"));
 +            }
-+            if on_its_way(&commands, parent) {
++            let entries = doc.read_entries().unwrap_or_default();
++            let session = session_of(host, child, local, &remote, now);
++            if on_its_way(host, &commands, &entries, parent, &child.id, session) {
 +                return Some(format!("{label} (sent, not started)"));
 +            }
-+            let entries = doc.read_entries().unwrap_or_default();
 +            let at = request_message(&entries, parent)?;
 +            if delivered(host, parent, &child.id, &entries[at], "end")
-+                || stopped_by_parent(&doc.read_commands().unwrap_or_default(), parent, entries[at].created_at)
++                || stopped_by_parent(&commands, parent, entries[at].created_at)
 +            {
 +                return None;
 +            }
 +            let asked = entries[at].created_at;
 +            let since = |ms: i64| ago(now.timestamp_millis() - ms);
 +            let mut facts = vec![format!("asked {} ago", since(asked))];
-+            match session_of(host, child, local, &remote, now) {
++            match session {
 +                Some(s) if s.status == SessionStatus::AwaitingInput => facts.insert(0, "waiting on an answer".into()),
 +                Some(s) if s.status == SessionStatus::Working || s.waiting.is_some() => {
 +                    if let Some(at) = journal.as_ref().and_then(|j| j.last_append_ms(&child.id)) {
@@ -4420,16 +4670,56 @@ index 000000000..555dcf43c
 +    }
 +}
 +
-+/// A message from `parent` the child's host hasn't run yet.
-+fn on_its_way(commands: &[zeron_doc::SessionCommandEntry], parent: &str) -> bool {
++/// A message from `parent` the child's host hasn't run yet: its command
++/// still pending, as this device's copy of the child's doc says.
++///
++/// For a child hosted on another device that copy only catches up while
++/// this device keeps the doc open (it stops syncing seconds after the last
++/// read, and the read here comes right after opening it), so the host's
++/// `applied` can be long in coming. Any sign the message got there counts
++/// instead: it's in the transcript, the parent's ledger has a report on it,
++/// or (`session`: the child's fresh row) a turn of the child's ended since.
++fn on_its_way(
++    host: &DocHost,
++    commands: &[zeron_doc::SessionCommandEntry],
++    entries: &[SessionMessageEntry],
++    parent: &str,
++    child: &str,
++    session: Option<&Session>,
++) -> bool {
++    let ran_since = |issued_at: i64| {
++        session
++            .and_then(|s| s.last_turn_outcome.as_ref())
++            .is_some_and(|o| o.finished_at.timestamp_millis() >= issued_at)
++    };
 +    commands
 +        .iter()
 +        .filter(|c| c.status == SessionCommandStatus::Pending)
-+        .any(|c| match &c.payload {
-+            SessionCommandPayload::Run { request, .. } => from_parent(&request.prompt, parent),
-+            SessionCommandPayload::Steer { prompt, .. } => from_parent(prompt, parent),
-+            _ => false,
++        .any(|c| {
++            let (text, message) = match &c.payload {
++                SessionCommandPayload::Run { request, message_id } => (&request.prompt, message_id.as_str()),
++                SessionCommandPayload::Steer { prompt, message_id, .. } => {
++                    (prompt, message_id.as_deref().unwrap_or(&c.id))
++                }
++                _ => return false,
++            };
++            from_parent(text, parent)
++                && !(entries.iter().any(|e| e.id == message)
++                    || reported_on(host, parent, child, message)
++                    || ran_since(c.issued_at))
 +        })
++}
++
++/// Whether `parent`'s ledger has any report from `child` on its message
++/// `asked` (an id in the child's transcript).
++fn reported_on(host: &DocHost, parent: &str, child: &str, asked: &str) -> bool {
++    let Ok(doc) = host.open(parent) else {
++        return false;
++    };
++    let prefix = format!("report-{child}-{asked}-");
++    doc.doc().read_commands().unwrap_or_default().iter().any(|c| {
++        matches!(&c.payload, SessionCommandPayload::Run { message_id, .. } if message_id.starts_with(&prefix))
++    })
 +}
 +
 +/// `text` is a message `parent` sent (not a report, which only parents
@@ -4449,6 +4739,25 @@ index 000000000..555dcf43c
 +        .rposition(|e| e.role == MessageRole::User && from_parent(&text_of(&e.parts), parent))
 +}
 +
++/// Where the parent's message that the child's settled turn answered sits in
++/// `entries`: its latest, once an answer to that has settled. With none
++/// settled since (a turn on it not begun yet, or stopped before it wrote a
++/// word), the latest sent by `cut`: when the turn was cut off (its Stop) or
++/// settled. One sent later came after that turn, and its own turn reports.
++fn request_for_turn(entries: &[SessionMessageEntry], parent: &str, cut: i64) -> Option<usize> {
++    let latest = request_message(entries, parent)?;
++    let answered = entries[latest + 1..]
++        .iter()
++        .any(|e| e.role == MessageRole::Assistant && e.status != Some(MessageStatus::Streaming));
++    if answered {
++        return Some(latest);
++    }
++    entries
++        .iter()
++        .rposition(|e| e.role == MessageRole::User && e.created_at <= cut && from_parent(&text_of(&e.parts), parent))
++        .or(Some(latest))
++}
++
 +/// What a report's key ends on when the parent's own wait returned the
 +/// reply: in its ledger, never read by its agent.
 +pub(crate) const WAITED: &str = "-waited";
@@ -4462,7 +4771,8 @@ index 000000000..555dcf43c
 +
 +/// Whether `parent` has `child`'s report (`stage` of it) on its message
 +/// `asked` already: a command keyed so in the parent's ledger, or, sent
-+/// before reports were keyed, one from `child` ending a turn since.
++/// before reports were keyed, one from `child` ending a turn since (as
++/// stopped, for the `stopped` stage; finished or failed, for the end).
 +fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEntry, stage: &str) -> bool {
 +    let Ok(doc) = host.open(parent) else {
 +        return false;
@@ -4475,14 +4785,15 @@ index 000000000..555dcf43c
 +        if message_id.strip_prefix(key.as_str()).is_some_and(|rest| rest.is_empty() || rest == WAITED) {
 +            return true;
 +        }
-+        stage == "end"
-+            && !message_id.starts_with("report-")
++        let ends = |status: ReportStatus| match stage {
++            "end" => matches!(status, ReportStatus::Finished | ReportStatus::Failed),
++            "stopped" => status == ReportStatus::Stopped,
++            _ => false,
++        };
++        !message_id.starts_with("report-")
 +            && c.issued_at >= asked.created_at
-+            && agent_messages::child_reports(&request.prompt).is_some_and(|reports| {
-+                reports.iter().any(|r| {
-+                    r.sender.chat_id == child && !matches!(r.status, ReportStatus::Message | ReportStatus::NeedsInput)
-+                })
-+            })
++            && agent_messages::child_reports(&request.prompt)
++                .is_some_and(|reports| reports.iter().any(|r| r.sender.chat_id == child && ends(r.status)))
 +    })
 +}
 +
@@ -4902,11 +5213,50 @@ index 000000000..555dcf43c
 +        assert!(reported.claim("c", "m1", "ask:r1"));
 +        assert!(reported.claim("c", "m1", "end"));
 +        assert!(!reported.claim("c", "m1", "end"));
++        // A stop's report is its own: the end on the same message still goes.
++        assert!(reported.claim("c", "m1", "stopped"));
 +        assert!(reported.claim("c", "m2", "end"), "a new request reports anew");
++        // One that never went is given back, and goes when tried again.
++        reported.release("c", "m2", "end");
++        assert!(reported.claim("c", "m2", "end"));
++        reported.release("c", "m1", "end");
++        assert!(!reported.claim("c", "m2", "end"), "an older message's release is no one's");
++    }
++
++    #[test]
++    fn a_settled_turn_answers_the_message_sent_before_it_ended() {
++        let asked = |id: &str, at: i64, text: &str| {
++            let mut e = entry(id, MessageRole::User, vec![said(&agent_messages::agent_message("Lead (parent00)", "parent", text))]);
++            e.created_at = at;
++            e
++        };
++        let answer = |id: &str, at: i64, status: MessageStatus| {
++            let mut e = entry(id, MessageRole::Assistant, vec![said("Working on it.")]);
++            e.created_at = at;
++            e.status = Some(status);
++            e
++        };
++        // Stopped mid-answer; the parent's next message came after the Stop.
++        let mut entries = vec![asked("p1", 100, "Fix it."), answer("a1", 110, MessageStatus::Aborted), asked("p2", 300, "Rebase.")];
++        assert_eq!(request_for_turn(&entries, "parent", 200), Some(0));
++        // ...and its turn has begun, still streaming: still the first.
++        entries.push(answer("a2", 310, MessageStatus::Streaming));
++        assert_eq!(request_for_turn(&entries, "parent", 200), Some(0));
++        // Once an answer to it settles, the latest is what turns answer.
++        entries[3].status = Some(MessageStatus::Complete);
++        assert_eq!(request_for_turn(&entries, "parent", 400), Some(2));
++        // Stopped before it wrote anything: the message it was on.
++        let entries = vec![asked("p1", 100, "Fix it."), answer("a1", 110, MessageStatus::Complete), asked("p2", 150, "Also this.")];
++        assert_eq!(request_for_turn(&entries, "parent", 200), Some(2));
++        // Finished, and the parent's next message landed before the report
++        // was written: it isn't what that turn answered.
++        let entries = vec![asked("p1", 100, "Fix it."), answer("a1", 110, MessageStatus::Complete), asked("p2", 250, "Next.")];
++        assert_eq!(request_for_turn(&entries, "parent", 200), Some(0));
++        assert_eq!(request_for_turn(&entries, "someone-else", 200), None);
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 404d662c7..01d818e50 100644
+index ca6c2f924..e971ee445 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -29,6 +29,7 @@ use zeron_doc::{
@@ -4927,7 +5277,7 @@ index 404d662c7..01d818e50 100644
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
  use crate::{EngineError, new_id, now_ms};
-@@ -275,6 +279,10 @@ struct Inner {
+@@ -281,6 +285,14 @@ struct Inner {
      /// while no run was live (between the failed run and its retry) found
      /// nothing to stop, and still ends the turn.
      user_stops: Mutex<HashMap<String, u64>>,
@@ -4935,10 +5285,14 @@ index 404d662c7..01d818e50 100644
 +    /// that settles soon after is the Stop's end, however it closes (a wait
 +    /// on background work the Stop killed closes as if done).
 +    stopped_at: Mutex<HashMap<String, std::time::Instant>>,
++    /// Chats whose turn a steer is stopping to be read at once
++    /// ([`SessionsEngine::steer_now`]), until that turn settles: its end is
++    /// the steer's turn starting, no Stop of anyone's.
++    steer_stops: Mutex<std::collections::HashSet<String>>,
      /// Loopback IPC port this engine serves, once known (0 = not serving):
      /// what the injected `zeron mcp` server dials back into.
      ipc_port: std::sync::atomic::AtomicU16,
-@@ -328,6 +336,9 @@ struct Inner {
+@@ -334,6 +346,9 @@ struct Inner {
      turn_listener: OnceLock<TurnListener>,
      /// Plugins whose native MCP servers local runs get (absent in bare tests).
      plugins: OnceLock<crate::plugins::Plugins>,
@@ -4948,15 +5302,16 @@ index 404d662c7..01d818e50 100644
  }
  
  /// Turn-start hook: called with `(chat_id, cwd)`.
-@@ -358,6 +369,7 @@ impl SessionsEngine {
+@@ -364,6 +379,8 @@ impl SessionsEngine {
                  revivals: Mutex::new(HashMap::new()),
                  cancelled_sends: Mutex::new(HashMap::new()),
                  user_stops: Mutex::new(HashMap::new()),
 +                stopped_at: Mutex::new(HashMap::new()),
++                steer_stops: Mutex::new(std::collections::HashSet::new()),
                  ipc_port: std::sync::atomic::AtomicU16::new(0),
                  ipc_ready: tokio::sync::Notify::new(),
                  ipc_token_file: Mutex::new(None),
-@@ -379,6 +391,7 @@ impl SessionsEngine {
+@@ -385,6 +402,7 @@ impl SessionsEngine {
                  scratch_root: OnceLock::new(),
                  turn_listener: OnceLock::new(),
                  plugins: OnceLock::new(),
@@ -4964,7 +5319,7 @@ index 404d662c7..01d818e50 100644
              }),
          }
      }
-@@ -434,6 +447,31 @@ impl SessionsEngine {
+@@ -440,6 +458,31 @@ impl SessionsEngine {
          let _ = self.inner.plugins.set(plugins);
      }
  
@@ -4996,7 +5351,7 @@ index 404d662c7..01d818e50 100644
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -516,6 +554,11 @@ impl SessionsEngine {
+@@ -522,6 +565,11 @@ impl SessionsEngine {
              .is_some_and(HarnessDescriptor::steers_mid_turn)
      }
  
@@ -5008,15 +5363,48 @@ index 404d662c7..01d818e50 100644
      /// Whether this chat has a turn in flight — streaming, or parked on a
      /// question it is still owed an answer to (see [`is_active`]). A persistent
      /// session parked BETWEEN turns is not: it holds a warm child with nothing
-@@ -1652,6 +1695,7 @@ impl SessionsEngine {
-         *lock(&self.inner.user_stops)
-             .entry(chat_id.to_string())
-             .or_default() += 1;
+@@ -1640,8 +1688,10 @@ impl SessionsEngine {
+         if !self.turn_in_flight(chat_id) {
+             return false;
+         }
+-        // The stopped turn is replaced, not crashed: never revived.
++        // The stopped turn is replaced, not crashed: never revived. Nor is
++        // it stopped: the steer's turn carries on from it.
+         self.note_user_stop(chat_id);
++        lock(&self.inner.steer_stops).insert(chat_id.to_string());
+         redeliver_on_stop.store(true, Release);
+         turn.stop_turn();
+         let deadline = tokio::time::Instant::now() + STOP_SETTLE;
+@@ -1680,6 +1730,7 @@ impl SessionsEngine {
+     /// models never come here: they keep the runtime and its work.)
+     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+         self.note_user_stop(chat_id);
++        self.note_stopped(chat_id);
+         self.terminate(chat_id).await
+     }
+ 
+@@ -1706,6 +1757,12 @@ impl SessionsEngine {
+         }
+     }
+ 
++    /// A Stop ends the chat's turn, however it settles: a child chat reports
++    /// it stopped (see `Inner::stopped_at`). A steer's stop isn't one.
++    fn note_stopped(&self, chat_id: &str) {
 +        lock(&self.inner.stopped_at).insert(chat_id.to_string(), std::time::Instant::now());
-         let live = if let Some(run) = lock(&self.inner.runs).get(chat_id) {
-             run.shutdown_cut
-                 .store(false, std::sync::atomic::Ordering::Release);
-@@ -2378,6 +2422,7 @@ impl Inner {
++    }
++
+     /// End the in-flight turn so another prompt can take its place ("send
+     /// now"), keeping the runtime and its background work. Its streaming
+     /// entry is stamped `aborted`; this waits (bounded) for that settlement
+@@ -1720,6 +1777,7 @@ impl SessionsEngine {
+     pub async fn stop_turn(&self, chat_id: &str) -> Result<bool, EngineError> {
+         const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+         self.note_user_stop(chat_id);
++        self.note_stopped(chat_id);
+         let target = lock(&self.inner.runs)
+             .get(chat_id)
+             .filter(|h| {
+@@ -2420,6 +2478,7 @@ impl Inner {
          outcome: Option<DoneStatus>,
      ) {
          let now = Utc::now();
@@ -5024,24 +5412,31 @@ index 404d662c7..01d818e50 100644
          let session = {
              let mut statuses = lock(&self.statuses);
              let entry = statuses
-@@ -2465,6 +2510,67 @@ impl Inner {
+@@ -2507,6 +2566,75 @@ impl Inner {
          {
              tracing::warn!(chat = %chat_id, %error, "couldn't wake a sleeping chat");
          }
 +        // A turn settling here is what a child chat reports to its parent,
 +        // when the parent asked for it ([`reports`]). A wait's held end is
 +        // no settling until it's marked.
-+        // A Stop lasts until a turn starts again: a turn settling after one
-+        // is that Stop's end, however it closes (a wait on background work
-+        // the Stop killed closes as if done).
++        // A Stop lasts until a turn starts again, or one settles: the first
++        // turn settling after it is that Stop's end, however it closes (a
++        // wait on background work the Stop killed closes as if done). Not
++        // the next one's, which can start before the stopped one settles.
 +        if status == SessionStatus::Working && was != status {
 +            lock(&self.stopped_at).remove(chat_id);
 +        }
-+        let stopped = lock(&self.stopped_at).contains_key(chat_id);
++        let stopped = status == SessionStatus::Idle
++            && (finished || outcome.is_some())
++            && lock(&self.stopped_at).remove(chat_id).is_some();
++        // A turn a steer stopped to be read at once settles here, and the
++        // steer's turn goes on from it: nothing ended. (A stop too slow for
++        // the steer leaves the mark to the turn's own end.)
++        let replaced = status == SessionStatus::Idle && lock(&self.steer_stops).remove(chat_id);
 +        let settled = match status {
 +            SessionStatus::Idle if finished && stopped => Some(ReportStatus::Stopped),
 +            SessionStatus::Idle if finished => Some(ReportStatus::Finished),
-+            SessionStatus::Idle if outcome == Some(DoneStatus::Interrupted) => {
++            SessionStatus::Idle if outcome == Some(DoneStatus::Interrupted) && !replaced => {
 +                Some(ReportStatus::Stopped)
 +            }
 +            SessionStatus::Errored if was != status => Some(ReportStatus::Failed),
@@ -5076,6 +5471,7 @@ index 404d662c7..01d818e50 100644
 +            self.reported.clone(),
 +            chat_id.to_owned(),
 +            status,
++            now_ms(),
 +        ));
 +    }
 +
@@ -5092,7 +5488,7 @@ index 404d662c7..01d818e50 100644
      }
  
      /// Publish what `chat_id`'s agent waits on after its turn ended (`None`:
-@@ -2502,9 +2608,18 @@ impl Inner {
+@@ -2600,9 +2728,18 @@ impl Inner {
      /// A message the user already sent follows the turn that is ending
      /// (see [`crate::doc_host::ChatDocHandle::continues_with_sent_message`]).
      fn continues_with_sent_message(&self, chat_id: &str) -> bool {
@@ -5114,7 +5510,7 @@ index 404d662c7..01d818e50 100644
      }
  
      /// Whether a run of `chat_id` launches without its provider's own
-@@ -4321,6 +4436,10 @@ async fn drive_run(
+@@ -4520,6 +4657,10 @@ async fn drive_run(
      let mut waiting_on = turn.watch_waiting();
      let mut wait: Option<ParkedWait> = None;
      let wake_grace = wake_grace();
@@ -5125,7 +5521,7 @@ index 404d662c7..01d818e50 100644
      // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
      // steerable harness parks here instead of ending the run — the child and
      // its steering mailbox stay warm, and the next user message (dispatch
-@@ -4465,9 +4584,23 @@ async fn drive_run(
+@@ -4698,9 +4839,23 @@ async fn drive_run(
                      continue;
                  }
                  // What a parked wait waits on changed: shown as it is; once
@@ -5152,7 +5548,7 @@ index 404d662c7..01d818e50 100644
                      if let Some(parked) = wait.as_mut() {
                          parked.grace = if on.is_empty() {
                              parked.grace.or_else(|| Some(tokio::time::Instant::now() + wake_grace))
-@@ -5483,8 +5616,9 @@ async fn drive_run(
+@@ -5723,8 +5878,9 @@ async fn drive_run(
                  let outcome = (!pending_steer && turn_was_active).then_some(*status);
                  // A finished turn whose agent waits on background work that
                  // will wake it parks into a wait: Waiting, its completion
@@ -5164,7 +5560,7 @@ index 404d662c7..01d818e50 100644
                  if completed_turn.is_some() && !on.is_empty() {
                      let since = Utc::now();
                      wait = Some(ParkedWait {
-@@ -6997,4 +7131,770 @@ mod tests {
+@@ -7269,4 +7425,1148 @@ mod tests {
          sessions.ipc_port_ready(limit).await;
          assert_eq!(start.elapsed(), Duration::ZERO);
      }
@@ -5183,10 +5579,14 @@ index 404d662c7..01d818e50 100644
 +        feed: mpsc::UnboundedSender<AgentEvent>,
 +        ask: Ask,
 +        _steers: Arc<Mutex<mpsc::Receiver<SteerMessage>>>,
++        /// Where the engine stops the run's turn in place.
++        turn: zeron_harness::TurnControl,
 +    }
 +
 +    /// A harness running several chats at once, told apart by the origin
-+    /// every run carries. Each chat's latest run is the test's to play.
++    /// every run carries. Each chat's latest run is the test's to play. It
++    /// stops a turn in place, and a steer stops a running tool first, as
++    /// Claude does.
 +    #[derive(Default)]
 +    struct ChatsHarness {
 +        runs: Mutex<HashMap<String, ChatRun>>,
@@ -5205,6 +5605,12 @@ index 404d662c7..01d818e50 100644
 +        }
 +        fn steering_mode(&self) -> zeron_proto::SteeringMode {
 +            zeron_proto::SteeringMode::StepBoundary
++        }
++        fn stops_turn_in_place(&self) -> bool {
++            true
++        }
++        fn steer_stops_tool(&self) -> bool {
++            true
 +        }
 +        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
 +            &[zeron_proto::ReasoningLevel::High]
@@ -5233,6 +5639,7 @@ index 404d662c7..01d818e50 100644
 +                    feed,
 +                    ask: Arc::from(controls.request_input),
 +                    _steers: Arc::new(Mutex::new(controls.steering)),
++                    turn: controls.turn,
 +                },
 +            );
 +            Ok(futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|e| e.map(Ok))).boxed())
@@ -5704,6 +6111,7 @@ index 404d662c7..01d818e50 100644
 +            Arc::new(reports::Reported::default()),
 +            "kid-a".into(),
 +            ReportStatus::Finished,
++            now_ms(),
 +        )
 +        .await;
 +        // And the same report sent again anyway (a retry): the lead's host
@@ -5748,6 +6156,7 @@ index 404d662c7..01d818e50 100644
 +            Arc::new(reports::Reported::default()),
 +            "kid-a".into(),
 +            ReportStatus::Finished,
++            now_ms(),
 +        )
 +        .await;
 +        rig.until("the lead hears back", |r| !r.reports("lead").is_empty()).await;
@@ -5934,6 +6343,371 @@ index 404d662c7..01d818e50 100644
 +        drop(b);
 +        rig.core.sessions.shutdown().await;
 +    }
++
++    use zeron_proto::agent_messages::ReportStatus;
++
++    /// A command the subagent runs, open until the test ends it.
++    fn command(id: &str) -> AgentEvent {
++        AgentEvent::ToolCall {
++            id: id.into(),
++            call: zeron_proto::ToolCall::Exec {
++                command: "npm run gate".into(),
++            },
++        }
++    }
++
++    fn command_ended(id: &str, stopped: bool) -> AgentEvent {
++        AgentEvent::ToolResult {
++            id: id.into(),
++            is_error: stopped,
++            output: None,
++            diff: None,
++            exit_code: None,
++        }
++    }
++
++    impl FamilyRig {
++        /// The lead's agent writes `chat` while it works: a steer, read at
++        /// once only when `at_once` (an explicit `mode: "steer"`).
++        fn lead_writes(&self, chat: &str, text: &str, id: &str, at_once: bool) {
++            self.core
++                .doc_host
++                .queue_command(
++                    chat,
++                    zeron_doc::SessionCommandPayload::Steer {
++                        prompt: from_lead(text),
++                        message_id: Some(id.into()),
++                        at_once,
++                    },
++                )
++                .unwrap();
++        }
++
++        /// Every report the lead has, read or waiting for its turn's end.
++        fn heard(&self) -> Vec<(String, zeron_proto::agent_messages::ReportStatus, String)> {
++            self.reports("lead")
++                .into_iter()
++                .chain(self.queued("lead"))
++                .flat_map(|text| read(&text))
++                .collect()
++        }
++
++        /// Zeron's note on who still works for the lead, as it would read
++        /// it under a report now.
++        fn roster(&self) -> String {
++            let batch = zeron_proto::agent_messages::child_report("Kid (kid-b)", "kid-b", ReportStatus::Finished, "ok");
++            let local = self.core.sessions.local_sessions();
++            let roster = reports::report_notes(&self.core.doc_host, "lead", &batch, &local, false)
++                .pop()
++                .unwrap_or_default();
++            notes(&format!("{batch}\n\n{roster}")).concat()
++        }
++
++        /// The steer the subagent's runtime reads from its mailbox, played
++        /// as read.
++        async fn take_steer(&self, run: &ChatRun) -> SteerMessage {
++            let steer = loop {
++                if let Ok(steer) = lock(&run._steers).try_recv() {
++                    break steer;
++                }
++                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++            };
++            run.feed
++                .send(AgentEvent::Steered { assistant_message_id: None, next_assistant_message_id: Some("a2".into()) })
++                .unwrap();
++            steer
++        }
++    }
++
++    /// The lead's agent writes Tests while Tests runs a command: the
++    /// command finishes, the message is read at the next step, and Tests'
++    /// one report is its finished reply. Nothing reads as stopped.
++    #[tokio::test]
++    async fn an_agents_message_to_a_busy_child_waits_for_its_command_and_reports_once() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Get the tests run.").await;
++        lead.feed.send(text("Asked Tests.")).unwrap();
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Running them.")).unwrap();
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead waits on Tests", |r| r.status("lead").waiting.is_some()).await;
++        kid.feed.send(command("gate")).unwrap();
++        rig.until("the command runs", |r| r.core.sessions.steer_stops_tool("kid-a")).await;
++
++        rig.lead_writes("kid-a", "Also check the docs.", "lead-m2", false);
++        let stop = tokio::time::timeout(std::time::Duration::from_millis(500), kid.turn.stop_requested()).await;
++        assert!(stop.is_err(), "the command wasn't stopped");
++        assert_eq!(rig.status("kid-a").status, SessionStatus::Working);
++        let on: Vec<_> = reports::children_on(&rig.core.doc_host, "lead", &rig.core.sessions.local_sessions())
++            .into_iter()
++            .map(|w| w.id)
++            .collect();
++        assert_eq!(on, ["kid-a"], "Tests still works for the lead");
++        assert!(rig.roster().starts_with("Still working for you: Tests (asked "), "{}", rig.roster());
++        assert!(rig.heard().is_empty());
++
++        // The command finishes; the message is read after it, in the turn.
++        kid.feed.send(command_ended("gate", false)).unwrap();
++        let steer = rig.take_steer(&kid).await;
++        assert!(!steer.prompt.contains("Zeron note"), "nothing to explain: {}", steer.prompt);
++        kid.feed.send(text("Tests green, docs checked.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead hears back", |r| !r.heard().is_empty()).await;
++        rig.quiet().await;
++        assert_eq!(
++            rig.heard(),
++            [("kid-a".into(), ReportStatus::Finished, "Tests green, docs checked.".into())]
++        );
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// An explicit steer (read at once) stops Tests' command in place: that
++    /// stop is the steer's turn starting, no Stop, and only its end reports.
++    #[tokio::test]
++    async fn a_steer_read_at_once_stops_the_command_but_reports_only_the_end() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Get the tests run.").await;
++        lead.feed.send(text("Asked Tests.")).unwrap();
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Running them.")).unwrap();
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead waits on Tests", |r| r.status("lead").waiting.is_some()).await;
++        kid.feed.send(command("gate")).unwrap();
++        rig.until("the command runs", |r| r.core.sessions.steer_stops_tool("kid-a")).await;
++
++        rig.lead_writes("kid-a", "Stop that, rebase first.", "lead-m2", true);
++        tokio::time::timeout(std::time::Duration::from_secs(5), kid.turn.stop_requested())
++            .await
++            .expect("the command's turn is stopped in place");
++        kid.feed.send(command_ended("gate", true)).unwrap();
++        kid.feed.send(done(DoneStatus::Interrupted)).unwrap();
++        let steer = rig.take_steer(&kid).await;
++        assert!(
++            steer.prompt.contains("[Zeron note: your running command `npm run gate` was stopped"),
++            "{}",
++            steer.prompt
++        );
++        rig.until("Tests works on the steer", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        rig.quiet().await;
++        assert!(rig.heard().is_empty(), "the stop is no end: {:?}", rig.heard());
++        assert!(rig.roster().starts_with("Still working for you: Tests (asked "), "{}", rig.roster());
++
++        kid.feed.send(text("Rebased, and green.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead hears back", |r| !r.heard().is_empty()).await;
++        rig.quiet().await;
++        assert_eq!(rig.heard(), [("kid-a".into(), ReportStatus::Finished, "Rebased, and green.".into())]);
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// The person stops Tests, and the lead writes it straight after: the
++    /// stop reports on what Tests was doing, said as the person's, and the
++    /// lead's new message still gets its own finished report.
++    #[tokio::test]
++    async fn a_stop_and_the_parents_next_message_report_apart() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Halfway through.")).unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
++
++        rig.core
++            .doc_host
++            .queue_command("kid-a", zeron_doc::SessionCommandPayload::Interrupt { stopped_by: None })
++            .unwrap();
++        rig.lead_writes("kid-a", "Rebase on main.", "lead-m2", false);
++        // The message starts Tests' next run, in a fresh runtime.
++        rig.until("Tests' next run", |r| {
++            !lock(&r.harness.runs).get("kid-a").unwrap().feed.same_channel(&kid.feed)
++        })
++        .await;
++        let next = lock(&rig.harness.runs).get("kid-a").cloned().unwrap();
++        rig.until("the stop reaches the lead", |r| !r.heard().is_empty()).await;
++        next.feed.send(started()).unwrap();
++        next.feed.send(text("Rebased.")).unwrap();
++        next.feed.send(done(DoneStatus::Completed)).unwrap();
++        let both: Vec<(String, ReportStatus, String)> = vec![
++            (
++                "kid-a".into(),
++                ReportStatus::Stopped,
++                "The person stopped it. What it wrote before the Stop, possibly unfinished:\n\nHalfway through.".into(),
++            ),
++            ("kid-a".into(), ReportStatus::Finished, "Rebased.".into()),
++        ];
++        rig.until("the lead hears both", |r| r.heard() == both).await;
++        rig.quiet().await;
++        rig.until("and nothing more", |r| r.heard() == both).await;
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A stop's report made once the lead's next message is in (and its
++    /// turn under way): still on the message the stopped turn was on, with
++    /// what it wrote there, and the new message's end still reports.
++    #[tokio::test]
++    async fn a_stops_report_made_late_is_on_the_message_its_turn_was_on() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Halfway through.")).unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
++        // The stop's report can't be queued at first.
++        reports::FAIL_QUEUE.with(|left| left.set(1));
++        rig.core
++            .doc_host
++            .queue_command("kid-a", zeron_doc::SessionCommandPayload::Interrupt { stopped_by: None })
++            .unwrap();
++        rig.lead_writes("kid-a", "Rebase on main.", "lead-m2", false);
++        rig.until("Tests' next run", |r| {
++            !lock(&r.harness.runs).get("kid-a").unwrap().feed.same_channel(&kid.feed)
++        })
++        .await;
++        let next = lock(&rig.harness.runs).get("kid-a").cloned().unwrap();
++        next.feed.send(started()).unwrap();
++        next.feed.send(text("Rebasing.")).unwrap();
++        rig.until("the report was tried", |_| reports::FAIL_QUEUE.with(std::cell::Cell::get) == 0).await;
++        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
++        assert!(rig.heard().is_empty());
++        // Tried again now, the next message's turn streaming.
++        reports::report_turn_end(
++            rig.core.doc_host.clone(),
++            rig.core.sessions.inner.journal.clone(),
++            rig.core.sessions.inner.reported.clone(),
++            "kid-a".into(),
++            ReportStatus::Stopped,
++            now_ms(),
++        )
++        .await;
++        rig.until("the stop reaches the lead", |r| !r.heard().is_empty()).await;
++        next.feed.send(text(" Rebased.")).unwrap();
++        next.feed.send(done(DoneStatus::Completed)).unwrap();
++        let both: Vec<(String, ReportStatus, String)> = vec![
++            (
++                "kid-a".into(),
++                ReportStatus::Stopped,
++                "The person stopped it. What it wrote before the Stop, possibly unfinished:\n\nHalfway through.".into(),
++            ),
++        ];
++        // (The finished one says the next turn's reply, whatever it is.)
++        let heard_both = |r: &FamilyRig| {
++            let heard = r.heard();
++            heard.len() == 2
++                && heard[0] == both[0]
++                && (heard[1].0.as_str(), heard[1].1) == ("kid-a", ReportStatus::Finished)
++        };
++        rig.until("the lead hears both", heard_both).await;
++        rig.quiet().await;
++        rig.until("and nothing more", heard_both).await;
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A steer's stop that never settles leaves the steer to the step
++    /// boundary, and the turn's end is a finish, not a stop.
++    #[tokio::test]
++    async fn a_steer_whose_stop_never_settles_reports_the_finish() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(command("gate")).unwrap();
++        rig.until("the command runs", |r| r.core.sessions.steer_stops_tool("kid-a")).await;
++        rig.lead_writes("kid-a", "Stop that.", "lead-m2", true);
++        // The runtime never answers the stop; past the engine's 15 s the
++        // steer waits for the step.
++        let steer = tokio::time::timeout(std::time::Duration::from_secs(25), async {
++            loop {
++                if let Ok(steer) = lock(&kid._steers).try_recv() {
++                    break steer;
++                }
++                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++            }
++        })
++        .await
++        .expect("the steer goes the ordinary way");
++        assert!(!steer.prompt.contains("Zeron note"), "nothing was stopped");
++        kid.feed.send(command_ended("gate", false)).unwrap();
++        kid.feed
++            .send(AgentEvent::Steered { assistant_message_id: None, next_assistant_message_id: Some("a2".into()) })
++            .unwrap();
++        kid.feed.send(text("Stopped the long part; all green.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead hears back", |r| !r.heard().is_empty()).await;
++        rig.quiet().await;
++        assert_eq!(
++            rig.heard(),
++            [("kid-a".into(), ReportStatus::Finished, "Stopped the long part; all green.".into())]
++        );
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A report that couldn't be queued gives its claim back: the next try
++    /// (a later settle, or the next start) sends it.
++    #[tokio::test]
++    async fn a_report_that_failed_to_queue_goes_on_the_next_try() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Green.")).unwrap();
++        reports::FAIL_QUEUE.with(|left| left.set(1));
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("Tests is done", |r| r.status("kid-a").last_completed_turn.is_some()).await;
++        rig.until("the report was tried", |_| reports::FAIL_QUEUE.with(std::cell::Cell::get) == 0).await;
++        // Tried again with this engine's own memory of what it sent (a
++        // later settle may have sent it already: it goes once either way,
++        // and with the failed claim kept, never).
++        reports::report_turn_end(
++            rig.core.doc_host.clone(),
++            rig.core.sessions.inner.journal.clone(),
++            rig.core.sessions.inner.reported.clone(),
++            "kid-a".into(),
++            ReportStatus::Finished,
++            now_ms(),
++        )
++        .await;
++        let once: Vec<(String, ReportStatus, String)> = vec![("kid-a".into(), ReportStatus::Finished, "Green.".into())];
++        rig.until("the lead hears back", |r| r.heard() == once).await;
++        rig.quiet().await;
++        rig.until("once", |r| r.heard() == once).await;
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A child on another device: this device's copy of its doc can show
++    /// the lead's message pending long after the child ran it. Once the
++    /// lead has its report, it's no longer "sent, not started".
++    #[tokio::test]
++    async fn a_child_elsewhere_that_reported_isnt_listed_as_not_started() {
++        let rig = family_rig().await;
++        rig.core
++            .workspace
++            .create_chat_with_parent("kid-r", None, Some("laptop"), None, Some(request().cwd), Some("lead".into()))
++            .unwrap();
++        rig.core.workspace.rename_chat("kid-r", "Remote").unwrap();
++        let mut ask = request();
++        ask.prompt = from_lead("Review the diff.");
++        rig.core
++            .doc_host
++            .queue_command("kid-r", zeron_doc::SessionCommandPayload::Run { request: ask, message_id: "r-m1".into() })
++            .unwrap();
++        assert_eq!(rig.roster(), "Still working for you: Remote (sent, not started). Their reports reach you on their own.");
++        // Its host ran it and reported; this copy of its doc never caught up.
++        let mut report = request();
++        report.prompt = zeron_proto::agent_messages::child_report("Remote (kid-r)", "kid-r", ReportStatus::Finished, "LGTM.");
++        rig.core
++            .doc_host
++            .queue_command(
++                "lead",
++                zeron_doc::SessionCommandPayload::Run { request: report, message_id: "report-kid-r-r-m1-end".into() },
++            )
++            .unwrap();
++        assert_eq!(rig.roster(), "No child is working for you now.");
++        rig.core.sessions.shutdown().await;
++    }
  }
 diff --git a/crates/engine/tests/adapter_chaos_live.rs b/crates/engine/tests/adapter_chaos_live.rs
 index 4c5d1a264..b5ecbf9ca 100644
@@ -5949,10 +6723,10 @@ index 4c5d1a264..b5ecbf9ca 100644
      }
  
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 0e6b7ba1f..2e977982a 100644
+index 74470d437..a28fee12e 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
-@@ -736,7 +736,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
+@@ -737,7 +737,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
      queue_as_viewer(
          handle.doc(),
          "cmd-int-1",
@@ -5961,7 +6735,7 @@ index 0e6b7ba1f..2e977982a 100644
      );
  
      wait_for(
-@@ -3564,7 +3564,7 @@ async fn session_row_counts_running_subagents_until_the_run_ends() {
+@@ -3568,7 +3568,7 @@ async fn session_row_counts_running_subagents_until_the_run_ends() {
      queue_as_viewer(
          handle.doc(),
          "subagents-interrupt",
@@ -5971,7 +6745,7 @@ index 0e6b7ba1f..2e977982a 100644
      wait_for(
          || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
 diff --git a/crates/engine/tests/message_queue.rs b/crates/engine/tests/message_queue.rs
-index dd81433f7..45172b5e6 100644
+index 0a00573d0..12cd03986 100644
 --- a/crates/engine/tests/message_queue.rs
 +++ b/crates/engine/tests/message_queue.rs
 @@ -500,7 +500,7 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
@@ -5983,7 +6757,7 @@ index dd81433f7..45172b5e6 100644
          .expect("queue interrupt");
      wait_for(
          || !core.sessions.turn_in_flight(CHAT),
-@@ -670,7 +670,7 @@ async fn interrupt_bypasses_a_saturated_prompt_command_drain() {
+@@ -672,7 +672,7 @@ async fn interrupt_bypasses_a_saturated_prompt_command_drain() {
      .await;
      let interrupt = core
          .doc_host
@@ -5992,7 +6766,7 @@ index dd81433f7..45172b5e6 100644
          .unwrap();
      let handle = core.doc_host.open(CHAT).unwrap();
      wait_for(
-@@ -940,7 +940,7 @@ async fn steer_now_starts_the_next_turn_when_the_previous_turn_is_already_idle()
+@@ -943,7 +943,7 @@ async fn steer_now_starts_the_next_turn_when_the_previous_turn_is_already_idle()
      let id = reply["id"].as_str().expect("queue id").to_string();
  
      core.doc_host
@@ -6114,7 +6888,7 @@ index 1e0447ee8..cb4aa330b 100644
  it lists under your chat's Subagents and in its transcript's subagent block. Use \
  `kind: side` only for a side conversation the person should treat as their own, \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 8991b315f..447ebe922 100644
+index d5d52d28d..7724444af 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1421,6 +1421,12 @@ impl Tools {
@@ -6665,7 +7439,7 @@ index 6682ed0c0..94382b19b 100644
      fn reads_the_messages_a_send_call_sends() {
          let call = |tool: &str, input: serde_json::Value| ToolCall::Mcp {
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 673a116a9..c9057fb97 100644
+index 8c5c5dfeb..d293ec54e 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -57,6 +57,14 @@ one, and the server refuses to message its own chat. The transcript renders
@@ -6684,5 +7458,5 @@ index 673a116a9..c9057fb97 100644
  
  `create_chat` and each request in `create_chats` accept `kind`:
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

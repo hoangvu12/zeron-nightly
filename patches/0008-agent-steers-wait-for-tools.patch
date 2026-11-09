@@ -1,0 +1,861 @@
+From 02a26849865118535e5e161f3f8d56bc0c21d164 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 9 Nov 2026 11:46:29 +0700
+Subject: [PATCH] An agent's message to a busy chat waits for the command it
+ runs
+
+An agent's send_message (mode "auto") to a working chat was a steer read
+at once. On Claude, with a tool call open, that stopped the turn in place
+first, and the CLI told the model "the user doesn't want to proceed with
+this tool use ... STOP and wait for the user". Workers read the killed
+gate, type check or screenshot run as "declined at the permission
+prompt", and halted for nobody.
+
+- Steer commands carry `at_once` (default true, so older peers' steers
+  and the person's read at once as before). send_message's "auto" sends
+  `at_once: false`: the steer goes by the mailbox, the running command
+  finishes, and the message lands at the turn's next step (Claude writes
+  it with priority "next"). An explicit mode "steer" is still read at
+  once; the tool's description and docs/mcp.md say to use it, or
+  interrupt_chat, only when the message can't wait.
+- A steer that does stop a command now carries a Zeron note under it, for
+  the agent only: "your running command `npm run gate` was stopped so you
+  could read the message above at once. Nobody declined it; run it again
+  if it's still needed." The transcript keeps the message as sent.
+- The run publishes what each open call is (a command, an MCP tool) next
+  to their count, for that note.
+
+Tests: steer_now (an agent's send during a command stops nothing and lands
+after it; an at-once steer's note), the MCP send's `atOnce`, the payload's
+default, and in the Claude harness a message sent while a command runs is
+written `next`, with no interrupt before it.
+---
+ crates/client/src/demo/mod.rs                |  2 +-
+ crates/client/src/session/mod.rs             |  2 +
+ crates/doc/examples/gen_fixture.rs           |  1 +
+ crates/doc/src/commands.rs                   | 34 +++++++
+ crates/doc/src/schema.rs                     |  1 +
+ crates/engine/src/doc_host.rs                | 30 ++++--
+ crates/engine/src/plugin_agents.rs           |  2 +-
+ crates/engine/src/sessions.rs                | 99 +++++++++++++++++---
+ crates/engine/tests/acp_lifecycle.rs         |  2 +
+ crates/engine/tests/cursor_live.rs           |  2 +-
+ crates/engine/tests/e2e.rs                   |  4 +
+ crates/engine/tests/message_queue.rs         |  3 +
+ crates/engine/tests/queue_order_live.rs      |  1 +
+ crates/engine/tests/restart_resume.rs        |  1 +
+ crates/engine/tests/steer_now.rs             | 74 ++++++++++++++-
+ crates/engine/tests/steering_live.rs         |  2 +-
+ crates/harness/tests/claude.rs               | 47 ++++++++++
+ crates/harness/tests/fixtures/fake-claude.sh | 18 ++++
+ crates/mcp/src/tools.rs                      | 15 ++-
+ docs/mcp.md                                  | 11 ++-
+ 20 files changed, 322 insertions(+), 29 deletions(-)
+
+diff --git a/crates/client/src/demo/mod.rs b/crates/client/src/demo/mod.rs
+index 553afd3e3..94c5137db 100644
+--- a/crates/client/src/demo/mod.rs
++++ b/crates/client/src/demo/mod.rs
+@@ -353,7 +353,7 @@ impl DemoHost {
+                         None,
+                     );
+                 }
+-                SessionCommandPayload::Steer { prompt, message_id } => {
++                SessionCommandPayload::Steer { prompt, message_id, .. } => {
+                     let prompt = self.adopt_attachments(&client, &host, &prompt);
+                     let steps = self.reply_for(&prompt);
+                     let id = message_id.unwrap_or_else(crate::new_id);
+diff --git a/crates/client/src/session/mod.rs b/crates/client/src/session/mod.rs
+index 14425f5e5..ac4750235 100644
+--- a/crates/client/src/session/mod.rs
++++ b/crates/client/src/session/mod.rs
+@@ -748,6 +748,7 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
+             SessionCommandPayload::Steer {
+                 prompt,
+                 message_id: Some(message_id),
++                ..
+             } => (message_id, prompt, PendingKind::Steer),
+             _ => continue,
+         };
+@@ -1145,6 +1146,7 @@ impl SessionHandle {
+                     SessionCommandPayload::Steer {
+                         prompt: content,
+                         message_id: Some(message_id.clone()),
++                        at_once: true,
+                     },
+                 )?;
+                 SendOutcome::Steered { message_id }
+diff --git a/crates/doc/examples/gen_fixture.rs b/crates/doc/examples/gen_fixture.rs
+index 7678b31ae..bc82b62ae 100644
+--- a/crates/doc/examples/gen_fixture.rs
++++ b/crates/doc/examples/gen_fixture.rs
+@@ -74,6 +74,7 @@ fn main() {
+         payload: SessionCommandPayload::Steer {
+             prompt: "also run clippy".into(),
+             message_id: None,
++            at_once: true,
+         },
+         issued_by: "device-rust".into(),
+         issued_at: 1_700_000_002_000,
+diff --git a/crates/doc/src/commands.rs b/crates/doc/src/commands.rs
+index c7d4d9004..1fbfa3d88 100644
+--- a/crates/doc/src/commands.rs
++++ b/crates/doc/src/commands.rs
+@@ -43,10 +43,17 @@ pub enum SessionCommandPayload {
+         /// Client-minted message id for the optimistic user entry (dedup key).
+         message_id: String,
+     },
++    /// A message into the turn in flight. `at_once`: the agent reads it now,
++    /// its turn stopped in place first while a command runs (the person's
++    /// steer, or an agent's explicit one); otherwise it waits for that
++    /// command and lands at the turn's next step. Missing on older peers'
++    /// steers, which were all read at once.
+     #[serde(rename_all = "camelCase")]
+     Steer {
+         prompt: String,
+         message_id: Option<String>,
++        #[serde(default = "at_once", skip_serializing_if = "is_at_once")]
++        at_once: bool,
+     },
+     Interrupt {},
+     #[serde(rename_all = "camelCase")]
+@@ -56,6 +63,14 @@ pub enum SessionCommandPayload {
+     },
+ }
+ 
++fn at_once() -> bool {
++    true
++}
++
++fn is_at_once(at_once: &bool) -> bool {
++    *at_once
++}
++
+ impl SessionCommandPayload {
+     pub fn kind(&self) -> SessionCommandKind {
+         match self {
+@@ -195,6 +210,7 @@ mod tests {
+             SessionCommandPayload::Steer {
+                 prompt: "go".into(),
+                 message_id: None,
++                at_once: true,
+             },
+             issued_at,
+         )
+@@ -256,6 +272,7 @@ mod tests {
+                         SessionCommandPayload::Steer {
+                             prompt: format!("unique message {i}"),
+                             message_id: Some(format!("m{i}")),
++                            at_once: true,
+                         },
+                         1_000 + (i * 17 % 23),
+                     )
+@@ -337,6 +354,23 @@ mod tests {
+         assert_eq!(evaluate_command(&r2, &cx1), CommandDisposition::Execute);
+     }
+ 
++    #[test]
++    fn a_steer_without_at_once_is_read_at_once() {
++        let older: SessionCommandPayload =
++            serde_json::from_str(r#"{"kind":"steer","prompt":"go","messageId":null}"#).unwrap();
++        assert!(matches!(older, SessionCommandPayload::Steer { at_once: true, .. }));
++        // Written as before unless it waits for the step.
++        assert!(!serde_json::to_string(&older).unwrap().contains("atOnce"));
++        let waits = SessionCommandPayload::Steer {
++            prompt: "go".into(),
++            message_id: None,
++            at_once: false,
++        };
++        let json = serde_json::to_string(&waits).unwrap();
++        assert!(json.contains(r#""atOnce":false"#), "{json}");
++        assert_eq!(serde_json::from_str::<SessionCommandPayload>(&json).unwrap(), waits);
++    }
++
+     #[test]
+     fn composer_cancel_rules() {
+         let e = steer("c1", 1_000);
+diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
+index e1ead668a..c8fd30eab 100644
+--- a/crates/doc/src/schema.rs
++++ b/crates/doc/src/schema.rs
+@@ -2578,6 +2578,7 @@ mod tests {
+             payload: SessionCommandPayload::Steer {
+                 prompt: "focus".into(),
+                 message_id: None,
++                at_once: true,
+             },
+             issued_by: "dev-b".into(),
+             issued_at: 10,
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index fe43ae17a..67c2efcc9 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -5730,13 +5730,18 @@ impl DocHost {
+                 handle.queue_paused.store(false, Ordering::Release);
+                 Ok((SessionCommandStatus::Applied, None))
+             }
+-            SessionCommandPayload::Steer { prompt, message_id } => {
++            SessionCommandPayload::Steer {
++                prompt,
++                message_id,
++                at_once,
++            } => {
+                 self.deliver_prompt(
+                     sessions,
+                     handle,
+                     prompt,
+                     message_id.clone(),
+                     entry.issued_at,
++                    *at_once,
+                 )
+                 .await
+             }
+@@ -5895,6 +5900,8 @@ impl DocHost {
+     /// resume then reattaches the prior harness conversation.
+     ///
+     /// Turn-boundary drivers retain explicit steers until their next boundary.
++    /// `at_once`: read now, the running command stopped first (see
++    /// [`SessionsEngine::steer_now`]); else at the turn's next step.
+     async fn deliver_prompt(
+         &self,
+         sessions: &SessionsEngine,
+@@ -5902,6 +5909,7 @@ impl DocHost {
+         prompt: &str,
+         message_id: Option<String>,
+         issued_at: i64,
++        at_once: bool,
+     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
+         let chat_id = &handle.chat_id;
+         // Explicit steering uses the run mailbox when the agent reads it
+@@ -5934,12 +5942,20 @@ impl DocHost {
+         {
+             tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
+         }
+-        // A steer is read at once: while a command runs, its turn stops in
+-        // place first (the runtime and its background work stay).
+-        match sessions
+-            .steer_now(chat_id, &prompt, Vec::new(), message_id.clone(), issued_at)
+-            .await?
+-        {
++        // A steer read at once stops the turn in place while a command runs
++        // (the runtime and its background work stay). One that waits (an
++        // agent's ordinary send) lets the command finish: killing it reads
++        // to the agent as its call being declined.
++        let steered = if at_once {
++            sessions
++                .steer_now(chat_id, &prompt, Vec::new(), message_id.clone(), issued_at)
++                .await?
++        } else {
++            sessions
++                .steer_at(chat_id, &prompt, message_id.clone(), issued_at)
++                .await?
++        };
++        match steered {
+             SteerOutcome::Accepted => {
+                 handle.queue_paused.store(false, Ordering::Release);
+                 Ok((SessionCommandStatus::Applied, None))
+diff --git a/crates/engine/src/plugin_agents.rs b/crates/engine/src/plugin_agents.rs
+index e78ead4dd..5ae01a0d8 100644
+--- a/crates/engine/src/plugin_agents.rs
++++ b/crates/engine/src/plugin_agents.rs
+@@ -100,7 +100,7 @@ impl AgentHost for EngineAgentHost {
+                     return Err("A steer carries words only: queue a message with files".into());
+                 }
+                 let id = crate::new_id();
+-                let payload = SessionCommandPayload::Steer { prompt: text.to_owned(), message_id: Some(id.clone()) };
++                let payload = SessionCommandPayload::Steer { prompt: text.to_owned(), message_id: Some(id.clone()), at_once: true };
+                 self.doc_host.queue_command_with_transfers(chat, payload, Vec::new()).map_err(failed)?;
+                 Ok(id)
+             }
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 54b5e34da..ca6c2f924 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -167,6 +167,9 @@ struct RunHandle {
+     /// Tool calls of the turn in flight that have not returned yet (a
+     /// command running, a wait), kept by the run task.
+     open_tools: Arc<std::sync::atomic::AtomicUsize>,
++    /// What each of them is ([`running_call`]), for the note a steer that
++    /// stops them carries.
++    open_calls: Arc<Mutex<Vec<String>>>,
+     /// A steer is stopping this turn ([`SessionsEngine::steer_now`]): the
+     /// steers the stop cancels go to `redeliver` instead of being dropped.
+     redeliver_on_stop: Arc<std::sync::atomic::AtomicBool>,
+@@ -1208,6 +1211,7 @@ impl SessionsEngine {
+                     && harness.stops_turn_in_place()
+                     && harness.steer_stops_tool(),
+                 open_tools: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
++                open_calls: Arc::new(Mutex::new(Vec::new())),
+                 redeliver_on_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                 redeliver: Arc::new(Mutex::new(Vec::new())),
+                 turn: turn.clone(),
+@@ -1418,6 +1422,21 @@ impl SessionsEngine {
+         attachments: Vec<String>,
+         message_id: Option<String>,
+         issued_at: i64,
++    ) -> Result<SteerOutcome, EngineError> {
++        self.steer_noted(chat_id, prompt, None, attachments, message_id, issued_at)
++            .await
++    }
++
++    /// [`Self::steer_with`], with Zeron's `note` under the prompt the agent
++    /// reads (never in the transcript, nor in what a re-dispatch sends).
++    async fn steer_noted(
++        &self,
++        chat_id: &str,
++        prompt: &str,
++        note: Option<String>,
++        attachments: Vec<String>,
++        message_id: Option<String>,
++        issued_at: i64,
+     ) -> Result<SteerOutcome, EngineError> {
+         let target = lock(&self.inner.runs)
+             .get(chat_id)
+@@ -1440,6 +1459,11 @@ impl SessionsEngine {
+         let user_id = message_id.unwrap_or_else(new_id);
+         let bootstrap = self.warm_fork_history(chat_id, harness_id, prompt, &history_sent);
+         let delivered = bootstrap.as_deref().unwrap_or(prompt);
++        let delivered = match &note {
++            Some(note) => format!("{delivered}\n\n{note}"),
++            None => delivered.to_owned(),
++        };
++        let delivered = delivered.as_str();
+         // A steer runs on the configuration live now; record it with the
+         // message so a re-dispatch keeps it.
+         let sent_with = self.last_request(chat_id).map(|mut request| {
+@@ -1540,6 +1564,10 @@ impl SessionsEngine {
+     /// under their own ids. Otherwise, or when the stop doesn't settle, it
+     /// is an ordinary steer ([`Self::steer_at`]), read at the next step
+     /// boundary. Nothing here tears a runtime down.
++    ///
++    /// The stop reaches the agent as its call refused ("the user doesn't
++    /// want to proceed"), so the prompt it reads after says what happened
++    /// ([`stopped_calls_note`]).
+     pub(crate) async fn steer_now(
+         &self,
+         chat_id: &str,
+@@ -1548,7 +1576,17 @@ impl SessionsEngine {
+         message_id: Option<String>,
+         issued_at: i64,
+     ) -> Result<SteerOutcome, EngineError> {
+-        if self.steer_stops_tool(chat_id) && self.stop_turn_keeping_runtime(chat_id).await {
++        let mut note = None;
++        if self.steer_stops_tool(chat_id) {
++            let calls = lock(&self.inner.runs)
++                .get(chat_id)
++                .map(|h| lock(&h.open_calls).clone())
++                .unwrap_or_default();
++            if self.stop_turn_keeping_runtime(chat_id).await {
++                note = Some(stopped_calls_note(&calls));
++            }
++        }
++        if note.is_some() {
+             let earlier = lock(&self.inner.runs)
+                 .get(chat_id)
+                 .map(|h| std::mem::take(&mut *lock(&h.redeliver)))
+@@ -1573,7 +1611,7 @@ impl SessionsEngine {
+                 }
+             }
+         }
+-        self.steer_with(chat_id, prompt, attachments, message_id, issued_at)
++        self.steer_noted(chat_id, prompt, note, attachments, message_id, issued_at)
+             .await
+     }
+ 
+@@ -3437,6 +3475,42 @@ fn revival_prompt(original: &str) -> String {
+ /// The note a turn the engine's own shutdown cut off ends with.
+ const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
+ 
++/// A running tool call as the note after a steer's stop names it.
++fn running_call(call: &zeron_proto::ToolCall) -> String {
++    use zeron_proto::ToolCall;
++    match call {
++        ToolCall::Exec { command } => {
++            let line = command.lines().next().unwrap_or_default().trim();
++            let short: String = line.chars().take(80).collect();
++            let more = if short.len() < command.trim().len() { "…" } else { "" };
++            format!("command `{short}{more}`")
++        }
++        ToolCall::Mcp { tool, .. } => format!("`{tool}` call"),
++        ToolCall::Unknown { name, .. } => format!("`{name}` call"),
++        _ => "tool call".to_owned(),
++    }
++}
++
++/// What a steer read at once tells the agent when it stopped the agent's
++/// running `calls` to get there: the provider tells it the person declined
++/// them, and an agent that believes that stops and waits for nobody.
++fn stopped_calls_note(calls: &[String]) -> String {
++    let what = match calls {
++        [] => "tool call".to_owned(),
++        [one] => one.clone(),
++        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
++    };
++    let (was, it, is) = if calls.len() > 1 {
++        ("were", "them", "they're")
++    } else {
++        ("was", "it", "it's")
++    };
++    format!(
++        "[Zeron note: your running {what} {was} stopped so you could read the message above at once. \
++         Nobody declined {it}; run {it} again if {is} still needed.]"
++    )
++}
++
+ /// The note a reply opens with when the provider no longer had the session
+ /// the run asked to resume.
+ const FRESH_START_NOTICE: &str = "The provider no longer has this chat's earlier session, \
+@@ -4087,18 +4161,19 @@ async fn drive_run(
+     // folding the echo would mint an orphan chip mid-text in the NEXT
+     // segment — the mid-word transcript splits.
+     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+-    // The turn's tool calls still running, published for a steer to read
+-    // ([`SessionsEngine::steer_now`]).
+-    let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
++    // The turn's tool calls still running, and what each is, published for
++    // a steer to read ([`SessionsEngine::steer_now`]).
++    let mut open_tools: std::collections::BTreeMap<String, String> = Default::default();
+     // (A call that returned stays closed: drivers refresh a call in place.)
+     let mut closed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+-    let open_count = lock(&inner.runs)
++    let (open_count, open_calls) = lock(&inner.runs)
+         .get(&chat_id)
+         .filter(|h| h.run_id == run_id)
+-        .map(|h| h.open_tools.clone())
++        .map(|h| (h.open_tools.clone(), h.open_calls.clone()))
+         .unwrap_or_default();
+-    let publish_open = |open: &std::collections::HashSet<String>| {
++    let publish_open = |open: &std::collections::BTreeMap<String, String>| {
+         open_count.store(open.len(), std::sync::atomic::Ordering::Release);
++        *lock(&open_calls) = open.values().cloned().collect();
+     };
+     let mut seen_images = std::collections::HashSet::new();
+     for entry in doc_ref.read_entries().unwrap_or_default() {
+@@ -5274,16 +5349,18 @@ async fn drive_run(
+             _ => {}
+         }
+         match &event {
+-            AgentEvent::ToolCall { id, .. }
++            AgentEvent::ToolCall { id, call }
+                 if id != zeron_proto::LIVE_PLAN_TOOL_ID && !closed_tools.contains(id) =>
+             {
+-                if open_tools.insert(id.clone()) {
++                let what = running_call(call);
++                if open_tools.get(id) != Some(&what) {
++                    open_tools.insert(id.clone(), what);
+                     publish_open(&open_tools);
+                 }
+             }
+             AgentEvent::ToolResult { id, .. } => {
+                 closed_tools.insert(id.clone());
+-                if open_tools.remove(id) {
++                if open_tools.remove(id).is_some() {
+                     publish_open(&open_tools);
+                 }
+             }
+diff --git a/crates/engine/tests/acp_lifecycle.rs b/crates/engine/tests/acp_lifecycle.rs
+index bde651c63..f9dfee6c8 100644
+--- a/crates/engine/tests/acp_lifecycle.rs
++++ b/crates/engine/tests/acp_lifecycle.rs
+@@ -102,6 +102,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
+         SessionCommandPayload::Steer {
+             prompt: "second".into(),
+             message_id: Some("second-user".into()),
++            at_once: true,
+         },
+     );
+     wait_for(|| {
+@@ -162,6 +163,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
+         SessionCommandPayload::Steer {
+             prompt: "self-continue".into(),
+             message_id: Some("third-user".into()),
++            at_once: true,
+         },
+     );
+     wait_for(|| {
+diff --git a/crates/engine/tests/cursor_live.rs b/crates/engine/tests/cursor_live.rs
+index 0030a3e41..848273654 100644
+--- a/crates/engine/tests/cursor_live.rs
++++ b/crates/engine/tests/cursor_live.rs
+@@ -136,7 +136,7 @@ async fn remote_steer_batch_reaches_real_muse_with_every_message() {
+     for (i, token) in tokens.iter().enumerate().skip(1) {
+         handle.doc().queue_command(&zeron_doc::SessionCommandEntry {
+             id: format!("remote-{i}"),
+-            payload: SessionCommandPayload::Steer {prompt: format!("Remember {token}. Reply with the immediately previous user token and this token. Do not use tools."), message_id: Some(format!("message-{i}"))},
++            payload: SessionCommandPayload::Steer {prompt: format!("Remember {token}. Reply with the immediately previous user token and this token. Do not use tools."), message_id: Some(format!("message-{i}")), at_once: true},
+             issued_by: "remote-viewer".into(), issued_at: now + i as i64,
+             based_on: None, expires_at: None, status: zeron_doc::SessionCommandStatus::Pending, resolution: None,
+         }).unwrap();
+diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
+index 0e6b7ba1f..74470d437 100644
+--- a/crates/engine/tests/e2e.rs
++++ b/crates/engine/tests/e2e.rs
+@@ -305,6 +305,7 @@ async fn update_deferred_steering_preserves_the_active_turn_and_queued_prompt()
+         SessionCommandPayload::Steer {
+             prompt: "follow up".into(),
+             message_id: Some("follow-up".into()),
++            at_once: true,
+         },
+     );
+     wait_for(
+@@ -936,6 +937,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
+         SessionCommandPayload::Steer {
+             prompt: "also do this".into(),
+             message_id: Some("m-2".into()),
++            at_once: true,
+         },
+     );
+     wait_for(
+@@ -1059,6 +1061,7 @@ async fn steer_into_unsteerable_live_turn_holds_instead_of_interrupting() {
+         SessionCommandPayload::Steer {
+             prompt: "also do this".into(),
+             message_id: Some("m-2".into()),
++            at_once: true,
+         },
+     );
+     wait_for(
+@@ -3015,6 +3018,7 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
+         SessionCommandPayload::Steer {
+             prompt: "next".into(),
+             message_id: Some("m-2".into()),
++            at_once: true,
+         },
+     );
+     wait_for(
+diff --git a/crates/engine/tests/message_queue.rs b/crates/engine/tests/message_queue.rs
+index dd81433f7..0a00573d0 100644
+--- a/crates/engine/tests/message_queue.rs
++++ b/crates/engine/tests/message_queue.rs
+@@ -563,6 +563,7 @@ async fn a_steer_command_for_a_turn_boundary_agent_waits_in_the_queue_for_the_tu
+             SessionCommandPayload::Steer {
+                 prompt: "and also this".into(),
+                 message_id: Some("m-steer".into()),
++                at_once: true,
+             },
+         )
+         .expect("queue steer command");
+@@ -659,6 +660,7 @@ async fn interrupt_bypasses_a_saturated_prompt_command_drain() {
+                 SessionCommandPayload::Steer {
+                     prompt: format!("blocked {i}"),
+                     message_id: Some(format!("blocked-{i}")),
++                    at_once: true,
+                 },
+             )
+             .unwrap();
+@@ -712,6 +714,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
+                 payload: SessionCommandPayload::Steer {
+                     prompt: prompt.clone(),
+                     message_id: Some(format!("remote-message-{i}")),
++                    at_once: true,
+                 },
+                 issued_by: "remote-device".into(),
+                 issued_at: now + i as i64,
+diff --git a/crates/engine/tests/queue_order_live.rs b/crates/engine/tests/queue_order_live.rs
+index 8fbf16bb2..fbcff78b6 100644
+--- a/crates/engine/tests/queue_order_live.rs
++++ b/crates/engine/tests/queue_order_live.rs
+@@ -331,6 +331,7 @@ async fn scenario(name: &str, which: &str) {
+                     SessionCommandPayload::Steer {
+                         prompt: Rig::follow_up(2),
+                         message_id: Some("steer-2".into()),
++                        at_once: true,
+                     },
+                 )
+                 .unwrap();
+diff --git a/crates/engine/tests/restart_resume.rs b/crates/engine/tests/restart_resume.rs
+index d4acca07a..70466ec2c 100644
+--- a/crates/engine/tests/restart_resume.rs
++++ b/crates/engine/tests/restart_resume.rs
+@@ -1412,6 +1412,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
+             SessionCommandPayload::Steer {
+                 prompt: "actually, also add tests".into(),
+                 message_id: Some("msg-user-2".into()),
++                at_once: true,
+             },
+         )
+         .expect("queue steer command");
+diff --git a/crates/engine/tests/steer_now.rs b/crates/engine/tests/steer_now.rs
+index 806c1a18e..34aba352c 100644
+--- a/crates/engine/tests/steer_now.rs
++++ b/crates/engine/tests/steer_now.rs
+@@ -4,7 +4,9 @@
+ //! first: the command ends, the runtime and its background work stay, and
+ //! the steer starts the next turn in that same runtime. Steers sent before
+ //! it, which the stop cancels, go again first. Agents that haven't opted
+-//! in (`Harness::steer_stops_tool`) keep the step-boundary wait.
++//! in (`Harness::steer_stops_tool`) keep the step-boundary wait. So does
++//! an agent's ordinary send (`Steer { at_once: false }`): stopping the
++//! command reads to the agent as its call declined.
+ 
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+@@ -265,11 +267,22 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
+     }
+ }
+ 
++/// Every prompt the agent read, without the note Zeron put under one.
+ fn read(rig: &Rig) -> Vec<String> {
+-    rig.ledger.read.lock().unwrap().clone()
++    rig.ledger
++        .read
++        .lock()
++        .unwrap()
++        .iter()
++        .map(|p| p.split("\n\n[Zeron note: ").next().unwrap_or_default().to_owned())
++        .collect()
+ }
+ 
+ fn steer(rig: &Rig, prompt: &str, id: &str) {
++    send(rig, prompt, id, true);
++}
++
++fn send(rig: &Rig, prompt: &str, id: &str, at_once: bool) {
+     rig.core
+         .doc_host
+         .queue_command(
+@@ -277,6 +290,7 @@ fn steer(rig: &Rig, prompt: &str, id: &str) {
+             SessionCommandPayload::Steer {
+                 prompt: prompt.into(),
+                 message_id: Some(id.into()),
++                at_once,
+             },
+         )
+         .unwrap();
+@@ -344,6 +358,62 @@ async fn a_steer_during_a_command_is_read_at_once_and_keeps_the_runtime() {
+         1,
+         "the steer is in the transcript once"
+     );
++    // The agent hears its command was stopped, not declined; the
++    // transcript keeps the message as sent.
++    let heard = rig.ledger.read.lock().unwrap().last().cloned().unwrap();
++    assert_eq!(
++        heard,
++        "stop and look at the logs\n\n[Zeron note: your running command `sleep 120` was stopped so you could \
++         read the message above at once. Nobody declined it; run it again if it's still needed.]"
++    );
++    let steered = entries.iter().find(|e| e.id == "m-steer").unwrap();
++    assert!(
++        !format!("{:?}", steered.parts).contains("Zeron note"),
++        "{:?}",
++        steered.parts
++    );
++    rig.core.sessions.shutdown().await;
++}
++
++#[tokio::test]
++async fn an_agents_send_during_a_command_waits_for_it_and_stops_nothing() {
++    let rig = rig(true);
++    let _turn = running_a_command(&rig).await;
++    wait_for(
++        || rig.core.sessions.steer_stops_tool(CHAT),
++        "the command to be open",
++    )
++    .await;
++    send(&rig, "from the lead: also check the docs", "m-agent", false);
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    assert_eq!(read(&rig).len(), 1, "it waits for the command");
++    assert_eq!(rig.ledger.stops.load(Ordering::SeqCst), 0, "nothing stopped");
++    assert_eq!(status(&rig.core), Some(SessionStatus::Working));
++    rig.ledger.release.notify_one();
++    wait_for(
++        || read(&rig).iter().any(|p| p == "from the lead: also check the docs"),
++        "the message at the step boundary",
++    )
++    .await;
++    wait_for(
++        || status(&rig.core) == Some(SessionStatus::Idle),
++        "the turn to end",
++    )
++    .await;
++    assert_eq!(rig.ledger.stops.load(Ordering::SeqCst), 0);
++    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
++    assert!(
++        !rig.ledger.read.lock().unwrap().iter().any(|p| p.contains("Zeron note")),
++        "nothing was stopped, so nothing to explain"
++    );
++    let doc = rig.core.doc_host.open(CHAT).unwrap();
++    let entries = doc.doc().read_entries().unwrap();
++    assert!(
++        !entries
++            .iter()
++            .any(|e| e.status == Some(MessageStatus::Aborted)),
++        "no turn was cut off"
++    );
+     rig.core.sessions.shutdown().await;
+ }
+ 
+diff --git a/crates/engine/tests/steering_live.rs b/crates/engine/tests/steering_live.rs
+index 665fc649a..f8ecabdc1 100644
+--- a/crates/engine/tests/steering_live.rs
++++ b/crates/engine/tests/steering_live.rs
+@@ -128,7 +128,7 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
+             .unwrap()
+     );
+     for i in 1..burst {
+-        core.doc_host.queue_command("audit", SessionCommandPayload::Steer { prompt: format!("Follow-up {i}: write ONLY the original test token into followup-{i}, and append {i} as a line to receipts. Keep earlier work running. Execute once. Reply DONE."), message_id: Some(format!("steer-{i}")) }).unwrap();
++        core.doc_host.queue_command("audit", SessionCommandPayload::Steer { prompt: format!("Follow-up {i}: write ONLY the original test token into followup-{i}, and append {i} as a line to receipts. Keep earlier work running. Execute once. Reply DONE."), message_id: Some(format!("steer-{i}")), at_once: true }).unwrap();
+     }
+     // Regular queued messages must remain held until the steered work finishes.
+     for i in 0..2 {
+diff --git a/crates/harness/tests/claude.rs b/crates/harness/tests/claude.rs
+index d2e54ae9d..a32faa3be 100644
+--- a/crates/harness/tests/claude.rs
++++ b/crates/harness/tests/claude.rs
+@@ -1550,6 +1550,53 @@ async fn a_typed_fork_settles_before_a_message_waiting_on_it_splits_the_turn() {
+     );
+ }
+ 
++/// A message sent while a command runs is written `next`, with no stop
++/// before it: the command runs to its end, and the message is read after
++/// its result. (An agent's send to a busy chat comes this way; only a steer
++/// read at once stops the turn first, by `TurnControl::stop_turn`.)
++#[tokio::test]
++async fn a_message_sent_while_a_command_runs_waits_for_it() {
++    let (controls, steer, _token) = controls("A");
++    let mut stream = harness()
++        .run(request("scenario:tool-open-steer"), controls)
++        .await
++        .expect("run starts");
++    macro_rules! next {
++        () => {
++            tokio::time::timeout(Duration::from_secs(10), stream.next())
++                .await
++                .expect("event in time")
++                .expect("stream open")
++                .expect("stream event")
++        };
++    }
++    loop {
++        if matches!(next!(), AgentEvent::ToolCall { id, .. } if id == "tool-gate") {
++            break;
++        }
++    }
++    steer.send(steer_msg("from the lead")).await.unwrap();
++    let mut events = Vec::new();
++    loop {
++        let event = next!();
++        let said = matches!(&event, AgentEvent::TextDelta { text } if text.starts_with("priority:"));
++        events.push(event);
++        if said {
++            break;
++        }
++    }
++    assert!(
++        events.iter().any(|e| matches!(e, AgentEvent::ToolResult { id, is_error: false, .. } if id == "tool-gate")),
++        "the command ran to its end: {events:?}"
++    );
++    assert_eq!(
++        events.last(),
++        Some(&AgentEvent::TextDelta {
++            text: "priority:next".into()
++        })
++    );
++}
++
+ /// "Send now" while a turn end is held for a queued steer: the stop's one
+ /// Done waits for the stop to settle, so the replacement prompt — sent the
+ /// moment that Done arrives — runs to its own end, never settled by the
+diff --git a/crates/harness/tests/fixtures/fake-claude.sh b/crates/harness/tests/fixtures/fake-claude.sh
+index 3a6ba5950..30b5b9bcd 100755
+--- a/crates/harness/tests/fixtures/fake-claude.sh
++++ b/crates/harness/tests/fixtures/fake-claude.sh
+@@ -273,6 +273,24 @@ case "$first" in
+   cat >/dev/null
+   ;;
+ 
++*scenario:tool-open-steer*)
++  # A message sent while a command runs (an open tool) is written `next`,
++  # with no stop (the `interrupt` control request) before it: the command
++  # runs to its end. The text after says which priority it came with.
++  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-tos"}'
++  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"tool-gate","name":"Bash","input":{"command":"npm run gate"}}]}}'
++  read -r next || exit 1
++  case "$next" in *'"subtype":"interrupt"'*) exit 8 ;; esac
++  case "$next" in
++    *'"priority":"now"'*) priority=now ;;
++    *'"priority":"next"'*) priority=next ;;
++    *) priority=none ;;
++  esac
++  emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-gate","is_error":false}]}}'
++  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"priority:$priority\"}}}"
++  cat >/dev/null
++  ;;
++
+ *scenario:stop-held*)
+   # "Send now" while a turn's result is held for a queued steer: the CLI is
+   # slow to answer the stop, had already begun the steer's turn, and that
+diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
+index 8991b315f..d5d52d28d 100644
+--- a/crates/mcp/src/tools.rs
++++ b/crates/mcp/src/tools.rs
+@@ -162,7 +162,7 @@ fn catalog() -> Vec<ToolDef> {
+         },
+         ToolDef {
+             name: "send_message",
+-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
++            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once, stopping a running command (it isn't re-run on its own); use it, or interrupt_chat, only when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
+             input_schema: chat_key_schema(json!({
+                 "text": { "type": "string" },
+                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
+@@ -1722,6 +1722,8 @@ impl Tools {
+                     )
+                     .await?
+             }
++            // Only an explicit steer stops a running command to be read now:
++            // the agent there reads that stop as its call declined.
+             "steer" => {
+                 self.zeron
+                     .queue_command(
+@@ -1729,6 +1731,7 @@ impl Tools {
+                         &SessionCommandPayload::Steer {
+                             prompt: text,
+                             message_id: Some(uuid::Uuid::new_v4().to_string()),
++                            at_once: mode == "steer",
+                         },
+                     )
+                     .await?
+@@ -2358,10 +2361,18 @@ mod tests {
+             .await
+             .unwrap();
+         assert_eq!(sent["delivery"], "steer");
++        // An explicit steer is read at once; an auto one waits for the step.
++        tools
++            .deliver(&chats[0], None, &[], Some(&session), "now".into(), "steer")
++            .await
++            .unwrap();
+         let writes = world.writes.lock().unwrap();
+-        assert_eq!(writes.len(), 1);
++        assert_eq!(writes.len(), 2);
+         assert_eq!(writes[0].0, methods::QUEUE_COMMAND);
+         assert_eq!(writes[0].1["command"]["kind"], "steer");
++        assert_eq!(writes[0].1["command"]["atOnce"], false);
++        assert_eq!(writes[1].1["command"]["kind"], "steer");
++        assert!(writes[1].1["command"].get("atOnce").is_none(), "read at once, as before");
+     }
+ 
+     #[tokio::test]
+diff --git a/docs/mcp.md b/docs/mcp.md
+index 673a116a9..8c5c5dfeb 100644
+--- a/docs/mcp.md
++++ b/docs/mcp.md
+@@ -179,9 +179,14 @@ transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
+ cancels server-side, exactly what the sidebar does on attach.
+ 
+ `send_message` mode `auto` starts idle chats and steers working chats through
+-their live mailbox without interrupting tools or child processes. Providers
+-consume it at their next supported input boundary. Only explicit `queue` mode
+-creates a held queue row. `awaitingInput` refuses and points at
++their live mailbox without interrupting tools or child processes
++(`Steer { atOnce: false }`): a command the agent is running finishes, and the
++message lands at its next step. Explicit `steer` mode is read at once, as the
++person's steer is: where a runtime stops its turn in place (Claude), a running
++command is stopped first, and the steer tells the agent its call was stopped,
++not declined. Use it, or `interrupt_chat`, only when the message can't wait for
++the command. Providers consume a steer at their next supported input boundary.
++Only explicit `queue` mode creates a held queue row. `awaitingInput` refuses and points at
+ `respond_to_input`. Quiet, long-running turns still receive steering; the host
+ falls back to starting a turn if the live runtime has already exited.
+ 
+-- 
+2.55.0.windows.2
+
