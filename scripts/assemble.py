@@ -181,19 +181,27 @@ def main() -> None:
                 run.dropped.append(f"**{name}** ({link}): no pinned `sha`")
                 continue
             info = github(f"repos/{upstream['repo']}/pulls/{number}")
-            if info and info.get("merged"):
-                run.notices.append(f"{link} is merged upstream: remove **{name}** from patches.toml")
-                continue
-            if info and info.get("state") == "closed":
-                run.notices.append(f"{link} was closed without merging; still applied at the pin")
-            head = out(src, "rev-parse", f"refs/nightly/pr/{number}")
-            if head != sha:
-                run.notices.append(f"{link} has new commits since the pin (head `{head[:9]}`); review, then move `sha`")
             if git(src, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
                 git(src, "fetch", "--no-tags", "--quiet", upstream_url, sha)
             if git(src, "merge-base", "--is-ancestor", sha, "HEAD", check=False).returncode == 0:
                 run.notices.append(f"{link} at `{sha[:9]}` is already in upstream: remove **{name}**")
                 continue
+            if info and info.get("merged"):
+                # Merged into another branch (main, for the v3 list) is not
+                # in this base: keep applying the pin until it gets here.
+                landed = info.get("merge_commit_sha") or ""
+                if landed and git(src, "cat-file", "-e", f"{landed}^{{commit}}", check=False).returncode != 0:
+                    git(src, "fetch", "--no-tags", "--quiet", upstream_url, landed, check=False)
+                if landed and git(src, "merge-base", "--is-ancestor", landed, "HEAD", check=False).returncode == 0:
+                    run.notices.append(f"{link} is merged upstream: remove **{name}** from {args.config.name}")
+                    continue
+                into = (info.get("base") or {}).get("ref", "another branch")
+                run.notices.append(f"{link} is merged into `{into}`, not yet in `{upstream['branch']}`; still applied at the pin")
+            elif info and info.get("state") == "closed":
+                run.notices.append(f"{link} was closed without merging; still applied at the pin")
+            head = out(src, "rev-parse", f"refs/nightly/pr/{number}")
+            if head != sha and not (info and info.get("merged")):
+                run.notices.append(f"{link} has new commits since the pin (head `{head[:9]}`); review, then move `sha`")
             failure = merge(src, sha, f"nightly: merge {name} (#{number})")
             label, ident = f"{link} at `{sha[:9]}`", f"pr {number} {sha}"
         elif "file" in patch:

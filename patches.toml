@@ -33,19 +33,19 @@ note = "Walk-based index for large plain folders, kept current with a watch. Sta
 name = "dead-run-shimmer"
 pr = 840
 sha = "febdceb6e950f123f5cbc5f78d3a031d4a70a919"
-note = "Stops the tool-group shimmer on dead runs, which kept repainting at 30 fps."
+note = "Stops the tool-group shimmer on dead runs, which kept repainting at 30 fps. Closed upstream (v3 replaces crates/ui), so it stays here for as long as v2 does."
 
 [[patch]]
 name = "flaky-test-fixes"
 pr = 869
 sha = "b9f2c4b89f526f9d7d64d0e2a7496da99cc84c31"
-note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests."
+note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests. Closed upstream, which would take it rebased on main."
 
 [[patch]]
 name = "composer-click-through"
 pr = 1191
 sha = "92ea6927e59bffc5df0017b64da949bc4833e11d"
-note = "Clicks in the composer no longer open images underneath it."
+note = "Clicks in the composer no longer open images underneath it. Closed upstream (v3 replaces crates/ui), so it stays here for as long as v2 does."
 
 [[patch]]
 name = "windows-icon"
@@ -59,12 +59,6 @@ name = "warm-chats-parked-cap"
 pr = 1101
 sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
 note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min (ZERON_PARKED_SESSION_CAP=0 disables); reuses laid-out transcripts on chat switch; model catalogs stay fresh for 10 min. Its conflict with main's parked waits in sessions.rs replays from rerere/, which also keeps the cap off a chat waiting for its wake turn."
-
-[[patch]]
-name = "change-request-spawn-off-runtime"
-pr = 1224
-sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
-note = "PR watches start Git off the runtime workers and share one inspection per path, so slow Windows process launches stop freezing the engine for seconds."
 
 [[patch]]
 name = "markdown-reply-images"
@@ -83,11 +77,4 @@ name = "slash-command-latency"
 pr = 927
 sha = ""
 enabled = false
-note = "Kill discovery probes, cache command catalogs. Conflicts with main."
-
-[[patch]]
-name = "engine-streaming-storage-idle"
-pr = 1127
-sha = ""
-enabled = false
-note = "Incremental transcript mirror, delta-log snapshots, quieter idle. Big; conflicts with main."
+note = "Kill discovery probes, cache command catalogs. Conflicts with main (registry.rs, the claude and codex harnesses)."

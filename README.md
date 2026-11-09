@@ -51,7 +51,9 @@ branch = "work/bigger"    # a branch pushed to this repo
 ```
 
 Set `enabled = false` to park an entry. The release notes say when a pinned
-PR has new commits, was merged upstream (then delete the entry) or was closed.
+PR has new commits, is in upstream (then delete the entry) or was closed. A
+PR merged into another branch than the list's (into `main`, for the v3 list)
+is no help yet: it stays applied at its pin, and the notes say so.
 
 To try it locally, use a checkout dedicated to the script (it resets it):
 
@@ -95,7 +97,7 @@ v3 is the zgx interface (`apps/zgx`), which upstream builds on its
 on demand. It works like the v2 nightly, with these differences:
 
 - It assembles `zeron/zgx` plus `patches-v3.toml` (`assemble.py --config
-  patches-v3.toml`). The version is `0.2.137-v3.YYYYMMDDHHMM`.
+  patches-v3.toml`). The version is `<next patch release>-v3.YYYYMMDDHHMM`.
 - `scripts/package-v3-windows.ps1` builds `zeron-zgx` with its `beta`
   feature (production sign-in, Zeron's own data) and the engine from the same
   tree. It packages them with the `ui` scripts as a portable zip and a

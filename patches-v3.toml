@@ -3,7 +3,8 @@
 # (.github/workflows/nightly-v3.yml). Same format as patches.toml.
 #
 # Most entries are engine fixes from patches.toml: v3 runs the engine built
-# from this same tree. Keep them in step with patches.toml by hand.
+# from this same tree. Keep them in step with patches.toml by hand, except
+# for PRs merged into main that zeron/zgx has yet to take.
 
 [upstream]
 repo = "zeronsh/zeron"
@@ -11,7 +12,7 @@ branch = "zeron/zgx"
 
 [nightly]
 repo = "hoangvu12/zeron-nightly"
-# The version's prerelease: 0.2.137-v3.YYYYMMDDHHMM.
+# The version's prerelease: <next patch release>-v3.YYYYMMDDHHMM.
 label = "v3"
 
 [[patch]]
@@ -30,17 +31,6 @@ file = "patches/0005-v3-windows-installer-updates.patch"
 note = "v3 updates itself on Windows: it downloads the release's installer and runs it silently over its folder, then restarts its engine into the new one once idle. Needed by every v3 nightly."
 
 [[patch]]
-name = "v3-windows-polish"
-pr = 1225
-sha = "3933c4cbe6bbd3edff89931e59551ecc89169e07"
-note = "v3 on Windows looks like the shipping app: frosted surfaces, caption buttons. Also no console windows, the exe icon, pictures from Windows devices, the model picker on any device and the page card. Merged with zeron/zgx, so it takes that pin of zgx; v3-zgx-windows-fixes adds the zgx side."
-
-[[patch]]
-name = "v3-zgx-windows-fixes"
-file = "patches/0006-v3-zgx-windows-fixes.patch"
-note = "Points v3's zgx at hoangvu12/zgx nightly/v3-zgx: zeron/zgx's pin plus zeronsh/zgx#1495 (Windows glass blur), #1496 (caption colours), the cursor fix under pointer_events none, #1500 (popup cursor, GetDC leak), #1516 (text below 2x), #1531 (fast drags paint) and #1539 (input method quit). Applies on top of v3-windows-polish. Drop it once zeron/zgx pins a zgx with all of them."
-
-[[patch]]
 name = "large-plain-folder-index"
 pr = 1196
 sha = "44d08d24675660638e957b0ef42c638188e70bce"
@@ -50,19 +40,19 @@ note = "Walk-based index for large plain folders, kept current with a watch. Sta
 name = "dead-run-shimmer"
 pr = 840
 sha = "febdceb6e950f123f5cbc5f78d3a031d4a70a919"
-note = "Stops the tool-group shimmer on dead runs. v2 interface only; kept so the engine matches v2's."
+note = "Stops the tool-group shimmer on dead runs. v2 interface only; kept so the engine matches v2's. Closed upstream (v3 replaces crates/ui)."
 
 [[patch]]
 name = "flaky-test-fixes"
 pr = 869
 sha = "b9f2c4b89f526f9d7d64d0e2a7496da99cc84c31"
-note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests."
+note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests. Closed upstream, which would take it rebased on main."
 
 [[patch]]
 name = "composer-click-through"
 pr = 1191
 sha = "92ea6927e59bffc5df0017b64da949bc4833e11d"
-note = "Clicks in the composer no longer open images underneath it. v2 interface only."
+note = "Clicks in the composer no longer open images underneath it. v2 interface only. Closed upstream (v3 replaces crates/ui)."
 
 [[patch]]
 name = "warm-chats-parked-cap"
@@ -74,13 +64,13 @@ note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle 
 name = "change-request-spawn-off-runtime"
 pr = 1224
 sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
-note = "PR watches start Git off the runtime workers, so slow Windows process launches stop freezing the engine."
+note = "PR watches start Git off the runtime workers, so slow Windows process launches stop freezing the engine. Merged into main (1dc5a8cc), not yet in zeron/zgx: drop it once zeron/zgx has it (patches.toml already did)."
 
 [[patch]]
 name = "revived-turn-zeron-tools"
 pr = 1285
 sha = "f365aadfac10ce2c878fcd09ebc36cb76b0a37bd"
-note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts."
+note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts. child-chats-report-back is rebased on this pin; moving it to the PR's head (0b2674d9) makes that one conflict in sessions.rs until it is rebased too."
 
 [[patch]]
 name = "markdown-reply-images"
@@ -95,17 +85,12 @@ note = "Images from a chat on another device load in a few relay round trips. Ap
 [[patch]]
 name = "agent-steers-wait-for-tools"
 file = "patches/0008-agent-steers-wait-for-tools.patch"
-note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it lands at the next step. mode 'steer' and the person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. Applies on top of relay-image-reads."
+note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it lands at the next step. mode 'steer' and the person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. v3 only: it conflicts with main's plugin_agents.rs."
 
 [[patch]]
 name = "child-chats-report-back"
 file = "patches/0007-child-chats-report-back.patch"
-note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Applies on top of agent-steers-wait-for-tools."
+note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Applies on top of revived-turn-zeron-tools at its pin; goes after agent-steers-wait-for-tools, which its tests need."
 
-# Not on v3: zeron/zgx has its own new app icon.
-[[patch]]
-name = "windows-icon"
-pr = 1084
-sha = "a0476792700411ba0e9362646223ae0a979a0dc8"
-enabled = false
-note = "zeron/zgx carries its own new icon, which this conflicts with."
+# Not on v3: windows-icon (#1084, parked in patches.toml). zeron/zgx has its
+# own new app icon, which it conflicts with.
