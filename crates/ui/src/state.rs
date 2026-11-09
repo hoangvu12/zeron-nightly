@@ -3518,13 +3518,6 @@ impl AppState {
             .is_some_and(|config| self.harness_remote_workspace(config.harness))
     }
 
-    /// [`Self::chat_remote_workspace`] for the selected chat.
-    pub(crate) fn selected_chat_remote_workspace(&self) -> bool {
-        self.selected_chat
-            .as_deref()
-            .is_some_and(|id| self.chat_remote_workspace(id))
-    }
-
     /// Record a provider-run chat's sign-in state (`None` clears it).
     pub(crate) fn set_provider_chat_state(
         &mut self,
@@ -7761,8 +7754,6 @@ mod tests {
         ]));
         assert!(state.chat_remote_workspace("cloud"));
         assert!(!state.chat_remote_workspace("local"));
-        state.selected_chat = Some("cloud".into());
-        assert!(state.selected_chat_remote_workspace());
         // A later catalog without it (the setting went off) forgets nothing.
         assert!(!state.learn_harness_catalog(&[descriptor(HarnessId::ClaudeCode, false)]));
         assert!(state.chat_remote_workspace("cloud"));
