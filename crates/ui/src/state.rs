@@ -983,6 +983,9 @@ pub struct AppState {
     /// harness catalog the app loads. Gates the files, diff, terminal,
     /// background processes, fork and side chats of their chats.
     remote_workspace_harnesses: HashSet<HarnessId>,
+    /// Provider-run chats' sign-in states (`providerState` on the chat
+    /// document, carried by its transcript watch), by chat id.
+    provider_chat_states: HashMap<String, zeron_proto::provider_cloud::ProviderChatState>,
     /// The new-session canvas's own target, set aside while a chat is open
     /// (a chat implies ITS project/device) and put back on return, so the
     /// canvas always reopens where the user left it.
@@ -1178,6 +1181,7 @@ impl AppState {
             no_project: false,
             selected_device: None,
             remote_workspace_harnesses: HashSet::new(),
+            provider_chat_states: HashMap::new(),
             canvas_target: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -3521,6 +3525,28 @@ impl AppState {
             .is_some_and(|id| self.chat_remote_workspace(id))
     }
 
+    /// Record a provider-run chat's sign-in state (`None` clears it).
+    pub(crate) fn set_provider_chat_state(
+        &mut self,
+        chat_id: &str,
+        state: Option<zeron_proto::provider_cloud::ProviderChatState>,
+    ) -> bool {
+        match state {
+            Some(state) => self.provider_chat_states.insert(chat_id.to_owned(), state.clone())
+                != Some(state),
+            None => self.provider_chat_states.remove(chat_id).is_some(),
+        }
+    }
+
+    /// What a provider-run chat shows while its login can't act for it
+    /// ("Sign in again", "Sign in as <email> to continue").
+    pub(crate) fn provider_chat_state(
+        &self,
+        chat_id: &str,
+    ) -> Option<&zeron_proto::provider_cloud::ProviderChatState> {
+        self.provider_chat_states.get(chat_id)
+    }
+
     /// Whether this device can start provider-run chats ("Anthropic cloud"
     /// in the place chip): its registry row advertises `provider-run-v1`,
     /// which it does while "Claude cloud sessions" is on with a login enabled.
@@ -4812,6 +4838,25 @@ fn spawn_transcript_watch(
                     .get("historyPending")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // A provider-run chat's sign-in state: present when it
+                // changed (null = cleared), absent when it didn't.
+                let provider_state = value.get("providerState").map(|state| {
+                    serde_json::from_value::<Option<zeron_proto::provider_cloud::ProviderChatState>>(
+                        state.clone(),
+                    )
+                    .ok()
+                    .flatten()
+                });
+                if let Some(provider_state) = provider_state {
+                    let alive = this.update(cx, |state, cx| {
+                        if state.set_provider_chat_state(&chat_id, provider_state) {
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                }
                 let decoded = cx
                     .background_executor()
                     .spawn(async move {
@@ -7721,6 +7766,21 @@ mod tests {
         // A later catalog without it (the setting went off) forgets nothing.
         assert!(!state.learn_harness_catalog(&[descriptor(HarnessId::ClaudeCode, false)]));
         assert!(state.chat_remote_workspace("cloud"));
+    }
+
+    #[test]
+    fn provider_chat_states_are_kept_per_chat_and_cleared() {
+        use zeron_proto::provider_cloud::ProviderChatState;
+        let mut state = AppState::new();
+        let again = ProviderChatState::SignInAgain {
+            email: "a@example.test".into(),
+        };
+        assert!(state.set_provider_chat_state("cloud", Some(again.clone())));
+        assert!(!state.set_provider_chat_state("cloud", Some(again.clone())));
+        assert_eq!(state.provider_chat_state("cloud").map(|s| s.label()), Some("Sign in again".into()));
+        assert!(state.provider_chat_state("other").is_none());
+        assert!(state.set_provider_chat_state("cloud", None));
+        assert!(state.provider_chat_state("cloud").is_none());
     }
 
     #[test]

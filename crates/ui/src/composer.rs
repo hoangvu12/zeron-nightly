@@ -6952,6 +6952,19 @@ impl Composer {
         let runs_on_cloud = self.pickers.read(cx).runs_on_cloud(cx);
         let draft = self.has_draft(cx);
         let state = self.state.read(cx);
+        // A provider-run chat whose login can't act for it says so, in the
+        // same quiet caption ("Sign in again", "Sign in as <email> to
+        // continue").
+        if let Some(sign_in) = state
+            .selected_chat
+            .as_deref()
+            .and_then(|id| state.provider_chat_state(id))
+        {
+            return Some(LinkNotice {
+                text: sign_in.label().into(),
+                glyph: NoticeGlyph::WarningDot,
+            });
+        }
         let now = crate::state::clock_now();
         let (link, host) = match state.selected_chat.as_deref() {
             Some(id) => (
