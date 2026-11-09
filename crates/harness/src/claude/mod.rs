@@ -216,7 +216,7 @@ fn mcp_servers_config_arg(
 
 /// The `--model` value: the 1M context window is selected via a model-id
 /// suffix (`sonnet[1m]`), exactly how the CLI itself does it.
-fn model_arg(request: &RunRequest) -> Option<String> {
+pub(crate) fn model_arg(request: &RunRequest) -> Option<String> {
     let model = request.model.as_ref()?;
     let one_m = request
         .model_options
@@ -254,7 +254,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 
 /// What a run may do without asking. `auto_approve` keeps meaning full
 /// access, whatever the mode says.
-fn access(request: &RunRequest) -> AccessMode {
+pub(crate) fn access(request: &RunRequest) -> AccessMode {
     if request.auto_approve {
         AccessMode::FullAccess
     } else {
@@ -267,7 +267,7 @@ fn access(request: &RunRequest) -> AccessMode {
 /// the run stays in `default` and every tool call is allowed when asked,
 /// so no request launches with a skip-permissions flag it did not before
 /// (the CLI refuses those as root outside a sandbox).
-fn access_permission_mode(request: &RunRequest) -> &'static str {
+pub(crate) fn access_permission_mode(request: &RunRequest) -> &'static str {
     if request.auto_approve {
         return "bypassPermissions";
     }
@@ -279,7 +279,7 @@ fn access_permission_mode(request: &RunRequest) -> &'static str {
 
 /// The `--permission-mode` a run launches (or is switched) with: plan mode
 /// over its access mode.
-fn permission_mode(request: &RunRequest) -> &'static str {
+pub(crate) fn permission_mode(request: &RunRequest) -> &'static str {
     if request.plan {
         "plan"
     } else {
@@ -303,7 +303,7 @@ const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 /// What a `can_use_tool` request has to ask the person before it is
 /// allowed, in `access`; `None` allows it now. `ExitPlanMode` (the plan is
 /// ready) asks whether to start implementing it.
-fn approval_question(
+pub(crate) fn approval_question(
     tool: &str,
     display_name: Option<&str>,
     description: Option<&str>,
@@ -341,7 +341,7 @@ fn approval_question(
 }
 
 /// What a refused approval tells the agent.
-const APPROVAL_DENIED: &str = "The user did not allow this.";
+pub(crate) const APPROVAL_DENIED: &str = "The user did not allow this.";
 
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
@@ -2137,12 +2137,12 @@ fn handle_control_request(
 }
 
 /// What a declined `AskUserQuestion` tells the agent.
-const QUESTIONS_DISMISSED: &str = "The user dismissed the questions without answering.";
+pub(crate) const QUESTIONS_DISMISSED: &str = "The user dismissed the questions without answering.";
 
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s
 /// (tolerant of `header`/`title`, `question`/`prompt`, string or object
 /// options — option descriptions are dropped, the wire type carries labels).
-fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
+pub(crate) fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
     let raw = input.get("questions").and_then(Value::as_array);
     raw.map(|a| a.as_slice())
         .unwrap_or_default()
@@ -2183,7 +2183,7 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
 
 /// Merge the user's answers back into the tool input, keyed by question text
 /// (single-select ⇒ a string, multi-select ⇒ an array), as the tool expects.
-fn updated_input_with_answers(
+pub(crate) fn updated_input_with_answers(
     input: &Value,
     questions: &[UserInputQuestion],
     answers: &[UserInputAnswer],

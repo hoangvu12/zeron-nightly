@@ -5755,6 +5755,7 @@ impl DocHost {
                         .collect();
                     sessions.cancel_sent_messages(&handle.chat_id, earlier);
                 }
+                sessions.note_stop_command(chat_id, &entry.id);
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }

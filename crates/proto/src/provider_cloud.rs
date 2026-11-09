@@ -6,7 +6,9 @@
 //! - Its `cwd` is the pseudo path `claude-cloud://<session id>`: no device has
 //!   it on disk, so an older engine that tries to launch it locally fails.
 //! - Each message Zeron sends carries a provider event `uuid` derived from the
-//!   Zeron message id, which the provider uses to ignore repeats.
+//!   Zeron message id, which the provider uses to ignore repeats. Interrupts
+//!   and setting changes derive theirs from the command that caused them, and
+//!   a prompt's answer from the prompt's `request_id`.
 
 use crate::ProviderSession;
 
@@ -60,6 +62,23 @@ pub fn event_uuid(message_id: &str) -> String {
             uuid::Uuid::new_v5(&NAMESPACE, format!("message:{message_id}").as_bytes()).to_string()
         }
     }
+}
+
+/// The provider event `uuid` of a control request (`kind`: `set_model`,
+/// `set_permission_mode`) that rides Zeron command `command_id` (a message
+/// whose own event takes [`event_uuid`]): a UUIDv5 of both, so re-executing
+/// the command (another host, a retry) sends the same uuid and the provider
+/// ignores the repeat. A Stop is its own command: its interrupt goes under
+/// [`event_uuid`] of the command id.
+pub fn control_uuid(command_id: &str, kind: &str) -> String {
+    uuid::Uuid::new_v5(&NAMESPACE, format!("control:{kind}:{command_id}").as_bytes()).to_string()
+}
+
+/// The provider event `uuid` of the answer to a prompt (a `control_request`
+/// the session asked): a UUIDv5 of its `request_id`, the same on every
+/// device, so two hosts answering the same prompt send one event.
+pub fn answer_uuid(request_id: &str) -> String {
+    uuid::Uuid::new_v5(&NAMESPACE, format!("answer:{request_id}").as_bytes()).to_string()
 }
 
 /// A provider session's title from its first prompt: the first non-empty
@@ -130,5 +149,22 @@ mod tests {
         assert_eq!(derived, event_uuid("msg-np-1"));
         assert!(uuid::Uuid::parse_str(&derived).is_ok());
         assert_ne!(derived, event_uuid("msg-np-2"));
+    }
+
+    #[test]
+    fn control_and_answer_uuids_are_deterministic_v5s() {
+        let id = "6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70";
+        let model = control_uuid(id, "set_model");
+        assert_eq!(model, control_uuid(id, "set_model"));
+        assert_ne!(model, control_uuid(id, "set_permission_mode"));
+        assert_ne!(model, event_uuid(id));
+        assert_eq!(uuid::Uuid::parse_str(&model).unwrap().get_version_num(), 5);
+        let answer = answer_uuid("req-1");
+        assert_eq!(answer, answer_uuid("req-1"));
+        assert_ne!(answer, answer_uuid("req-2"));
+        assert_eq!(
+            answer,
+            uuid::Uuid::new_v5(&NAMESPACE, b"answer:req-1").to_string()
+        );
     }
 }
