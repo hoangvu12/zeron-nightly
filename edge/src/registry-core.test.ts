@@ -190,6 +190,44 @@ describe("applyOp", () => {
     expect(stale.changed).toBe(false);
   });
 
+  it("explicit clocks win claims and keep low-clock upserts harmless", () => {
+    // A host claim: an update of `deviceId` alone, its clock set ahead.
+    const claim: Op = {
+      kind: "chats",
+      id: "chat-1",
+      op: "update",
+      set: { deviceId: "dev-b" },
+      hlc: hlc(1500, "dev-b"),
+      clocks: { deviceId: hlc(9000, "dev-b") }
+    };
+    expect(validateOp(claim)).toBeNull();
+    const row = applied(undefined, upsert({ set: { title: "hi", deviceId: "dev-a" } }));
+    const claimed = applied(row, claim);
+    // A later whole-row write from a device that hasn't seen the claim loses
+    // `deviceId` and lands the rest.
+    const stale = upsert({ set: { title: "renamed", deviceId: "dev-a" }, hlc: hlc(5000, "dev-c") });
+    const merged = applied(claimed, stale);
+    expect(merged.fields).toEqual({ title: "renamed", deviceId: "dev-b" });
+
+    // A low-clock upsert: a fixed old clock on the row and on every field.
+    const old = hlc(10, "dev-d");
+    const low = upsert({
+      set: { title: "found", deviceId: "dev-d" },
+      hlc: old,
+      clocks: { title: old, deviceId: old }
+    });
+    expect(validateOp(low)).toBeNull();
+    // It creates a missing row…
+    const created = applied(undefined, low);
+    expect(created.fields.title).toBe("found");
+    expect(created.clocks.deviceId).toBe(old);
+    // …changes nothing on a row with newer fields…
+    expect(applyOp(merged, low).changed).toBe(false);
+    // …and never revives a newer tombstone.
+    const gone = applied(merged, { kind: "chats", id: "chat-1", op: "delete", hlc: hlc(9500) });
+    expect(applyOp(gone, low).changed).toBe(false);
+  });
+
   it("rowToSeedOp round-trips tombstones", () => {
     const gone = applied(undefined, { kind: "spaces", id: "sp-1", op: "delete", hlc: hlc(7000) });
     const seeded = applied(undefined, rowToSeedOp(gone));

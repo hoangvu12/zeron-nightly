@@ -93,6 +93,22 @@ impl HlcClock {
     }
 }
 
+/// The largest ms an HLC can carry: the room's `validateOp` wants 13 digits.
+const MAX_HLC_MS: i64 = 9_999_999_999_999;
+
+/// One past `clock` for `device`: the next counter at the same ms, carried
+/// into the next ms like [`HlcClock`]. `None` for a malformed clock.
+fn hlc_after(clock: &str, device: &str) -> Option<String> {
+    let mut parts = clock.splitn(3, '-');
+    let ms: i64 = parts.next()?.parse().ok()?;
+    let counter: u32 = parts.next()?.parse().ok()?;
+    Some(if counter >= 999_999 {
+        encode_hlc((ms + 1).min(MAX_HLC_MS), 0, device)
+    } else {
+        encode_hlc(ms, counter + 1, device)
+    })
+}
+
 // ── rows and ops (wire-compatible with edge/src/registry-core.ts) ───────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -788,6 +804,12 @@ impl RegistryDoc {
         self.clock.next(Self::now_ms(), &device)
     }
 
+    /// A caller-chosen clock: `at` with counter 0 and this device's suffix,
+    /// kept to the 13 digits the room accepts. Bypasses [`HlcClock`].
+    fn hlc_at(&self, at: DateTime<Utc>) -> String {
+        encode_hlc(at.timestamp_millis().clamp(0, MAX_HLC_MS), 0, &self.device_id)
+    }
+
     fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
         if ops.is_empty() {
             return;
@@ -1228,11 +1250,70 @@ impl RegistryDoc {
     // ── chats ───────────────────────────────────────────────────────────────
 
     pub fn upsert_chat(&mut self, chat: &Chat) -> Result<(), DocError> {
+        let set = Self::chat_fields(chat)?;
+        self.write(KIND_CHATS, &chat.id, OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// Low-clock upsert (docs/design/provider-run-chats.md §6): the full row,
+    /// with the row and every field clocked at `at` (counter 0, this device).
+    /// The registry has no conditional insert, so a fixed OLD clock is how a
+    /// write creates a truly missing row and nothing else: each field loses
+    /// to any real write, and the row to a newer delete's tombstone.
+    pub fn upsert_chat_at(&mut self, chat: &Chat, at: DateTime<Utc>) -> Result<(), DocError> {
+        let set = Self::chat_fields(chat)?;
+        let hlc = self.hlc_at(at);
+        let clocks = set.keys().map(|k| (k.clone(), hlc.clone())).collect();
+        self.enqueue_ops(vec![RowOp {
+            kind: KIND_CHATS.to_string(),
+            id: chat.id.clone(),
+            op: OpKind::Upsert,
+            set: Some(set),
+            hlc,
+            clocks: Some(clocks),
+        }]);
+        Ok(())
+    }
+
+    /// Host claim (docs/design/provider-run-chats.md §4): an update of
+    /// `deviceId` alone, naming this device, so every other field keeps its
+    /// own last write. Its clock is the later of `not_before` and one past
+    /// the field's current clock: [`HlcClock`] never observes other devices'
+    /// clocks, so a plain tick can lose to a host written by a device whose
+    /// wall clock runs ahead. `false` when there is no live row to claim.
+    pub fn claim_chat_host(
+        &mut self,
+        chat_id: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        let floor = self.hlc_at(not_before);
+        let clock = row
+            .clocks
+            .get("deviceId")
+            .and_then(|current| hlc_after(current, &self.device_id))
+            .map_or(floor.clone(), |past| past.max(floor));
+        let hlc = self.next_hlc();
+        self.enqueue_ops(vec![RowOp {
+            kind: KIND_CHATS.to_string(),
+            id: chat_id.to_string(),
+            op: OpKind::Update,
+            set: Some(fields([("deviceId", json!(self.device_id))])),
+            hlc,
+            clocks: Some(BTreeMap::from([("deviceId".to_string(), clock)])),
+        }]);
+        Ok(true)
+    }
+
+    /// Every field a full chat row writes (`None`s as clocked `Null`s).
+    fn chat_fields(chat: &Chat) -> Result<BTreeMap<String, Value>, DocError> {
         let config = match &chat.config {
             Some(config) => serde_json::to_value(config)?,
             None => Value::Null,
         };
-        let set = fields([
+        Ok(fields([
             ("id", json!(chat.id)),
             ("deviceId", json!(chat.device_id)),
             ("title", opt_str(chat.title.as_deref())),
@@ -1276,9 +1357,7 @@ impl RegistryDoc {
             ),
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
             ("childKind", opt_str(chat.child_kind.map(zeron_proto::ChildKind::as_str))),
-        ]);
-        self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
-        Ok(())
+        ]))
     }
 
     /// Claim-on-first-command row: ONLY the fields the claim actually knows

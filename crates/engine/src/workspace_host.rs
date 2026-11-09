@@ -1388,6 +1388,24 @@ impl WorkspaceHost {
         Ok(true)
     }
 
+    /// Claim the chat's host field for this device with a clock no earlier
+    /// than `not_before` ([`RegistryDoc::claim_chat_host`]). Returns false
+    /// when the chat doesn't exist.
+    pub fn claim_chat_host(
+        &self,
+        chat_id: &str,
+        not_before: chrono::DateTime<Utc>,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.claim_chat_host(chat_id, not_before))?)
+    }
+
+    /// Create a missing chat row with every field clocked at `at`; it loses
+    /// to any real write and to a newer delete
+    /// ([`RegistryDoc::upsert_chat_at`]).
+    pub fn upsert_chat_at(&self, chat: &Chat, at: chrono::DateTime<Utc>) -> Result<(), EngineError> {
+        Ok(self.mutate(|doc| doc.upsert_chat_at(chat, at))?)
+    }
+
     /// Upsert a chat row copied verbatim from another profile (local→synced
     /// import). Same write path as every live mutation, so the row persists
     /// and pushes like any other; the caller fixes `room_gen` beforehand.

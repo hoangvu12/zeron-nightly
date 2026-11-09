@@ -207,6 +207,51 @@ fn seed_ops_preserve_original_causality() {
 }
 
 #[test]
+fn explicit_clocks_win_claims_and_keep_low_clock_upserts_harmless() {
+    // A host claim: an update of `deviceId` alone, its clock set ahead.
+    let claim = RowOp {
+        clocks: Some(BTreeMap::from([("deviceId".into(), hlc_by(9000, "dev-b"))])),
+        ..update(&[("deviceId", json!("dev-b"))], hlc_by(1500, "dev-b"))
+    };
+    let row = applied(
+        None,
+        &upsert(&[("title", json!("hi")), ("deviceId", json!("dev-a"))], 1000),
+    );
+    let claimed = applied(Some(&row), &claim);
+    // A later whole-row write from a device that hasn't seen the claim loses
+    // `deviceId` and lands the rest.
+    let stale = RowOp {
+        hlc: hlc_by(5000, "dev-c"),
+        ..upsert(&[("title", json!("renamed")), ("deviceId", json!("dev-a"))], 0)
+    };
+    let merged = applied(Some(&claimed), &stale);
+    assert_eq!(merged.fields["deviceId"], json!("dev-b"));
+    assert_eq!(merged.fields["title"], json!("renamed"));
+
+    // A low-clock upsert: a fixed old clock on the row and on every field.
+    let old = hlc_by(10, "dev-d");
+    let low = RowOp {
+        hlc: old.clone(),
+        clocks: Some(BTreeMap::from([
+            ("title".into(), old.clone()),
+            ("deviceId".into(), old.clone()),
+        ])),
+        ..upsert(&[("title", json!("found")), ("deviceId", json!("dev-d"))], 0)
+    };
+    // It creates a missing row…
+    let created = applied(None, &low);
+    assert_eq!(created.fields["title"], json!("found"));
+    assert_eq!(created.clocks["deviceId"], old);
+    // …changes nothing on a row with newer fields…
+    let (_, changed) = apply_op(Some(&merged), &low);
+    assert!(!changed);
+    // …and never revives a newer tombstone.
+    let gone = applied(Some(&merged), &delete(9500));
+    let (_, changed) = apply_op(Some(&gone), &low);
+    assert!(!changed);
+}
+
+#[test]
 fn wire_shapes_match_the_edge() {
     // The exact JSON the TS side produces/consumes (registry-core.ts).
     let op: RowOp = serde_json::from_value(json!({
@@ -804,6 +849,217 @@ fn late_create_chat_config_survives_a_prior_claim() {
         assert_eq!(merged.config, chat("chat-race", "dev-a").config);
         assert_eq!(merged.title.as_deref(), Some("First chat"));
     }
+}
+
+// ── explicit clocks (docs/design/provider-run-chats.md §4, §6) ──────────────
+
+fn relay_row<'a>(
+    server: &'a HashMap<(String, String), RegistryRow>,
+    chat_id: &str,
+) -> &'a RegistryRow {
+    &server[&(KIND_CHATS.to_string(), chat_id.to_string())]
+}
+
+/// The queued ops of the doc's newest pending batch.
+fn last_op(doc: &RegistryDoc) -> &RowOp {
+    doc.pending
+        .last()
+        .and_then(|b| b.ops.last())
+        .expect("a queued op")
+}
+
+/// What `validateOp` in `edge/src/registry-core.ts` demands of every clock.
+fn relay_accepts_hlc(clock: &str) -> bool {
+    let mut parts = clock.splitn(3, '-');
+    let digits = |s: Option<&str>, n: usize| {
+        s.is_some_and(|s| s.len() == n && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    digits(parts.next(), 13)
+        && digits(parts.next(), 6)
+        && parts.next().is_some_and(|d| {
+            (1..=128).contains(&d.len())
+                && d.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+}
+
+#[test]
+fn host_claim_writes_only_the_host_above_its_field_clock() {
+    let mut doc = RegistryDoc::new("dev-a");
+    // A claim never creates a row.
+    assert!(!doc.claim_chat_host("chat-1", ts(0)).unwrap());
+    assert_eq!(doc.pending_ops_len(), 0);
+
+    // The host field was last written by a device whose clock runs far ahead.
+    let mut row = applied(
+        None,
+        &upsert(&[("id", json!("chat-1")), ("deviceId", json!("dev-z"))], 1000),
+    );
+    row.clocks
+        .insert("deviceId".into(), encode_hlc(9_000_000, 999_999, "dev-z"));
+    let _ = doc.apply_rows(1, vec![row]);
+
+    // A floor below that clock climbs one past it…
+    assert!(doc.claim_chat_host("chat-1", ts(5_000)).unwrap());
+    let op = last_op(&doc);
+    assert_eq!(op.op, OpKind::Update);
+    assert_eq!(op.set, Some(fields([("deviceId", json!("dev-a"))])));
+    assert_eq!(op.clock_for("deviceId"), encode_hlc(9_000_001, 0, "dev-a"));
+    assert_eq!(doc.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
+
+    // …a floor above it is the clock…
+    assert!(doc.claim_chat_host("chat-1", ts(20_000_000)).unwrap());
+    let claimed = encode_hlc(20_000_000, 0, "dev-a");
+    assert_eq!(last_op(&doc).clock_for("deviceId"), claimed);
+    let row = doc.overlay_row(KIND_CHATS, "chat-1").unwrap();
+    assert_eq!(row.clocks["deviceId"], claimed);
+    assert_eq!(row.clocks["id"], hlc(1000), "no other field is written");
+
+    // …and the op is one the relay accepts.
+    let wire = serde_json::to_value(last_op(&doc)).unwrap();
+    assert!(relay_accepts_hlc(wire["hlc"].as_str().unwrap()));
+    assert_eq!(wire["clocks"]["deviceId"], json!(claimed));
+
+    // A deleted chat can't be claimed either.
+    doc.delete_chat("chat-1").unwrap();
+    assert!(!doc.claim_chat_host("chat-1", ts(30_000_000)).unwrap());
+}
+
+#[test]
+fn host_claim_beats_a_later_stale_whole_row_write() {
+    let mut host = RegistryDoc::new("dev-b");
+    let mut claimant = RegistryDoc::new("dev-a");
+    let mut stale = RegistryDoc::new("dev-c");
+    host.upsert_chat(&chat("chat-1", "dev-b")).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut claimant, &mut stale]);
+
+    let not_before = Utc::now() + chrono::Duration::seconds(5);
+    assert!(claimant.claim_chat_host("chat-1", not_before).unwrap());
+    server_round(&mut server, &mut seq, &mut [&mut claimant]);
+    assert_eq!(relay_row(&server, "chat-1").fields["deviceId"], json!("dev-a"));
+
+    // `stale` hasn't seen the claim: its whole-row rewrite, made after it,
+    // still names the old host.
+    let mut rewrite = chat("chat-1", "dev-b");
+    rewrite.title = Some("renamed".into());
+    stale.upsert_chat(&rewrite).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut claimant, &mut stale]);
+    for doc in [&host, &claimant, &stale] {
+        let merged = doc.chat("chat-1").unwrap().expect("merged row");
+        assert_eq!(merged.device_id, "dev-a");
+        assert_eq!(merged.title.as_deref(), Some("renamed"));
+    }
+
+    // So does one from a device whose wall clock runs up to 5 s ahead.
+    let skewed = RowOp {
+        hlc: encode_hlc(not_before.timestamp_millis() - 1, 999_999, "dev-z"),
+        ..upsert(&[("deviceId", json!("dev-z"))], 0)
+    };
+    let (merged, _) = apply_op(Some(relay_row(&server, "chat-1")), &skewed);
+    assert_eq!(merged.unwrap().fields["deviceId"], json!("dev-a"));
+}
+
+#[test]
+fn low_clock_upsert_creates_a_missing_row() {
+    let mut finder = RegistryDoc::new("dev-a");
+    let mut viewer = RegistryDoc::new("dev-b");
+    let found = chat("chat-1", "dev-a");
+    finder.upsert_chat_at(&found, ts(2_000)).unwrap();
+
+    let clock = encode_hlc(2_000, 0, "dev-a");
+    let op = last_op(&finder);
+    assert_eq!(op.op, OpKind::Upsert);
+    assert_eq!(op.hlc, clock);
+    let set = op.set.as_ref().unwrap();
+    let clocks = op.clocks.as_ref().expect("per-field clocks");
+    assert!(set.contains_key("deviceId") && set.contains_key("title"));
+    assert!(set.keys().eq(clocks.keys()), "every field carries its clock");
+    assert!(clocks.values().all(|c| *c == clock));
+    assert_eq!(finder.chat("chat-1").unwrap(), Some(found.clone()));
+
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut finder, &mut viewer]);
+    assert!(relay_row(&server, "chat-1").clocks.values().all(|c| *c == clock));
+    for doc in [&finder, &viewer] {
+        assert_eq!(doc.chat("chat-1").unwrap(), Some(found.clone()));
+    }
+
+    // An out-of-range instant still makes a clock the relay accepts.
+    finder.upsert_chat_at(&chat("chat-2", "dev-a"), ts(-5)).unwrap();
+    assert!(relay_accepts_hlc(&last_op(&finder).hlc));
+}
+
+#[test]
+fn low_clock_upsert_changes_nothing_on_a_newer_row() {
+    let mut host = RegistryDoc::new("dev-b");
+    let real = chat("chat-1", "dev-b");
+    host.upsert_chat(&real).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut host]);
+    let before = relay_row(&server, "chat-1").clone();
+
+    // A device with a stale registry discovers the same chat.
+    let mut found = chat("chat-1", "dev-a");
+    found.title = Some("from discovery".into());
+    found.archived = true;
+    found.cwd = None;
+    let mut finder = RegistryDoc::new("dev-a");
+    finder.upsert_chat_at(&found, ts(2_000)).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut finder]);
+    assert_eq!(relay_row(&server, "chat-1"), &before);
+    assert_eq!(host.chat("chat-1").unwrap(), Some(real.clone()));
+
+    // Locally too: the overlay keeps the newer fields.
+    host.upsert_chat_at(&found, ts(2_000)).unwrap();
+    assert_eq!(host.chat("chat-1").unwrap(), Some(real));
+}
+
+#[test]
+fn low_clock_upsert_does_not_revive_a_newer_tombstone() {
+    let mut host = RegistryDoc::new("dev-b");
+    host.upsert_chat(&chat("chat-1", "dev-b")).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut host]);
+    host.delete_chat("chat-1").unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host]);
+
+    let mut finder = RegistryDoc::new("dev-a");
+    finder
+        .upsert_chat_at(&chat("chat-1", "dev-a"), ts(2_000))
+        .unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut finder]);
+    assert!(relay_row(&server, "chat-1").deleted);
+    assert_eq!(host.chat("chat-1").unwrap(), None);
+
+    // Locally too.
+    host.upsert_chat_at(&chat("chat-1", "dev-a"), ts(2_000))
+        .unwrap();
+    assert_eq!(host.chat("chat-1").unwrap(), None);
+}
+
+#[test]
+fn explicit_clock_writes_work_on_a_local_only_replica() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.set_local_only(true);
+    let real = chat("chat-1", "dev-b");
+    doc.upsert_chat(&real).unwrap();
+
+    doc.upsert_chat_at(&chat("chat-1", "dev-a"), ts(2_000)).unwrap();
+    assert_eq!(doc.chat("chat-1").unwrap(), Some(real));
+    doc.upsert_chat_at(&chat("chat-2", "dev-a"), ts(2_000)).unwrap();
+    assert_eq!(doc.chat("chat-2").unwrap(), Some(chat("chat-2", "dev-a")));
+
+    assert!(doc.claim_chat_host("chat-1", Utc::now()).unwrap());
+    assert_eq!(doc.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
+
+    doc.delete_chat("chat-2").unwrap();
+    doc.upsert_chat_at(&chat("chat-2", "dev-a"), ts(2_000)).unwrap();
+    assert_eq!(doc.chat("chat-2").unwrap(), None);
+    assert_eq!(doc.pending_len(), 0);
 }
 
 #[test]
