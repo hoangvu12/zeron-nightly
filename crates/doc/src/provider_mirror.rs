@@ -302,3 +302,133 @@ impl SessionDoc {
         self.provider_duplicates().into_iter().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parts::{MessagePart, MessageStatus};
+    use crate::schema::MessageRole;
+
+    fn message(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "hi".into(),
+            }],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    fn provider_doc(peer: u64) -> SessionDoc {
+        let doc = SessionDoc::init("chat").unwrap();
+        doc.doc().set_peer_id(peer).unwrap();
+        doc.doc()
+            .get_map("meta")
+            .insert("providerSession", "{}")
+            .unwrap();
+        doc.doc().commit();
+        doc
+    }
+
+    #[test]
+    fn every_device_keeps_the_same_copy_and_hides_the_rest_until_swept() {
+        let a = provider_doc(7);
+        let b = provider_doc(3);
+        b.doc()
+            .import(&a.doc().export(loro::ExportMode::all_updates()).unwrap())
+            .unwrap();
+        a.push_provider_message(&message("on-a"), "evt-1", 5).unwrap();
+        b.push_provider_message(&message("on-b"), "evt-1", 5).unwrap();
+        let (from_a, from_b) = (
+            a.doc().export(loro::ExportMode::all_updates()).unwrap(),
+            b.doc().export(loro::ExportMode::all_updates()).unwrap(),
+        );
+        a.doc().import(&from_b).unwrap();
+        b.doc().import(&from_a).unwrap();
+        // Shown once, the same copy on both (the lowest element id: peer 3).
+        for doc in [&a, &b] {
+            let ids: Vec<_> = doc.read_entries().unwrap().into_iter().map(|e| e.id).collect();
+            assert_eq!(ids, vec!["on-b".to_owned()]);
+            assert_eq!(doc.provider_entries().len(), 2);
+        }
+        assert_eq!(a.sweep_provider_duplicates().unwrap(), 1);
+        b.doc()
+            .import(&a.doc().export(loro::ExportMode::all_updates()).unwrap())
+            .unwrap();
+        for doc in [&a, &b] {
+            let ids: Vec<_> = doc.provider_entries().into_iter().map(|e| e.id).collect();
+            assert_eq!(ids, vec!["on-b".to_owned()]);
+        }
+        // Concurrent sweeps on both devices converge too.
+        assert_eq!(b.sweep_provider_duplicates().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_chat_that_isnt_provider_run_hides_nothing() {
+        let doc = SessionDoc::init("local").unwrap();
+        doc.push_provider_message(&message("x"), "evt", 1).unwrap();
+        doc.push_provider_message(&message("y"), "evt", 1).unwrap();
+        assert_eq!(doc.read_entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_watermark_only_moves_forward_and_a_turns_end_closes_its_prompts() {
+        let doc = provider_doc(1);
+        let asked = |id: &str| ProviderPrompt::Asked {
+            request_id: id.into(),
+        };
+        doc.commit_provider_event(4, TurnUpdate::Keep, Some(&asked("p1")))
+            .unwrap();
+        doc.commit_provider_event(6, TurnUpdate::Keep, Some(&asked("p2")))
+            .unwrap();
+        doc.commit_provider_event(
+            7,
+            TurnUpdate::Keep,
+            Some(&ProviderPrompt::Answered {
+                request_id: "p1".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(doc.provider_watermark(), 7);
+        assert_eq!(
+            doc.provider_open_prompts(),
+            BTreeMap::from([("p2".to_owned(), 6)])
+        );
+        doc.commit_provider_event(3, TurnUpdate::Keep, None).unwrap();
+        assert_eq!(doc.provider_watermark(), 7);
+        let turn = ProviderTurn {
+            entry_id: "e".into(),
+            from_seq: 5,
+        };
+        doc.commit_provider_event(8, TurnUpdate::Open(turn.clone()), None)
+            .unwrap();
+        assert_eq!(doc.provider_turn(), Some(turn));
+        doc.commit_provider_event(9, TurnUpdate::Close, None).unwrap();
+        assert_eq!(doc.provider_turn(), None);
+        assert!(doc.provider_open_prompts().is_empty());
+        assert_eq!(doc.provider_watermark(), 9);
+    }
+
+    #[test]
+    fn an_echo_is_matched_by_its_entry_id_and_stamped() {
+        let doc = provider_doc(1);
+        doc.push_message(&message("6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70"))
+            .unwrap();
+        assert!(
+            doc.stamp_provider_echo("6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70", 2)
+                .unwrap()
+        );
+        assert_eq!(doc.provider_entries()[0].provider_seq, Some(2));
+        // A message id that isn't a uuid travels under its UUIDv5.
+        doc.push_message(&message("msg-2")).unwrap();
+        let uuid = zeron_proto::provider_cloud::event_uuid("msg-2");
+        assert!(doc.stamp_provider_echo(&uuid, 3).unwrap());
+        assert!(!doc.stamp_provider_echo("someone-elses", 4).unwrap());
+    }
+}

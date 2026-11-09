@@ -150,6 +150,7 @@ async fn open_run(
     harness.provider_cloud().unwrap().bind_run(RunBinding {
         session: session.clone(),
         prompt_uuid: None,
+        resume: None,
     });
     let cwd = zeron_proto::provider_cloud::claude_cwd(&session.session_id);
     let mut empty = request(&cwd);
@@ -434,6 +435,7 @@ async fn only_a_successful_request_clears_sign_in_again() {
             path_contains: "/v1/code/sessions".into(),
             status,
             times: 1,
+            retry_after: None,
         });
         assert!(rig.create().await.is_err());
         assert_eq!(
