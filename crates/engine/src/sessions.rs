@@ -4836,6 +4836,8 @@ async fn drive_run(
                 continue;
             };
             let seq = sequence_num;
+            // A batch boundary: a turn's end, or a person's message.
+            let batch = turn_end || message.is_some();
             if let Some(text) = message {
                 match doc_ref.stamp_provider_echo(&uuid, seq) {
                     // This device's own send (or a replay): written already.
@@ -4922,7 +4924,11 @@ async fn drive_run(
                 Ok(()) => pm.watermark = pm.watermark.max(seq),
                 Err(err) => tracing::warn!(chat = %chat_id, error = %err, "replay watermark write failed"),
             }
-            if let Err(err) = doc_ref.sweep_provider_duplicates() {
+            // The host's sweep, once per batch: at each turn's end and each
+            // person's message (and when a run starts, above), not per event.
+            if batch
+                && let Err(err) = doc_ref.sweep_provider_duplicates()
+            {
                 tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
             }
             continue;
@@ -5778,6 +5784,31 @@ async fn drive_run(
                     outcome,
                 );
                 continue;
+            }
+            // A provider-run chat's turn end is committed by the marker
+            // that follows its Done (the harness sends it at once, then
+            // ends): read it before the run goes, or the next run would take
+            // the finished turn for one cut off.
+            if provider.is_some()
+                && !interrupted
+                && let Ok(Some(Ok(AgentEvent::ProviderEvent {
+                    sequence_num,
+                    turn_end,
+                    prompt,
+                    ..
+                }))) = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await
+            {
+                let turn = if turn_end {
+                    zeron_doc::TurnUpdate::Close
+                } else {
+                    zeron_doc::TurnUpdate::Keep
+                };
+                if let Err(err) = doc_ref.commit_provider_event(sequence_num, turn, prompt.as_ref()) {
+                    tracing::warn!(chat = %chat_id, error = %err, "replay watermark write failed");
+                }
+                if let Err(err) = doc_ref.sweep_provider_duplicates() {
+                    tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
+                }
             }
             final_completed_turn = completed_turn;
             // Retiring an already parked process is not a new turn outcome.

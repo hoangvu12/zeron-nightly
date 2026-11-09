@@ -69,7 +69,7 @@ use tokio::time::Instant;
 use zeron_proto::provider_cloud::{answer_uuid, control_uuid, event_uuid};
 use zeron_proto::{AgentEvent, DoneStatus, ProviderSession, RunRequest};
 
-use super::api::{ApiError, CloudClient, StreamItem};
+use super::api::{ApiError, CloudClient, EventAck, StreamItem};
 use super::credentials::ClaudeAccount;
 use super::mirror::{Control, Mirror};
 use super::{Bindings, PermissionMode, Settings};
@@ -289,9 +289,9 @@ async fn post(
     bindings: &Bindings,
     session: &ProviderSession,
     payloads: Vec<Value>,
-) -> Result<(), ApiError> {
+) -> Result<Vec<EventAck>, ApiError> {
     if payloads.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let account = account_of(session);
     let acks = with_retries(|| client.send_events(&account, &session.session_id, payloads.clone()))
@@ -304,7 +304,7 @@ async fn post(
             bindings.mark_delivered(&session.session_id, uuid);
         }
     }
-    Ok(())
+    Ok(acks)
 }
 
 /// Whether the session's history after `seq` holds a `control_response` for
@@ -376,7 +376,9 @@ impl RunSession {
         if !payloads.is_empty() && !self.bindings.hosts(&self.session.session_id) {
             return Err(ApiError::NotHost);
         }
-        post(&self.client, &self.bindings, &self.session, payloads).await
+        post(&self.client, &self.bindings, &self.session, payloads)
+            .await
+            .map(drop)
     }
 
     /// Send `message` now (with the settings it changed ahead of it),
@@ -463,17 +465,26 @@ impl RunSession {
     pub async fn run(mut self) {
         let session_id = self.session.session_id.clone();
         let (mut opening, opening_actual) = std::mem::take(&mut self.opening_changes);
+        let prompted = self.opening.is_some();
         if let Some((uuid, prompt)) = self.opening.take() {
             opening.push(user_payload(&uuid, &session_id, &prompt));
         }
-        if let Err(error) = self.post(opening).await {
-            if matches!(error, ApiError::NotHost) {
-                demoted(&self.events).await;
-            } else {
-                fail(&self.events, error.to_string(), true).await;
-            }
+        // A turn whose end is stored before this run's opening prompt is an
+        // earlier one (a replay catching the transcript up, or turns run
+        // elsewhere meanwhile): its end closes its own entry (its marker)
+        // and doesn't end this run's turn.
+        if !opening.is_empty() && !self.bindings.hosts(&session_id) {
+            demoted(&self.events).await;
             return;
         }
+        let floor = match post(&self.client, &self.bindings, &self.session, opening).await {
+            Ok(acks) if prompted => acks.last().and_then(|ack| ack.sequence_num).unwrap_or(0),
+            Ok(_) => 0,
+            Err(error) => {
+                fail(&self.events, error.to_string(), true).await;
+                return;
+            }
+        };
         if let Some(actual) = opening_actual {
             self.bindings.note_actual(&session_id, actual);
         }
@@ -602,6 +613,7 @@ impl RunSession {
                         // The stored event's marker goes after everything it
                         // mapped to (and after a prompt is up).
                         let mark = mapped.mark;
+                        let earlier = mapped.seq.is_some_and(|seq| seq < floor);
                         match mapped.control {
                             Some(Control::Prompt { request_id, request, seq }) => {
                                 if stop_deadline.is_some()
@@ -667,6 +679,9 @@ impl RunSession {
                         }
                         for mut event in mapped.events {
                             let turn_over = matches!(event, AgentEvent::Done { .. });
+                            if turn_over && earlier {
+                                continue;
+                            }
                             if turn_over && stop_deadline.is_some()
                                 && let AgentEvent::Done { status, .. } = &mut event
                             {

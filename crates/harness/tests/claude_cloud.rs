@@ -90,8 +90,20 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     (controls, steer_tx, token)
 }
 
-/// Events up to and including the next `Done`.
+/// Events up to and including the next `Done`, without the mirror's
+/// bookkeeping markers ([`AgentEvent::ProviderEvent`]; see [`marked_turn`]).
 async fn turn(
+    stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>,
+) -> Vec<AgentEvent> {
+    marked_turn(stream)
+        .await
+        .into_iter()
+        .filter(|e| !matches!(e, AgentEvent::ProviderEvent { .. }))
+        .collect()
+}
+
+/// Events up to and including the next `Done`, markers included.
+async fn marked_turn(
     stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>,
 ) -> Vec<AgentEvent> {
     let mut out = Vec::new();
@@ -170,6 +182,7 @@ async fn creates_mirrors_and_follows_up_with_an_honest_identity() {
     rig.harness.provider_cloud().unwrap().bind_run(RunBinding {
         session: session.clone(),
         prompt_uuid: Some(FIRST.into()),
+        resume: None,
     });
     let (controls, steer, _interrupt) = controls();
     let mut stream = rig
@@ -301,6 +314,7 @@ async fn a_login_for_another_account_is_refused() {
     rig.harness.provider_cloud().unwrap().bind_run(RunBinding {
         session: session.clone(),
         prompt_uuid: Some(SECOND.into()),
+        resume: None,
     });
     let cwd = zeron_proto::provider_cloud::claude_cwd(&session.session_id);
     let (controls, _steer, _interrupt) = controls();
@@ -442,6 +456,7 @@ async fn start(
     rig.harness.provider_cloud().unwrap().bind_run(RunBinding {
         session: session.clone(),
         prompt_uuid: Some(prompt_uuid.into()),
+        resume: None,
     });
     rig.harness.run(request, controls).await.unwrap()
 }
@@ -550,10 +565,17 @@ async fn stop_interrupts_the_turn_under_the_stop_commands_id_and_a_repeat_is_a_n
     let events = turn(&mut stream).await;
     assert_eq!(done_status(&events), Some(DoneStatus::Interrupted));
     assert_eq!(text(&events), "ZULU");
-    let ended = tokio::time::timeout(Duration::from_secs(10), stream.next())
-        .await
-        .expect("the run ends");
-    assert!(ended.is_none());
+    // Only the stopped turn's end marker follows; then the run ends.
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the run ends");
+        match next {
+            None => break,
+            Some(Ok(AgentEvent::ProviderEvent { .. })) => continue,
+            other => panic!("after the stop: {other:?}"),
+        }
+    }
 
     let interrupts = of_type(posted(&rig), "control_request");
     assert_eq!(interrupts.len(), 1);
@@ -826,6 +848,7 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     other.provider_cloud().unwrap().bind_run(RunBinding {
         session: session.clone(),
         prompt_uuid: Some(SECOND.into()),
+        resume: None,
     });
     let (controls, _steer, _interrupt) = crate::controls();
     let again = other.run(plan, controls).await.unwrap();
@@ -844,7 +867,7 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
 }
 
 #[tokio::test]
-async fn a_message_sent_from_elsewhere_shows_and_this_devices_own_echoes_dont() {
+async fn every_persons_message_rides_its_marker_for_the_engine_to_write_or_match() {
     let rig = rig().await;
     let session = create(&rig, "Run uname -a", FIRST).await;
     let sid = session.session_id.clone();
@@ -858,42 +881,78 @@ async fn a_message_sent_from_elsewhere_shows_and_this_devices_own_echoes_dont() 
         controls,
     )
     .await;
-    let first = turn(&mut stream).await;
-    // The opening prompt's echo (it rode the create request) shows nothing.
+    let first = marked_turn(&mut stream).await;
+    // No message goes out as an event of its own: each rides its stored
+    // event's marker, and the engine writes it unless the transcript has it
+    // (the opening prompt's echo, by its id).
     assert_eq!(
         count(&first, |e| matches!(e, AgentEvent::UserMessage { .. })),
         0
     );
+    assert_eq!(
+        messages(&first),
+        vec![(FIRST.to_owned(), "Run uname -a".to_owned())]
+    );
 
-    // Typed on claude.ai: the session runs a turn for it, and the chat shows
-    // the message as the person's.
+    // Typed on claude.ai: the session runs a turn for it, and its marker
+    // carries the message, under its own uuid, ahead of the reply.
+    let typed = uuid::Uuid::new_v4().to_string();
     rig.fake.queue_turn(Turn::text_zulu());
     rig.fake.post_as_client(
         &sid,
         json!({
-            "uuid": uuid::Uuid::new_v4().to_string(),
+            "uuid": typed,
             "session_id": "",
             "type": "user",
             "parent_tool_use_id": null,
             "message": {"role": "user", "content": "Typed on claude.ai"},
         }),
     );
-    let events = turn(&mut stream).await;
-    assert!(
-        matches!(events.first(), Some(AgentEvent::UserMessage { text }) if text == "Typed on claude.ai"),
-        "{events:?}"
+    let events = marked_turn(&mut stream).await;
+    assert_eq!(
+        messages(&events),
+        vec![(typed.clone(), "Typed on claude.ai".to_owned())]
     );
+    let carried = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ProviderEvent { message: Some(_), .. }))
+        .unwrap();
+    let reply = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { .. }))
+        .unwrap();
+    assert!(carried < reply, "{events:?}");
     assert_eq!(text(&events), "ZULU");
     assert_eq!(done_status(&events), Some(DoneStatus::Completed));
 
-    // A message sent from here: its echo shows nothing.
+    // A message sent from here: its echo's marker carries it too, under the
+    // message's own event uuid, for the engine to match by id.
     rig.fake.queue_turn(Turn::text_zulu());
     steer.send(message(SECOND, "From Zeron")).await.unwrap();
-    let events = turn(&mut stream).await;
+    let events = marked_turn(&mut stream).await;
     assert_eq!(
         count(&events, |e| matches!(e, AgentEvent::UserMessage { .. })),
         0
     );
+    assert_eq!(
+        messages(&events),
+        vec![(SECOND.to_owned(), "From Zeron".to_owned())]
+    );
+}
+
+/// The persons' messages the markers in `events` carry: (uuid, text).
+fn messages(events: &[AgentEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ProviderEvent {
+                uuid,
+                message: Some(text),
+                ..
+            } => Some((uuid.clone(), text.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -1144,6 +1203,7 @@ async fn a_replayed_prompt_already_answered_is_neither_shown_nor_answered() {
         other.provider_cloud().unwrap().bind_run(RunBinding {
             session: session.clone(),
             prompt_uuid: Some(FIRST.into()),
+            resume: None,
         });
         let (controls, _interrupt, asked) = asking_controls();
         let mut replay = request(
