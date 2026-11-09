@@ -19,3 +19,12 @@
 - **Recommended surface treatment** — A theme variant's authored recommendation for whether its surfaces are frosted or opaque. It is used only when the user keeps the surface preference at theme default.
 - **Surface preference** — A device-local choice of theme default, frosted, or opaque that is independent of appearance, theme, and accent selections.
 - **Resolved surface treatment** — The effective frosted or opaque treatment produced by applying the surface preference to the active variant's recommendation.
+
+## Hosting vocabulary
+
+- **Host** — The device whose Zeron engine owns a chat and runs its commands. A host is always a device with a Zeron engine.
+- **Zeron Cloud** — Machines Zeron runs for the user. Each Cloud session machine is a host like any laptop. _Avoid_: "the cloud" on its own.
+- **Provider cloud** — An agent provider's own hosted place for running agents, such as Anthropic's Claude Code cloud. It runs no Zeron engine, so it is never a host. _Avoid_: cloud chat, remote session.
+- **Provider cloud session** — One agent session running in a provider cloud. It belongs to the provider account that created it and is the record of the conversation.
+- **Provider-run chat** — A Zeron chat tied to one provider cloud session. Its host device mirrors the session and sends to it; when they disagree, the session wins.
+- **Remote workspace** — The working copy of a provider-run chat, which lives in the provider cloud rather than on the host, so the host's files, diffs and terminals don't apply to it.
