@@ -8,7 +8,9 @@
 //! Writes a fake login (account `a@example.test`) to `<folder>/login`, a stub
 //! `claude` to `<folder>/bin`, queues a few text turns, and prints the
 //! environment to launch the app with: `CLAUDE_CONFIG_DIR`,
-//! `CLAUDE_CODE_EXECUTABLE` and `ZERON_CLAUDE_CLOUD_API`. Runs until killed.
+//! `CLAUDE_CODE_EXECUTABLE` and `ZERON_CLAUDE_CLOUD_API`. Touching
+//! `<folder>/reject-token` makes the server refuse that login from then on.
+//! Runs until killed.
 
 use zeron_provider_fake::{ClaudeLogin, FakeAccount, FakeSessionServer, SeedSession, StubClaude, Turn};
 
@@ -29,8 +31,17 @@ async fn main() {
     println!("ZERON_CLAUDE_CLOUD_API={}", fake.base_url());
     println!("CLAUDE_CONFIG_DIR={}", login.dir().display());
     println!("CLAUDE_CODE_EXECUTABLE={}", stub.path().display());
+    // Touch `<folder>/reject-token` to refuse the fake login from then on
+    // (a persistent 401: the chat shows "Sign in again").
+    let reject = folder.join("reject-token");
+    let mut rejected = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if !rejected && reject.exists() {
+            fake.reject_token("fake-token-a");
+            rejected = true;
+            println!("rejecting the fake login's token");
+        }
         let created = fake.created_sessions();
         if !created.is_empty() {
             println!("sessions created: {created:?}");
