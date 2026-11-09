@@ -1264,6 +1264,22 @@ impl Tools {
         {
             mutate["branch"] = json!(branch);
         }
+        // A provider-run chat (Anthropic cloud): its session is created with
+        // the first message, and the engine names the chat after it.
+        let provider_run = harness.runs_in_provider_cloud();
+        let provider_message = provider_run.then(|| uuid::Uuid::new_v4().to_string());
+        if let Some(message_id) = &provider_message {
+            let prompt = args
+                .prompt
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .context("An Anthropic cloud chat starts with its first message: pass a prompt")?;
+            mutate["prompt"] = json!(prompt);
+            mutate["messageId"] = json!(message_id);
+            if let Some(title) = args.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                mutate["title"] = json!(title);
+            }
+        }
         let mut cwd = args
             .cwd
             .as_deref()
@@ -1276,6 +1292,7 @@ impl Tools {
         if space.is_none()
             && cwd.is_none()
             && !args.cloud
+            && !provider_run
             && self.zeron.devices().await?.iter().any(|d| {
                 d.id == device_id
                     && d.capabilities
@@ -1304,14 +1321,24 @@ impl Tools {
                     .context("the engine didn't name the Cloud machine")?,
                 created["cwd"].as_str().map(str::to_owned).or(cwd),
             )
+        } else if provider_run {
+            (device_id, created["cwd"].as_str().map(str::to_owned))
         } else {
             (device_id, cwd)
+        };
+        let chat_id = if provider_run {
+            created["chatId"]
+                .as_str()
+                .map(str::to_owned)
+                .context("the engine didn't name the Anthropic cloud chat")?
+        } else {
+            chat_id
         };
         if let Some(title) = args
             .title
             .as_deref()
             .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .filter(|t| !t.is_empty() && !provider_run)
         {
             self.zeron
                 .mutate(json!({ "op": "renameChat", "chatId": chat_id, "title": title }))
@@ -1372,14 +1399,24 @@ impl Tools {
                 sleep: None,
                 provider_session: None,
             };
-            let delivered = self
-                .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
-                .await?;
-            result["sent"] = delivered.receipt;
+            // A provider-run chat's first message rode createChat.
+            let message_id = match provider_message {
+                Some(message_id) => {
+                    result["sent"] = json!({ "messageId": message_id, "via": "createChat" });
+                    message_id
+                }
+                None => {
+                    let delivered = self
+                        .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
+                        .await?;
+                    result["sent"] = delivered.receipt;
+                    delivered.message_id
+                }
+            };
             let pending = Arc::new(PendingTurn {
                 baseline: None,
                 start: TurnStart {
-                    after_message: Some(delivered.message_id),
+                    after_message: Some(message_id),
                 },
             });
             self.pending_turns

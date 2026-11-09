@@ -525,6 +525,34 @@ fn own_push_ack_never_advances_the_cursor() {
 }
 
 #[test]
+fn provider_session_is_written_once_and_survives_whole_row_writes() {
+    let session = zeron_proto::ProviderSession {
+        provider: "claude".into(),
+        session_id: "cse_fake0001".into(),
+        account_uuid: "acct-a".into(),
+        account_email: "a@example.test".into(),
+        org_id: "org-a".into(),
+    };
+    let mut doc = RegistryDoc::new("dev-a");
+    assert!(!doc.set_chat_provider_session("chat-1", &session).unwrap(), "no row yet");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    assert!(doc.set_chat_provider_session("chat-1", &session).unwrap());
+    let read = |doc: &RegistryDoc| doc.chat("chat-1").unwrap().unwrap().provider_session;
+    assert_eq!(read(&doc), Some(session.clone()));
+    // A whole-row write (ours, or an older engine's) never touches it.
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    assert_eq!(read(&doc), Some(session.clone()));
+    // It never changes to another session.
+    let other = zeron_proto::ProviderSession {
+        session_id: "cse_fake0002".into(),
+        ..session.clone()
+    };
+    assert!(!doc.set_chat_provider_session("chat-1", &other).unwrap());
+    assert!(doc.set_chat_provider_session("chat-1", &session).unwrap());
+    assert_eq!(read(&doc), Some(session));
+}
+
+#[test]
 fn broadcast_seq_gap_applies_rows_but_holds_the_cursor() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.apply_state(10, true, 0, Vec::new());
