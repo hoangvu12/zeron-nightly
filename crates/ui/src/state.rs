@@ -7681,6 +7681,69 @@ mod tests {
     }
 
     #[test]
+    fn remote_workspace_follows_the_harness_descriptor_not_the_slug() {
+        let mut state = AppState::new();
+        let with_harness = |id: &str, harness: HarnessId| {
+            let mut row = chat(id, 0, None);
+            row.config = Some(zeron_proto::ChatConfig {
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
+            });
+            row
+        };
+        state.apply_chats(vec![
+            with_harness("cloud", HarnessId::ClaudeCodeCloud),
+            with_harness("local", HarnessId::ClaudeCode),
+        ]);
+        // No catalog says so yet: the slug alone hides nothing.
+        assert!(!state.chat_remote_workspace("cloud"));
+        let descriptor = |id: HarnessId, remote_workspace: bool| {
+            serde_json::from_value::<zeron_engine::registry::HarnessDescriptor>(serde_json::json!({
+                "id": id, "name": "x", "supportsSteering": false,
+                "steeringMode": "turn-boundary", "reasoningLevels": [],
+                "remoteWorkspace": remote_workspace,
+            }))
+            .unwrap()
+        };
+        assert!(state.learn_harness_catalog(&[
+            descriptor(HarnessId::ClaudeCode, false),
+            descriptor(HarnessId::ClaudeCodeCloud, true),
+        ]));
+        assert!(state.chat_remote_workspace("cloud"));
+        assert!(!state.chat_remote_workspace("local"));
+        state.selected_chat = Some("cloud".into());
+        assert!(state.selected_chat_remote_workspace());
+        // A later catalog without it (the setting went off) forgets nothing.
+        assert!(!state.learn_harness_catalog(&[descriptor(HarnessId::ClaudeCode, false)]));
+        assert!(state.chat_remote_workspace("cloud"));
+    }
+
+    #[test]
+    fn provider_run_eligibility_rides_the_local_device_row() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("mac".into());
+        let device = |id: &str, capabilities: &[&str]| -> Device {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "platform": "macos", "lastSeenAt": null,
+                "capabilities": capabilities,
+            }))
+            .unwrap()
+        };
+        state.devices = vec![device("mac", &[]), device("pc", &["provider-run-v1"])];
+        assert!(!state.provider_run_eligible(), "another device's capability");
+        state.devices = vec![device("mac", &[zeron_proto::capabilities::PROVIDER_RUN_V1])];
+        assert!(state.provider_run_eligible());
+        // Zeron Cloud's session capability is a different thing.
+        state.devices = vec![device("mac", &[zeron_proto::CLOUD_SESSION_CAPABILITY])];
+        assert!(!state.provider_run_eligible());
+    }
+
+    #[test]
     fn side_chats_remain_addressable_but_do_not_appear_in_sidebar() {
         let mut state = AppState::new();
         let main = chat("main", 0, None);

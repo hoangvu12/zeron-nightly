@@ -9250,7 +9250,7 @@ impl Composer {
         }
         if !self.staged().is_empty() || !self.staged_appshots().is_empty() {
             self.failure =
-                Some("Anthropic cloud chats can't take attachments yet: remove them to send.".into());
+                Some("Provider-run chats can't take attachments yet: remove them to send.".into());
             self.failure_key = Some(self.current_key.clone());
             cx.notify();
             return;

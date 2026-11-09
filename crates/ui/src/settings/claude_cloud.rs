@@ -197,7 +197,7 @@ impl Render for ClaudeCloudSessionsCard {
             (_, Some(s)) if !s.available => "Cloud machines don't offer this.".to_string(),
             (_, Some(s)) if s.forced => "Set by ZERON_CLAUDE_CLOUD_SESSIONS".to_string(),
             (_, Some(_)) => {
-                "Run chats in Anthropic's Claude Code cloud with your Claude login.".to_string()
+                "Start provider-run chats in Anthropic cloud with your Claude login.".to_string()
             }
             (Loadable::Error(error), None) => error.clone(),
             _ => "Loading…".to_string(),

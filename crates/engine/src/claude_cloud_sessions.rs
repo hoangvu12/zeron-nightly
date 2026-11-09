@@ -162,6 +162,20 @@ fn available() -> bool {
     !crate::runner::is_cloud_platform()
 }
 
+/// Hand checks point the harness at the fake session server
+/// (`zeron-provider-fake`'s `serve` example) through
+/// `ZERON_CLAUDE_CLOUD_API`. Loopback addresses only, so no setting of it
+/// can send a real login's token anywhere but Anthropic.
+const API_OVERRIDE_ENV: &str = "ZERON_CLAUDE_CLOUD_API";
+
+fn local_api_override() -> Option<String> {
+    let url = std::env::var(API_OVERRIDE_ENV).ok()?;
+    let url = url.trim().trim_end_matches('/');
+    let rest = url.strip_prefix("http://")?;
+    let host = rest.split([':', '/']).next()?;
+    matches!(host, "127.0.0.1" | "localhost").then(|| url.to_owned())
+}
+
 /// Register or remove the `claude-code-cloud` harness to match `settings`
 /// (the environment switch keeps it registered). Returns whether the device
 /// can create and host provider-run chats now.
@@ -173,7 +187,10 @@ pub fn apply(registry: &HarnessRegistry, settings: &ClaudeCloudSettings) -> bool
     let registered = registry.is_registered(HarnessId::ClaudeCodeCloud);
     if wanted && !registered {
         match zeron_harness::claude_cloud::ClaudeCloudConfig::device_default() {
-            Some(config) => {
+            Some(mut config) => {
+                if let Some(url) = local_api_override() {
+                    config.base_url = url;
+                }
                 registry.register(Arc::new(zeron_harness::ClaudeCloudHarness::new(config)));
             }
             None => {

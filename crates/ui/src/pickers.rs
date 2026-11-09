@@ -1449,7 +1449,8 @@ impl Pickers {
     /// The harnesses this picker offers: runnable ones for the composer,
     /// narrowed to title-capable agents when bound to thread naming.
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
-        if self.title.is_none() && self.config.provider_cloud {
+        // On the new-chat canvas only (`draft_owner` tracks the open chat).
+        if self.title.is_none() && self.config.provider_cloud && self.draft_owner.is_none() {
             return provider_cloud_harnesses(list);
         }
         let mut offered = offered_harnesses(list);
@@ -6904,8 +6905,7 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
 
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
-        // (Provider-run chats get a Claude-cloud mark of their own in #4.)
-        HarnessId::ClaudeCode | HarnessId::ClaudeCodeCloud | HarnessId::Mock => (
+        HarnessId::ClaudeCode | HarnessId::Mock => (
             crate::icons::CLAUDE_MARK,
             Some(crate::icons::claude_brand()),
         ),
@@ -8761,21 +8761,21 @@ mod tests {
                 let mut state = AppState::new();
                 state.local_device_id = Some("mac".into());
                 state.devices = vec![provider_run_device(true)];
-                state.chats = vec![zeron_proto::Chat {
-                    config: Some(ChatConfig {
-                        harness: HarnessId::ClaudeCodeCloud,
-                        model: Some("claude-opus-5-5".into()),
-                        reasoning: None,
-                        model_options: Default::default(),
-                        sandbox: SandboxLevel::WorkspaceWrite,
-                        access: AccessMode::default(),
-                        plan: false,
-                    }),
-                    ..serde_json::from_value(serde_json::json!({
-                        "id": "cloud-chat", "deviceId": "mac", "createdAt": 0,
-                    }))
-                    .unwrap()
-                }];
+                let mut chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+                    "id": "cloud-chat", "deviceId": "mac", "archived": false,
+                    "createdAt": "2026-11-01T00:00:00Z",
+                }))
+                .unwrap();
+                chat.config = Some(ChatConfig {
+                    harness: HarnessId::ClaudeCodeCloud,
+                    model: Some("claude-opus-5-5".into()),
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    access: AccessMode::default(),
+                    plan: false,
+                });
+                state.chats = vec![chat];
                 state.selected_chat = Some("cloud-chat".into());
                 state
             });
