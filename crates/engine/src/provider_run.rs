@@ -14,12 +14,22 @@
 //!   session and account the run acts for. A chat without a provider session
 //!   refuses to run.
 //!
+//! - [`follow_sign_in_states`]: what the harness learns about its logins
+//!   ("Sign in again", "Sign in as <email> to continue") is recorded in the
+//!   chat document of every chat this device hosts for that account
+//!   (`providerState`), and cleared once a request for it works again.
+//!
 //! Seams for later tickets: GitHub projects (#6), creation uncertainty (#11),
-//! hosting/takeover (#12, which adds the host check here before binding).
+//! hosting/takeover (#12, which adds the host check here before binding and
+//! publishes `hostUnavailable` for a chat whose account has no login here).
+
+use std::collections::HashMap;
 
 use zeron_doc::SessionCommandPayload;
-use zeron_harness::provider_cloud::{CreateSession, ProviderCloudError, RunBinding};
-use zeron_proto::{ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
+use zeron_harness::provider_cloud::{
+    CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus, RunBinding,
+};
+use zeron_proto::{Chat, ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
 
 use crate::EngineError;
 use crate::doc_host::DocHost;
@@ -208,4 +218,78 @@ pub(crate) fn bind_run(
         prompt_uuid: message_id.map(zeron_proto::provider_cloud::event_uuid),
     });
     Ok(())
+}
+
+/// Record the harness's sign-in states in the chats this device hosts (see
+/// module docs), for as long as the engine runs. Nothing to follow when
+/// provider-run chats are off.
+pub(crate) fn follow_sign_in_states(registry: &HarnessRegistry, doc_host: &DocHost) {
+    let Ok(harness) = registry.resolve(HarnessId::ClaudeCodeCloud) else {
+        return;
+    };
+    let Some(cloud) = harness.provider_cloud() else {
+        return;
+    };
+    let Some(workspace) = doc_host.workspace().cloned() else {
+        return;
+    };
+    let mut status = cloud.status();
+    let mut chats = workspace.watch_chats();
+    let host = doc_host.clone();
+    doc_host.spawn_worker(async move {
+        // What each chat's document was last given, so a chat-list change
+        // only opens the documents whose state moves.
+        let mut written: HashMap<String, Option<ProviderChatState>> = HashMap::new();
+        let mut disabled = None;
+        loop {
+            let current = status.borrow_and_update().clone();
+            let rows = chats.borrow_and_update().clone();
+            if current.disabled != disabled {
+                if let Some(reason) = &current.disabled {
+                    tracing::error!(reason, "provider-run chats turned off");
+                }
+                disabled = current.disabled.clone();
+            }
+            record_states(&host, &current, &rows, &mut written);
+            tokio::select! {
+                changed = status.changed() => if changed.is_err() { return },
+                changed = chats.changed() => if changed.is_err() { return },
+            }
+        }
+    });
+}
+
+/// One pass of [`follow_sign_in_states`]: each chat hosted here whose
+/// account the harness has an answer for gets that answer.
+fn record_states(
+    host: &DocHost,
+    status: &ProviderCloudStatus,
+    chats: &[Chat],
+    written: &mut HashMap<String, Option<ProviderChatState>>,
+) {
+    for chat in chats {
+        if chat.device_id != host.device_id() {
+            continue;
+        }
+        let Some(session) = &chat.provider_session else {
+            continue;
+        };
+        let Some(state) = status.accounts.get(&session.account_uuid) else {
+            continue;
+        };
+        if written.get(&chat.id) == Some(state) {
+            continue;
+        }
+        let recorded = host
+            .open(&chat.id)
+            .and_then(|handle| Ok(handle.doc().set_provider_chat_state(state.as_ref())?));
+        match recorded {
+            Ok(()) => {
+                written.insert(chat.id.clone(), state.clone());
+            }
+            Err(error) => {
+                tracing::warn!(chat = %chat.id, %error, "couldn't record the chat's sign-in state")
+            }
+        }
+    }
 }

@@ -36,7 +36,8 @@ async fn rig() -> Rig {
         base_url: fake.base_url().to_owned(),
         login: ClaudeConfigDir::at(login.dir()),
         claude_executable: Some(stub.path().to_owned()),
-    });
+    })
+    .expect("harness builds");
     Rig {
         _dir: dir,
         fake,

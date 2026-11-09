@@ -9,8 +9,11 @@
 //! harness a [`RunBinding`] naming the session and the account that owns it.
 //! A run whose session has no binding refuses to start (fail closed).
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use zeron_proto::ProviderSession;
+pub use zeron_proto::provider_cloud::ProviderChatState;
 
 /// Why a provider-cloud operation failed. The message is for people; it
 /// never carries a credential.
@@ -30,9 +33,25 @@ pub enum ProviderCloudError {
         status: Option<u16>,
         message: String,
     },
+    /// The feature turned itself off on this device (the reason).
+    #[error("{0}")]
+    Disabled(String),
     /// Anything else (network, a response this build can't read).
     #[error("{0}")]
     Other(String),
+}
+
+/// What the harness knows about its logins and itself on this device,
+/// published as it changes ([`ProviderCloud::status`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderCloudStatus {
+    /// Each account this device acted for, by account uuid: what its chats
+    /// show (`None`: its login works). Accounts not tried yet are absent.
+    pub accounts: BTreeMap<String, Option<ProviderChatState>>,
+    /// Set once the feature turned itself off on this device, saying why
+    /// (a 401 that persisted after the CLI renewed the login). Every later
+    /// request is refused until the engine restarts.
+    pub disabled: Option<String>,
 }
 
 /// One new provider cloud session, created with its first prompt.
@@ -70,4 +89,7 @@ pub trait ProviderCloud: Send + Sync {
     /// before every fresh dispatch; replaces any earlier binding for the
     /// same session.
     fn bind_run(&self, binding: RunBinding);
+
+    /// The logins' states and the kill switch, current and as they change.
+    fn status(&self) -> tokio::sync::watch::Receiver<ProviderCloudStatus>;
 }

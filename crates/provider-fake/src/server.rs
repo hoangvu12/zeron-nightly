@@ -187,6 +187,8 @@ struct Inner {
     requests: Vec<RecordedRequest>,
     turns: VecDeque<Turn>,
     faults: Vec<Fault>,
+    /// Bearer tokens the server refuses with 401 (revoked or expired).
+    rejected_tokens: std::collections::HashSet<String>,
 }
 
 impl Inner {
@@ -281,6 +283,13 @@ impl FakeSessionServer {
         lock(&self.state).faults.push(fault);
     }
 
+    /// From now on, every request carrying `token` gets a 401
+    /// `authentication_error`, as the real API answers a revoked or expired
+    /// token.
+    pub fn reject_token(&self, token: &str) {
+        lock(&self.state).rejected_tokens.insert(token.to_owned());
+    }
+
     /// Every request received so far, in order.
     pub fn requests(&self) -> Vec<RecordedRequest> {
         lock(&self.state).requests.clone()
@@ -363,15 +372,23 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             return Ok(error(status, "injected_error", "injected by the test"));
         }
     }
-    let authorized = recorded
+    let token = recorded
         .header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| !t.trim().is_empty());
-    if !authorized {
+        .map(str::trim)
+        .unwrap_or_default();
+    if token.is_empty() {
         return Ok(error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "missing bearer token",
+        ));
+    }
+    if lock(&state).rejected_tokens.contains(token) {
+        return Ok(error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "OAuth token has expired",
         ));
     }
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();

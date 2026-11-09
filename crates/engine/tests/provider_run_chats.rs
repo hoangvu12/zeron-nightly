@@ -53,7 +53,8 @@ async fn rig_with(enabled: bool, prepare: impl FnOnce(&ClaudeLogin, &StubClaude)
             base_url: fake.base_url().to_owned(),
             login: ClaudeConfigDir::at(login.dir()),
             claude_executable: Some(stub.path().to_owned()),
-        })));
+        })
+        .expect("harness builds")));
     }
     let core = EngineCore::assemble(
         &tmp.path().join("data"),

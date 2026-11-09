@@ -1,15 +1,22 @@
 //! A stub `claude` CLI that answers `auth status --json` from files the test
-//! writes, so it can play renewal, a logged-out login or another account:
+//! writes, so it can play renewal, a logged-out login, another account or a
+//! CLI that hangs:
 //!
-//! - `status.json`: what it prints (default: logged in as the given account);
+//! - `status.json`: what it prints (default: logged in as the given account;
+//!   [`StubClaude::report_account`], [`StubClaude::log_out`]);
 //! - `exit_code`: its exit code (default 0);
+//! - `delay_secs`: whole seconds it waits before doing anything else
+//!   ([`StubClaude::set_delay`]);
 //! - `renew.credentials.json`: if present, copied over
-//!   `$CLAUDE_CONFIG_DIR/.credentials.json` first (the CLI refreshing).
+//!   `$CLAUDE_CONFIG_DIR/.credentials.json` after the wait (the CLI
+//!   refreshing; [`StubClaude::renew_with`]).
 //!
-//! Every call is logged to `calls.log` (`<args>|<CLAUDE_CONFIG_DIR>`).
-//! Windows gets a `claude.cmd`, everything else a `claude` sh script.
+//! Every call is logged to `calls.log` (`<args>|<CLAUDE_CONFIG_DIR>`) as it
+//! starts ([`StubClaude::calls`], [`StubClaude::call_count`]). Windows gets a
+//! `claude.cmd`, everything else a `claude` sh script.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -37,6 +44,10 @@ if not \"%~1 %~2 %~3\"==\"auth status --json\" (\r\n\
   echo unsupported 1>&2\r\n\
   exit /b 2\r\n\
 )\r\n\
+set DELAY=0\r\n\
+if exist \"%STUB%delay_secs\" set /p DELAY=<\"%STUB%delay_secs\"\r\n\
+set /a PINGS=DELAY+1\r\n\
+if not \"%DELAY%\"==\"0\" ping -n %PINGS% 127.0.0.1 >nul\r\n\
 if exist \"%STUB%renew.credentials.json\" if defined CLAUDE_CONFIG_DIR copy /y \"%STUB%renew.credentials.json\" \"%CLAUDE_CONFIG_DIR%\\.credentials.json\" >nul\r\n\
 type \"%STUB%status.json\"\r\n\
 set CODE=0\r\n\
@@ -51,6 +62,7 @@ if [ "$1 $2 $3" != "auth status --json" ]; then
   echo unsupported >&2
   exit 2
 fi
+if [ -f "$STUB/delay_secs" ]; then sleep "$(cat "$STUB/delay_secs")"; fi
 if [ -f "$STUB/renew.credentials.json" ] && [ -n "$CLAUDE_CONFIG_DIR" ]; then
   cp "$STUB/renew.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json"
 fi
@@ -76,15 +88,7 @@ impl StubClaude {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let stub = Self { dir, path };
-        stub.set_status(json!({
-            "loggedIn": true,
-            "authMethod": "claude.ai",
-            "apiProvider": "firstParty",
-            "email": account.email,
-            "orgId": account.org_id,
-            "orgName": "Fake Org",
-            "subscriptionType": "team",
-        }));
+        stub.report_account(account);
         stub
     }
 
@@ -99,6 +103,38 @@ impl StubClaude {
 
     pub fn set_exit_code(&self, code: i32) {
         std::fs::write(self.dir.join("exit_code"), code.to_string()).unwrap();
+    }
+
+    /// Report a login as `account`, exit code 0 (what a signed-in CLI
+    /// prints; another account than the chat's plays a mismatch).
+    pub fn report_account(&self, account: &FakeAccount) {
+        self.set_status(json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "email": account.email,
+            "orgId": account.org_id,
+            "orgName": "Fake Org",
+            "subscriptionType": "team",
+        }));
+        self.set_exit_code(0);
+    }
+
+    /// Report a signed-out login, as the CLI does: `loggedIn: false`, exit 1.
+    pub fn log_out(&self) {
+        self.set_status(json!({
+            "loggedIn": false,
+            "authMethod": "none",
+            "apiProvider": "firstParty",
+        }));
+        self.set_exit_code(1);
+    }
+
+    /// Wait `delay` (rounded up to whole seconds) before answering, as a CLI
+    /// stuck on a slow refresh would.
+    pub fn set_delay(&self, delay: Duration) {
+        let secs = delay.as_millis().div_ceil(1000);
+        std::fs::write(self.dir.join("delay_secs"), secs.to_string()).unwrap();
     }
 
     /// On its next runs the stub "refreshes" the login: it writes these
@@ -119,5 +155,10 @@ impl StubClaude {
                 }
             })
             .collect()
+    }
+
+    /// How many times the stub has been run.
+    pub fn call_count(&self) -> usize {
+        self.calls().len()
     }
 }

@@ -171,12 +171,15 @@ pub struct ClaudeCloudHarness {
 }
 
 impl ClaudeCloudHarness {
-    pub fn new(config: ClaudeCloudConfig) -> Self {
+    /// Fails when its HTTP client (which names Zeron on every request) can't
+    /// be built; there is no unnamed fallback.
+    pub fn new(config: ClaudeCloudConfig) -> Result<Self, HarnessError> {
         let credentials = Arc::new(Credentials::new(config.login, config.claude_executable));
-        Self {
-            client: Arc::new(CloudClient::new(&config.base_url, credentials)),
+        let client = CloudClient::new(&config.base_url, credentials).map_err(harness_error)?;
+        Ok(Self {
+            client: Arc::new(client),
             bindings: Arc::new(Bindings::default()),
-        }
+        })
     }
 
     /// The session API client (its login folder included).
@@ -194,10 +197,11 @@ fn harness_error(error: ApiError) -> HarnessError {
 
 fn provider_error(error: ApiError) -> ProviderCloudError {
     match error {
-        ApiError::Credentials(CredentialError::AccountMismatch) => {
-            ProviderCloudError::AccountMismatch(CredentialError::AccountMismatch.to_string())
+        ApiError::Credentials(error @ CredentialError::AccountMismatch { .. }) => {
+            ProviderCloudError::AccountMismatch(error.to_string())
         }
         ApiError::Credentials(error) => ProviderCloudError::SignInRequired(error.to_string()),
+        ApiError::Disabled(reason) => ProviderCloudError::Disabled(reason),
         ApiError::Status { status, message } => ProviderCloudError::Provider {
             status: Some(status),
             message: format!("Claude cloud returned {status}: {message}"),
@@ -264,6 +268,10 @@ impl ProviderCloud for ClaudeCloudHarness {
 
     fn bind_run(&self, binding: RunBinding) {
         self.bindings.bind(binding);
+    }
+
+    fn status(&self) -> tokio::sync::watch::Receiver<crate::provider_cloud::ProviderCloudStatus> {
+        self.client.status()
     }
 }
 

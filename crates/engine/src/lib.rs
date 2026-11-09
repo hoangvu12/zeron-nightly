@@ -352,6 +352,7 @@ impl EngineCore {
             }
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
+        provider_run::follow_sign_in_states(&registry, &doc_host);
         let repos = Repos::new(data_dir, &device_id);
         sessions.set_scratch_root(repos.scratch_root());
         doc_host.set_repos(repos.clone());

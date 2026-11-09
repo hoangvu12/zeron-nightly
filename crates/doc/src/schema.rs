@@ -607,6 +607,36 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// What a provider-run chat shows because its host can't act for the
+    /// chat's account ("Sign in again", "Sign in as <email> to continue"),
+    /// written by the host. One atomic value; `None` when all is well.
+    pub fn provider_chat_state(&self) -> Option<zeron_proto::provider_cloud::ProviderChatState> {
+        let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
+            self.doc.get_map("meta").get("providerState")
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    /// Record (or, with `None`, clear) the chat's provider state. No-op
+    /// when it already reads that way.
+    pub fn set_provider_chat_state(
+        &self,
+        state: Option<&zeron_proto::provider_cloud::ProviderChatState>,
+    ) -> Result<(), DocError> {
+        if self.provider_chat_state().as_ref() == state {
+            return Ok(());
+        }
+        let meta = self.doc.get_map("meta");
+        match state {
+            Some(state) => meta.insert("providerState", serde_json::to_string(state)?)?,
+            None => meta.delete("providerState")?,
+        }
+        self.doc.commit();
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> Option<String> {
         match self.doc.get_map("meta").get("chatId") {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
@@ -1738,6 +1768,23 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, MessageRole::System);
         assert_eq!(entries[0].parts, vec![seam]);
+    }
+
+    #[test]
+    fn a_provider_chat_state_is_set_and_cleared_in_the_metadata() {
+        use zeron_proto::provider_cloud::ProviderChatState;
+        let doc = SessionDoc::init("provider-state").unwrap();
+        assert_eq!(doc.provider_chat_state(), None);
+        let state = ProviderChatState::SignInAs {
+            email: "a@example.test".into(),
+        };
+        doc.set_provider_chat_state(Some(&state)).unwrap();
+        assert_eq!(doc.provider_chat_state(), Some(state));
+        doc.set_provider_chat_state(None).unwrap();
+        assert_eq!(doc.provider_chat_state(), None);
+        // Clearing what isn't there is a no-op.
+        doc.set_provider_chat_state(None).unwrap();
+        assert!(doc.read_entries().unwrap().is_empty(), "no entry");
     }
 
     #[test]
