@@ -63,6 +63,8 @@ class Run:
     dropped: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     inputs: list[str] = field(default_factory=list)
+    # Dropped entries marked `required`: the build must not ship without them.
+    missing: list[str] = field(default_factory=list)
 
 
 def unresolved(src: Path) -> list[str]:
@@ -217,6 +219,8 @@ def main() -> None:
             sys.exit(f"patch {name!r} needs one of pr, file or branch")
         if failure:
             run.dropped.append(f"**{name}** ({label}): {failure}")
+            if patch.get("required"):
+                run.missing.append(name)
         else:
             run.included.append(f"**{name}** — {label}{note}")
             run.inputs.append(ident)
@@ -260,6 +264,10 @@ def main() -> None:
                 sink.write(f"{key}={value}\n")
     print(report)
     print(json.dumps(summary, indent=2))
+    if run.missing:
+        # A build without these would reach installs and break them (they
+        # update to whatever ships), so fail the run instead.
+        sys.exit(f"required patches dropped: {', '.join(run.missing)}; not shipping this build")
 
 
 if __name__ == "__main__":

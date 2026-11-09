@@ -9,7 +9,8 @@
 #
 # `enabled = false` keeps an entry without applying it. A patch that no longer
 # applies is dropped from that night's build and listed in the release notes;
-# the rest of the build goes on without it.
+# the rest of the build goes on without it, unless it is `required = true`:
+# then the run fails and nothing ships, since installs update to every release.
 
 [upstream]
 repo = "zeronsh/zeron"
@@ -21,7 +22,14 @@ repo = "hoangvu12/zeron-nightly"
 [[patch]]
 name = "windows-prerelease-versions"
 file = "patches/0001-windows-prerelease-versions.patch"
+required = true
 note = "Lets the Windows updater and packaging take 0.2.137-nightly.N versions. Needed by every nightly."
+
+[[patch]]
+name = "installer-redirection-guard"
+pr = 1308
+sha = "f2da771b71df3fe622ecddfed6665043e0a171d7"
+note = "The Zeron the installer opens can follow junctions and symlinks the user made, such as skills linked into ~/.claude/skills: Setup no longer turns on Windows' RedirectionGuard, which it passed to Zeron, its engine and every agent. v3's own installer does the same (dist/zeron-v3.iss)."
 
 [[patch]]
 name = "large-plain-folder-index"

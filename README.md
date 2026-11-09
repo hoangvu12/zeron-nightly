@@ -20,8 +20,9 @@ nightlies update themselves from this repo's releases.
    enabled `[[patch]]` in order: upstream PRs at a pinned commit, patch files
    with `git am -3`, or branches of this repo.
 2. A patch that no longer applies is **dropped from that build** and listed in
-   the release notes. The build goes on without it. Conflicts resolved once
-   replay from `rerere/`.
+   the release notes. The build goes on without it, unless the entry says
+   `required = true`: then the run fails and nothing ships, since installs
+   update to every release. Conflicts resolved once replay from `rerere/`.
 3. Upstream's own `.github/workflows` are removed (they belong to
    zeronsh/zeron), and the version becomes the next patch release's
    prerelease: upstream `0.2.136` → `0.2.137-nightly.YYYYMMDDHHMM`. That sorts

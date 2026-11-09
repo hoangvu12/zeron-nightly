@@ -18,16 +18,19 @@ label = "v3"
 [[patch]]
 name = "windows-prerelease-versions"
 file = "patches/0001-windows-prerelease-versions.patch"
+required = true
 note = "Lets the Windows updater and packaging take prerelease versions."
 
 [[patch]]
 name = "v3-windows-install-layout"
 file = "patches/0004-v3-windows-install-layout.patch"
+required = true
 note = "v3 on Windows opens no console window and reads its ui folder beside zeron.exe. Needed by every v3 nightly."
 
 [[patch]]
 name = "v3-windows-installer-updates"
 file = "patches/0005-v3-windows-installer-updates.patch"
+required = true
 note = "v3 updates itself on Windows: it downloads the release's installer and runs it silently over its folder, then restarts its engine into the new one once idle. Needed by every v3 nightly."
 
 [[patch]]
@@ -61,12 +64,6 @@ sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
 note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min. Its sessions.rs conflict replays from rerere/."
 
 [[patch]]
-name = "change-request-spawn-off-runtime"
-pr = 1224
-sha = "0ef067a5167540732c7edc7af780546ae9ad0ed0"
-note = "PR watches start Git off the runtime workers, so slow Windows process launches stop freezing the engine. Merged into main (1dc5a8cc), not yet in zeron/zgx: drop it once zeron/zgx has it (patches.toml already did)."
-
-[[patch]]
 name = "revived-turn-zeron-tools"
 pr = 1285
 sha = "0b2674d93839f081e9a41c95dc59987a12cee080"
@@ -81,6 +78,12 @@ note = "Markdown images in replies from any local folder, kept when the reply fi
 name = "relay-image-reads"
 file = "patches/0003-relay-image-reads.patch"
 note = "Images from a chat on another device load in a few relay round trips. Applies on top of markdown-reply-images."
+
+[[patch]]
+name = "composer-menu-follows-selection"
+pr = 1309
+sha = "48921a7152867e87d82758d07b33ae861ee190bc"
+note = "The arrow keys keep the lit row in view in the composer's /, $ and @ lists: past the rows that show, the list scrolls with it."
 
 [[patch]]
 name = "agent-steers-wait-for-tools"
