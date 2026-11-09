@@ -171,7 +171,7 @@ impl AccessToken {
     }
 }
 
-//// Why no token could be read. Never carries a credential.
+/// Why no token could be read. Never carries a credential.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
     #[error(
