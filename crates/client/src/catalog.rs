@@ -27,6 +27,10 @@ pub struct HarnessInfo {
     /// Offered by the listing device (Settings → Providers). `None` ⇒ legacy.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Its chats work in a remote workspace (a provider cloud): no files,
+    /// diff, terminal, background processes, forks or side chats.
+    #[serde(default)]
+    pub remote_workspace: bool,
 }
 
 fn default_true() -> bool {
@@ -43,6 +47,7 @@ impl HarnessInfo {
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
+            remote_workspace: false,
         }
     }
 

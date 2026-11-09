@@ -1113,6 +1113,7 @@ impl DemoHost {
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: Some(true),
+            remote_workspace: false,
         });
         list
     }
