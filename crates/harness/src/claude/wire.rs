@@ -317,7 +317,7 @@ pub(crate) struct ControlRequestFrame {
     pub request: ControlRequestBody,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ControlRequestBody {
     #[serde(default)]
     pub subtype: String,

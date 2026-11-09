@@ -4404,10 +4404,16 @@ impl DocHost {
     /// drains closes the race between clicking Cancel and the status watcher.
     /// A parked runtime still running background work is stopped too: the
     /// idle reaper spares it, so Stop is what ends that work.
+    ///
+    /// `stop_command` is the Stop command's id, noted on the run just before
+    /// it is stopped (and only when there is something to stop): a driver
+    /// whose provider dedupes by event id sends the stop under it, and stops
+    /// nothing at the provider for a teardown with no Stop behind it.
     async fn interrupt_and_pause_queue(
         &self,
         sessions: &SessionsEngine,
         handle: &Arc<ChatDocHandle>,
+        stop_command: &str,
     ) -> Result<bool, EngineError> {
         let _drain = handle.drain_lock.lock().await;
         if !sessions.turn_in_flight(&handle.chat_id)
@@ -4417,6 +4423,7 @@ impl DocHost {
         }
         handle.queue_paused.store(true, Ordering::Release);
         self.cancel_held_sends(handle);
+        sessions.note_stop_command(&handle.chat_id, stop_command);
         match sessions.interrupt(&handle.chat_id).await {
             Ok(true) => Ok(true),
             Ok(false) => {
@@ -5755,8 +5762,8 @@ impl DocHost {
                         .collect();
                     sessions.cancel_sent_messages(&handle.chat_id, earlier);
                 }
-                sessions.note_stop_command(chat_id, &entry.id);
-                self.interrupt_and_pause_queue(sessions, handle).await?;
+                self.interrupt_and_pause_queue(sessions, handle, &entry.id)
+                    .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondInput {
