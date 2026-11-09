@@ -79,6 +79,17 @@ impl World {
             })
             .expect("harness builds"),
         ));
+        // The setting is off by default and applied at engine start; on, it
+        // keeps the fake-backed harness registered above.
+        {
+            use zeron_engine::claude_cloud_sessions::{ClaudeCloudSessions, ClaudeCloudSettings};
+            ClaudeCloudSessions::open(&dir)
+                .save(ClaudeCloudSettings {
+                    enabled: true,
+                    ..ClaudeCloudSettings::default()
+                })
+                .expect("setting saves");
+        }
         let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::ClaudeCodeCloud, None)
             .expect("engine core assembles");
         let client = zeron_rpc::memory_client(core.rpc_service());
