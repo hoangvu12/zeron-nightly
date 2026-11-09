@@ -1055,6 +1055,59 @@ impl WorkspaceHost {
         parent_chat_id: Option<String>,
         child_kind: Option<zeron_proto::ChildKind>,
     ) -> Result<(), EngineError> {
+        self.create_chat_row(
+            chat_id,
+            space_id,
+            device_id,
+            host,
+            config,
+            cwd,
+            parent_chat_id,
+            child_kind,
+            None,
+        )
+    }
+
+    /// A provider-run chat's row, hosted by this device, with its
+    /// `providerSession` in the same row op that creates it: a crash can't
+    /// leave a provider-run row that has no session (it could never run).
+    /// Idempotent like [`Self::create_chat_hosted`].
+    pub fn create_provider_run_chat(
+        &self,
+        chat_id: &str,
+        config: ChatConfig,
+        cwd: String,
+        parent_chat_id: Option<String>,
+        child_kind: Option<zeron_proto::ChildKind>,
+        session: &zeron_proto::ProviderSession,
+    ) -> Result<(), EngineError> {
+        let device_id = self.device_id().to_owned();
+        self.create_chat_row(
+            chat_id,
+            None,
+            Some(&device_id),
+            Some(&device_id),
+            Some(config),
+            Some(cwd),
+            parent_chat_id,
+            child_kind,
+            Some(session.clone()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_chat_row(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        host: Option<&str>,
+        config: Option<ChatConfig>,
+        cwd: Option<String>,
+        parent_chat_id: Option<String>,
+        child_kind: Option<zeron_proto::ChildKind>,
+        provider_session: Option<zeron_proto::ProviderSession>,
+    ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
@@ -1117,7 +1170,7 @@ impl WorkspaceHost {
                 child_kind: child_kind.filter(|_| parent.is_some()),
                 parent_chat_id: parent,
                 sleep: None,
-                provider_session: None,
+                provider_session,
             })
         })?;
         Ok(())

@@ -1,7 +1,7 @@
 //! Provider-run chats end to end in one engine, through its public request
 //! surface (`Mutate createChat`, queued commands), against the fake Claude
 //! Code session server and a stub `claude` CLI
-//! (docs/design/provider-run-chats.md; ticket #3).
+//! (docs/design/provider-run-chats.md).
 //!
 //! Only externally visible results are asserted: what the fake server
 //! received, the chat row and document, and the transcript.
@@ -53,7 +53,8 @@ async fn rig_with(enabled: bool, prepare: impl FnOnce(&ClaudeLogin, &StubClaude)
             base_url: fake.base_url().to_owned(),
             login: ClaudeConfigDir::at(login.dir()),
             claude_executable: Some(stub.path().to_owned()),
-        })));
+        })
+        .expect("harness builds")));
     }
     let core = EngineCore::assemble(
         &tmp.path().join("data"),
@@ -289,6 +290,8 @@ async fn replies_stream_live_and_follow_ups_reach_the_session_honestly() {
     // The token is read from the folder for every request.
     rig.login.set_token("token-a-2", in_ms(3_600_000));
     let credentials = std::fs::read(rig.login.credentials_file()).unwrap();
+    let account_file = rig.login.dir().join(".claude.json");
+    let account = std::fs::read(&account_file).unwrap();
 
     let (turn, gate) = Turn::text_zulu().hold_after(is_text_delta);
     rig.fake.queue_turn(turn);
@@ -354,11 +357,13 @@ async fn replies_stream_live_and_follow_ups_reach_the_session_honestly() {
             request.path
         );
     }
-    // Zeron only reads the login: the file is as the CLI (here, the test) left it.
+    // Zeron only reads the login: both files are as the CLI (here, the test)
+    // left them.
     assert_eq!(
         std::fs::read(rig.login.credentials_file()).unwrap(),
         credentials
     );
+    assert_eq!(std::fs::read(&account_file).unwrap(), account);
     rig.core.shutdown().await;
 }
 

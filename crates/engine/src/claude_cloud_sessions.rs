@@ -191,7 +191,12 @@ pub fn apply(registry: &HarnessRegistry, settings: &ClaudeCloudSettings) -> bool
                 if let Some(url) = local_api_override() {
                     config.base_url = url;
                 }
-                registry.register(Arc::new(zeron_harness::ClaudeCloudHarness::new(config)));
+                match zeron_harness::ClaudeCloudHarness::new(config) {
+                    Ok(harness) => registry.register(Arc::new(harness)),
+                    Err(error) => {
+                        tracing::error!(%error, "Claude cloud sessions are unavailable on this device")
+                    }
+                }
             }
             None => {
                 tracing::warn!("Claude cloud sessions: no home directory for the device's login");

@@ -81,7 +81,7 @@ impl Mirror {
         let main_feed = payload.get("parent_tool_use_id").is_none_or(Value::is_null);
         let mut out = Vec::new();
         match kind {
-            // Prompts and their answers are ticket #5's; the echo of a
+            // Prompts and their answers aren't mirrored here; the echo of a
             // message (plain text, no tool results) was written by its sender.
             "control_request" | "control_response" => return out,
             "user" if main_feed && !carries_tool_results(&payload) => return out,

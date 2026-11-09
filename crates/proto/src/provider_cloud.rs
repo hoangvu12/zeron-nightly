@@ -62,6 +62,34 @@ pub fn event_uuid(message_id: &str) -> String {
     }
 }
 
+/// What a provider-run chat shows when its host can't act for the chat's
+/// account (docs/design/provider-run-chats.md §3). The host records it in
+/// the chat document's metadata (`providerState`) and clears it once a
+/// request for that account works again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProviderChatState {
+    /// The login for the chat's account is signed out, expired past the
+    /// CLI's renewal, or refused even after a renewal: "Sign in again".
+    #[serde(rename_all = "camelCase")]
+    SignInAgain { email: String },
+    /// This device has no login for the chat's account (its login is
+    /// another account's), so it can't host the chat: "Sign in as <email>
+    /// to continue". Never a reason to turn the feature off.
+    #[serde(rename_all = "camelCase")]
+    SignInAs { email: String },
+}
+
+impl ProviderChatState {
+    /// The words the chat shows.
+    pub fn label(&self) -> String {
+        match self {
+            Self::SignInAgain { .. } => "Sign in again".to_owned(),
+            Self::SignInAs { email } => format!("Sign in as {email} to continue"),
+        }
+    }
+}
+
 /// A provider session's title from its first prompt: the first non-empty
 /// line, at most 80 characters.
 pub fn title_from_prompt(prompt: &str) -> String {
@@ -92,6 +120,21 @@ mod tests {
         );
         assert_eq!(title_from_prompt(""), "Zeron chat");
         assert_eq!(title_from_prompt(&"x".repeat(90)).chars().count(), 81);
+    }
+
+    #[test]
+    fn chat_states_read_as_the_ui_shows_them() {
+        let again = ProviderChatState::SignInAgain {
+            email: "a@example.test".into(),
+        };
+        assert_eq!(again.label(), "Sign in again");
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::json!({"kind": "signInAgain", "email": "a@example.test"})
+        );
+        let elsewhere: ProviderChatState =
+            serde_json::from_str(r#"{"kind":"signInAs","email":"a@example.test"}"#).unwrap();
+        assert_eq!(elsewhere.label(), "Sign in as a@example.test to continue");
     }
 
     #[test]
