@@ -73,9 +73,10 @@ pub enum ProviderChatState {
     /// CLI's renewal, or refused even after a renewal: "Sign in again".
     #[serde(rename_all = "camelCase")]
     SignInAgain { email: String },
-    /// This device has no login for the chat's account (its login is
-    /// another account's), so it can't host the chat: "Sign in as <email>
-    /// to continue". Never a reason to turn the feature off.
+    /// No eligible device (one with a login for the chat's account) is
+    /// online: "Sign in as <email> to continue". Decided by hosting, never
+    /// by one device finding it has no such login; never a reason to turn
+    /// the feature off.
     #[serde(rename_all = "camelCase")]
     SignInAs { email: String },
 }
