@@ -1,4 +1,4 @@
-From 4723e75b3174fdb6f2c1223e8c8753645fcbcd6a Mon Sep 17 00:00:00 2001
+From 534ee7d652621da6618c7945f376f88119d1e3b0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 06:29:50 +0700
 Subject: [PATCH] Windows: updates by installer for an install of more than
@@ -17,14 +17,14 @@ rest behind.
 ---
  apps/zgx/src/engine/manager.rs | 11 ++++
  apps/zgx/src/engine_update.rs  |  6 ++-
- crates/update/src/windows.rs   | 91 ++++++++++++++++++++++++++++++++++
- 3 files changed, 106 insertions(+), 2 deletions(-)
+ crates/update/src/windows.rs   | 95 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 110 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/engine/manager.rs b/apps/zgx/src/engine/manager.rs
-index 4fb221068..25a5d8fde 100644
+index 316c40c9..36668986 100644
 --- a/apps/zgx/src/engine/manager.rs
 +++ b/apps/zgx/src/engine/manager.rs
-@@ -289,6 +289,17 @@ impl Spawner {
+@@ -328,6 +328,17 @@ impl Spawner {
  /// Zeron.app's engine, started as Zeron.app starts it (crates/launch).
  fn launch(config: &Config) -> std::io::Result<()> {
      let exe = std::env::current_exe()?;
@@ -43,7 +43,7 @@ index 4fb221068..25a5d8fde 100644
          &zeron_launch::LaunchConfig {
              data_dir: config.data_dir.clone(),
 diff --git a/apps/zgx/src/engine_update.rs b/apps/zgx/src/engine_update.rs
-index 929df56d5..63dddc6e8 100644
+index 929df56d..63dddc6e 100644
 --- a/apps/zgx/src/engine_update.rs
 +++ b/apps/zgx/src/engine_update.rs
 @@ -170,8 +170,10 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
@@ -60,7 +60,7 @@ index 929df56d5..63dddc6e8 100644
              }
              let running = info["build"].as_str().map(str::to_owned);
 diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
-index 1be2061cc..31cbdb1c8 100644
+index ecf79829..fc107b99 100644
 --- a/crates/update/src/windows.rs
 +++ b/crates/update/src/windows.rs
 @@ -32,6 +32,25 @@ const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstal
@@ -89,7 +89,7 @@ index 1be2061cc..31cbdb1c8 100644
  }
  
  pub(super) fn is_managed(exe: &Path) -> bool {
-@@ -72,6 +91,9 @@ pub async fn stage(
+@@ -76,6 +95,9 @@ pub async fn stage(
                  .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
          "invalid Windows release version"
      );
@@ -99,7 +99,7 @@ index 1be2061cc..31cbdb1c8 100644
      let file = artifact(&manifest.version);
      let expected = manifest
          .files
-@@ -110,6 +132,72 @@ pub async fn stage(
+@@ -114,6 +136,76 @@ pub async fn stage(
      Ok(staged)
  }
  
@@ -152,8 +152,12 @@ index 1be2061cc..31cbdb1c8 100644
 +    );
 +    verify(staged)?;
 +    let mut command = std::process::Command::new(staged);
++    // Inno Setup's RedirectionGuard would pass on to the app it opens again,
++    // and from it to the engine and every agent: none could follow a link a
++    // user made, such as a skill folder linked into ~/.claude/skills.
 +    command
 +        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"])
++        .arg("/NOREDIRECTIONGUARD")
 +        .arg(format!("/DIR={}", directory.display()))
 +        .arg(format!("/WAITPID={}", std::process::id()));
 +    if relaunch {
@@ -172,7 +176,7 @@ index 1be2061cc..31cbdb1c8 100644
  fn verify(staged: &Path) -> anyhow::Result<()> {
      let expected = std::fs::read_to_string(staged.with_file_name("sha256"))?;
      verify_digest(staged, expected.trim())
-@@ -144,6 +232,9 @@ fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
+@@ -148,6 +240,9 @@ fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
  /// and [`Self::recover_from_backup`] cover the leftovers of a hard crash
  /// between the two renames.
  pub fn apply(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {
@@ -183,5 +187,5 @@ index 1be2061cc..31cbdb1c8 100644
      ensure!(
          std::env::current_exe()?.canonicalize()? == installed.canonicalize()?,
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

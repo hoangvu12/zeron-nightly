@@ -69,6 +69,12 @@ SolidCompression=yes
 CloseApplications=yes
 CloseApplicationsFilter=zeron.exe
 RestartApplications=no
+; Inno Setup 6.7+ turns on Windows' RedirectionGuard for itself, and a
+; per-user Setup passes it to the zeron.exe it opens, then to the engine and
+; every agent: none of them can follow a junction or symlink a user made,
+; such as skills linked into ~/.claude/skills (error 448, "untrusted mount
+; point"). The updater also passes /NOREDIRECTIONGUARD (patches/0005).
+RedirectionGuard=no
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
