@@ -15,26 +15,29 @@
 //!
 //! Renewal is the CLI's, triggered but never done here: a token within 5
 //! minutes of expiry, or one the API refused (401), makes Zeron run `claude
-//! auth status --json` in the folder ([`Credentials::renew_rejected`]). At
-//! most one runs per folder in this process at a time, and callers that
-//! arrive while it runs share its outcome (single-flight). It has 10 s; a run
-//! that overstays is left to finish rather than killed mid-refresh (that
-//! would lose the CLI's rotated token, see [`crate::claude::refresh_lock`]).
-//! The output's `loggedIn`, `email` and `orgId` are checked against the
-//! chat's account, then the files are read again. Each failure says what the
-//! chat shows ([`CredentialError::chat_state`]).
+//! auth status --json` in the folder ([`Credentials::renew`]). At most one
+//! runs per folder in this process at a time, from spawn until the CLI
+//! exits, and callers that arrive while it runs share its outcome
+//! (single-flight). Its outcome is given up on after 10 s, but the CLI is
+//! never killed mid-refresh (that would lose its rotated token, see
+//! [`crate::claude::refresh_lock`]) and the folder stays busy until it is
+//! reaped. The output must say the login is signed in, as the chat
+//! account's email and org; then the files are read again. Each failure
+//! says what it means for this device's login ([`CredentialError::account_login`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
-use zeron_proto::provider_cloud::ProviderChatState;
+use tokio::sync::watch;
 
-/// The token file the CLI keeps in its config folder.
+use crate::claude::refresh_lock;
+use crate::provider_cloud::AccountLogin;
+
+// The token file the CLI keeps in its config folder.
 pub const CREDENTIALS_FILE: &str = ".credentials.json";
 /// The CLI's global config, which names the signed-in account.
 pub const ACCOUNT_FILE: &str = ".claude.json";
@@ -174,16 +177,17 @@ impl AccessToken {
 /// Why no token could be read. Never carries a credential.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
-    #[error(
-        "This device isn't signed in to Claude (no login in {0}). Sign in again with `claude`."
-    )]
+    /// The folder isn't signed in to any account: this device has no login
+    /// for the chat's account.
+    #[error("This device isn't signed in to Claude (no login in {0}).")]
     NoLogin(String),
     #[error("The Claude login in {0} could not be read.")]
     Unreadable(String),
     /// The folder (or `auth status`) names another account than the chat's:
-    /// this device can't host the chat. `email` is the chat's account.
+    /// this device has no login for the chat's account. `email` is the
+    /// chat's account.
     #[error(
-        "This device is signed in to Claude as a different account than this chat's. Sign in as {email} to continue."
+        "This device is signed in to Claude as a different account than this chat's ({email}), so it can't continue the chat here."
     )]
     AccountMismatch { email: String },
     #[error("The Claude login has expired. Sign in again with `claude`.")]
@@ -200,18 +204,15 @@ pub enum CredentialError {
 }
 
 impl CredentialError {
-    /// What a chat owned by the account with `email` shows for this
-    /// failure; `None` for a passing problem (a file unreadable twice).
-    pub fn chat_state(&self, email: &str) -> Option<ProviderChatState> {
-        let email = email.to_owned();
+    /// What this failure says about this device's login for the account;
+    /// `None` for a passing problem (a file unreadable twice).
+    pub fn account_login(&self) -> Option<AccountLogin> {
         match self {
             Self::Unreadable(_) => None,
-            Self::AccountMismatch { .. } => Some(ProviderChatState::SignInAs { email }),
-            Self::NoLogin(_)
-            | Self::Expired
-            | Self::LoggedOut
-            | Self::RenewFailed(_)
-            | Self::Rejected => Some(ProviderChatState::SignInAgain { email }),
+            Self::NoLogin(_) | Self::AccountMismatch { .. } => Some(AccountLogin::CantHost),
+            Self::Expired | Self::LoggedOut | Self::RenewFailed(_) | Self::Rejected => {
+                Some(AccountLogin::SignInAgain)
+            }
         }
     }
 
@@ -254,8 +255,8 @@ struct OauthAccount {
 }
 
 /// `claude auth status --json`, the fields the renewal reads. Signed in:
-/// `{"loggedIn":true,"authMethod":"claude.ai","email":…,"orgId":…,…}`;
-/// signed out: `{"loggedIn":false,"authMethod":"none",…}`, exit code 1.
+/// `{"loggedIn":true,"authMethod":"claude.ai","email":…,"orgId":…,…}`, exit
+/// code 0; signed out: `{"loggedIn":false,"authMethod":"none",…}`, exit 1.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AuthStatus {
     #[serde(rename = "loggedIn", default)]
@@ -267,17 +268,27 @@ struct AuthStatus {
 }
 
 impl AuthStatus {
-    /// Whether the status allows acting for `expected`.
+    /// Whether the status allows acting for `expected`: signed in, as the
+    /// account's email and org. Anything it doesn't say is a failed renewal.
     fn verdict(&self, expected: &ClaudeAccount) -> Result<(), CredentialError> {
-        if self.logged_in == Some(false) {
-            return Err(CredentialError::LoggedOut);
+        match self.logged_in {
+            Some(true) => {}
+            Some(false) => return Err(CredentialError::LoggedOut),
+            None => {
+                return Err(CredentialError::RenewFailed(
+                    "`claude auth status` didn't say whether it's signed in".into(),
+                ));
+            }
         }
-        let differs = |reported: &Option<String>, wanted: &str| {
-            reported
-                .as_deref()
-                .is_some_and(|value| !wanted.is_empty() && !value.eq_ignore_ascii_case(wanted))
+        let (Some(email), Some(org_id)) = (
+            self.email.as_deref().filter(|e| !e.is_empty()),
+            self.org_id.as_deref().filter(|o| !o.is_empty()),
+        ) else {
+            return Err(CredentialError::RenewFailed(
+                "`claude auth status` didn't say which account it's signed in to".into(),
+            ));
         };
-        if differs(&self.email, &expected.email) || differs(&self.org_id, &expected.org_id) {
+        if !email.eq_ignore_ascii_case(&expected.email) || org_id != expected.org_id {
             return Err(CredentialError::mismatch(expected));
         }
         Ok(())
@@ -310,19 +321,53 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// What one `claude auth status --json` run said: the status it printed
-/// (`None`: nothing readable), or why it gave no answer.
-type RunOutcome = Result<Option<AuthStatus>, CredentialError>;
+/// What one `claude auth status --json` run said, or why it said nothing
+/// usable.
+type RunOutcome = Result<AuthStatus, CredentialError>;
+
+/// The renewal state of one folder.
+#[derive(Debug, Clone, Default)]
+struct FlightState {
+    /// Bumped with every published outcome.
+    generation: u64,
+    /// A `claude auth status` is running in the folder (its reaper holds
+    /// it): no other may start.
+    running: bool,
+    /// The running one overstayed [`RENEW_TIMEOUT`] and its outcome was
+    /// given up on; callers fail fast until it is reaped.
+    overrun: bool,
+    /// The latest published outcome.
+    last: Option<RunOutcome>,
+}
 
 /// The renewal of one folder, shared by every [`Credentials`] in the
 /// process that reads it (two engines in one process, say).
-#[derive(Default)]
 struct Flight {
-    /// Bumped after each run, so a caller that waited can tell a run
-    /// finished meanwhile and take that run's outcome.
-    finished: AtomicU64,
-    /// Held while a run is in flight; keeps the last run's outcome.
-    last: tokio::sync::Mutex<Option<RunOutcome>>,
+    state: watch::Sender<FlightState>,
+}
+
+impl Default for Flight {
+    fn default() -> Self {
+        Self {
+            state: watch::Sender::new(FlightState::default()),
+        }
+    }
+}
+
+impl Flight {
+    /// Publish `outcome`; `done`: the run has been reaped.
+    fn publish(&self, outcome: RunOutcome, done: bool) {
+        self.state.send_modify(|state| {
+            state.generation += 1;
+            state.last = Some(outcome);
+            if done {
+                state.running = false;
+                state.overrun = false;
+            } else {
+                state.overrun = true;
+            }
+        });
+    }
 }
 
 static FLIGHTS: LazyLock<Mutex<HashMap<PathBuf, Arc<Flight>>>> = LazyLock::new(Default::default);
@@ -335,6 +380,9 @@ fn flight_for(dir: &Path) -> Arc<Flight> {
         .or_default()
         .clone()
 }
+
+/// What a caller sees when it arrives while an overdue run is being reaped.
+const STILL_RUNNING: &str = "an earlier `claude auth status` is still running";
 
 /// One login folder, read on demand. Holds no credential itself.
 pub struct Credentials {
@@ -384,18 +432,18 @@ impl Credentials {
         })
     }
 
+    /// The folder's token. Its account was checked already, so a missing
+    /// token means that login is signed out.
     async fn read_token(&self) -> Result<AccessToken, CredentialError> {
         let file: CredentialsFile = read_json(&self.folder.credentials_file())
             .await
             .map_err(|()| CredentialError::Unreadable(self.label()))?
-            .ok_or_else(|| CredentialError::NoLogin(self.label()))?;
-        let entry = file
-            .oauth
-            .ok_or_else(|| CredentialError::NoLogin(self.label()))?;
+            .ok_or(CredentialError::LoggedOut)?;
+        let entry = file.oauth.ok_or(CredentialError::LoggedOut)?;
         let value = entry
             .access_token
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| CredentialError::NoLogin(self.label()))?;
+            .ok_or(CredentialError::LoggedOut)?;
         AccessToken::new(&value, entry.expires_at)
             .ok_or_else(|| CredentialError::Unreadable(self.label()))
     }
@@ -422,26 +470,19 @@ impl Credentials {
         }
         let stale = token.fingerprint();
         drop(token);
-        self.renew_and_read(expected, stale).await
+        self.renew(expected, stale).await
     }
 
-    /// The API refused the token with fingerprint `rejected` (401): have the
-    /// CLI renew the login, check the account again and read the token anew.
-    /// Whether the API takes that one is the caller's retry to find out.
-    pub async fn renew_rejected(
-        &self,
-        expected: &ClaudeAccount,
-        rejected: u64,
-    ) -> Result<AccessToken, CredentialError> {
-        self.renew_and_read(expected, rejected).await
-    }
-
-    async fn renew_and_read(
+    /// Have the CLI renew the login whose token has fingerprint `stale`
+    /// (near expiry, or refused with a 401), check the account again and
+    /// read the token anew. Whether the API takes the new one is the
+    /// caller's to find out.
+    pub async fn renew(
         &self,
         expected: &ClaudeAccount,
         stale: u64,
     ) -> Result<AccessToken, CredentialError> {
-        self.renew(expected, stale).await?;
+        self.renewal(expected, stale).await?;
         self.check_account(expected).await?;
         let token = self.read_token().await?;
         if token.expiring(now_ms()) {
@@ -452,31 +493,74 @@ impl Credentials {
 
     /// Have the CLI refresh the folder's token, unless the file already
     /// holds a fresh token other than `stale` (someone renewed it). A caller
-    /// arriving while a run is in flight waits for it and takes its outcome.
-    async fn renew(&self, expected: &ClaudeAccount, stale: u64) -> Result<(), CredentialError> {
-        let seen = self.flight.finished.load(Ordering::SeqCst);
-        let mut last = self.flight.last.lock().await;
-        if self.flight.finished.load(Ordering::SeqCst) != seen
-            && let Some(outcome) = last.as_ref()
-        {
-            return judge(outcome, expected);
+    /// arriving while a run is in flight waits for its outcome; one arriving
+    /// while an overdue run is being reaped fails at once.
+    async fn renewal(&self, expected: &ClaudeAccount, stale: u64) -> Result<(), CredentialError> {
+        let mut state = self.flight.state.subscribe();
+        loop {
+            let now = state.borrow_and_update().clone();
+            if now.overrun {
+                return Err(CredentialError::RenewFailed(STILL_RUNNING.into()));
+            }
+            if now.running {
+                return self
+                    .outcome_after(&mut state, now.generation, expected)
+                    .await;
+            }
+            if let Ok(token) = self.read_token().await
+                && token.fingerprint() != stale
+                && !token.expiring(now_ms())
+            {
+                return Ok(());
+            }
+            // Claim the folder, then start the run with no await between,
+            // so a cancelled caller never strands a claim or a child.
+            let mut claimed = None;
+            self.flight.state.send_if_modified(|flight| {
+                if flight.running || flight.overrun {
+                    return false;
+                }
+                flight.running = true;
+                claimed = Some(flight.generation);
+                true
+            });
+            let Some(generation) = claimed else {
+                continue;
+            };
+            if let Err(error) = self.start_run() {
+                self.flight.publish(Err(error), true);
+            }
+            return self.outcome_after(&mut state, generation, expected).await;
         }
-        if let Ok(token) = self.read_token().await
-            && token.fingerprint() != stale
-            && !token.expiring(now_ms())
-        {
-            return Ok(());
-        }
-        let outcome = self.run_auth_status().await;
-        let verdict = judge(&outcome, expected);
-        *last = Some(outcome);
-        self.flight.finished.fetch_add(1, Ordering::SeqCst);
-        verdict
     }
 
-    /// One `claude auth status --json` in the folder, given at most
-    /// [`RENEW_TIMEOUT`].
-    async fn run_auth_status(&self) -> RunOutcome {
+    /// The first outcome published after `generation`, for `expected`.
+    async fn outcome_after(
+        &self,
+        state: &mut watch::Receiver<FlightState>,
+        generation: u64,
+        expected: &ClaudeAccount,
+    ) -> Result<(), CredentialError> {
+        loop {
+            {
+                let now = state.borrow_and_update();
+                if now.generation > generation {
+                    return match &now.last {
+                        Some(Ok(status)) => status.verdict(expected),
+                        Some(Err(error)) => Err(error.clone()),
+                        None => Err(CredentialError::RenewFailed(STILL_RUNNING.into())),
+                    };
+                }
+            }
+            if state.changed().await.is_err() {
+                return Err(CredentialError::RenewFailed(STILL_RUNNING.into()));
+            }
+        }
+    }
+
+    /// Spawn `claude auth status --json` in the folder and hand it to its
+    /// reaper at once.
+    fn start_run(&self) -> Result<(), CredentialError> {
         let claude = match &self.claude {
             Some(path) => path.clone(),
             None => crate::claude::resolve_claude_executable().ok_or_else(|| {
@@ -488,8 +572,8 @@ impl Credentials {
             .args(["auth", "status", "--json"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            // Never killed mid-refresh: see `finish_in_background`.
+            .stderr(std::process::Stdio::piped())
+            // Never killed mid-refresh: see `reap`.
             .kill_on_drop(false);
         match &self.folder.env {
             Some(dir) => command.env("CLAUDE_CONFIG_DIR", dir),
@@ -500,58 +584,113 @@ impl Credentials {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = command.spawn().map_err(|error| {
+        let child = command.spawn().map_err(|error| {
             tracing::warn!(target: "zeron_harness::claude_cloud", %error, "claude auth status could not run");
             CredentialError::RenewFailed("`claude auth status` could not run".into())
         })?;
-        let mut stdout = child.stdout.take();
-        let finished = tokio::time::timeout(RENEW_TIMEOUT, async {
+        tokio::spawn(reap(child, self.folder.dir.clone(), self.flight.clone()));
+        Ok(())
+    }
+}
+
+/// Own one `claude auth status` from spawn to exit: drain its stdout and
+/// stderr to the end (closing them early could fail the CLI's writes before
+/// it saves the token) and publish its outcome. After [`RENEW_TIMEOUT`] the
+/// outcome is given up on (callers get [`CredentialError::RenewFailed`])
+/// but the folder stays claimed until the CLI exits, so no second run
+/// starts beside it. It is never killed mid-refresh: one still running
+/// after [`refresh_lock::SETTLE_MAX`] more is stopped only once no refresh
+/// is in flight in its folder.
+///
+/// The reaper is a task detached on the runtime, independent of whichever
+/// caller started the run (a caller that is cancelled leaves it running).
+/// It outlives an engine's shutdown deliberately and ends with the runtime;
+/// a CLI still running then is left to finish on its own, never killed.
+async fn reap(mut child: tokio::process::Child, dir: PathBuf, flight: Arc<Flight>) {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let finished = {
+        let work = async {
             let mut out = Vec::new();
-            if let Some(stdout) = stdout.as_mut() {
-                let _ = stdout.read_to_end(&mut out).await;
-            }
-            let _ = child.wait().await;
-            out
-        })
-        .await;
-        match finished {
-            Ok(out) => Ok(serde_json::from_slice(&out).ok()),
-            Err(_) => {
-                tracing::warn!(target: "zeron_harness::claude_cloud", "claude auth status timed out");
-                drop(stdout);
-                tokio::spawn(finish_in_background(child, self.folder.dir.clone()));
-                Err(CredentialError::RenewFailed(
-                    "`claude auth status` didn't answer in time".into(),
-                ))
+            let mut err = Vec::new();
+            let (_, _, status) = tokio::join!(
+                async {
+                    if let Some(pipe) = stdout.as_mut() {
+                        let _ = pipe.read_to_end(&mut out).await;
+                    }
+                },
+                async {
+                    if let Some(pipe) = stderr.as_mut() {
+                        let _ = pipe.read_to_end(&mut err).await;
+                    }
+                },
+                child.wait(),
+            );
+            (out, status)
+        };
+        tokio::pin!(work);
+        let deadline = tokio::time::sleep(RENEW_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut overrun = false;
+        loop {
+            tokio::select! {
+                result = &mut work => break Some(result),
+                () = &mut deadline => {
+                    if overrun {
+                        break None;
+                    }
+                    overrun = true;
+                    tracing::warn!(target: "zeron_harness::claude_cloud", "claude auth status is taking too long; giving up on it");
+                    flight.publish(
+                        Err(CredentialError::RenewFailed(
+                            "`claude auth status` didn't answer in time".into(),
+                        )),
+                        false,
+                    );
+                    deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + refresh_lock::SETTLE_MAX);
+                }
             }
         }
-    }
+    };
+    let outcome = match finished {
+        Some((out, status)) => read_outcome(&out, status),
+        None => {
+            refresh_lock::settle(&dir, refresh_lock::SETTLE_MAX).await;
+            let _ = child.kill().await;
+            Err(CredentialError::RenewFailed(
+                "`claude auth status` never finished".into(),
+            ))
+        }
+    };
+    flight.publish(outcome, true);
 }
 
-/// A run's outcome for one caller's account.
-fn judge(outcome: &RunOutcome, expected: &ClaudeAccount) -> Result<(), CredentialError> {
-    match outcome {
-        Ok(Some(status)) => status.verdict(expected),
-        // Nothing readable: the file read that follows decides.
-        Ok(None) => Ok(()),
-        Err(error) => Err(error.clone()),
+/// What a finished run printed and how it exited. The CLI exits 1 when it
+/// is signed out (and says so); any other failure, or output Zeron can't
+/// read, is a failed renewal.
+fn read_outcome(out: &[u8], status: std::io::Result<std::process::ExitStatus>) -> RunOutcome {
+    let parsed: Option<AuthStatus> = serde_json::from_slice(out).ok();
+    let exit = match &status {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(
+            status
+                .code()
+                .map_or("a signal".to_owned(), |c| format!("code {c}")),
+        ),
+        Err(error) => Some(error.to_string()),
+    };
+    match (parsed, exit) {
+        (Some(status), _) if status.logged_in == Some(false) => Ok(status),
+        (Some(status), None) => Ok(status),
+        (_, Some(exit)) => Err(CredentialError::RenewFailed(format!(
+            "`claude auth status` failed ({exit})"
+        ))),
+        (None, None) => Err(CredentialError::RenewFailed(
+            "`claude auth status` printed nothing Zeron can read".into(),
+        )),
     }
-}
-
-/// Let an overdue `claude auth status` finish: killing it mid-refresh would
-/// lose the rotated token the CLI is saving. One still running after
-/// [`crate::claude::refresh_lock::SETTLE_MAX`] is stopped once no refresh
-/// is in flight in its folder.
-async fn finish_in_background(mut child: tokio::process::Child, dir: PathBuf) {
-    use crate::claude::refresh_lock;
-    if tokio::time::timeout(refresh_lock::SETTLE_MAX, child.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
-    refresh_lock::settle(&dir, refresh_lock::SETTLE_MAX).await;
-    let _ = child.kill().await;
 }
 
 #[cfg(test)]

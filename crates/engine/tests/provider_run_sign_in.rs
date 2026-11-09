@@ -279,29 +279,39 @@ async fn a_401_after_the_renewal_shows_sign_in_again_and_turns_the_feature_off()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_without_the_chats_login_shows_sign_in_as_until_it_is_back() {
+async fn a_device_without_the_chats_login_says_it_cant_host_but_writes_nothing_on_the_chat() {
     let rig = Rig::new().await;
     let (chat, cwd) = rig.create_and_mirror().await;
 
     // Zeron's account switcher (say) signs the folder in as someone else.
     rig.login.set_account(&FakeAccount::b());
     rig.send(&chat, &cwd, SECOND, "hello?");
-    wait_for("Sign in as a on the chat", || {
-        rig.state(&chat)
-            == Some(ProviderChatState::SignInAs {
-                email: FakeAccount::a().email,
-            })
+    wait_for("this device can't host a's chats", || {
+        rig.harness
+            .provider_cloud()
+            .unwrap()
+            .status()
+            .borrow()
+            .cant_host(&FakeAccount::a().account_uuid)
     })
     .await;
+    wait_for("the refusal in the transcript", || {
+        rig.transcript(&chat).contains("different account")
+    })
+    .await;
+    // Whether another device could host it isn't this device's to say: the
+    // shared chat document shows no sign-in state.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.state(&chat), None);
+    assert!(!rig.transcript(&chat).contains("Sign in as"));
     assert!(rig.posted_events().is_empty(), "nothing sent as b");
     assert_eq!(rig.disabled(), None, "a mismatch never trips the switch");
     assert_eq!(rig.stub.call_count(), 0);
 
-    // The account's login is back: the next message works and the state clears.
+    // The account's login is back: the next message works.
     rig.login.set_account(&FakeAccount::a());
     rig.fake.queue_turn(Turn::text_zulu());
     rig.send(&chat, &cwd, THIRD, "Reply with the single word ZULU.");
-    wait_for("the state cleared", || rig.state(&chat).is_none()).await;
     wait_for("the reply", || {
         rig.entries(&chat).iter().any(|e| {
             e.role == MessageRole::Assistant
@@ -310,5 +320,14 @@ async fn a_device_without_the_chats_login_shows_sign_in_as_until_it_is_back() {
         })
     })
     .await;
+    assert!(
+        !rig.harness
+            .provider_cloud()
+            .unwrap()
+            .status()
+            .borrow()
+            .cant_host(&FakeAccount::a().account_uuid)
+    );
+    assert_eq!(rig.state(&chat), None);
     rig.core.shutdown().await;
 }
