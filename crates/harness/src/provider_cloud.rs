@@ -41,17 +41,43 @@ pub enum ProviderCloudError {
     Other(String),
 }
 
+/// What this device's login means for one account's chats, as the last
+/// request for that account found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountLogin {
+    /// An authenticated request for the account succeeded.
+    Works,
+    /// This device's login for the account is signed out, expired past the
+    /// CLI's renewal, or refused even after one: its chats show "Sign in
+    /// again" ([`ProviderChatState::SignInAgain`]).
+    SignInAgain,
+    /// This device has no login for the account (none at all, or one for
+    /// another account), so it can't host the account's chats right now.
+    /// A per-device fact, never written to a chat: publishing
+    /// `hostUnavailable` and deciding that no eligible device is online
+    /// ("Sign in as <email> to continue") belong to hosting.
+    CantHost,
+}
+
 /// What the harness knows about its logins and itself on this device,
 /// published as it changes ([`ProviderCloud::status`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCloudStatus {
-    /// Each account this device acted for, by account uuid: what its chats
-    /// show (`None`: its login works). Accounts not tried yet are absent.
-    pub accounts: BTreeMap<String, Option<ProviderChatState>>,
+    /// Each account this device acted for, by account uuid. Accounts not
+    /// tried yet are absent.
+    pub accounts: BTreeMap<String, AccountLogin>,
     /// Set once the feature turned itself off on this device, saying why
     /// (a 401 that persisted after the CLI renewed the login). Every later
     /// request is refused until the engine restarts.
     pub disabled: Option<String>,
+}
+
+impl ProviderCloudStatus {
+    /// Whether this device can't host chats of the account with
+    /// `account_uuid` right now (it has no login for it).
+    pub fn cant_host(&self, account_uuid: &str) -> bool {
+        self.accounts.get(account_uuid) == Some(&AccountLogin::CantHost)
+    }
 }
 
 /// One new provider cloud session, created with its first prompt.

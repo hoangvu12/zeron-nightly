@@ -13,18 +13,20 @@
 //! - [`bind_run`]: before every fresh dispatch, the harness is told which
 //!   session and account the run acts for. A chat without a provider session
 //!   refuses to run.
-//! - [`follow_sign_in_states`]: what the harness learns about its logins
-//!   ("Sign in again", "Sign in as <email> to continue") is recorded in the
-//!   chat document of every chat this device hosts for that account
-//!   (`providerState`), and cleared once a request for it works again.
-//!   Publishing `hostUnavailable` for a chat whose account has no login here
-//!   belongs with hosting and takeover.
+//! - [`follow_sign_in_states`]: a login the harness finds must be signed in
+//!   again shows "Sign in again" in the chat document of every chat this
+//!   device hosts for that account (`providerState`), cleared once a request
+//!   for it works again. That this device has no login for an account
+//!   ([`AccountLogin::CantHost`]) is never written to a chat: publishing
+//!   `hostUnavailable`, and "Sign in as <email> to continue" when no eligible
+//!   device is online, belong with hosting and takeover.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zeron_doc::SessionCommandPayload;
 use zeron_harness::provider_cloud::{
-    CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus, RunBinding,
+    AccountLogin, CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus,
+    RunBinding,
 };
 use zeron_proto::{Chat, ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
 
@@ -240,16 +242,9 @@ pub(crate) fn follow_sign_in_states(registry: &HarnessRegistry, doc_host: &DocHo
         // What each chat's document was last given, so a chat-list change
         // only opens the documents whose state moves.
         let mut written: HashMap<String, Option<ProviderChatState>> = HashMap::new();
-        let mut disabled = None;
         loop {
             let current = status.borrow_and_update().clone();
             let rows = chats.borrow_and_update().clone();
-            if current.disabled != disabled {
-                if let Some(reason) = &current.disabled {
-                    tracing::error!(reason, "provider-run chats turned off");
-                }
-                disabled = current.disabled.clone();
-            }
             record_states(&host, &current, &rows, &mut written);
             tokio::select! {
                 changed = status.changed() => if changed.is_err() { return },
@@ -259,14 +254,17 @@ pub(crate) fn follow_sign_in_states(registry: &HarnessRegistry, doc_host: &DocHo
     });
 }
 
-/// One pass of [`follow_sign_in_states`]: each chat hosted here whose
-/// account the harness has an answer for gets that answer.
+/// One pass of [`follow_sign_in_states`]. A chat hosted here whose account's
+/// login must be signed in again shows "Sign in again"; one whose account's
+/// login works shows nothing. A device without a login for the account
+/// writes nothing: that it can't host is its own fact, not the chat's.
 fn record_states(
     host: &DocHost,
     status: &ProviderCloudStatus,
     chats: &[Chat],
     written: &mut HashMap<String, Option<ProviderChatState>>,
 ) {
+    let mut hosted = HashSet::new();
     for chat in chats {
         if chat.device_id != host.device_id() {
             continue;
@@ -274,10 +272,15 @@ fn record_states(
         let Some(session) = &chat.provider_session else {
             continue;
         };
-        let Some(state) = status.accounts.get(&session.account_uuid) else {
-            continue;
+        hosted.insert(chat.id.as_str());
+        let state = match status.accounts.get(&session.account_uuid) {
+            Some(AccountLogin::Works) => None,
+            Some(AccountLogin::SignInAgain) => Some(ProviderChatState::SignInAgain {
+                email: session.account_email.clone(),
+            }),
+            Some(AccountLogin::CantHost) | None => continue,
         };
-        if written.get(&chat.id) == Some(state) {
+        if written.get(&chat.id) == Some(&state) {
             continue;
         }
         let recorded = host
@@ -285,11 +288,12 @@ fn record_states(
             .and_then(|handle| Ok(handle.doc().set_provider_chat_state(state.as_ref())?));
         match recorded {
             Ok(()) => {
-                written.insert(chat.id.clone(), state.clone());
+                written.insert(chat.id.clone(), state);
             }
             Err(error) => {
                 tracing::warn!(chat = %chat.id, %error, "couldn't record the chat's sign-in state")
             }
         }
     }
+    written.retain(|chat, _| hosted.contains(chat.as_str()));
 }

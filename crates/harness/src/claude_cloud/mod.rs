@@ -31,7 +31,8 @@ use futures::stream::BoxStream;
 use serde_json::json;
 use tokio::sync::mpsc;
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ProviderSession, ReasoningLevel, RunRequest, SteeringMode,
+    AccessMode, AgentEvent, HarnessId, Model, ProviderSession, ReasoningLevel, RunRequest,
+    SteeringMode,
 };
 
 use crate::provider_cloud::{CreateSession, ProviderCloud, ProviderCloudError, RunBinding};
@@ -91,6 +92,65 @@ struct SessionState {
     /// The highest stored sequence number mirrored so far. `None` after a
     /// restart, until a durable watermark replaces this.
     last_seq: Option<u64>,
+    /// The settings the session is in, as its last `system/init` (or this
+    /// device's acknowledged change) said; `None` until known.
+    actual: Option<Settings>,
+    /// The settings this device's last run of the chat asked for; `None`
+    /// until one ran here (another device's session, or after a restart).
+    ran_with: Option<Settings>,
+}
+
+/// A Claude Code permission mode (`--permission-mode`, `set_permission_mode`,
+/// `system/init`'s `permissionMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionMode {
+    Default,
+    AcceptEdits,
+    BypassPermissions,
+    Plan,
+}
+
+impl PermissionMode {
+    pub fn from_wire(mode: &str) -> Option<Self> {
+        Some(match mode {
+            "default" => Self::Default,
+            "acceptEdits" => Self::AcceptEdits,
+            "bypassPermissions" => Self::BypassPermissions,
+            "plan" => Self::Plan,
+            _ => return None,
+        })
+    }
+
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// A session's model and permission mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Settings {
+    /// `None`: the account's default model.
+    pub model: Option<String>,
+    pub mode: PermissionMode,
+}
+
+/// What a fresh run starts from.
+pub(crate) struct RunStart {
+    pub session: ProviderSession,
+    /// The opening prompt's event uuid, when the engine named its message
+    /// (no id: a new message, and no setting change goes with it).
+    pub prompt_uuid: Option<String>,
+    /// Whether the session already has the opening prompt.
+    pub delivered: bool,
+    /// Where the stream starts.
+    pub from_seq: u64,
+    pub actual: Option<Settings>,
+    pub ran_with: Option<Settings>,
 }
 
 /// The sessions runs may use, by session id.
@@ -104,7 +164,7 @@ impl Bindings {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn created(&self, session: ProviderSession, prompt_uuid: String) {
+    fn created(&self, session: ProviderSession, prompt_uuid: String, model: Option<String>) {
         self.lock().insert(
             session.session_id.clone(),
             SessionState {
@@ -112,6 +172,13 @@ impl Bindings {
                 prompt_uuid: None,
                 delivered: HashSet::from([prompt_uuid]),
                 last_seq: Some(0),
+                // Every session starts in `default` (each recorded
+                // `system/init`), on the model it was created with.
+                actual: Some(Settings {
+                    model,
+                    mode: PermissionMode::Default,
+                }),
+                ran_with: None,
             },
         );
     }
@@ -132,34 +199,61 @@ impl Bindings {
                         prompt_uuid: binding.prompt_uuid,
                         delivered: HashSet::new(),
                         last_seq: None,
+                        actual: None,
+                        ran_with: None,
                     },
                 );
             }
         }
     }
 
-    /// The session a run starts for, its opening prompt's uuid, whether the
-    /// session already has that prompt, and where the stream starts.
-    fn take_run(&self, session_id: &str) -> Option<(ProviderSession, String, bool, u64)> {
+    /// What the next fresh run for the session starts from.
+    fn take_run(&self, session_id: &str) -> Option<RunStart> {
         let mut sessions = self.lock();
         let state = sessions.get_mut(session_id)?;
-        let uuid = state
-            .prompt_uuid
-            .take()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let delivered = state.delivered.contains(&uuid);
-        Some((
-            state.session.clone(),
-            uuid,
-            delivered,
-            state.last_seq.unwrap_or(0),
-        ))
+        let uuid = state.prompt_uuid.take();
+        Some(RunStart {
+            session: state.session.clone(),
+            delivered: uuid.as_ref().is_some_and(|u| state.delivered.contains(u)),
+            prompt_uuid: uuid,
+            from_seq: state.last_seq.unwrap_or(0),
+            actual: state.actual.clone(),
+            ran_with: state.ran_with.clone(),
+        })
+    }
+
+    /// The settings the session is in now (its `system/init`, or a change
+    /// it acknowledged).
+    pub(crate) fn note_actual(&self, session_id: &str, actual: Settings) {
+        if let Some(state) = self.lock().get_mut(session_id) {
+            state.actual = Some(actual);
+        }
+    }
+
+    /// The settings a run of the chat on this device asked for.
+    pub(crate) fn note_ran_with(&self, session_id: &str, settings: Settings) {
+        if let Some(state) = self.lock().get_mut(session_id) {
+            state.ran_with = Some(settings);
+        }
+    }
+
+    pub(crate) fn actual(&self, session_id: &str) -> Option<Settings> {
+        self.lock()
+            .get(session_id)
+            .and_then(|state| state.actual.clone())
     }
 
     pub(crate) fn mark_delivered(&self, session_id: &str, uuid: &str) {
         if let Some(state) = self.lock().get_mut(session_id) {
             state.delivered.insert(uuid.to_owned());
         }
+    }
+
+    /// Whether this device sent the event `uuid` to the session.
+    pub(crate) fn was_delivered(&self, session_id: &str, uuid: &str) -> bool {
+        self.lock()
+            .get(session_id)
+            .is_some_and(|state| state.delivered.contains(uuid))
     }
 
     pub(crate) fn note_seq(&self, session_id: &str, seq: u64) {
@@ -207,7 +301,9 @@ fn provider_error(error: ApiError) -> ProviderCloudError {
         }
         ApiError::Credentials(error) => ProviderCloudError::SignInRequired(error.to_string()),
         ApiError::Disabled(reason) => ProviderCloudError::Disabled(reason),
-        ApiError::Status { status, message } => ProviderCloudError::Provider {
+        ApiError::Status {
+            status, message, ..
+        } => ProviderCloudError::Provider {
             status: Some(status),
             message: format!("Claude cloud returned {status}: {message}"),
         },
@@ -275,7 +371,8 @@ impl ProviderCloud for ClaudeCloudHarness {
             account_email: account.email,
             org_id: account.org_id,
         };
-        self.bindings.created(session.clone(), request.prompt_uuid);
+        self.bindings
+            .created(session.clone(), request.prompt_uuid, request.model);
         Ok(session)
     }
 
@@ -299,8 +396,24 @@ impl Harness for ClaudeCloudHarness {
     fn supports_steering(&self) -> bool {
         true
     }
+    /// A message sent during a turn goes to the session at once; the worker
+    /// reads it at its next step boundary, or runs it right after the turn.
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
+        SteeringMode::StepBoundary
+    }
+    /// Model, permission mode and plan mode change on the live session with
+    /// control requests (`set_model`, `set_permission_mode`) sent ahead of
+    /// the message that carries them; nothing about a session is launched.
+    fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        live.cwd == next.cwd
+    }
+    fn access_modes(&self) -> &[AccessMode] {
+        &AccessMode::ALL
+    }
+    /// The session's own plan mode (`set_permission_mode` `plan`);
+    /// approving `ExitPlanMode` ends it.
+    fn supports_plan(&self) -> bool {
+        true
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[]
@@ -349,31 +462,48 @@ impl Harness for ClaudeCloudHarness {
                 )
             })?
             .to_owned();
-        let (session, prompt_uuid, delivered, from_seq) =
-            self.bindings.take_run(&session_id).ok_or_else(|| {
-                HarnessError::Protocol(
-                    "This chat's Claude cloud session isn't known on this device.".into(),
-                )
-            })?;
+        let start = self.bindings.take_run(&session_id).ok_or_else(|| {
+            HarnessError::Protocol(
+                "This chat's Claude cloud session isn't known on this device.".into(),
+            )
+        })?;
         // Open the stream before sending, so nothing the session does in
         // reply is missed; a login that can't act for the chat's account
         // refuses here, before anything is sent.
-        let account = session::account_of(&session);
+        let account = session::account_of(&start.session);
         let stream = self
             .client
-            .stream(&account, &session_id, from_seq)
+            .stream(&account, &session_id, start.from_seq)
             .await
             .map_err(harness_error)?;
         let (events, receiver) = mpsc::channel(256);
-        let opening = (!delivered && !request.prompt.trim().is_empty())
-            .then(|| (prompt_uuid, request.prompt.clone()));
+        // A setting changed here since this device's last run, that the
+        // session isn't in, goes first, under ids derived from the opening
+        // prompt's ([`session::changes`]).
+        let opening_changes = session::changes(
+            start.prompt_uuid.as_deref(),
+            start.ran_with.as_ref(),
+            start.actual.as_ref(),
+            &session::settings_of(&request),
+        );
+        // A message with no id is a new one: its own uuid is minted here.
+        let opening = (!start.delivered && !request.prompt.trim().is_empty()).then(|| {
+            (
+                start
+                    .prompt_uuid
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                request.prompt.clone(),
+            )
+        });
         tokio::spawn(
             session::RunSession {
                 client: self.client.clone(),
                 bindings: self.bindings.clone(),
-                session,
+                session: start.session,
                 opening,
-                mirror: mirror::Mirror::new(request.cwd.clone(), from_seq),
+                opening_changes,
+                mirror: mirror::Mirror::new(request.cwd.clone(), start.from_seq),
+                config: request,
                 stream,
                 controls,
                 events,

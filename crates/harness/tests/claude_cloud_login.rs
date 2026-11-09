@@ -15,12 +15,12 @@ use tokio::sync::oneshot;
 use zeron_harness::claude_cloud::credentials::ClaudeConfigDir;
 use zeron_harness::claude_cloud::{ClaudeCloudConfig, ClaudeCloudHarness};
 use zeron_harness::provider_cloud::{
-    CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus, RunBinding,
+    AccountLogin, CreateSession, ProviderCloudError, ProviderCloudStatus, RunBinding,
 };
 use zeron_harness::{CancellationToken, Harness, HarnessError, RunControls};
 use zeron_proto::{HarnessId, ProviderSession, RunRequest, SandboxLevel};
 use zeron_provider_fake::{
-    ClaudeLogin, FakeAccount, FakeSessionServer, SeedSession, StubClaude, in_ms,
+    ClaudeLogin, FakeAccount, FakeSessionServer, Fault, SeedSession, StubClaude, in_ms,
 };
 
 struct Rig {
@@ -75,12 +75,12 @@ impl Rig {
             .clone()
     }
 
-    /// What account "a"'s chats show (outer `None`: not tried yet).
-    fn state_of_a(&self) -> Option<Option<ProviderChatState>> {
+    /// What this device's login means for account "a" (`None`: not tried).
+    fn state_of_a(&self) -> Option<AccountLogin> {
         self.status()
             .accounts
             .get(&FakeAccount::a().account_uuid)
-            .cloned()
+            .copied()
     }
 
     fn authorizations(&self) -> Vec<String> {
@@ -103,12 +103,6 @@ async fn create_with(harness: &ClaudeCloudHarness) -> Result<ProviderSession, Pr
             title: None,
         })
         .await
-}
-
-fn sign_in_again() -> ProviderChatState {
-    ProviderChatState::SignInAgain {
-        email: FakeAccount::a().email,
-    }
 }
 
 fn fresh(token: &str) -> String {
@@ -216,7 +210,7 @@ async fn chats_needing_a_renewal_at_once_share_one_auth_status_run() {
         "{:?}",
         rig.authorizations()
     );
-    assert_eq!(rig.state_of_a(), Some(None));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,7 +232,7 @@ async fn a_401_renews_the_login_once_then_retries_with_the_new_token() {
     rig.create().await.unwrap();
     assert_eq!(rig.stub.call_count(), 1);
     assert_eq!(rig.authorizations().last().unwrap(), "Bearer token-a-2");
-    assert_eq!(rig.state_of_a(), Some(None));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
     assert_eq!(rig.status().disabled, None);
 }
 
@@ -257,7 +251,7 @@ async fn a_401_that_survives_a_renewal_asks_to_sign_in_again_and_turns_the_featu
     assert_eq!(rig.stub.call_count(), 1, "one renewal, never a loop");
     assert_eq!(rig.authorizations().len(), 2, "the request and one retry");
     assert!(rig.fake.created_sessions().is_empty());
-    assert_eq!(rig.state_of_a(), Some(Some(sign_in_again())));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
     let reason = rig
         .status()
         .disabled
@@ -290,7 +284,7 @@ async fn a_logged_out_login_asks_to_sign_in_again_without_turning_the_feature_of
         rig.fake.requests().is_empty(),
         "nothing sent with a dying token"
     );
-    assert_eq!(rig.state_of_a(), Some(Some(sign_in_again())));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
 
     // Logged out behind a 401 too: still a sign-in, never the kill switch.
     rig.login.set_token("token-a-1", in_ms(3_600_000));
@@ -307,7 +301,7 @@ async fn a_logged_out_login_asks_to_sign_in_again_without_turning_the_feature_of
     rig.stub.report_account(&FakeAccount::a());
     rig.stub.renew_with(&fresh("token-a-2"));
     rig.create().await.expect("works once signed in");
-    assert_eq!(rig.state_of_a(), Some(None));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -319,7 +313,8 @@ async fn a_renewal_reporting_another_account_means_this_device_cant_host() {
 
     match rig.create().await {
         Err(ProviderCloudError::AccountMismatch(message)) => {
-            assert!(message.contains("Sign in as a@example.test"), "{message}")
+            assert!(message.contains("different account"), "{message}");
+            assert!(!message.contains("Sign in"), "{message}");
         }
         other => panic!("expected an account mismatch, got {other:?}"),
     }
@@ -328,12 +323,8 @@ async fn a_renewal_reporting_another_account_means_this_device_cant_host() {
         rig.fake.requests().is_empty(),
         "nothing sent for the wrong account"
     );
-    assert_eq!(
-        rig.state_of_a(),
-        Some(Some(ProviderChatState::SignInAs {
-            email: FakeAccount::a().email
-        }))
-    );
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::CantHost));
+    assert!(rig.status().cant_host(&FakeAccount::a().account_uuid));
     assert_eq!(
         rig.status().disabled,
         None,
@@ -342,29 +333,19 @@ async fn a_renewal_reporting_another_account_means_this_device_cant_host() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_without_a_login_for_the_chats_account_asks_to_sign_in_as_it() {
+async fn a_device_without_a_login_for_the_chats_account_cant_host_until_it_is_back() {
     let rig = Rig::new().await;
     let session = rig.create().await.unwrap();
     open_run(&rig.harness, &session).await.expect("runs as a");
-    assert_eq!(rig.state_of_a(), Some(None));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
     let before = rig.fake.requests().len();
 
     // The device's login now belongs to someone else.
     rig.login.set_account(&FakeAccount::b());
     let error = open_run(&rig.harness, &session).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("Sign in as a@example.test to continue"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("different account"), "{error}");
     assert_eq!(rig.fake.requests().len(), before, "nothing sent as b");
-    assert_eq!(
-        rig.state_of_a(),
-        Some(Some(ProviderChatState::SignInAs {
-            email: FakeAccount::a().email
-        }))
-    );
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::CantHost));
     assert_eq!(rig.stub.call_count(), 0, "a file read decides, no CLI run");
 
     // Back to a: the chat works again and the state clears.
@@ -372,11 +353,11 @@ async fn a_device_without_a_login_for_the_chats_account_asks_to_sign_in_as_it() 
     open_run(&rig.harness, &session)
         .await
         .expect("runs as a again");
-    assert_eq!(rig.state_of_a(), Some(None));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_renewal_that_overstays_ten_seconds_gives_up() {
+async fn a_renewal_that_overstays_ten_seconds_gives_up_and_keeps_the_folder_busy() {
     let rig = Rig::new().await;
     rig.login.set_token("token-a-old", in_ms(60_000));
     rig.stub.renew_with(&fresh("token-a-fresh"));
@@ -396,7 +377,110 @@ async fn a_renewal_that_overstays_ten_seconds_gives_up() {
     );
     assert_eq!(rig.stub.call_count(), 1);
     assert!(rig.fake.requests().is_empty());
-    assert_eq!(rig.state_of_a(), Some(Some(sign_in_again())));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
+
+    // The overdue CLI is still running: a request now neither starts a
+    // second one beside it nor waits for it, from this engine or another
+    // one in this process on the same folder.
+    let started = Instant::now();
+    let error = rig.create().await.unwrap_err();
+    assert!(error.to_string().contains("still running"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "it waited");
+    let other = Rig::harness_for(&rig.fake, &rig.login, &rig.stub);
+    assert!(create_with(&other).await.is_err());
+    assert_eq!(rig.stub.call_count(), 1, "{:?}", rig.stub.calls());
+    assert!(rig.fake.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewal_outlives_the_request_that_started_it() {
+    let rig = Rig::new().await;
+    rig.login.set_token("token-a-old", in_ms(60_000));
+    rig.stub.renew_with(&fresh("token-a-fresh"));
+    rig.stub.set_delay(Duration::from_secs(2));
+
+    // The chat that needed the renewal goes away while the CLI runs.
+    let harness = rig.harness.clone();
+    let first = tokio::spawn(async move { create_with(&harness).await });
+    while rig.stub.call_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    first.abort();
+
+    // The run carries on, and the next request joins it rather than
+    // starting another.
+    rig.create().await.expect("created with the renewed token");
+    assert_eq!(rig.stub.call_count(), 1);
+    assert!(
+        rig.authorizations()
+            .iter()
+            .all(|a| a == "Bearer token-a-fresh")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_successful_request_clears_sign_in_again() {
+    let rig = Rig::new().await;
+    rig.login.set_token("token-a-old", in_ms(60_000));
+    rig.stub.log_out();
+    assert!(rig.create().await.is_err());
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
+
+    // A fresh token, but the server fails the request: nothing learned.
+    rig.login.set_token("token-a-2", in_ms(3_600_000));
+    for status in [503, 403] {
+        rig.fake.inject(Fault {
+            method: None,
+            path_contains: "/v1/code/sessions".into(),
+            status,
+            times: 1,
+        });
+        assert!(rig.create().await.is_err());
+        assert_eq!(
+            rig.state_of_a(),
+            Some(AccountLogin::SignInAgain),
+            "{status}"
+        );
+    }
+
+    rig.create().await.expect("works");
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewal_that_doesnt_vouch_for_the_account_fails() {
+    let rig = Rig::new().await;
+    // Near expiry, so every request has the CLI run.
+    rig.login.set_token("token-a-old", in_ms(60_000));
+
+    // Signed in, but it doesn't say as whom.
+    rig.stub
+        .set_status(serde_json::json!({"loggedIn": true, "authMethod": "claude.ai"}));
+    let error = rig.create().await.unwrap_err();
+    assert!(error.to_string().contains("which account"), "{error}");
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
+
+    // The right account, but the CLI failed.
+    rig.stub.report_account(&FakeAccount::a());
+    rig.stub.set_exit_code(3);
+    let error = rig.create().await.unwrap_err();
+    assert!(error.to_string().contains("code 3"), "{error}");
+
+    // Nothing readable at all.
+    rig.stub.set_status(serde_json::json!("not a status"));
+    rig.stub.set_exit_code(0);
+    let error = rig.create().await.unwrap_err();
+    assert!(
+        error.to_string().contains("nothing Zeron can read"),
+        "{error}"
+    );
+
+    assert_eq!(rig.stub.call_count(), 3);
+    assert!(
+        rig.fake.requests().is_empty(),
+        "nothing sent on a doubtful renewal"
+    );
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -427,7 +511,7 @@ async fn a_token_file_that_doesnt_parse_is_read_once_more() {
     assert!(error.to_string().contains("could not be read"), "{error}");
     assert_eq!(rig.fake.requests().len(), sent);
     assert_eq!(rig.stub.call_count(), 0);
-    assert_eq!(rig.state_of_a(), Some(None));
+    assert_eq!(rig.state_of_a(), Some(AccountLogin::Works));
 }
 
 #[tokio::test(flavor = "multi_thread")]

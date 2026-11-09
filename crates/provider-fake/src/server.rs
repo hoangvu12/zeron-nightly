@@ -5,8 +5,15 @@
 //! and `ephemeral_event`, history answers `{data, resume_cursor}`, the list
 //! answers `{data, next_cursor, resume_token}`. Sequence numbers are strings
 //! on the wire, as the real API writes them.
+//!
+//! The worker's controls follow `07-honest` and `10-conflict`: an interrupt is
+//! stored, acknowledged by a worker `control_response` (`still_queued`), and
+//! a playing turn ends with `[Request interrupted by user]` and a `result`
+//! `error_during_execution` / `aborted_streaming`; a client
+//! `control_response` is always stored, but only the first per `request_id`
+//! counts.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -17,7 +24,7 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::{Step, Turn};
 
@@ -57,6 +64,8 @@ pub struct Fault {
     pub path_contains: String,
     pub status: u16,
     pub times: usize,
+    /// A `Retry-After` (seconds) on the failure.
+    pub retry_after: Option<u64>,
 }
 
 /// A session that exists before the test starts (another device's, or one
@@ -108,6 +117,9 @@ impl StoredEvent {
     }
 }
 
+/// A [`Live`] item that ends the streams receiving it.
+const DROP_STREAM: &str = "zeron-fake-drop";
+
 #[derive(Clone, Debug)]
 struct Live {
     event: &'static str,
@@ -121,6 +133,20 @@ struct Session {
     /// payload uuid → (event_id, sequence number).
     uuids: HashMap<String, (String, u64)>,
     live: broadcast::Sender<Live>,
+    /// The turn playing now.
+    playing: Option<tokio::task::AbortHandle>,
+    /// Counts turns started: a playback stores only while it is the
+    /// session's current turn (an aborted one may be mid-step).
+    turns_started: u64,
+    /// Messages posted while a turn played, waiting for it (their uuids).
+    queued: VecDeque<String>,
+    /// Worker prompts asked so far (`request_id`s), in order.
+    prompts: Vec<String>,
+    /// The winning (first) answer to each prompt: its `response` body.
+    answers: HashMap<String, Value>,
+    answered: Arc<Notify>,
+    permission_mode: Option<String>,
+    model: Option<Value>,
 }
 
 impl Session {
@@ -130,11 +156,24 @@ impl Session {
             events: Vec::new(),
             uuids: HashMap::new(),
             live: broadcast::channel(4096).0,
+            playing: None,
+            turns_started: 0,
+            queued: VecDeque::new(),
+            prompts: Vec::new(),
+            answers: HashMap::new(),
+            answered: Arc::new(Notify::new()),
+            permission_mode: None,
+            model: None,
         }
     }
 
     fn archived(&self) -> bool {
         self.info["status"] == "archived"
+    }
+
+    /// Whether turn number `turn` is the one playing.
+    fn plays(&self, turn: u64) -> bool {
+        self.playing.is_some() && self.turns_started == turn
     }
 
     /// Store `payload` (its `uuid` is the event id) and send it live.
@@ -319,6 +358,81 @@ impl FakeSessionServer {
             .session(session_id)
             .and_then(|s| s.info["status"].as_str().map(str::to_owned))
     }
+
+    /// The `request_id`s of the worker's prompts (permission and
+    /// AskUserQuestion `control_request`s) so far, in order.
+    pub fn prompts(&self, session_id: &str) -> Vec<String> {
+        lock(&self.state)
+            .session(session_id)
+            .map(|s| s.prompts.clone())
+            .unwrap_or_default()
+    }
+
+    /// The worker's prompts no client has answered yet.
+    pub fn open_prompts(&self, session_id: &str) -> Vec<String> {
+        lock(&self.state)
+            .session(session_id)
+            .map(|s| {
+                s.prompts
+                    .iter()
+                    .filter(|id| !s.answers.contains_key(*id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The answer that counted for prompt `request_id` (the first a client
+    /// sent): the `control_response`'s inner `response` body.
+    pub fn answer(&self, session_id: &str, request_id: &str) -> Option<Value> {
+        lock(&self.state)
+            .session(session_id)
+            .and_then(|s| s.answers.get(request_id).cloned())
+    }
+
+    /// The permission mode the last `set_permission_mode` chose.
+    pub fn permission_mode(&self, session_id: &str) -> Option<String> {
+        lock(&self.state)
+            .session(session_id)
+            .and_then(|s| s.permission_mode.clone())
+    }
+
+    /// The model the last `set_model` chose (`null` = the default).
+    pub fn model(&self, session_id: &str) -> Option<Value> {
+        lock(&self.state)
+            .session(session_id)
+            .and_then(|s| s.model.clone())
+    }
+
+    /// End every stream open on the session now, as a dropped connection
+    /// would (the client may reconnect).
+    pub fn drop_streams(&self, session_id: &str) {
+        if let Some(session) = lock(&self.state).session(session_id) {
+            let _ = session.live.send(Live {
+                event: DROP_STREAM,
+                id: None,
+                data: String::new(),
+            });
+        }
+    }
+
+    /// Whether a turn is playing on the session now.
+    pub fn turn_playing(&self, session_id: &str) -> bool {
+        lock(&self.state)
+            .session(session_id)
+            .is_some_and(|s| s.playing.is_some())
+    }
+
+    /// Post `payload` as another client would (another device, claude.ai):
+    /// handled as `POST …/events` is, but not recorded as a request. Returns
+    /// its ack.
+    pub fn post_as_client(&self, session_id: &str, payload: Value) -> Value {
+        let mut inner = lock(&self.state);
+        accept_events(&self.state, &mut inner, session_id, vec![payload])
+            .ok()
+            .and_then(|mut acks| acks.pop())
+            .unwrap_or(Value::Null)
+    }
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response<Body> {
@@ -375,7 +489,13 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             fault.times -= 1;
             let status =
                 StatusCode::from_u16(fault.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            return Ok(error(status, "injected_error", "injected by the test"));
+            let mut response = error(status, "injected_error", "injected by the test");
+            if let Some(seconds) = fault.retry_after {
+                response
+                    .headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, seconds.into());
+            }
+            return Ok(response);
         }
     }
     let token = recorded
@@ -478,20 +598,24 @@ fn create(state: &State, body: Value) -> Response<Body> {
         "config": body["config"].clone(),
         "session_url": format!("https://claude.ai/code/{id}"),
     });
-    let mut session = Session::new(info);
-    let mut plays = false;
-    for event in body["events"].as_array().cloned().unwrap_or_default() {
-        let payload = event["payload"].clone();
-        plays |= payload["type"] == "user";
-        session.store("client", payload);
-    }
-    let reply = json!({ "deduplicated": false, "session": session.info.clone() });
+    let events: Vec<Value> = body["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event["payload"].clone())
+        .collect();
     inner.created.push(id.clone());
-    inner.sessions.push((id.clone(), session));
-    if plays {
-        start_turn(state, &mut inner, &id);
-    }
-    json_response(StatusCode::OK, reply)
+    inner.sessions.push((id.clone(), Session::new(info)));
+    let _ = accept_events(state, &mut inner, &id, events);
+    let info = inner
+        .session(&id)
+        .map(|s| s.info.clone())
+        .unwrap_or_default();
+    json_response(
+        StatusCode::OK,
+        json!({ "deduplicated": false, "session": info }),
+    )
 }
 
 fn post_events(state: &State, id: &str, body: Value) -> Response<Body> {
@@ -506,39 +630,158 @@ fn post_events(state: &State, id: &str, body: Value) -> Response<Body> {
             "session is archived",
         );
     }
+    let payloads: Vec<Value> = body["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event["payload"].clone())
+        .collect();
+    if payloads
+        .iter()
+        .any(|p| p.get("uuid").and_then(Value::as_str).is_none())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "payload.uuid is required",
+        );
+    }
+    match accept_events(state, &mut inner, id, payloads) {
+        Ok(results) => json_response(StatusCode::OK, json!({ "results": results })),
+        Err(response) => *response,
+    }
+}
+
+/// Store client events on session `id` and act on them as the worker would:
+/// a repeated uuid is acknowledged `duplicate: true` and does nothing; a
+/// message starts a turn, or waits for the one playing; controls and answers
+/// are handled as the module docs say. Returns one ack per event.
+fn accept_events(
+    state: &State,
+    inner: &mut Inner,
+    id: &str,
+    payloads: Vec<Value>,
+) -> Result<Vec<Value>, Box<Response<Body>>> {
     let mut results = Vec::new();
-    let mut plays = false;
-    for event in body["events"].as_array().cloned().unwrap_or_default() {
-        let payload = event["payload"].clone();
-        let Some(uuid) = payload
+    for payload in payloads {
+        let Some(session) = inner.session(id) else {
+            return Err(Box::new(not_found()));
+        };
+        let uuid = payload
             .get("uuid")
             .and_then(Value::as_str)
             .map(str::to_owned)
-        else {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "payload.uuid is required",
-            );
-        };
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if let Some((event_id, seq)) = session.uuids.get(&uuid).cloned() {
             results.push(
                 json!({"duplicate": true, "event_id": event_id, "sequence_num": seq.to_string()}),
             );
             continue;
         }
-        plays |= payload["type"] == "user";
-        let stored = session.store("client", payload);
+        let stored = session.store("client", payload.clone());
         results.push(json!({
             "duplicate": false,
             "event_id": stored.event_id,
             "sequence_num": stored.sequence_num.to_string(),
         }));
+        match payload["type"].as_str() {
+            Some("user") => {
+                if session.playing.is_some() {
+                    session.queued.push_back(uuid);
+                } else {
+                    start_turn(state, inner, id);
+                }
+            }
+            Some("control_request") => control(state, inner, id, &payload),
+            Some("control_response") => {
+                let request_id = payload
+                    .pointer("/response/request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let answer = payload
+                    .pointer("/response/response")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                // The first answer wins; a later one is stored and dropped.
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    session.answers.entry(request_id)
+                {
+                    slot.insert(answer);
+                    session.answered.notify_waiters();
+                }
+            }
+            _ => {}
+        }
     }
-    if plays {
-        start_turn(state, &mut inner, id);
+    Ok(results)
+}
+
+/// The worker's reply to a client `control_request`.
+fn control(state: &State, inner: &mut Inner, id: &str, payload: &Value) {
+    let Some(session) = inner.session(id) else {
+        return;
+    };
+    let request_id = payload["request_id"].clone();
+    let request = &payload["request"];
+    let reply = |response: Value| {
+        json!({
+            "type": "control_response",
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "response": { "subtype": "success", "request_id": request_id, "response": response },
+        })
+    };
+    match request["subtype"].as_str().unwrap_or_default() {
+        "interrupt" => {
+            if request["cancel_queued"] == true {
+                session.queued.clear();
+            }
+            let still_queued: Vec<Value> = session.queued.iter().map(|u| json!(u)).collect();
+            session.store("worker", reply(json!({ "still_queued": still_queued })));
+            // Interrupting a turn ends it; interrupting while idle (or again)
+            // does nothing more.
+            let Some(playing) = session.playing.take() else {
+                return;
+            };
+            playing.abort();
+            let queued = session.queued.len();
+            for step in Turn::from_jsonl(include_str!("../fixtures/interrupted.jsonl")).steps {
+                if let Step::Stored(mut payload) = step {
+                    payload["uuid"] = json!(uuid::Uuid::new_v4().to_string());
+                    if payload["type"] == "result" {
+                        payload["queued_turn_count"] = json!(queued);
+                    }
+                    session.store("worker", payload);
+                }
+            }
+            if session.queued.pop_front().is_some() {
+                start_turn(state, inner, id);
+            }
+        }
+        "set_permission_mode" => {
+            let mode = request["mode"].clone();
+            session.permission_mode = mode.as_str().map(str::to_owned);
+            session.store("worker", reply(json!({ "mode": mode })));
+        }
+        "set_model" => {
+            let model = request["model"].clone();
+            session.model = Some(model.clone());
+            session.store("worker", reply(json!({ "model": model })));
+        }
+        other => {
+            let error = json!({
+                "type": "control_response",
+                "uuid": uuid::Uuid::new_v4().to_string(),
+                "response": {
+                    "subtype": "error",
+                    "request_id": request_id,
+                    "error": format!("unsupported control request: {other}"),
+                },
+            });
+            session.store("worker", error);
+        }
     }
-    json_response(StatusCode::OK, json!({ "results": results }))
 }
 
 /// Play the next queued turn on `session_id`, if one is queued.
@@ -546,33 +789,200 @@ fn start_turn(state: &State, inner: &mut Inner, session_id: &str) {
     let Some(turn) = inner.turns.pop_front() else {
         return;
     };
-    let state = state.clone();
-    let session_id = session_id.to_owned();
-    tokio::spawn(async move {
-        for step in turn.steps {
-            // Fresh uuids per playback: a fixture may play more than once.
-            let fresh = |mut payload: Value| {
-                if payload.get("uuid").is_some() {
-                    payload["uuid"] = json!(uuid::Uuid::new_v4().to_string());
-                }
-                payload
-            };
-            match step {
-                Step::Stored(payload) => {
-                    if let Some(session) = lock(&state).session(&session_id) {
-                        session.store("worker", fresh(payload));
-                    }
-                }
-                Step::Ephemeral(payload) => {
-                    if let Some(session) = lock(&state).session(&session_id) {
-                        session.ephemeral(fresh(payload));
-                    }
-                }
-                Step::Hold(gate) => gate.pass().await,
-            }
-            tokio::task::yield_now().await;
+    let Some(session) = inner.session(session_id) else {
+        return;
+    };
+    // Playback needs this lock (the caller holds it) for its first step, so
+    // the turn is marked playing before anything of it is stored.
+    session.turns_started += 1;
+    let task = tokio::spawn(play(
+        state.clone(),
+        session_id.to_owned(),
+        session.turns_started,
+        turn,
+    ));
+    session.playing = Some(task.abort_handle());
+}
+
+/// The tool-use ids a `user` payload carries results for.
+fn tool_result_ids(payload: &Value) -> Vec<String> {
+    payload
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "tool_result")
+                .filter_map(|b| b["tool_use_id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rewrite a prompted tool's result to say what the winning answer was: a
+/// refusal's message, or AskUserQuestion's picks (in the worker's words).
+fn apply_answer(block: &mut Value, answer: &Value) {
+    match answer["behavior"].as_str() {
+        Some("deny") => {
+            block["content"] = answer["message"].clone();
+            block["is_error"] = json!(true);
         }
-    });
+        Some("allow") => {
+            let Some(answers) = answer
+                .pointer("/updatedInput/answers")
+                .and_then(Value::as_object)
+            else {
+                return;
+            };
+            let picks: Vec<String> = answers
+                .iter()
+                .map(|(question, pick)| {
+                    let pick = match pick {
+                        Value::String(s) => s.clone(),
+                        Value::Array(all) => all
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        other => other.to_string(),
+                    };
+                    format!("\"{question}\"=\"{pick}\"")
+                })
+                .collect();
+            block["content"] = json!(format!(
+                "Your questions have been answered: {}. You can now continue with these answers in mind.",
+                picks.join(", ")
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// The answers to `waits` (request ids), once every one has one.
+async fn answers_for(
+    state: &State,
+    session_id: &str,
+    waits: &HashSet<String>,
+) -> Option<HashMap<String, Value>> {
+    loop {
+        let answered = {
+            let mut inner = lock(state);
+            let session = inner.session(session_id)?;
+            if waits.iter().all(|r| session.answers.contains_key(r)) {
+                return Some(
+                    waits
+                        .iter()
+                        .map(|r| (r.clone(), session.answers[r].clone()))
+                        .collect(),
+                );
+            }
+            session.answered.clone()
+        };
+        let notified = answered.notified();
+        let ready = lock(state)
+            .session(session_id)
+            .is_none_or(|s| waits.iter().all(|r| s.answers.contains_key(r)));
+        if !ready {
+            notified.await;
+        }
+    }
+}
+
+/// Play one worker turn on `session_id`, then the next waiting message's.
+async fn play(state: State, session_id: String, number: u64, turn: Turn) {
+    // Act on the session only while this is its current turn.
+    let current = |f: &mut dyn FnMut(&mut Session)| -> bool {
+        match lock(&state).session(&session_id) {
+            Some(session) if session.plays(number) => {
+                f(session);
+                true
+            }
+            _ => false,
+        }
+    };
+    // tool_use_id → the request id its prompt was asked under.
+    let mut prompted: HashMap<String, String> = HashMap::new();
+    for step in turn.steps {
+        // Fresh ids per playback: a fixture may play more than once.
+        let fresh = |mut payload: Value| {
+            if payload.get("uuid").is_some() {
+                payload["uuid"] = json!(uuid::Uuid::new_v4().to_string());
+            }
+            payload
+        };
+        match step {
+            Step::Stored(payload) => {
+                let mut payload = fresh(payload);
+                if payload["type"] == "control_request" {
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    payload["request_id"] = json!(request_id);
+                    if let Some(tool) = payload
+                        .pointer("/request/tool_use_id")
+                        .and_then(Value::as_str)
+                    {
+                        prompted.insert(tool.to_owned(), request_id.clone());
+                    }
+                    let mut request_id = Some(request_id);
+                    current(&mut |s| s.prompts.extend(request_id.take()));
+                }
+                // A prompted tool's result waits for the prompt's answer.
+                let waits: HashSet<String> = tool_result_ids(&payload)
+                    .iter()
+                    .filter_map(|tool| prompted.get(tool).cloned())
+                    .collect();
+                let Some(answers) = answers_for(&state, &session_id, &waits).await else {
+                    return;
+                };
+                if let Some(blocks) = payload
+                    .pointer_mut("/message/content")
+                    .and_then(Value::as_array_mut)
+                {
+                    for block in blocks.iter_mut().filter(|b| b["type"] == "tool_result") {
+                        let answer = block["tool_use_id"]
+                            .as_str()
+                            .and_then(|tool| prompted.get(tool))
+                            .and_then(|request| answers.get(request))
+                            .cloned();
+                        if let Some(answer) = answer {
+                            apply_answer(block, &answer);
+                        }
+                    }
+                }
+                let mut payload = Some(payload);
+                let stored = current(&mut |s| {
+                    if let Some(mut payload) = payload.take() {
+                        if payload["type"] == "result" {
+                            payload["queued_turn_count"] = json!(s.queued.len());
+                        }
+                        s.store("worker", payload);
+                    }
+                });
+                if !stored {
+                    return;
+                }
+            }
+            Step::Ephemeral(payload) => {
+                let mut payload = Some(fresh(payload));
+                if !current(&mut |s| s.ephemeral(payload.take().unwrap_or_default())) {
+                    return;
+                }
+            }
+            Step::Hold(gate) => gate.pass().await,
+        }
+        tokio::task::yield_now().await;
+    }
+    // The turn is over: the next waiting message's turn plays.
+    let mut inner = lock(&state);
+    let Some(session) = inner.session(&session_id) else {
+        return;
+    };
+    if !session.plays(number) {
+        return;
+    }
+    session.playing = None;
+    if session.queued.pop_front().is_some() {
+        start_turn(&state, &mut inner, &session_id);
+    }
 }
 
 fn history(state: &State, id: &str, req: &RecordedRequest) -> Response<Body> {
@@ -650,6 +1060,7 @@ fn stream(state: &State, id: &str, req: &RecordedRequest) -> Response<Body> {
     let live = futures::stream::unfold(live, |mut rx| async move {
         loop {
             match rx.recv().await {
+                Ok(item) if item.event == DROP_STREAM => return None,
                 Ok(item) => return Some((sse(item.event, item.id, &item.data), rx)),
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,

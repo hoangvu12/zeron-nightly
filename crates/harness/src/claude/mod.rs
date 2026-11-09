@@ -82,7 +82,7 @@ use catalog::{apply_ultrathink, to_effort};
 use fork_tail::ForkTail;
 use normalize::{Normalizer, Transcript};
 use wire::{
-    ControlRequestFrame, Frame, allow_response, control_error_line, control_response_line,
+    ControlRequestBody, ControlRequestFrame, Frame, allow_response, control_error_line, control_response_line,
     deny_response,
 };
 
@@ -216,7 +216,7 @@ fn mcp_servers_config_arg(
 
 /// The `--model` value: the 1M context window is selected via a model-id
 /// suffix (`sonnet[1m]`), exactly how the CLI itself does it.
-fn model_arg(request: &RunRequest) -> Option<String> {
+pub(crate) fn model_arg(request: &RunRequest) -> Option<String> {
     let model = request.model.as_ref()?;
     let one_m = request
         .model_options
@@ -279,7 +279,7 @@ fn access_permission_mode(request: &RunRequest) -> &'static str {
 
 /// The `--permission-mode` a run launches (or is switched) with: plan mode
 /// over its access mode.
-fn permission_mode(request: &RunRequest) -> &'static str {
+pub(crate) fn permission_mode(request: &RunRequest) -> &'static str {
     if request.plan {
         "plan"
     } else {
@@ -2066,74 +2066,99 @@ fn handle_control_request(
         let _ = stdin_tx.send(StdinMsg::Line(line));
         return;
     }
-    if req.request.tool_name != "AskUserQuestion" {
-        let body = req.request;
-        // Approving the plan leaves plan mode for the run's access mode,
-        // not the CLI's `default`.
-        let allow = {
-            let after_plan = access_permission_mode(config);
-            let exit_plan = body.tool_name == "ExitPlanMode";
-            move |input: Value| {
-                if exit_plan {
-                    wire::exit_plan_response(input, after_plan)
-                } else {
-                    allow_response(input)
-                }
-            }
-        };
-        let question = approval_question(
-            &body.tool_name,
-            body.display_name.as_deref(),
-            body.description.as_deref(),
-            &body.input,
-            access(config),
-        );
-        let Some(question) = question else {
-            let line = control_response_line(&req.request_id, allow(body.input));
-            let _ = stdin_tx.send(StdinMsg::Line(line));
-            return;
-        };
-        let answers = (request_input)(vec![question.clone()]);
-        let stdin_tx = stdin_tx.clone();
-        tokio::spawn(async move {
-            // A dropped sender or no answer is a refusal, like a no.
-            let answers = answers.await.unwrap_or_default();
-            let response = if approval::approved(&question, &answers) {
-                allow(body.input)
-            } else {
-                deny_response(APPROVAL_DENIED)
-            };
+    match decide_prompt(req.request, config) {
+        PromptDecision::Answer(response) => {
             let line = control_response_line(&req.request_id, response);
             let _ = stdin_tx.send(StdinMsg::Line(line));
-        });
-        return;
+        }
+        PromptDecision::Ask { questions, answer } => {
+            // The engine's input bridge is the SOLE emitter of
+            // `InputRequested`/`InputResolved`: it mints the request id,
+            // parks the resolver for `respond_input`, and surfaces both
+            // events. Emitting our own copy here (keyed by Claude's
+            // control-request id) folded a SECOND input part into the doc
+            // whose id no resolver knew — the QuestionPanel answered that
+            // unanswerable twin and the run never resumed.
+            let answers = (request_input)(questions);
+            let stdin_tx = stdin_tx.clone();
+            let request_id = req.request_id;
+            tokio::spawn(async move {
+                // A dropped sender (the caller went away) is no answer.
+                let answers = answers.await.unwrap_or_default();
+                let line = control_response_line(&request_id, answer(answers));
+                let _ = stdin_tx.send(StdinMsg::Line(line));
+            });
+        }
     }
-    let request_input = Arc::clone(request_input);
-    let stdin_tx = stdin_tx.clone();
-    tokio::spawn(async move {
-        let request_id = req.request_id;
-        let input = req.request.input;
+}
+
+/// How a `can_use_tool` prompt is answered, the same for every Claude Code
+/// driver (the local CLI's stdin, the cloud session's events).
+pub(crate) enum PromptDecision {
+    /// What the run's access mode already allows: the response to send now.
+    Answer(Value),
+    /// Ask the person these; `answer` turns their answers into the response.
+    /// No answers (closed, or the run stopped waiting) is a decline: the
+    /// agent reads that the prompt went unanswered and is unblocked.
+    Ask {
+        questions: Vec<UserInputQuestion>,
+        answer: Box<dyn FnOnce(Vec<UserInputAnswer>) -> Value + Send>,
+    },
+}
+
+/// Decide prompt `body` for a run in `config`. What the access mode covers
+/// is allowed at once; anything else asks first (see [`approval_question`])
+/// and only a yes allows it. `AskUserQuestion` asks its own questions and
+/// hands the answers back keyed by question text, as the tool expects.
+/// Approving `ExitPlanMode` leaves plan mode for the run's access mode, not
+/// the CLI's `default`.
+pub(crate) fn decide_prompt(body: ControlRequestBody, config: &RunRequest) -> PromptDecision {
+    if body.tool_name == "AskUserQuestion" {
+        let input = body.input;
         let questions = parse_questions(&input);
-        // The engine's input bridge is the SOLE emitter of
-        // `InputRequested`/`InputResolved`: it mints the request id, parks the
-        // resolver for `respond_input`, and surfaces both events. Emitting our
-        // own copy here (keyed by Claude's control-request id) folded a SECOND
-        // input part into the doc whose id no resolver knew — the QuestionPanel
-        // answered that unanswerable twin and the run never resumed.
-        //
-        // No answers — the person closed the questions, or a dropped sender
-        // (caller went away) — is a decline: deny the tool so the agent reads
-        // that it went unanswered, rather than an empty pick, and is
-        // unblocked rather than wedged.
-        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
-        let response = if answers.is_empty() {
-            serde_json::json!({ "behavior": "deny", "message": QUESTIONS_DISMISSED })
-        } else {
-            allow_response(updated_input_with_answers(&input, &questions, &answers))
+        let asked = questions.clone();
+        return PromptDecision::Ask {
+            questions,
+            answer: Box::new(move |answers| {
+                if answers.is_empty() {
+                    deny_response(QUESTIONS_DISMISSED)
+                } else {
+                    allow_response(updated_input_with_answers(&input, &asked, &answers))
+                }
+            }),
         };
-        let line = control_response_line(&request_id, response);
-        let _ = stdin_tx.send(StdinMsg::Line(line));
-    });
+    }
+    let after_plan = access_permission_mode(config);
+    let exit_plan = body.tool_name == "ExitPlanMode";
+    let allow = move |input: Value| {
+        if exit_plan {
+            wire::exit_plan_response(input, after_plan)
+        } else {
+            allow_response(input)
+        }
+    };
+    let question = approval_question(
+        &body.tool_name,
+        body.display_name.as_deref(),
+        body.description.as_deref(),
+        &body.input,
+        access(config),
+    );
+    let Some(question) = question else {
+        return PromptDecision::Answer(allow(body.input));
+    };
+    let input = body.input;
+    let asked = question.clone();
+    PromptDecision::Ask {
+        questions: vec![question],
+        answer: Box::new(move |answers| {
+            if approval::approved(&asked, &answers) {
+                allow(input)
+            } else {
+                deny_response(APPROVAL_DENIED)
+            }
+        }),
+    }
 }
 
 /// What a declined `AskUserQuestion` tells the agent.

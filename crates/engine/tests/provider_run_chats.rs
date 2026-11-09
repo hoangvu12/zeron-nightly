@@ -4,7 +4,9 @@
 //! (docs/design/provider-run-chats.md).
 //!
 //! Only externally visible results are asserted: what the fake server
-//! received, the chat row and document, and the transcript.
+//! received, the chat row and document, and the transcript. The controls
+//! (ticket #5) go through the same surface: Steer, Interrupt and
+//! RespondInput commands, and follow-ups whose settings changed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +19,8 @@ use zeron_harness::claude_cloud::credentials::ClaudeConfigDir;
 use zeron_harness::claude_cloud::{ClaudeCloudConfig, ClaudeCloudHarness};
 use zeron_proto::{HarnessId, ProviderSession, RunRequest, SandboxLevel, ToolCall};
 use zeron_provider_fake::{
-    ClaudeLogin, FakeAccount, FakeSessionServer, SeedSession, StubClaude, Turn, in_ms,
-    is_text_delta,
+    ClaudeLogin, FakeAccount, FakeSessionServer, PROMPTS_QUESTION, SeedSession, StubClaude, Turn,
+    in_ms, is_text_delta,
 };
 use zeron_rpc::methods;
 
@@ -49,12 +51,14 @@ async fn rig_with(enabled: bool, prepare: impl FnOnce(&ClaudeLogin, &StubClaude)
     prepare(&login, &stub);
     let registry = HarnessRegistry::new();
     if enabled {
-        registry.register(Arc::new(ClaudeCloudHarness::new(ClaudeCloudConfig {
-            base_url: fake.base_url().to_owned(),
-            login: ClaudeConfigDir::at(login.dir()),
-            claude_executable: Some(stub.path().to_owned()),
-        })
-        .expect("harness builds")));
+        registry.register(Arc::new(
+            ClaudeCloudHarness::new(ClaudeCloudConfig {
+                base_url: fake.base_url().to_owned(),
+                login: ClaudeConfigDir::at(login.dir()),
+                claude_executable: Some(stub.path().to_owned()),
+            })
+            .expect("harness builds"),
+        ));
     }
     let core = EngineCore::assemble(
         &tmp.path().join("data"),
@@ -81,6 +85,13 @@ async fn rig() -> Rig {
 impl Rig {
     /// The composer's `createChat` for "Anthropic cloud", no project.
     async fn create(&self) -> Result<serde_json::Value, zeron_rpc::RpcError> {
+        self.create_with_access("full-access").await
+    }
+
+    async fn create_with_access(
+        &self,
+        access: &str,
+    ) -> Result<serde_json::Value, zeron_rpc::RpcError> {
         self.client
             .call(
                 methods::MUTATE,
@@ -89,7 +100,7 @@ impl Rig {
                     "chatId": "client-picked-id",
                     "deviceId": self.core.device_id,
                     "config": {"harness": "claude-code-cloud", "model": null, "reasoning": null,
-                               "sandbox": "workspace-write"},
+                               "sandbox": "workspace-write", "access": access},
                     "prompt": FIRST_PROMPT,
                     "messageId": FIRST,
                 }),
@@ -115,33 +126,89 @@ impl Rig {
 
     /// A follow-up, as the composer queues one.
     fn send(&self, chat: &str, cwd: &str, message_id: &str, prompt: &str) {
+        self.send_with(chat, cwd, message_id, prompt, |_| {});
+    }
+
+    /// A follow-up whose composer settings `adjust` changes.
+    fn send_with(
+        &self,
+        chat: &str,
+        cwd: &str,
+        message_id: &str,
+        prompt: &str,
+        adjust: impl FnOnce(&mut RunRequest),
+    ) {
+        let mut request = RunRequest {
+            mcp: None,
+            prompt: prompt.into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: cwd.into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            access: Default::default(),
+            plan: false,
+            attachments: Vec::new(),
+            worktree: None,
+            resume: None,
+            env: Default::default(),
+            extra_mcp: Vec::new(),
+        };
+        adjust(&mut request);
         self.core
             .doc_host
             .queue_command(
                 chat,
                 SessionCommandPayload::Run {
-                    request: RunRequest {
-                        mcp: None,
-                        prompt: prompt.into(),
-                        harness: None,
-                        model: None,
-                        reasoning: None,
-                        model_options: Default::default(),
-                        cwd: cwd.into(),
-                        sandbox: SandboxLevel::WorkspaceWrite,
-                        auto_approve: false,
-                        access: Default::default(),
-                        plan: false,
-                        attachments: Vec::new(),
-                        worktree: None,
-                        resume: None,
-                        env: Default::default(),
-                        extra_mcp: Vec::new(),
-                    },
+                    request,
                     message_id: message_id.into(),
                 },
             )
             .expect("queue follow-up");
+    }
+
+    /// Every event payload sent to the session, in order.
+    fn posted_payloads(&self) -> Vec<serde_json::Value> {
+        self.posted_events()
+            .iter()
+            .flat_map(|r| r.body["events"].as_array().cloned().unwrap_or_default())
+            .map(|e| e["payload"].clone())
+            .collect()
+    }
+
+    /// The questions the chat waits on: (request id, questions).
+    fn open_input(&self, chat: &str) -> Option<(String, Vec<zeron_proto::UserInputQuestion>)> {
+        self.entries(chat)
+            .iter()
+            .flat_map(|e| e.parts.clone())
+            .find_map(|p| match p {
+                MessagePart::Input {
+                    request_id,
+                    questions,
+                    resolved: false,
+                    ..
+                } => Some((request_id, questions)),
+                _ => None,
+            })
+    }
+
+    /// Answer the chat's open question with `label`, as the question panel does.
+    fn answer(&self, chat: &str, request_id: &str, question_id: &str, label: &str) {
+        self.core
+            .doc_host
+            .queue_command(
+                chat,
+                SessionCommandPayload::RespondInput {
+                    request_id: request_id.into(),
+                    answers: vec![zeron_proto::UserInputAnswer {
+                        question_id: question_id.into(),
+                        labels: vec![label.into()],
+                    }],
+                },
+            )
+            .expect("queue answer");
     }
 
     fn posted_events(&self) -> Vec<zeron_provider_fake::RecordedRequest> {
@@ -423,4 +490,323 @@ async fn provider_run_chats_are_off_unless_enabled() {
     assert!(rig.fake.requests().is_empty());
     assert!(rig.core.workspace.read_chats().unwrap().is_empty());
     rig.core.shutdown().await;
+}
+
+// ---- Controls (ticket #5) ----
+
+const THIRD: &str = "3c9d7e2f-1a4b-4c8d-9e0f-a1b2c3d4e5f6";
+const FOURTH: &str = "7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918";
+
+fn position(entries: &[SessionMessageEntry], pred: impl Fn(&SessionMessageEntry) -> bool) -> usize {
+    entries.iter().position(pred).expect("entry present")
+}
+
+fn no_streaming(rig: &Rig, chat: &str) -> bool {
+    rig.entries(chat)
+        .iter()
+        .all(|e| e.status != Some(MessageStatus::Streaming))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_mid_turn_reaches_the_session_at_once() {
+    let rig = rig().await;
+    let (chat, cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    let (held, gate) = Turn::text_zulu().hold_after(is_text_delta);
+    rig.fake.queue_turn(held);
+    rig.fake.queue_turn(Turn::text_zulu());
+    rig.send(&chat, &cwd, SECOND, SECOND_PROMPT);
+    gate.reached().await;
+    // The person sees the reply streaming, then steers.
+    wait_for("the streamed text", || {
+        rig.assistants(&chat, MessageStatus::Streaming)
+            .iter()
+            .any(|e| text_of(e).contains("ZULU"))
+    })
+    .await;
+    rig.core
+        .doc_host
+        .queue_command(
+            &chat,
+            SessionCommandPayload::Steer {
+                prompt: "Say it once more.".into(),
+                message_id: Some(THIRD.into()),
+            },
+        )
+        .unwrap();
+    // It reaches the session while the turn it steers is still running.
+    wait_for("the steer sent", || {
+        rig.posted_payloads().iter().any(|p| p["uuid"] == THIRD)
+    })
+    .await;
+    assert!(rig.fake.turn_playing(&sid));
+    gate.release();
+
+    wait_for("the steered turn over", || {
+        no_streaming(&rig, &chat)
+            && rig
+                .entries(&chat)
+                .last()
+                .is_some_and(|e| e.role == MessageRole::Assistant && text_of(e).contains("ZULU"))
+            && rig.entries(&chat).iter().any(|e| e.id == THIRD)
+    })
+    .await;
+    let entries = rig.entries(&chat);
+    let second = position(&entries, |e| e.id == SECOND);
+    let third = position(&entries, |e| e.id == THIRD);
+    assert_eq!(text_of(&entries[third]), "Say it once more.");
+    assert!(second < third);
+    // The reply before the steer and the one after it, each its own entry.
+    let order: Vec<(String, MessageRole, Option<MessageStatus>, String)> = entries
+        .iter()
+        .map(|e| (e.id.clone(), e.role, e.status, text_of(e)))
+        .collect();
+    assert!(
+        entries[second + 1..third]
+            .iter()
+            .any(|e| e.role == MessageRole::Assistant && text_of(e).contains("ZULU")),
+        "{order:#?}"
+    );
+    assert_eq!(text_of(entries.last().unwrap()).trim(), "ZULU");
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_interrupts_the_sessions_turn_under_the_stop_commands_id() {
+    let rig = rig().await;
+    let (chat, cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    let (held, _gate) = Turn::text_zulu().hold_after(is_text_delta);
+    rig.fake.queue_turn(held);
+    rig.send(&chat, &cwd, SECOND, SECOND_PROMPT);
+    _gate.reached().await;
+    wait_for("the streamed text", || {
+        rig.assistants(&chat, MessageStatus::Streaming)
+            .iter()
+            .any(|e| text_of(e).contains("ZULU"))
+    })
+    .await;
+
+    let stop = rig
+        .core
+        .doc_host
+        .queue_command(&chat, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    wait_for("the stopped turn settled", || {
+        no_streaming(&rig, &chat) && !rig.assistants(&chat, MessageStatus::Aborted).is_empty()
+    })
+    .await;
+    let interrupts: Vec<_> = rig
+        .posted_payloads()
+        .into_iter()
+        .filter(|p| p["type"] == "control_request")
+        .collect();
+    assert_eq!(interrupts.len(), 1, "{interrupts:?}");
+    let uuid = zeron_proto::provider_cloud::event_uuid(&stop);
+    assert_eq!(interrupts[0]["uuid"], uuid.as_str());
+    assert_eq!(interrupts[0]["request"]["subtype"], "interrupt");
+    assert!(!rig.fake.turn_playing(&sid));
+    let last = rig.fake.stored_events(&sid).pop().unwrap();
+    assert_eq!(last.payload["terminal_reason"], "aborted_streaming");
+
+    // The chat goes on: the next message runs a new turn in the session.
+    rig.fake.queue_turn(Turn::text_zulu());
+    rig.send(&chat, &cwd, FOURTH, "Again, ZULU.");
+    wait_for("the next turn", || {
+        rig.entries(&chat).iter().any(|e| e.id == FOURTH)
+            && no_streaming(&rig, &chat)
+            && rig.entries(&chat).last().is_some_and(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+    })
+    .await;
+    assert!(rig.posted_payloads().iter().any(|p| p["uuid"] == FOURTH));
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_answers_from_the_chat_reach_the_session() {
+    let rig = rig().await;
+    rig.fake.queue_turn(Turn::prompts());
+    let created = rig
+        .create_with_access("supervised")
+        .await
+        .expect("createChat");
+    let chat = created["chatId"].as_str().unwrap().to_owned();
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    // The MCP tool's permission prompt, in the chat's question panel.
+    wait_for("the permission question", || {
+        rig.open_input(&chat).is_some()
+    })
+    .await;
+    let (request, questions) = rig.open_input(&chat).unwrap();
+    assert!(
+        questions[0].question.contains("Read Wiki Structure"),
+        "{questions:?}"
+    );
+    rig.answer(&chat, &request, &questions[0].id, "Yes");
+
+    // Then AskUserQuestion.
+    wait_for("the question", || {
+        rig.open_input(&chat)
+            .is_some_and(|(_, q)| q[0].question == PROMPTS_QUESTION)
+    })
+    .await;
+    let (request, questions) = rig.open_input(&chat).unwrap();
+    rig.answer(&chat, &request, &questions[0].id, "blue");
+
+    wait_for("the turn completed", || {
+        no_streaming(&rig, &chat) && !rig.assistants(&chat, MessageStatus::Complete).is_empty()
+    })
+    .await;
+    let prompts = rig.fake.prompts(&sid);
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(
+        rig.fake.answer(&sid, &prompts[0]).unwrap()["behavior"],
+        "allow"
+    );
+    assert_eq!(
+        rig.fake.answer(&sid, &prompts[1]).unwrap()["updatedInput"]["answers"][PROMPTS_QUESTION],
+        "blue"
+    );
+    let answers: Vec<_> = rig
+        .posted_payloads()
+        .into_iter()
+        .filter(|p| p["type"] == "control_response")
+        .collect();
+    assert_eq!(answers.len(), 2);
+    for (answer, request_id) in answers.iter().zip(&prompts) {
+        assert_eq!(
+            answer["uuid"],
+            zeron_proto::provider_cloud::answer_uuid(request_id).as_str()
+        );
+    }
+    assert!(rig.open_input(&chat).is_none());
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_and_plan_changes_go_ahead_of_the_message_as_control_requests() {
+    let rig = rig().await;
+    let (chat, cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    rig.fake.queue_turn(Turn::text_zulu());
+    rig.send_with(&chat, &cwd, SECOND, "Plan it", |r| {
+        r.model = Some("claude-sonnet-5".into());
+        r.plan = true;
+    });
+    wait_for("the reply", || {
+        rig.assistants(&chat, MessageStatus::Complete).len() == 2
+    })
+    .await;
+    let sent = rig.posted_payloads();
+    let kinds: Vec<(&str, &str)> = sent
+        .iter()
+        .map(|p| {
+            (
+                p["type"].as_str().unwrap(),
+                p["request"]["subtype"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("control_request", "set_model"),
+            ("control_request", "set_permission_mode"),
+            ("user", ""),
+        ]
+    );
+    assert_eq!(
+        sent[0]["uuid"],
+        zeron_proto::provider_cloud::control_uuid(SECOND, "set_model").as_str()
+    );
+    assert_eq!(sent[2]["uuid"], SECOND);
+    assert_eq!(
+        rig.fake.model(&sid),
+        Some(serde_json::json!("claude-sonnet-5"))
+    );
+    assert_eq!(rig.fake.permission_mode(&sid).as_deref(), Some("plan"));
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_typed_on_claude_ai_shows_as_the_persons() {
+    let rig = rig().await;
+    let (chat, _cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    rig.fake.queue_turn(Turn::text_zulu());
+    rig.fake.post_as_client(
+        &sid,
+        serde_json::json!({
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "session_id": "",
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": "Typed on claude.ai"},
+        }),
+    );
+    wait_for("the message and its reply", || {
+        rig.assistants(&chat, MessageStatus::Complete).len() == 2 && no_streaming(&rig, &chat)
+    })
+    .await;
+    let entries = rig.entries(&chat);
+    let typed = position(&entries, |e| {
+        e.role == MessageRole::User && text_of(e) == "Typed on claude.ai"
+    });
+    assert!(
+        entries[typed + 1..]
+            .iter()
+            .any(|e| e.role == MessageRole::Assistant && text_of(e).trim() == "ZULU")
+    );
+    // The first prompt (sent from here) shows once.
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.role == MessageRole::User && text_of(e) == FIRST_PROMPT)
+            .count(),
+        1
+    );
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutting_the_engine_down_mid_turn_leaves_the_session_working() {
+    let rig = rig().await;
+    let (chat, cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    let (held, gate) = Turn::text_zulu().hold_after(is_text_delta);
+    rig.fake.queue_turn(held);
+    rig.send(&chat, &cwd, SECOND, SECOND_PROMPT);
+    gate.reached().await;
+    wait_for("the streamed text", || {
+        rig.assistants(&chat, MessageStatus::Streaming)
+            .iter()
+            .any(|e| text_of(e).contains("ZULU"))
+    })
+    .await;
+
+    // Quitting Zeron is not a Stop: nothing goes to the session.
+    rig.core.shutdown().await;
+    let controls: Vec<_> = rig
+        .posted_payloads()
+        .into_iter()
+        .filter(|p| p["type"] == "control_request")
+        .collect();
+    assert!(controls.is_empty(), "{controls:?}");
+    // The session works on with every device off, and finishes the turn.
+    assert!(rig.fake.turn_playing(&sid));
+    gate.release();
+    wait_for("the turn finished at the provider", || {
+        !rig.fake.turn_playing(&sid)
+    })
+    .await;
+    let last = rig.fake.stored_events(&sid).pop().unwrap();
+    assert_eq!(last.payload["subtype"], "success");
 }

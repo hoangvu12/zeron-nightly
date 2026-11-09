@@ -82,9 +82,31 @@ pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     processes: std::sync::Arc<background::BackgroundWork>,
+    stop_command: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TurnControl {
+    /// Host: the Zeron command (a Stop) behind the next stop or interrupt,
+    /// noted before it is signalled. Drivers whose provider dedupes by event
+    /// id send the stop under it, so a re-executed Stop is one stop. A stop
+    /// with none noted is the host's own teardown (shutdown, sign-out, a
+    /// replaced runtime): a provider-run session is left working.
+    pub fn note_stop_command(&self, command_id: &str) {
+        *self
+            .stop_command
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command_id.to_owned());
+    }
+
+    /// Driver: the command behind the stop being handled, if the host noted
+    /// one ([`Self::note_stop_command`]); taken once.
+    pub fn take_stop_command(&self) -> Option<String> {
+        self.stop_command
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     /// Host: end the in-flight turn, keeping the runtime and its background work.
     pub fn stop_turn(&self) {
         self.stop.notify_one();

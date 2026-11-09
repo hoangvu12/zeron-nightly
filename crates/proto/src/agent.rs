@@ -1171,8 +1171,10 @@ pub enum AgentEvent {
     /// subagent mid-run (claude: a tagged user frame's text blocks). The
     /// engine writes it to the subagent doc as its own user entry, closing
     /// the streaming assistant segment above it — the subagent transcript
-    /// then reads like any steered chat. Never emitted untagged (the parent
-    /// chat's user messages come from doc commands, not the wire).
+    /// then reads like any steered chat. Untagged, it is a message someone
+    /// sent a provider-run chat's session from elsewhere (claude.ai, the
+    /// phone), and the engine writes it as the chat's own user entry; every
+    /// other chat's user messages come from doc commands, not the wire.
     #[serde(rename_all = "camelCase")]
     UserMessage {
         text: String,

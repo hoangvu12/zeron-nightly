@@ -8,13 +8,20 @@
 //!   events strictly after `from_sequence_num` then follows live, history,
 //!   list paging with `next_cursor`, archived status, and injected failures
 //!   ([`Fault`]). Every request is recorded, headers included.
+//! - The worker's side of the controls (ticket #5): a message posted while a
+//!   turn plays waits for it (the turn's `result` counts it in
+//!   `queued_turn_count`, then its own turn plays); `interrupt` aborts the
+//!   playing turn the way the real worker does and is harmless when repeated
+//!   or idle; `set_model` / `set_permission_mode` are acknowledged and
+//!   recorded; a worker `control_request` (a permission prompt or
+//!   AskUserQuestion) holds its tool's result until a client answers, and the
+//!   first answer to a `request_id` wins: later ones are stored and dropped.
 //! - [`StubClaude`]: a scriptable stand-in for the `claude` CLI's
 //!   `auth status --json` (the renewal hook).
 //! - [`ClaudeLogin`]: a CLI login folder (`.credentials.json` +
 //!   `.claude.json`) with fake values.
 //!
-//! Room to grow: first answer wins per `request_id`, more injected failures,
-//! list-driven discovery.
+//! Room to grow: more injected failures, list-driven discovery.
 
 mod login;
 mod server;
@@ -80,6 +87,17 @@ impl Turn {
         Self::from_jsonl(include_str!("../fixtures/turn-text-zulu.jsonl"))
     }
 
+    /// One turn with both kinds of prompt, from the spike's zeron-env session
+    /// (recorded 2026-11-09): a Bash call, then an MCP tool
+    /// (`mcp__deepwiki__read_wiki_structure`) that asks permission, a
+    /// WebFetch that fails, and AskUserQuestion ("Which color do you choose:
+    /// red or blue?", options `red` / `blue`), ending `result/success`. Each
+    /// prompted tool's result waits for the prompt's answer, and is rewritten
+    /// to say what the winning answer was.
+    pub fn prompts() -> Self {
+        Self::from_jsonl(include_str!("../fixtures/turn-prompts.jsonl"))
+    }
+
     /// Pause playback right after the first step `at` matches; the returned
     /// gate releases it.
     pub fn hold_after(mut self, at: impl Fn(&Step) -> bool) -> (Self, Gate) {
@@ -93,6 +111,11 @@ impl Turn {
         (self, gate)
     }
 }
+
+/// The question [`Turn::prompts`] asks with AskUserQuestion.
+pub const PROMPTS_QUESTION: &str = "Which color do you choose: red or blue?";
+/// The MCP tool [`Turn::prompts`] asks permission to call.
+pub const PROMPTS_MCP_TOOL: &str = "mcp__deepwiki__read_wiki_structure";
 
 /// Whether a step is a live text delta (for [`Turn::hold_after`]).
 pub fn is_text_delta(step: &Step) -> bool {

@@ -1642,6 +1642,16 @@ impl SessionsEngine {
         false
     }
 
+    /// Tell the chat's live run which Stop command the coming stop is
+    /// ([`zeron_harness::TurnControl::note_stop_command`]): a driver whose
+    /// provider dedupes by event id sends the stop under it, so the same
+    /// Stop executed twice stops once.
+    pub fn note_stop_command(&self, chat_id: &str, command_id: &str) {
+        if let Some(run) = lock(&self.inner.runs).get(chat_id) {
+            run.turn.note_stop_command(command_id);
+        }
+    }
+
     /// A Stop acting now cancels these messages, sent before it but still
     /// on their way: one that reaches dispatch after the runtime went down
     /// is dropped rather than run in a fresh runtime.
@@ -5030,9 +5040,10 @@ async fn drive_run(
                 match &event {
                     AgentEvent::SessionStarted { .. }
                         if resume_state.idle && !saw_session_started => {}
-                    AgentEvent::Steered { .. } => {
+                    AgentEvent::Steered { .. } | AgentEvent::UserMessage { .. } => {
                         idle_since = None;
-                        // The person wrote: their turn supersedes the wait.
+                        // The person wrote (here, or for a provider-run
+                        // chat anywhere else): their turn supersedes the wait.
                         wait = None;
                         inner.set_status(&chat_id, SessionStatus::Working, true);
                     }
@@ -5292,6 +5303,49 @@ async fn drive_run(
             {
                 let _ = doc.set_fork_history_session(&session);
             }
+            continue;
+        }
+
+        // A message sent to the session from somewhere else (a provider-run
+        // chat's claude.ai or phone): its own user entry, splitting the
+        // assistant entry the way a steer does. (Tagged, it is a subagent's
+        // and goes to that subagent's doc.)
+        if let AgentEvent::UserMessage { text } = &event {
+            inner.publish(&chat_id, &event);
+            self_continued_turn = false;
+            if let Err(err) = finish_segment(
+                doc_ref,
+                writer.take(),
+                &entry_id,
+                &device_id,
+                segment_started,
+                &folded,
+                MessageStatus::Complete,
+            ) {
+                tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
+            }
+            inner.note_message(&chat_id, &folded_text(&folded));
+            folded.clear();
+            dirty = false;
+            let entry = SessionMessageEntry {
+                id: new_id(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: text.clone(),
+                }],
+                created_at: now_ms(),
+                device_id: device_id.clone(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            };
+            if let Err(err) = doc_ref.push_message(&entry) {
+                tracing::warn!(chat = %chat_id, error = %err, "user message write failed");
+            }
+            entry_id = new_id();
+            segment_started = now_ms();
+            inner.set_status(&chat_id, SessionStatus::Working, true);
             continue;
         }
 

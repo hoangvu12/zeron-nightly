@@ -12,7 +12,7 @@
 //! A 401 has the CLI renew the login once, then the request is sent once
 //! more with the token read after it. A 401 to that retry turns the whole
 //! feature off on this device, saying why, and the chat's account shows
-//! "Sign in again". Every request's outcome for its account is published in
+//! "Sign in again". What each request found about its account is published in
 //! [`CloudClient::status`].
 
 use std::collections::VecDeque;
@@ -26,7 +26,7 @@ use tokio::sync::watch;
 
 use super::credentials::{ClaudeAccount, CredentialError, Credentials};
 use super::sse::SseDecoder;
-use crate::provider_cloud::{ProviderChatState, ProviderCloudStatus};
+use crate::provider_cloud::{AccountLogin, ProviderCloudStatus};
 
 /// Why the feature turns itself off after a 401 survives a renewal.
 pub const REJECTED_AFTER_RENEWAL: &str = "Claude cloud sessions turned off on this device: Claude refused the login even after the Claude CLI renewed it.";
@@ -46,7 +46,12 @@ pub enum ApiError {
     #[error(transparent)]
     Credentials(#[from] CredentialError),
     #[error("Claude cloud returned {status}: {message}")]
-    Status { status: u16, message: String },
+    Status {
+        status: u16,
+        message: String,
+        /// How long the server asked to wait (`Retry-After`), if it did.
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("Claude cloud could not be reached: {0}")]
     Transport(String),
     #[error("Claude cloud sent a response Zeron can't read: {0}")]
@@ -54,6 +59,38 @@ pub enum ApiError {
     /// The feature turned itself off on this device (why).
     #[error("{0}")]
     Disabled(String),
+}
+
+impl ApiError {
+    /// Whether trying again later can work: the server couldn't be reached,
+    /// was busy (429) or failed (5xx). Never a refusal or a login problem.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Status { status, .. } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
+
+    /// How long the server asked to wait before trying again.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// A `Retry-After` in seconds (the API's form; a date isn't read).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
 }
 
 /// A sequence number, which the API writes as a string.
@@ -178,39 +215,32 @@ impl CloudClient {
         self.status.borrow().disabled.clone()
     }
 
-    /// Record what `account`'s chats show now (`None`: its login works).
-    fn note(&self, account: &ClaudeAccount, state: Option<ProviderChatState>) {
+    /// Record what this device's login means for `account` now.
+    fn note(&self, account: &ClaudeAccount, login: AccountLogin) {
         self.status.send_if_modified(|status| {
-            if status.accounts.get(&account.account_uuid) == Some(&state) {
+            if status.accounts.get(&account.account_uuid) == Some(&login) {
                 return false;
             }
-            status.accounts.insert(account.account_uuid.clone(), state);
+            status.accounts.insert(account.account_uuid.clone(), login);
             true
         });
     }
 
-    fn note_failure(&self, account: &ClaudeAccount, error: &CredentialError) {
-        if let Some(state) = error.chat_state(&account.email) {
-            self.note(account, Some(state));
-        }
-    }
-
     /// Turn the feature off on this device, saying why.
     fn trip(&self, reason: &str) {
-        tracing::error!(target: "zeron_harness::claude_cloud", reason, "Claude cloud sessions turned off");
         self.status.send_if_modified(|status| {
             if status.disabled.is_some() {
                 return false;
             }
+            tracing::error!(target: "zeron_harness::claude_cloud", reason, "Claude cloud sessions turned off");
             status.disabled = Some(reason.to_owned());
             true
         });
     }
 
     /// Send one request acting for `account`, `build` adding its query and
-    /// body. The token is read for this request only and dropped once it's
-    /// sent; a 401 has the CLI renew the login, then the request goes once
-    /// more (see the module docs).
+    /// body (see the module docs). A credential failure is recorded for the
+    /// account on the way out.
     async fn execute(
         &self,
         method: reqwest::Method,
@@ -221,20 +251,34 @@ impl CloudClient {
         if let Some(reason) = self.disabled() {
             return Err(ApiError::Disabled(reason));
         }
-        let url = format!("{}{path}", self.base);
-        let mut token = match self.credentials.token_for(account).await {
-            Ok(token) => token,
-            Err(error) => {
-                self.note_failure(account, &error);
-                return Err(error.into());
-            }
-        };
-        let mut retry = false;
+        let sent = self
+            .send_authorized(&format!("{}{path}", self.base), method, account, build)
+            .await;
+        if let Err(ApiError::Credentials(error)) = &sent
+            && let Some(login) = error.account_login()
+        {
+            self.note(account, login);
+        }
+        sent
+    }
+
+    /// The token is read for this request only and dropped once it's sent;
+    /// a 401 has the CLI renew the login, then the request goes once more.
+    /// Only a successful response says the login works.
+    async fn send_authorized(
+        &self,
+        url: &str,
+        method: reqwest::Method,
+        account: &ClaudeAccount,
+        build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ApiError> {
+        let mut token = self.credentials.token_for(account).await?;
+        let mut retried = false;
         loop {
             let sent = token.fingerprint();
             let request = build(
                 self.http
-                    .request(method.clone(), &url)
+                    .request(method.clone(), url)
                     .header(reqwest::header::AUTHORIZATION, token.authorization())
                     .header("anthropic-version", API_VERSION),
             );
@@ -244,23 +288,17 @@ impl CloudClient {
                 .await
                 .map_err(|e| ApiError::Transport(without_url(&e)))?;
             if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-                self.note(account, None);
+                if response.status().is_success() {
+                    self.note(account, AccountLogin::Works);
+                }
                 return Ok(response);
             }
-            if retry {
-                let error = CredentialError::Rejected;
-                self.note_failure(account, &error);
+            if retried {
                 self.trip(REJECTED_AFTER_RENEWAL);
-                return Err(error.into());
+                return Err(CredentialError::Rejected.into());
             }
-            retry = true;
-            token = match self.credentials.renew_rejected(account, sent).await {
-                Ok(token) => token,
-                Err(error) => {
-                    self.note_failure(account, &error);
-                    return Err(error.into());
-                }
-            };
+            retried = true;
+            token = self.credentials.renew(account, sent).await?;
         }
     }
 
@@ -269,6 +307,7 @@ impl CloudClient {
         response: reqwest::Response,
     ) -> Result<T, ApiError> {
         let status = response.status();
+        let wait = retry_after(response.headers());
         let body = response
             .bytes()
             .await
@@ -277,6 +316,7 @@ impl CloudClient {
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 message: error_message(&body),
+                retry_after: wait,
             });
         }
         serde_json::from_slice(&body).map_err(|e| ApiError::Decode(e.to_string()))
@@ -412,10 +452,12 @@ impl CloudClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
+            let wait = retry_after(response.headers());
             let body = response.bytes().await.unwrap_or_default();
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 message: error_message(&body),
+                retry_after: wait,
             });
         }
         let bytes = response.bytes_stream().boxed();
