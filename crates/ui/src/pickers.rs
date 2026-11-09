@@ -9820,6 +9820,7 @@ mod tests {
     fn descriptor(id: HarnessId, name: &str) -> HarnessDescriptor {
         HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id,
             name: name.into(),
             installed: true,
@@ -11167,6 +11168,7 @@ mod tests {
     fn mock_harness_hidden_unless_alone() {
         let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id,
             name: name.into(),
             supports_steering: true,
@@ -11197,6 +11199,7 @@ mod tests {
     fn offered_harnesses_follow_the_catalog_enabled_flags() {
         let descriptor = |id: HarnessId, name: &str, enabled: Option<bool>| HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id,
             name: name.into(),
             supports_steering: true,
@@ -11253,6 +11256,7 @@ mod tests {
         let descriptor =
             |id: HarnessId, name: &str, enabled: Option<bool>, installed: bool| HarnessDescriptor {
                 icon: None,
+                remote_workspace: false,
                 id,
                 name: name.into(),
                 supports_steering: true,

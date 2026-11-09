@@ -772,6 +772,21 @@ pub(crate) struct RawChat {
     slept_at: Option<i64>,
     #[serde(default)]
     sleep_woke_at: Option<i64>,
+    /// LENIENT, as `config`: a provider session this build can't read costs
+    /// the field, never the row.
+    #[serde(default, deserialize_with = "lenient_provider_session")]
+    provider_session: Option<zeron_proto::ProviderSession>,
+}
+
+/// Decode a chat row's `providerSession` leniently (see `RawChat`).
+fn lenient_provider_session<'de, D>(
+    deserializer: D,
+) -> Result<Option<zeron_proto::ProviderSession>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -820,6 +835,7 @@ impl From<RawChat> for Chat {
                 at: dt(raw.slept_at.unwrap_or(until)),
                 woke_at: raw.sleep_woke_at.map(dt),
             }),
+            provider_session: raw.provider_session,
         }
     }
 }
@@ -959,6 +975,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             sleep: None,
+            provider_session: None,
         }
     }
 

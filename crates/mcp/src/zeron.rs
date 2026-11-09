@@ -1075,6 +1075,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             sleep: None,
+            provider_session: None,
         }
     }
 

@@ -8,6 +8,6 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v5"] }
 chrono.workspace = true
 pulldown-cmark.workspace = true

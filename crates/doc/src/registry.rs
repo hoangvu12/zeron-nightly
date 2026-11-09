@@ -1603,6 +1603,33 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Record the provider cloud session a provider-run chat is tied to: a
+    /// field-only update of `providerSession`, written once. `upsert_chat`
+    /// never writes the field, so a later whole-row write (ours or an older
+    /// engine's) leaves it alone. `false` when there is no such row, or when
+    /// the row already names a different session (it never changes).
+    pub fn set_chat_provider_session(
+        &mut self,
+        chat_id: &str,
+        session: &zeron_proto::ProviderSession,
+    ) -> Result<bool, DocError> {
+        let Some(chat) = self.chat(chat_id)? else {
+            return Ok(false);
+        };
+        match &chat.provider_session {
+            Some(existing) if existing == session => return Ok(true),
+            Some(_) => return Ok(false),
+            None => {}
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("providerSession", serde_json::to_value(session)?)]),
+        );
+        Ok(true)
+    }
+
     /// Host-side resume continuity. An empty `session_id` is the explicit
     /// "do not resume" tombstone written after a harness rejects a resume.
     pub fn set_chat_harness_session(

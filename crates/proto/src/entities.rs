@@ -341,6 +341,28 @@ pub struct Chat {
     /// peers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleep: Option<ChatSleep>,
+    /// The provider cloud session a provider-run chat is tied to (see
+    /// [`ProviderSession`]). Written once, when the chat is created; older
+    /// engines never write it. `None` for every other chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session: Option<ProviderSession>,
+}
+
+/// The provider cloud session a provider-run chat mirrors and sends to, and
+/// the provider account that owns it (docs/design/provider-run-chats.md §5).
+/// Kept on the chat row and copied into the chat document's metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSession {
+    /// Which provider cloud (`claude`, [`crate::provider_cloud::CLAUDE`]).
+    pub provider: String,
+    /// The provider's own session id (`cse_…` for Claude).
+    pub session_id: String,
+    /// The provider account that owns the session: a device hosts the chat
+    /// only with this account's login.
+    pub account_uuid: String,
+    pub account_email: String,
+    pub org_id: String,
 }
 
 /// A chat put to sleep ([`Chat::sleep`]).

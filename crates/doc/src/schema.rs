@@ -579,6 +579,34 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// A provider-run chat's provider session, copied from its chat row
+    /// (`providerSession`) so it survives a delete-and-revive of the row,
+    /// which drops fields older engines don't know. One atomic value.
+    pub fn provider_run_session(&self) -> Option<zeron_proto::ProviderSession> {
+        let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
+            self.doc.get_map("meta").get("providerSession")
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    /// Copy the chat row's `providerSession` into the metadata (no-op when
+    /// it is there already).
+    pub fn set_provider_run_session(
+        &self,
+        session: &zeron_proto::ProviderSession,
+    ) -> Result<(), DocError> {
+        if self.provider_run_session().as_ref() == Some(session) {
+            return Ok(());
+        }
+        self.doc
+            .get_map("meta")
+            .insert("providerSession", serde_json::to_string(session)?)?;
+        self.doc.commit();
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> Option<String> {
         match self.doc.get_map("meta").get("chatId") {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),

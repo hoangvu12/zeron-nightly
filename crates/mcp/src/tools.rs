@@ -1370,6 +1370,7 @@ impl Tools {
                 last_seen_at: None,
                 room_gen: None,
                 sleep: None,
+                provider_session: None,
             };
             let delivered = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")

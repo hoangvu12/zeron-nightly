@@ -804,6 +804,7 @@ impl Client {
             parent_chat_id: None,
             child_kind: None,
             sleep: None,
+            provider_session: None,
         };
         let id = chat.id.clone();
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;

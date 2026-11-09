@@ -565,6 +565,7 @@ impl HarnessesPage {
     pub(crate) fn show_provider_details(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         self.harnesses = Loadable::Ready(vec![HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id: harness,
             name: format!("{harness:?}"),
             supports_steering: false,
@@ -1656,6 +1657,7 @@ mod tests {
                 page.harnesses =
                     super::Loadable::Ready(vec![zeron_engine::registry::HarnessDescriptor {
                         icon: None,
+                        remote_workspace: false,
                         id: zeron_proto::HarnessId::Codex,
                         name: "Codex".into(),
                         supports_steering: false,
@@ -1697,6 +1699,7 @@ mod tests {
         });
         let descriptor = |id, name: &str| zeron_engine::registry::HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id,
             name: name.into(),
             supports_steering: false,
@@ -1797,6 +1800,7 @@ mod tests {
         });
         let descriptor = |id, name: &str| zeron_engine::registry::HarnessDescriptor {
             icon: None,
+            remote_workspace: false,
             id,
             name: name.into(),
             supports_steering: false,

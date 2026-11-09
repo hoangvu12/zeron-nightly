@@ -13678,6 +13678,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             sleep: None,
+            provider_session: None,
         };
         let state = cx.new(|_| {
             let mut state = AppState::new();

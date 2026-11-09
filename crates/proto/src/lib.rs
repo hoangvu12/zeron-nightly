@@ -19,6 +19,7 @@ pub mod plan_usage;
 pub mod preview;
 pub mod program_status;
 pub mod projectless;
+pub mod provider_cloud;
 pub mod redact;
 pub mod providers;
 pub mod run_errors;

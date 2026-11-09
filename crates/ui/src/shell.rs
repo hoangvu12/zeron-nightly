@@ -14686,6 +14686,7 @@ mod tests {
             parent_chat_id: None,
             child_kind: None,
             sleep: None,
+            provider_session: None,
         }
     }
 
@@ -17828,6 +17829,7 @@ mod exit_regressions {
                         last_seen_at: None,
                         room_gen: None,
                         sleep: None,
+                        provider_session: None,
                     }]);
                     state.select_space(Some("mine".into()), cx);
                 });
