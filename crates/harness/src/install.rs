@@ -54,7 +54,9 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
     match id {
         // A registry agent installs from its registry entry
         // (`crate::acp_registry`), never through a vendor script.
-        Mock | Registry(_) => vec![],
+        // Provider-run chats run at the provider; the CLI they read logins
+        // from is Claude Code's own install.
+        Mock | ClaudeCodeCloud | Registry(_) => vec![],
         Fx if windows => vec![],
         Fx => vec![Shell("curl -fsSL https://fx.sh/setup.sh | bash", "bash")],
         Antigravity => vec![Archive],
@@ -166,14 +168,14 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
         Muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
         Fx => "curl -fsSL https://fx.sh/setup.sh | bash",
-        Antigravity | Mock | Registry(_) => return None,
+        Antigravity | ClaudeCodeCloud | Mock | Registry(_) => return None,
     })
 }
 
 fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
     use HarnessId::*;
     match id {
-        ClaudeCode => ("claude", "~/.local/bin"),
+        ClaudeCode | ClaudeCodeCloud => ("claude", "~/.local/bin"),
         Codex => ("codex", "~/.local/bin or the npm global bin"),
         Cursor => ("cursor-agent", "~/.local/bin or ~/.cursor/bin"),
         Opencode => ("opencode", "~/.opencode/bin or the npm global bin"),
@@ -192,7 +194,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
 pub fn installed(id: HarnessId) -> bool {
     use HarnessId::*;
     match id {
-        ClaudeCode => crate::ClaudeHarness::new().installed(),
+        ClaudeCode | ClaudeCodeCloud => crate::ClaudeHarness::new().installed(),
         Codex => crate::CodexHarness::new().installed(),
         Cursor => crate::CursorHarness::new().installed(),
         Opencode => crate::OpencodeHarness::new().installed(),

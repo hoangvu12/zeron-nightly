@@ -54,9 +54,9 @@ mod background;
 pub mod catalog;
 mod discovery;
 mod fork_tail;
-mod normalize;
+pub(crate) mod normalize;
 pub mod refresh_lock;
-mod wire;
+pub(crate) mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,7 +104,7 @@ with tool search first.";
 /// is applied by [`ClaudeHarness::resolve_executable`], so availability and
 /// launches agree on one resolution order. Resolved per call — cheap after
 /// the snapshot is cached.
-fn resolve_claude_executable() -> Option<PathBuf> {
+pub(crate) fn resolve_claude_executable() -> Option<PathBuf> {
     let mut extra = Vec::new();
     if let Some(home) = crate::executable::home_dir() {
         extra.push(home.join(".claude").join("local").join("claude"));

@@ -347,6 +347,17 @@ pub trait Harness: Send + Sync {
     fn supports_plan(&self) -> bool {
         false
     }
+    /// Whether this harness's chats work in a remote workspace (a provider
+    /// cloud), so the host's files, diff, terminal, background processes,
+    /// forks and side chats don't apply to them.
+    fn remote_workspace(&self) -> bool {
+        false
+    }
+    /// The provider-cloud facet of a harness that runs provider-run chats
+    /// ([`provider_cloud::ProviderCloud`]); `None` for every other harness.
+    fn provider_cloud(&self) -> Option<&dyn provider_cloud::ProviderCloud> {
+        None
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
         Ok(None)
@@ -425,6 +436,7 @@ pub(crate) mod code_signature;
 pub use zeron_proto::redact;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub mod claude;
+pub mod claude_cloud;
 pub mod codex;
 pub mod agent_ports;
 pub mod cursor;
@@ -439,6 +451,7 @@ mod model_context;
 pub mod opencode;
 pub mod pi;
 pub mod process;
+pub mod provider_cloud;
 mod scratch;
 pub mod shell_env;
 pub(crate) mod skills;
@@ -737,6 +750,7 @@ pub(crate) fn crash_message(
 
 pub use acp::AcpHarness;
 pub use claude::ClaudeHarness;
+pub use claude_cloud::ClaudeCloudHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;

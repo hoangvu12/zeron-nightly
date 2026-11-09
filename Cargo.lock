@@ -13736,6 +13736,7 @@ dependencies = [
  "zeron-plugin-guard",
  "zeron-preview",
  "zeron-proto",
+ "zeron-provider-fake",
  "zeron-rpc",
  "zeron-sync",
  "zeron-term-link",
@@ -13775,6 +13776,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeron-doc",
  "zeron-proto",
+ "zeron-provider-fake",
  "zeron-voice-media",
  "zip",
 ]
@@ -13914,6 +13916,22 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "zeron-provider-fake"
+version = "0.2.139"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
