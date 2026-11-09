@@ -29,13 +29,17 @@
 //!   answers, the question closes here and nothing is sent (the provider
 //!   keeps the first answer anyway).
 //!
-//! A message someone sent the session from elsewhere (claude.ai, the phone)
-//! comes out as an untagged [`AgentEvent::UserMessage`]; echoes of what this
-//! device sent show nothing. A dropped stream is reconnected a bounded
-//! number of times with backoff ([`RECONNECTS`]), then the run ends errored.
+//! A person's message, from this device or elsewhere (claude.ai, the
+//! phone), rides its event's marker ([`AgentEvent::ProviderEvent`]), which
+//! the run sends after everything each stored event mapped to: the engine
+//! writes the message unless the transcript has it, and advances the
+//! chat's replay watermark. A fresh run picks up from the chat document
+//! ([`crate::provider_cloud::ProviderResume`]); a `result` stored before
+//! the run's opening message belongs to an earlier turn and doesn't end
+//! this one. A dropped stream is reconnected a bounded number of times with
+//! backoff ([`RECONNECTS`]), then the run ends errored.
 //!
-//! Not here (later tickets): the durable replay watermark (#8), takeover
-//! checks before each request (#12).
+//! Not here (later tickets): takeover checks before each request (#12).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,7 +52,7 @@ use tokio::sync::mpsc;
 use zeron_proto::provider_cloud::{answer_uuid, control_uuid, event_uuid};
 use zeron_proto::{AgentEvent, DoneStatus, ProviderSession, RunRequest};
 
-use super::api::{ApiError, CloudClient, StreamItem};
+use super::api::{ApiError, CloudClient, EventAck, StreamItem};
 use super::credentials::ClaudeAccount;
 use super::mirror::{Control, Mirror};
 use super::{Applied, Bindings};
@@ -207,9 +211,9 @@ async fn fail(events: &Events, message: String, shown: bool) {
 }
 
 impl RunSession {
-    async fn post(&mut self, payloads: Vec<Value>) -> Result<(), ApiError> {
+    async fn post(&mut self, payloads: Vec<Value>) -> Result<Vec<EventAck>, ApiError> {
         if payloads.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let uuids: Vec<String> = payloads
             .iter()
@@ -227,7 +231,7 @@ impl RunSession {
             self.bindings
                 .mark_delivered(&self.session.session_id, &uuid);
         }
-        Ok(())
+        Ok(acks)
     }
 
     /// Send `message` now (with any configuration it carries ahead of it),
@@ -263,6 +267,17 @@ impl RunSession {
         self.bindings
             .note_applied(&self.session.session_id, applied_by(&self.config));
         Ok(())
+    }
+
+    /// Send the run's opening (its settings controls, then its prompt).
+    /// Returns the prompt's sequence number: a turn end stored before it is
+    /// an earlier turn's (a replay, or turns run elsewhere meanwhile).
+    async fn open(&mut self, opening: Vec<Value>) -> Result<Option<u64>, ApiError> {
+        let prompt = opening.iter().any(|p| p["type"] == "user");
+        let acks = self.post(opening).await?;
+        Ok(prompt
+            .then(|| acks.last().and_then(|ack| ack.sequence_num))
+            .flatten())
     }
 
     /// Ask the person what prompt `request_id` asks, the way the local
@@ -330,10 +345,15 @@ impl RunSession {
         if let Some((uuid, prompt)) = self.opening.take() {
             opening.push(user_payload(&uuid, &session_id, &prompt));
         }
+        // A turn end stored before the opening prompt isn't this turn's.
+        let mut floor = 0u64;
         if !opening.is_empty() {
-            if let Err(error) = self.post(opening).await {
-                fail(&self.events, error.to_string(), true).await;
-                return;
+            match self.open(opening).await {
+                Ok(seq) => floor = seq.unwrap_or(0),
+                Err(error) => {
+                    fail(&self.events, error.to_string(), true).await;
+                    return;
+                }
             }
             self.bindings
                 .note_applied(&session_id, applied_by(&self.config));
@@ -358,6 +378,12 @@ impl RunSession {
                 _ = self.events.closed() => break 'main,
                 _ = interrupt.cancelled(), if stop_deadline.is_none() => {
                     let command = self.controls.turn.take_stop_command();
+                    // No Stop behind it (the engine shutting down, the run
+                    // replaced): the session goes on at the provider, and a
+                    // later run picks it back up.
+                    if command.is_none() {
+                        break 'main;
+                    }
                     if !turn_active {
                         let _ = send(&self.events, done(DoneStatus::Interrupted, None)).await;
                         break 'main;
@@ -445,22 +471,26 @@ impl RunSession {
                                     }
                                     responded.insert(request_id);
                                 }
-                                // A message someone sent from elsewhere
-                                // (claude.ai, the phone) shows as theirs;
-                                // this device's own were written already.
-                                Control::UserMessage { uuid, text } => {
-                                    if self.bindings.was_delivered(&session_id, &uuid) {
-                                        continue;
+                                // A person's message: its marker below
+                                // carries it to the transcript. One sent from
+                                // elsewhere (claude.ai, the phone) starts a
+                                // turn.
+                                Control::UserMessage { uuid, .. } => {
+                                    if !self.bindings.was_delivered(&session_id, &uuid) {
+                                        turn_active = true;
                                     }
-                                    if !send(&self.events, AgentEvent::UserMessage { text }).await {
-                                        break 'main;
-                                    }
-                                    turn_active = true;
                                 }
                             }
                         }
+                        // An earlier turn's end (stored before this run's
+                        // opening prompt) doesn't end this run's turn.
+                        let earlier = mapped.seq.is_some_and(|seq| seq < floor);
+                        let mark = mapped.mark;
                         for mut event in mapped.events {
                             let turn_over = matches!(event, AgentEvent::Done { .. });
+                            if turn_over && earlier {
+                                continue;
+                            }
                             if turn_over && stop_deadline.is_some()
                                 && let AgentEvent::Done { status, .. } = &mut event
                             {
@@ -475,8 +505,17 @@ impl RunSession {
                             turn_active = false;
                             reconnects = 0;
                             if stop_deadline.is_some() || !steering_open {
+                                // The turn's end is committed with its marker.
+                                if let Some(mark) = mark {
+                                    let _ = send(&self.events, mark).await;
+                                }
                                 break 'main;
                             }
+                        }
+                        if let Some(mark) = mark
+                            && !send(&self.events, mark).await
+                        {
+                            break 'main;
                         }
                     }
                     ended => {

@@ -35,7 +35,9 @@ use zeron_proto::{
     SteeringMode,
 };
 
-use crate::provider_cloud::{CreateSession, ProviderCloud, ProviderCloudError, RunBinding};
+use crate::provider_cloud::{
+    CreateSession, ProviderCloud, ProviderCloudError, ProviderResume, RunBinding,
+};
 use crate::{Harness, HarnessError, RunControls};
 use api::{ApiError, CloudClient};
 use credentials::{ClaudeConfigDir, CredentialError, Credentials};
@@ -89,9 +91,11 @@ struct SessionState {
     prompt_uuid: Option<String>,
     /// Event uuids this device already delivered to the session.
     delivered: HashSet<String>,
-    /// The highest stored sequence number mirrored so far. `None` after a
-    /// restart, until a durable watermark replaces this.
+    /// The highest stored sequence number mirrored so far in this process.
     last_seq: Option<u64>,
+    /// Where the next fresh run picks up, from the chat document (the
+    /// engine's [`RunBinding::resume`]); wins over `last_seq`.
+    resume: Option<ProviderResume>,
     /// What this device last put the session in, so a fresh run whose
     /// configuration differs sends the change.
     applied: Applied,
@@ -122,8 +126,8 @@ pub(crate) struct RunStart {
     pub prompt_uuid: String,
     /// Whether the session already has the opening prompt.
     pub delivered: bool,
-    /// Where the stream starts.
-    pub from_seq: u64,
+    /// Where the stream starts, and what the transcript already has.
+    pub resume: ProviderResume,
     pub applied: Applied,
 }
 
@@ -146,6 +150,7 @@ impl Bindings {
                 prompt_uuid: None,
                 delivered: HashSet::from([prompt_uuid]),
                 last_seq: Some(0),
+                resume: None,
                 applied: Applied {
                     model: Some(model),
                     ..Applied::default()
@@ -161,6 +166,7 @@ impl Bindings {
             Some(state) => {
                 state.session = binding.session;
                 state.prompt_uuid = binding.prompt_uuid;
+                state.resume = binding.resume;
             }
             None => {
                 sessions.insert(
@@ -170,6 +176,7 @@ impl Bindings {
                         prompt_uuid: binding.prompt_uuid,
                         delivered: HashSet::new(),
                         last_seq: None,
+                        resume: binding.resume,
                         applied: Applied::default(),
                     },
                 );
@@ -185,11 +192,20 @@ impl Bindings {
             .prompt_uuid
             .take()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let resume = state.resume.take().unwrap_or_else(|| {
+            let seq = state.last_seq.unwrap_or(0);
+            ProviderResume {
+                from_sequence_num: seq,
+                mirrored_through: seq,
+                watermark: seq,
+                open_prompts: Vec::new(),
+            }
+        });
         Some(RunStart {
             session: state.session.clone(),
             delivered: state.delivered.contains(&uuid),
             prompt_uuid: uuid,
-            from_seq: state.last_seq.unwrap_or(0),
+            resume,
             applied: state.applied.clone(),
         })
     }
@@ -428,7 +444,7 @@ impl Harness for ClaudeCloudHarness {
         let account = session::account_of(&start.session);
         let stream = self
             .client
-            .stream(&account, &session_id, start.from_seq)
+            .stream(&account, &session_id, start.resume.from_sequence_num)
             .await
             .map_err(harness_error)?;
         let (events, receiver) = mpsc::channel(256);
@@ -444,7 +460,7 @@ impl Harness for ClaudeCloudHarness {
                 session: start.session,
                 opening,
                 opening_controls,
-                mirror: mirror::Mirror::new(request.cwd.clone(), start.from_seq),
+                mirror: mirror::Mirror::new(request.cwd.clone(), start.resume),
                 config: request,
                 stream,
                 controls,

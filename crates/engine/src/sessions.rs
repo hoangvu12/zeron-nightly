@@ -4447,6 +4447,24 @@ async fn drive_run(
     // measures from here as well as from the park.
     let mut last_subagent_activity: Option<tokio::time::Instant> = None;
 
+    // A provider-run chat's mirror bookkeeping. A turn the last run left
+    // cut off is written over again into its own entry from the replay,
+    // which shows what it had (its open question included) until the
+    // replay catches up.
+    let mut provider = (harness_id == HarnessId::ClaudeCodeCloud)
+        .then(|| crate::provider_run::MirrorState::new(doc_ref));
+    if let Some(pm) = provider.as_mut()
+        && writer.is_none()
+        && let Some((cut_off, index)) = pm.rebuild_target(doc_ref)
+    {
+        entry_id = cut_off;
+        let mut rebuild = SegmentWriter::rebuild(doc_ref, index);
+        if pm.catch_up.is_none() {
+            rebuild.release();
+        }
+        writer = Some(rebuild);
+    }
+
     let mut final_completed_turn = None;
     let mut final_outcome = None;
     let final_status = loop {
@@ -4660,6 +4678,22 @@ async fn drive_run(
                             tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
                         }
                         dirty = false;
+                        // A provider-run chat's entry that just started showing
+                        // streamed output: a restart before its turn ends writes
+                        // it over again from the replay, never beside it.
+                        if let Some(pm) = provider.as_mut()
+                            && writer.is_some()
+                            && pm.turn_entry.as_deref() != Some(entry_id.as_str())
+                        {
+                            let turn = zeron_doc::ProviderTurn {
+                                entry_id: entry_id.clone(),
+                                from_seq: pm.segment_floor,
+                            };
+                            match doc_ref.set_provider_turn(Some(&turn)) {
+                                Ok(()) => pm.turn_entry = Some(entry_id.clone()),
+                                Err(err) => tracing::warn!(chat = %chat_id, error = %err, "provider turn write failed"),
+                            }
+                        }
                     }
                     for sink in subagents.values_mut() {
                         sink.flush(&device_id);
@@ -4746,6 +4780,116 @@ async fn drive_run(
             };
             event
         };
+
+        // ── provider-run mirror markers ────────────────────────────────
+        // A provider-run chat's stored provider event is through (see
+        // `AgentEvent::ProviderEvent`): stamp the entry it wrote, write the
+        // person's message it is (unless the transcript has it), commit, then
+        // advance the replay watermark and sweep duplicates. Before the
+        // parked gate: a turn's end arrives as a marker after its Done.
+        if let AgentEvent::ProviderEvent {
+            uuid,
+            sequence_num,
+            message,
+            turn_end,
+            prompt,
+        } = event
+        {
+            let Some(pm) = provider.as_mut() else {
+                continue;
+            };
+            let seq = sequence_num;
+            if let Some(text) = message {
+                match doc_ref.stamp_provider_echo(&uuid, seq) {
+                    // This device's own send (or a replay): written already.
+                    Ok(true) => {}
+                    // Someone's message from elsewhere: through the loop as
+                    // a turn boundary, written under its uuid, then this
+                    // marker again.
+                    Ok(false) => {
+                        pm.pending_user = Some((uuid.clone(), seq));
+                        prepared_events.push_front(AgentEvent::ProviderEvent {
+                            uuid,
+                            sequence_num: seq,
+                            message: None,
+                            turn_end,
+                            prompt,
+                        });
+                        prepared_events.push_front(AgentEvent::UserMessage { text });
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(chat = %chat_id, error = %err, "provider echo lookup failed")
+                    }
+                }
+            }
+            // The replay caught up with what the cut-off entry showed.
+            if pm.catch_up.is_some_and(|through| seq >= through) {
+                pm.catch_up = None;
+                if let Some(w) = writer.as_mut() {
+                    w.release();
+                }
+                dirty = true;
+            }
+            // What the event wrote is committed before the watermark moves.
+            if dirty && !writer.as_ref().is_some_and(SegmentWriter::is_held) {
+                if let Err(err) = sync_segment(
+                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                ) {
+                    tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                }
+                dirty = false;
+            }
+            if !folded.is_empty()
+                && pm.stamped.as_deref() != Some(entry_id.as_str())
+                && let Some(w) = writer.as_ref()
+            {
+                match w.set_provider(&uuid, seq) {
+                    Ok(()) => pm.stamped = Some(entry_id.clone()),
+                    Err(err) => tracing::warn!(chat = %chat_id, error = %err, "provider stamp failed"),
+                }
+            }
+            // A turn's end the run didn't pass on (a turn before this run's
+            // message): its entry closes here.
+            if turn_end && (!folded.is_empty() || writer.is_some()) {
+                if let Err(err) = finish_segment(
+                    doc_ref,
+                    writer.take(),
+                    &entry_id,
+                    &device_id,
+                    segment_started,
+                    &folded,
+                    MessageStatus::Complete,
+                ) {
+                    tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
+                }
+                inner.note_message(&chat_id, &folded_text(&folded));
+                folded.clear();
+                dirty = false;
+                entry_id = new_id();
+                segment_started = now_ms();
+            }
+            let turn = if turn_end {
+                pm.turn_entry = None;
+                zeron_doc::TurnUpdate::Close
+            } else if writer.is_some() && pm.turn_entry.as_deref() != Some(entry_id.as_str()) {
+                pm.turn_entry = Some(entry_id.clone());
+                zeron_doc::TurnUpdate::Open(zeron_doc::ProviderTurn {
+                    entry_id: entry_id.clone(),
+                    from_seq: pm.segment_floor,
+                })
+            } else {
+                zeron_doc::TurnUpdate::Keep
+            };
+            match doc_ref.commit_provider_event(seq, turn, prompt.as_ref()) {
+                Ok(()) => pm.watermark = pm.watermark.max(seq),
+                Err(err) => tracing::warn!(chat = %chat_id, error = %err, "replay watermark write failed"),
+            }
+            if let Err(err) = doc_ref.sweep_provider_duplicates() {
+                tracing::warn!(chat = %chat_id, error = %err, "duplicate sweep failed");
+            }
+            continue;
+        }
 
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
@@ -5327,8 +5471,12 @@ async fn drive_run(
             inner.note_message(&chat_id, &folded_text(&folded));
             folded.clear();
             dirty = false;
+            // A provider-run chat's: written under its provider event.
+            let mirrored = provider.as_mut().and_then(|pm| pm.pending_user.take());
             let entry = SessionMessageEntry {
-                id: new_id(),
+                id: mirrored
+                    .as_ref()
+                    .map_or_else(new_id, |(uuid, _)| uuid.clone()),
                 role: MessageRole::User,
                 parts: vec![MessagePart::Text {
                     id: "t0".into(),
@@ -5340,7 +5488,11 @@ async fn drive_run(
                 continuation_of: None,
                 duration_ms: None,
             };
-            if let Err(err) = doc_ref.push_message(&entry) {
+            let written = match &mirrored {
+                Some((uuid, seq)) => doc_ref.push_provider_message(&entry, uuid, *seq),
+                None => doc_ref.push_message(&entry),
+            };
+            if let Err(err) = written {
                 tracing::warn!(chat = %chat_id, error = %err, "user message write failed");
             }
             entry_id = new_id();
@@ -5398,6 +5550,14 @@ async fn drive_run(
         // Defensive rule from zeron: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
+        // A provider-run chat's new segment: nothing at or before the
+        // watermark wrote it.
+        if let Some(pm) = provider.as_mut()
+            && folded.is_empty()
+            && writer.is_none()
+        {
+            pm.segment_floor = pm.watermark + 1;
+        }
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
             // R2 sidecar PARKED (2026-08-10, product call): the fold's

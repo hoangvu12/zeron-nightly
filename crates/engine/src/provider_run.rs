@@ -22,9 +22,10 @@
 
 use std::collections::HashMap;
 
-use zeron_doc::SessionCommandPayload;
+use zeron_doc::{SessionCommandPayload, SessionDoc};
 use zeron_harness::provider_cloud::{
-    CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus, RunBinding,
+    CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus, ProviderResume,
+    RunBinding,
 };
 use zeron_proto::{Chat, ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
 
@@ -213,11 +214,42 @@ pub(crate) fn bind_run(
     let cloud = resolved
         .provider_cloud()
         .ok_or_else(|| refused("Claude cloud sessions are off on this device."))?;
+    let resume = doc_host
+        .open(chat_id)
+        .map(|handle| resume_point(handle.doc()))
+        .map_err(|e| refused(format!("This chat's transcript couldn't be read: {e}")))?;
     cloud.bind_run(RunBinding {
         session,
         prompt_uuid: message_id.map(zeron_proto::provider_cloud::event_uuid),
+        resume: Some(resume),
     });
     Ok(())
+}
+
+/// Where a fresh run of a provider-run chat picks up, from its document
+/// (docs/design/provider-run-chats.md §5, "Replay watermark"): replay from
+/// the lower of the watermark and just before the oldest prompt still open,
+/// and write over again a turn that was cut off mid-way (from just before
+/// the first event that can have written to its entry).
+pub(crate) fn resume_point(doc: &SessionDoc) -> ProviderResume {
+    let watermark = doc.provider_watermark();
+    let mirrored_through = doc
+        .provider_turn()
+        .filter(|turn| doc.entry_index(&turn.entry_id).is_some())
+        .map_or(watermark, |turn| {
+            turn.from_seq.saturating_sub(1).min(watermark)
+        });
+    let open = doc.provider_open_prompts();
+    let from_sequence_num = open
+        .values()
+        .map(|seq| seq.saturating_sub(1))
+        .fold(mirrored_through, u64::min);
+    ProviderResume {
+        from_sequence_num,
+        mirrored_through,
+        watermark,
+        open_prompts: open.into_keys().collect(),
+    }
 }
 
 /// Record the harness's sign-in states in the chats this device hosts (see
@@ -291,5 +323,52 @@ fn record_states(
                 tracing::warn!(chat = %chat.id, %error, "couldn't record the chat's sign-in state")
             }
         }
+    }
+}
+
+/// A provider-run chat's run in the engine's event loop: what the mirror
+/// bookkeeping (docs/design/provider-run-chats.md §5) needs between events.
+/// The loop itself applies each [`zeron_proto::AgentEvent::ProviderEvent`]
+/// (see `drive_run`).
+#[derive(Debug, Default)]
+pub(crate) struct MirrorState {
+    /// The replay watermark, as last committed.
+    pub watermark: u64,
+    /// The first provider event that can have written the current segment.
+    pub segment_floor: u64,
+    /// The entry the document's `providerTurn` names.
+    pub turn_entry: Option<String>,
+    /// The entry already stamped with the provider event it starts from.
+    pub stamped: Option<String>,
+    /// A cut-off entry being written over again holds its writes until a
+    /// marker at or past this sequence number (what it showed is replayed).
+    pub catch_up: Option<u64>,
+    /// A person's message on its way to the transcript: (uuid, seq).
+    pub pending_user: Option<(String, u64)>,
+}
+
+impl MirrorState {
+    pub fn new(doc: &SessionDoc) -> Self {
+        let watermark = doc.provider_watermark();
+        Self {
+            watermark,
+            segment_floor: watermark + 1,
+            turn_entry: doc.provider_turn().map(|turn| turn.entry_id),
+            ..Self::default()
+        }
+    }
+
+    /// The entry of a turn that was cut off mid-way (a restart, a dropped
+    /// run, another host's), to be written over again from the replay:
+    /// (entry id, position). [`resume_point`] replays from just before its
+    /// first event.
+    pub fn rebuild_target(&mut self, doc: &SessionDoc) -> Option<(String, usize)> {
+        let turn = doc.provider_turn()?;
+        let index = doc.entry_index(&turn.entry_id)?;
+        self.segment_floor = turn.from_seq;
+        self.stamped = None;
+        self.turn_entry = Some(turn.entry_id.clone());
+        self.catch_up = (turn.from_seq <= self.watermark).then_some(self.watermark);
+        Some((turn.entry_id, index))
     }
 }

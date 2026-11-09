@@ -73,6 +73,30 @@ pub struct RunBinding {
     pub session: ProviderSession,
     /// The uuid the run's opening prompt is sent under; `None` mints one.
     pub prompt_uuid: Option<String>,
+    /// Where the run's mirror picks up, from the chat document; `None`
+    /// carries on from what this process last mirrored.
+    pub resume: Option<ProviderResume>,
+}
+
+/// Where a fresh run's mirror picks up a session it (or another device)
+/// mirrored before (docs/design/provider-run-chats.md §5, "Replay
+/// watermark"), read from the chat document before connecting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderResume {
+    /// The stream replays strictly after this: the lower of
+    /// `mirrored_through` and one less than the oldest open prompt's
+    /// `sequence_num`, so a prompt still waiting is always asked again.
+    pub from_sequence_num: u64,
+    /// Events up to here are in the transcript already: of those, only
+    /// prompts and answers are acted on. Everything after is mirrored (a
+    /// turn cut off mid-way is written over again from its start).
+    pub mirrored_through: u64,
+    /// The replay watermark: the highest `sequence_num` committed.
+    pub watermark: u64,
+    /// Prompts the transcript shows asked and unanswered (provider request
+    /// ids): of the replayed prompts up to the watermark, only these are
+    /// asked again.
+    pub open_prompts: Vec<String>,
 }
 
 #[async_trait]

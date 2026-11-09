@@ -11,6 +11,7 @@
 pub mod commands;
 pub mod constants;
 pub mod parts;
+pub mod provider_mirror;
 pub mod queue;
 pub mod rebuild;
 pub mod registry;
@@ -22,6 +23,7 @@ pub mod workspace;
 pub use commands::*;
 pub use constants::*;
 pub use parts::*;
+pub use provider_mirror::*;
 pub use queue::*;
 pub use rebuild::*;
 pub use registry::*;

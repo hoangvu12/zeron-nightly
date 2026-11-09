@@ -9,11 +9,22 @@
 //!   stored message instead.
 //! - The session stores every person's message as a `user` event from a
 //!   client. The mirror hands those to the run ([`Control::UserMessage`]),
-//!   which drops the ones this device sent (it wrote them already) and shows
-//!   the rest: messages typed on claude.ai or the phone. The worker's own
+//!   and its marker carries the text: the engine writes it unless the
+//!   transcript has it already (this device's own send, found by its id
+//!   even after a restart or a send whose answer was lost), so messages
+//!   typed on claude.ai or the phone show as the person's. The worker's own
 //!   plain `user` events (`[Request interrupted by user]`) show nothing.
 //! - A stored event already seen (a reconnect replaying from an earlier
 //!   number) shows nothing again.
+//! - A fresh run picks up where the chat document says the transcript got
+//!   to ([`ProviderResume`]): replayed events it already has show nothing,
+//!   and of their prompts only those still open are asked again (a
+//!   replayed `result` never ends the new run's turn).
+//! - Each stored event past that is followed by its marker
+//!   ([`AgentEvent::ProviderEvent`]): its uuid and sequence number, the
+//!   person's message it is, whether it ended a turn, and the prompt it
+//!   asked or answered. The engine stamps
+//!   entries with it and advances the replay watermark.
 //! - `SessionStarted` names this harness and the chat's pseudo `cwd`, and no
 //!   session id: a provider-run chat never records a local resume id
 //!   (older engines would resume it as a local Claude session).
@@ -24,12 +35,13 @@
 //!   message sent during the turn runs next (a steer the worker didn't fold
 //!   in), and that turn's `result` ends it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, HarnessId};
+use zeron_proto::{AgentEvent, HarnessId, ProviderPrompt};
 
 use super::api::StreamItem;
+use crate::provider_cloud::ProviderResume;
 use crate::claude::normalize::Normalizer;
 use crate::claude::wire::{ControlRequestBody, ControlRequestFrame, parse_frame};
 
@@ -54,6 +66,12 @@ pub(crate) enum Control {
 pub(crate) struct Mapped {
     pub events: Vec<AgentEvent>,
     pub controls: Vec<Control>,
+    /// The stored event's sequence number, if it was one.
+    pub seq: Option<u64>,
+    /// The stored event's [`AgentEvent::ProviderEvent`], sent after
+    /// everything above (`None` for live events, and for replayed ones the
+    /// transcript already has).
+    pub mark: Option<AgentEvent>,
 }
 
 /// Which kinds of delta streamed for one API message.
@@ -69,18 +87,27 @@ pub(crate) struct Mirror {
     streamed: HashMap<String, Streamed>,
     /// The highest stored sequence number mapped (0: none yet).
     last_seq: u64,
+    /// Stored events up to here are in the transcript already.
+    mirrored_through: u64,
+    /// The chat's replay watermark when the run started.
+    watermark: u64,
+    /// Prompts the transcript shows open (provider request ids).
+    open_prompts: HashSet<String>,
     /// The turn is being interrupted: its end is an interrupted one.
     interrupted: bool,
 }
 
 impl Mirror {
-    /// A mirror for a stream that starts after `last_seq`.
-    pub fn new(cwd: String, last_seq: u64) -> Self {
+    /// A mirror for a stream that starts after `resume.from_sequence_num`.
+    pub fn new(cwd: String, resume: ProviderResume) -> Self {
         Self {
             norm: Normalizer::new(),
             cwd,
             streamed: HashMap::new(),
-            last_seq,
+            last_seq: resume.from_sequence_num,
+            mirrored_through: resume.mirrored_through,
+            watermark: resume.watermark,
+            open_prompts: resume.open_prompts.into_iter().collect(),
             interrupted: false,
         }
     }
@@ -101,7 +128,7 @@ impl Mirror {
     }
 
     pub fn map(&mut self, item: StreamItem) -> Mapped {
-        let (payload, source) = match item {
+        let (payload, source, seq, event_id) = match item {
             StreamItem::Stored(stored) => {
                 if let Some(seq) = stored.sequence_num {
                     if seq <= self.last_seq {
@@ -109,23 +136,93 @@ impl Mirror {
                     }
                     self.last_seq = seq;
                 }
-                (stored.payload, stored.source)
+                (
+                    stored.payload,
+                    stored.source,
+                    stored.sequence_num,
+                    stored.event_id,
+                )
             }
-            StreamItem::Ephemeral(payload) => (payload, None),
+            StreamItem::Ephemeral(payload) => (payload, None, None, None),
             StreamItem::Other { .. } => return Mapped::default(),
         };
         let control =
             control(&payload).or_else(|| user_message(&payload, source.as_deref()).map(Some));
+        // A replayed prompt the transcript shows answered stays answered.
+        let control = control.map(|control| match control {
+            Some(Control::Prompt { request_id, .. })
+                if seq.is_some_and(|seq| seq <= self.watermark)
+                    && !self.open_prompts.contains(&request_id) =>
+            {
+                None
+            }
+            other => other,
+        });
+        let prompt = match &control {
+            Some(Some(Control::Prompt { request_id, .. })) => Some(ProviderPrompt::Asked {
+                request_id: request_id.clone(),
+            }),
+            Some(Some(Control::Responded { request_id })) => Some(ProviderPrompt::Answered {
+                request_id: request_id.clone(),
+            }),
+            _ => None,
+        };
+        // Already in the transcript: only its prompt traffic counts.
+        if seq.is_some_and(|seq| seq <= self.mirrored_through) {
+            return Mapped {
+                controls: control
+                    .flatten()
+                    .filter(|c| !matches!(c, Control::UserMessage { .. }))
+                    .into_iter()
+                    .collect(),
+                seq,
+                ..Mapped::default()
+            };
+        }
+        let turn_end = payload.get("type").and_then(Value::as_str) == Some("result")
+            && !self.continues(&payload);
+        let mark = seq.map(|sequence_num| AgentEvent::ProviderEvent {
+            uuid: event_id
+                .filter(|id| !id.is_empty())
+                .or_else(|| {
+                    payload
+                        .get("uuid")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default(),
+            sequence_num,
+            message: match &control {
+                Some(Some(Control::UserMessage { text, .. })) => Some(text.clone()),
+                _ => None,
+            },
+            turn_end,
+            prompt,
+        });
         match control {
             Some(control) => Mapped {
                 events: Vec::new(),
                 controls: control.into_iter().collect(),
+                seq,
+                mark,
             },
             None => Mapped {
                 events: self.map_payload(payload),
                 controls: Vec::new(),
+                seq,
+                mark,
             },
         }
+    }
+
+    /// A `result` that isn't the turn's end: more of the session's turns
+    /// are queued behind it.
+    fn continues(&self, payload: &Value) -> bool {
+        !self.interrupted
+            && payload
+                .get("queued_turn_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0)
     }
 
     fn map_payload(&mut self, payload: Value) -> Vec<AgentEvent> {
@@ -133,12 +230,7 @@ impl Mirror {
         let main_feed = payload.get("parent_tool_use_id").is_none_or(Value::is_null);
         let mut out = Vec::new();
         // More of the session's turns are queued: this result is a boundary.
-        let continues = kind == "result"
-            && !self.interrupted
-            && payload
-                .get("queued_turn_count")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| n > 0);
+        let continues = kind == "result" && self.continues(&payload);
         match kind {
             // A plain `user` event that isn't a person's message (those are
             // [`Control::UserMessage`]s): the worker's own markers.
