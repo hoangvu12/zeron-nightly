@@ -2331,6 +2331,9 @@ pub struct Shell {
     _provider_discovery: Task<()>,
     /// The window the shell renders in, once it has.
     window: Option<gpui::AnyWindowHandle>,
+    /// The switched-away Claude account last offered (see
+    /// [`Shell::note_account_offer`]).
+    account_offer_shown: Option<String>,
     /// Whether a window is on screen ([`platform_window_shown`]; tests
     /// stand in for the platform).
     window_shown: fn(&Window) -> bool,
@@ -2873,6 +2876,7 @@ impl Shell {
             harness_update_banner_task: None,
             _provider_discovery: provider_discovery,
             window: None,
+            account_offer_shown: None,
             window_shown: if cfg!(test) {
                 |_| true
             } else {
@@ -20149,6 +20153,7 @@ async fn provider_discovery_loop(this: gpui::WeakEntity<Shell>, cx: &mut gpui::A
                 });
             if let Some(reply) = reply {
                 let applied = this.update(cx, |shell, cx| {
+                    shell.note_account_offer(reply.account_offer.as_deref(), cx);
                     shell.state.update(cx, |state, cx| {
                         if state.apply_provider_overlay(reply.sessions) {
                             cx.notify();
@@ -20182,6 +20187,28 @@ impl Shell {
             .update_window(self.window?, |_, window, _| shown(window))
             .unwrap_or(false);
         on_screen.then_some(engine)
+    }
+}
+
+impl Shell {
+    /// The engine says the device's Claude login was switched away from
+    /// `offer`'s account: say once that it can be added back, so its cloud
+    /// chats keep working here (the settings card holds the prompt).
+    fn note_account_offer(&mut self, offer: Option<&str>, cx: &mut Context<Self>) {
+        let Some(email) = offer else {
+            self.account_offer_shown = None;
+            return;
+        };
+        if self.account_offer_shown.as_deref() == Some(email) {
+            return;
+        }
+        self.account_offer_shown = Some(email.to_owned());
+        crate::toast::info(
+            cx,
+            format!(
+                "This device's Claude login changed. To keep {email}'s cloud chats working here, add it in Settings → General → Claude cloud sessions."
+            ),
+        );
     }
 }
 
