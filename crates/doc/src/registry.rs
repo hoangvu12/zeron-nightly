@@ -1396,21 +1396,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Move the chat to `device_id` with an update of `deviceId` alone (a
-    /// provider-run chat's rows are never rewritten whole). `false` when
-    /// there is no such row.
-    pub fn set_chat_device(&mut self, chat_id: &str, device_id: &str) -> Result<bool, DocError> {
-        if !self.row_exists(KIND_CHATS, chat_id) {
-            return Ok(false);
-        }
-        self.write(
-            KIND_CHATS,
-            chat_id,
-            OpKind::Update,
-            fields([("deviceId", json!(device_id))]),
-        );
-        Ok(true)
-    }
 
     /// Backdate a chat's activity timestamps with an update of those fields
     /// alone. `false` when there is no such row.
