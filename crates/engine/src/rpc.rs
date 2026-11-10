@@ -3221,6 +3221,18 @@ impl RpcService for EngineRpc {
                 let status = crate::claude_cloud_sessions::status(&self.registry, next).await;
                 RpcReply::value(&status)
             }
+            methods::SYNC_PROVIDER_SESSIONS => {
+                let reply = match self.registry.claude_cloud() {
+                    Some(store) => {
+                        store
+                            .discovery()
+                            .refresh(&self.sessions, &self.doc_host)
+                            .await
+                    }
+                    None => Default::default(),
+                };
+                RpcReply::value(&reply)
+            }
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
                 self.registry

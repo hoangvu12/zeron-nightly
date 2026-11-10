@@ -433,7 +433,16 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(zeron_sync::StaticUrl(url.to_string())), None, None);
+        self.connect_registry_via(Arc::new(zeron_sync::StaticUrl(url.to_string())));
+    }
+
+    /// Test seam: join a registry room whose address `url` gives on each
+    /// dial, as [`Self::connect_registry_url`]. A provider that refuses
+    /// every dial leaves the host expecting a room it never hears from (a
+    /// stale replica), with no network involved.
+    #[doc(hidden)]
+    pub fn connect_registry_via(&self, url: Arc<dyn zeron_sync::UrlProvider>) {
+        self.spawn_join(url, None, None);
     }
 
     fn spawn_join(
@@ -754,6 +763,19 @@ impl WorkspaceHost {
     /// The chat row as currently known (overlay view).
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, EngineError> {
         Ok(self.read(|doc| doc.chat(chat_id))?)
+    }
+
+    /// Whether `chat_id`'s row was deleted here (a tombstone), not merely
+    /// unknown.
+    pub fn chat_deleted(&self, chat_id: &str) -> bool {
+        self.read(|doc| doc.chat_deleted(chat_id))
+    }
+
+    /// Whether this replica's registry can be trusted to name a chat's host:
+    /// it has heard from the relay since it connected (or it has no relay).
+    /// A room that exists but hasn't synced yet may be arbitrarily behind.
+    pub fn registry_current(&self) -> bool {
+        self.registry_synced()
     }
 
     /// Whether `chat_id`'s parent is unknown here yet: this host claimed its

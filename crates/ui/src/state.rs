@@ -29,7 +29,9 @@ use serde::de::DeserializeOwned;
 
 use crate::comments::ReviewComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use zeron_engine::provider_discovery::ProviderSessionOverlay;
 use zeron_engine::{EngineConfig, EngineRuntime, InstanceLock};
+use zeron_harness::provider_cloud::SessionActivity;
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
     EngineInfo, HarnessId, Session, SidebarPreferencesState, Space, WorkspaceScope,
@@ -986,6 +988,13 @@ pub struct AppState {
     /// Provider-run chats' sign-in states (`providerState` on the chat
     /// document, carried by its transcript watch), by chat id.
     provider_chat_states: HashMap<String, zeron_proto::provider_cloud::ProviderChatState>,
+    /// The chat rows as the engine last sent them, before the provider
+    /// session overlay is laid over them into [`Self::chats`].
+    engine_chats: Vec<Chat>,
+    /// This device's latest read of its Claude cloud session lists, by chat
+    /// id: title, activity and last activity shown over provider-run chats,
+    /// never written to their rows (docs/design/provider-run-chats.md §6).
+    provider_overlay: HashMap<String, ProviderSessionOverlay>,
     /// The new-session canvas's own target, set aside while a chat is open
     /// (a chat implies ITS project/device) and put back on return, so the
     /// canvas always reopens where the user left it.
@@ -1182,6 +1191,8 @@ impl AppState {
             selected_device: None,
             remote_workspace_harnesses: HashSet::new(),
             provider_chat_states: HashMap::new(),
+            engine_chats: Vec::new(),
+            provider_overlay: HashMap::new(),
             canvas_target: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -1412,7 +1423,38 @@ impl AppState {
     /// Returns whether anything observable changed. The engine re-publishes
     /// identical lists (presence and sync churn elsewhere in the doc), and
     /// each notify re-renders the whole shell.
-    pub fn apply_chats(&mut self, mut chats: Vec<Chat>) -> bool {
+    pub fn apply_chats(&mut self, chats: Vec<Chat>) -> bool {
+        self.engine_chats = chats.clone();
+        self.apply_overlaid_chats(chats)
+    }
+
+    /// Lay this device's latest session-list read over the provider-run
+    /// chats. Returns whether anything observable changed.
+    pub fn apply_provider_overlay(&mut self, sessions: Vec<ProviderSessionOverlay>) -> bool {
+        let next: HashMap<String, ProviderSessionOverlay> = sessions
+            .into_iter()
+            .map(|session| (session.chat_id.clone(), session))
+            .collect();
+        if next == self.provider_overlay {
+            return false;
+        }
+        self.provider_overlay = next;
+        if !self.chats_synced {
+            return true;
+        }
+        self.apply_overlaid_chats(self.engine_chats.clone());
+        true
+    }
+
+    fn apply_overlaid_chats(&mut self, mut chats: Vec<Chat>) -> bool {
+        for chat in &mut chats {
+            if chat.provider_session.is_none() {
+                continue;
+            }
+            if let Some(overlay) = self.provider_overlay.get(&chat.id) {
+                overlay_provider_chat(chat, overlay);
+            }
+        }
         let mut changed = false;
         if let Some(pending) = &self.pending_side_chat {
             if chats.iter().any(|chat| chat.id == pending.id) {
@@ -3209,9 +3251,13 @@ impl AppState {
         }
         // This app draws no Waiting of its own: waiting on background work
         // that will wake the agent reads as the work under way it is.
-        match display_status(chat, self.session_for(&chat.id), now) {
+        let status = match display_status(chat, self.session_for(&chat.id), now) {
             ChatIndicator::Waiting => ChatIndicator::Working,
             status => status,
+        };
+        match self.provider_overlay.get(&chat.id) {
+            Some(overlay) => provider_status(status, overlay.activity),
+            None => status,
         }
     }
 
@@ -3601,6 +3647,8 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.engine_chats.clear();
+        self.provider_overlay.clear();
         self.pending_side_chat = None;
         self.unsaved_side_chat = false;
         self.sessions.clear();
@@ -7351,6 +7399,60 @@ mod tests {
         assert_eq!(state.selected_chat.as_deref(), Some("b"));
     }
 
+    #[test]
+    fn the_session_list_lays_title_status_and_unread_over_provider_chats() {
+        let base = clock_epoch();
+        let mut cloud = chat("cloud", 0, None);
+        cloud.title = Some("Listed when imported".into());
+        cloud.last_seen_at = Some(base + TimeDelta::minutes(5));
+        cloud.provider_session = Some(zeron_proto::ProviderSession {
+            provider: "claude".into(),
+            session_id: "cse_1".into(),
+            account_uuid: "acct".into(),
+            account_email: "a@example.test".into(),
+            org_id: "org".into(),
+        });
+        let mut local = chat("local", 1, None);
+        local.title = Some("Local".into());
+        let mut state = AppState::new();
+        state.apply_chats(vec![cloud.clone(), local.clone()]);
+        let now = base + TimeDelta::minutes(30);
+        assert_eq!(
+            state.display_status_for(&state.chats[0].clone(), now),
+            ChatIndicator::Idle
+        );
+
+        let overlay = |activity, minutes| ProviderSessionOverlay {
+            chat_id: "cloud".into(),
+            session_id: "cse_1".into(),
+            title: Some("Renamed on claude.ai".into()),
+            activity,
+            last_event_at: base + TimeDelta::minutes(minutes),
+        };
+        assert!(state.apply_provider_overlay(vec![overlay(SessionActivity::WaitingForYou, 10)]));
+        assert!(!state.apply_provider_overlay(vec![overlay(SessionActivity::WaitingForYou, 10)]));
+        let shown = state.chats.iter().find(|c| c.id == "cloud").unwrap().clone();
+        assert_eq!(shown.title.as_deref(), Some("Renamed on claude.ai"));
+        assert_eq!(
+            state.display_status_for(&shown, now),
+            ChatIndicator::AwaitingInput
+        );
+        // Idle at the provider, with activity since it was last seen: unread.
+        state.apply_provider_overlay(vec![overlay(SessionActivity::Idle, 10)]);
+        let shown = state.chats.iter().find(|c| c.id == "cloud").unwrap().clone();
+        assert_eq!(state.display_status_for(&shown, now), ChatIndicator::Completed);
+        // A fresh engine list keeps the overlay; a local chat is untouched.
+        state.apply_chats(vec![cloud.clone(), local.clone()]);
+        let shown = state.chats.iter().find(|c| c.id == "cloud").unwrap();
+        assert_eq!(shown.title.as_deref(), Some("Renamed on claude.ai"));
+        let untouched = state.chats.iter().find(|c| c.id == "local").unwrap();
+        assert_eq!(untouched, &local);
+        // Nothing listed: the row's own values again.
+        assert!(state.apply_provider_overlay(Vec::new()));
+        let shown = state.chats.iter().find(|c| c.id == "cloud").unwrap();
+        assert_eq!(shown, &cloud);
+    }
+
     fn clock_epoch() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
             .unwrap()
@@ -9019,5 +9121,31 @@ impl AppState {
             checkout_id: Some(snapshot.checkout_id.clone()),
         };
         self.change_requests.store(key, snapshot);
+    }
+}
+
+/// A provider-run chat as this device's session list shows it: the list's
+/// title, and its last activity (which also makes it unread until seen).
+fn overlay_provider_chat(chat: &mut Chat, overlay: &ProviderSessionOverlay) {
+    if let Some(title) = overlay.title.as_deref().filter(|t| !t.trim().is_empty()) {
+        chat.title = Some(title.to_owned());
+    }
+    if chat
+        .last_message_at
+        .is_none_or(|at| at < overlay.last_event_at)
+    {
+        chat.last_message_at = Some(overlay.last_event_at);
+    }
+}
+
+/// A provider-run chat's status: what this device sees of it, unless the
+/// session list says it works or waits on the person (it may be running on
+/// claude.ai, with no device mirroring it).
+fn provider_status(status: ChatIndicator, activity: SessionActivity) -> ChatIndicator {
+    match (status, activity) {
+        (ChatIndicator::Working | ChatIndicator::AwaitingInput, _) => status,
+        (_, SessionActivity::Working) => ChatIndicator::Working,
+        (_, SessionActivity::WaitingForYou) => ChatIndicator::AwaitingInput,
+        (status, SessionActivity::Idle) => status,
     }
 }

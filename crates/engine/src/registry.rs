@@ -850,16 +850,11 @@ pub fn registry_for_platform(platform: &str) -> HarnessRegistry {
     if platform == zeron_proto::CLOUD_PLATFORM {
         registry.retain(|id| id == HarnessId::Mock || CLOUD_HARNESS_IDS.contains(&id));
     } else if zeron_harness::claude_cloud::enabled()
-        && let Some(config) = zeron_harness::claude_cloud::ClaudeCloudConfig::device_default()
+        && let Some(harness) = crate::claude_cloud_sessions::device_harness()
     {
         // Provider-run chats (Claude cloud sessions): off unless switched on
         // (docs/design/provider-run-chats.md).
-        match zeron_harness::ClaudeCloudHarness::new(config) {
-            Ok(harness) => registry.register(Arc::new(harness)),
-            Err(error) => {
-                tracing::error!(%error, "Claude cloud sessions are unavailable on this device")
-            }
-        }
+        registry.register(Arc::new(harness));
     }
     registry
 }

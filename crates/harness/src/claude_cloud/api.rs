@@ -115,10 +115,22 @@ pub struct SessionInfo {
     pub environment_kind: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// What the worker is doing, in the list's (not verified live) words.
+    /// A session the list doesn't describe reads as idle.
+    #[serde(default)]
+    pub worker_status: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
     pub last_event_at: Option<String>,
+}
+
+impl SessionInfo {
+    pub fn archived(&self) -> bool {
+        self.status.as_deref() == Some("archived")
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -524,7 +536,9 @@ fn path_segment(id: &str) -> String {
         .collect()
 }
 
-fn is_loopback(base: &str) -> bool {
+/// Whether `base` names this machine (`127.0.0.1`, `localhost` or `::1`),
+/// with or without a scheme and port.
+pub fn is_loopback(base: &str) -> bool {
     let rest = base
         .strip_prefix("http://")
         .or_else(|| base.strip_prefix("https://"))
