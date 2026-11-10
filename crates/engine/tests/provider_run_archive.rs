@@ -112,8 +112,13 @@ struct Host {
 }
 
 impl Host {
-    /// The sidebar's call.
+    /// The sidebar's call, once the registry is current: a device only acts
+    /// on the list then (one just joined to the room may be behind).
     async fn discover(&self) -> Value {
+        wait_for("the registry current", || {
+            self.core.workspace.registry_current()
+        })
+        .await;
         self.client
             .call(methods::DISCOVER_PROVIDER_SESSIONS, json!({ "visible": true }))
             .await
