@@ -26,7 +26,7 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 
-use crate::{Step, Turn};
+use crate::{Gate, Step, Turn};
 
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -228,6 +228,8 @@ struct Inner {
     faults: Vec<Fault>,
     /// Bearer tokens the server refuses with 401 (revoked or expired).
     rejected_tokens: std::collections::HashSet<String>,
+    /// Gates the next event posts wait on before they are accepted.
+    post_holds: VecDeque<Gate>,
 }
 
 impl Inner {
@@ -322,6 +324,15 @@ impl FakeSessionServer {
     /// the order queued.
     pub fn queue_turn(&self, turn: Turn) {
         lock(&self.state).turns.push_back(turn);
+    }
+
+    /// The next `POST …/events` is received (and recorded) but waits, before
+    /// anything of it is stored, until the returned gate is released: what
+    /// the session does meanwhile is stored ahead of it.
+    pub fn hold_next_post(&self) -> Gate {
+        let gate = Gate::default();
+        lock(&self.state).post_holds.push_back(gate.clone());
+        gate
     }
 
     pub fn inject(&self, fault: Fault) {
@@ -518,6 +529,12 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
         ));
     }
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if method == "POST" && segments.last() == Some(&"events") {
+        let hold = lock(&state).post_holds.pop_front();
+        if let Some(gate) = hold {
+            gate.pass().await;
+        }
+    }
     Ok(match (method.as_str(), segments.as_slice()) {
         ("GET", ["v1", "code", "sessions"]) => list(&state, &recorded),
         ("POST", ["v1", "code", "sessions"]) => create(&state, body),

@@ -825,11 +825,11 @@ async fn the_host_refuses_forks_and_side_chats_of_a_provider_run_chat() {
     fleet.shutdown().await;
 }
 
-/// Known issue (reported to #8/#5, not #12's code): two messages drained
-/// together right after a takeover reach the session once each, but in about
-/// one run in five the reply is never mirrored into the transcript. Run with
-/// `--ignored` to reproduce.
-#[ignore = "reproducer for a mirror issue outside #12"]
+/// Two messages drained together right after a takeover reach the session
+/// once each, and the replies show. (The second can be stored in the middle
+/// of the first one's reply; the reply once got stamped with the message's
+/// uuid and swept as its duplicate. See `provider_run_chats.rs`,
+/// `a_message_stored_mid_reply_leaves_the_reply_in_the_transcript`.)
 #[tokio::test(flavor = "multi_thread")]
 async fn two_messages_drained_together_after_a_takeover_are_answered() {
     let fleet = fleet(&[(PC, "PC", cloud_a()), (LAPTOP, "Laptop", cloud_a())]).await;

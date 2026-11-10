@@ -4837,7 +4837,8 @@ async fn drive_run(
             };
             let seq = sequence_num;
             // A batch boundary: a turn's end, or a person's message.
-            let batch = turn_end || message.is_some();
+            let person = message.is_some();
+            let batch = turn_end || person;
             if let Some(text) = message {
                 match doc_ref.stamp_provider_echo(&uuid, seq) {
                     // This device's own send (or a replay): written already.
@@ -4879,7 +4880,13 @@ async fn drive_run(
                 }
                 dirty = false;
             }
-            if !folded.is_empty()
+            // The entry carries the first stored event that wrote it. A
+            // person's message wrote its own entry, never this one: it can be
+            // stored mid-reply (sent while the reply streams live), and
+            // stamping the reply with its uuid would make the reply a
+            // duplicate of the message, which the sweep then deletes.
+            if !person
+                && !folded.is_empty()
                 && pm.stamped.as_deref() != Some(entry_id.as_str())
                 && let Some(w) = writer.as_ref()
             {

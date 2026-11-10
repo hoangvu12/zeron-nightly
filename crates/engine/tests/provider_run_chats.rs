@@ -586,6 +586,82 @@ async fn a_steer_mid_turn_reaches_the_session_at_once() {
     rig.core.shutdown().await;
 }
 
+/// A message sent while the reply is about to stream lands, in the session,
+/// in the middle of that reply (after its live text, before the stored
+/// message). The reply it splits keeps its entry: the person's message is not
+/// the event that wrote it, so the duplicate sweep never takes the reply for
+/// a copy of the message. (The takeover flake of #12: two messages drained
+/// together, the reply then missing from the transcript.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_stored_mid_reply_leaves_the_reply_in_the_transcript() {
+    let rig = rig().await;
+    let (chat, cwd) = create_and_mirror(&rig).await;
+    let sid = rig.fake.created_sessions()[0].clone();
+
+    // The turn waits before its live text, and again right after it.
+    let (held, before_text) = Turn::text_zulu().hold_after(
+        |step| matches!(step, zeron_provider_fake::Step::Stored(p) if p["subtype"] == "status"),
+    );
+    let (held, after_text) = held.hold_after(is_text_delta);
+    rig.fake.queue_turn(held);
+    rig.fake.queue_turn(Turn::text_zulu());
+    rig.send(&chat, &cwd, SECOND, SECOND_PROMPT);
+    before_text.reached().await;
+
+    // The next message reaches the server, which stores it only once the
+    // reply's text has streamed (the run reads that text after its send
+    // returns, ahead of the message's own event).
+    let post = rig.fake.hold_next_post();
+    rig.send(&chat, &cwd, THIRD, "Again: the single word ZULU.");
+    wait_for("the message on its way", || {
+        rig.posted_payloads().iter().any(|p| p["uuid"] == THIRD)
+    })
+    .await;
+    before_text.release();
+    after_text.reached().await;
+    post.release();
+    wait_for("the message stored", || {
+        rig.fake
+            .stored_events(&sid)
+            .iter()
+            .any(|e| e.payload["uuid"] == THIRD)
+    })
+    .await;
+    // The person's message's marker is through before the reply goes on.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    after_text.release();
+
+    wait_for("both replies", || {
+        !rig.fake.turn_playing(&sid)
+            && no_streaming(&rig, &chat)
+            && rig
+                .entries(&chat)
+                .last()
+                .is_some_and(|e| e.role == MessageRole::Assistant && text_of(e).contains("ZULU"))
+    })
+    .await;
+    let entries = rig.entries(&chat);
+    let order: Vec<(String, MessageRole, Option<MessageStatus>, String)> = entries
+        .iter()
+        .map(|e| (e.id.clone(), e.role, e.status, text_of(e)))
+        .collect();
+    let second = position(&entries, |e| e.id == SECOND);
+    // Both turns' replies are there (a turn queued behind another continues
+    // its entry).
+    let replies: usize = entries[second..]
+        .iter()
+        .filter(|e| e.role == MessageRole::Assistant)
+        .map(|e| text_of(e).matches("ZULU").count())
+        .sum();
+    assert_eq!(replies, 2, "{order:#?}");
+    assert_eq!(
+        entries.iter().filter(|e| e.id == THIRD).count(),
+        1,
+        "{order:#?}"
+    );
+    rig.core.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_interrupts_the_sessions_turn_under_the_stop_commands_id() {
     let rig = rig().await;
