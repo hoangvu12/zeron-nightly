@@ -2684,10 +2684,11 @@ fn doc_messages_stream(
                 // changes) produce empty deltas — skip the frame entirely.
                 let usage = doc.context_usage();
                 // A provider-run chat's sign-in state rides along
-                // (`providerState`; absent when none, and to older viewports
-                // an unknown key).
+                // (`providerState`, to older viewports an unknown key): on
+                // the first frame always, null included, so a viewer that
+                // reconnects drops a state cleared meanwhile; afterwards
+                // only when it changed.
                 let state = doc.provider_chat_state();
-                let first = previous_state.is_none();
                 if frame.is_empty_delta()
                     && usage == previous_usage
                     && replay_baseline.is_none()
@@ -2702,7 +2703,7 @@ fn doc_messages_stream(
                     replay_baseline,
                 })
                 .ok()?;
-                if state.is_some() || !first {
+                if previous_state.as_ref() != Some(&state) {
                     value["providerState"] = serde_json::to_value(&state).ok()?;
                 }
                 previous_state = Some(state);
@@ -2787,10 +2788,9 @@ async fn opening_doc_messages_stream(
         })
         .map_err(|e| crate::EngineError::Other(e.to_string()))?;
         preview["historyPending"] = serde_json::Value::Bool(true);
-        if let Some(state) = handle.doc().provider_chat_state() {
-            preview["providerState"] = serde_json::to_value(&state)
-                .map_err(|e| crate::EngineError::Other(e.to_string()))?;
-        }
+        // Always, null included: the opening frame clears a stale notice.
+        preview["providerState"] = serde_json::to_value(handle.doc().provider_chat_state())
+            .map_err(|e| crate::EngineError::Other(e.to_string()))?;
         Ok::<_, crate::EngineError>((handle, preview))
     })
     .await
@@ -3187,24 +3187,30 @@ impl RpcService for EngineRpc {
                         "Cloud machines don't offer Claude cloud sessions.".into(),
                     ));
                 }
-                let next = store.settings().with(&change);
-                store
-                    .save(next.clone())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let was_active = self.registry.provider_run_active();
-                let active = crate::claude_cloud_sessions::apply(&self.registry, &next);
-                // A harness registered now, not at startup: follow its
-                // logins' sign-in states as `assemble` does for one there
-                // from the start (a removed one's follower ends with it).
-                if active && !was_active {
-                    crate::provider_run::follow_sign_in_states(&self.registry, &self.doc_host);
-                }
-                if let Err(error) = self
-                    .workspace
-                    .set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, active)
-                {
-                    tracing::warn!(%error, "provider-run capability update failed");
-                }
+                // One change at a time, from reading the settings through
+                // the capability update (the guard ends before the await).
+                let next = {
+                    let _changing = store.changing();
+                    let next = store.settings().with(&change);
+                    store
+                        .save(next.clone())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let was_active = self.registry.provider_run_active();
+                    let active = crate::claude_cloud_sessions::apply(&self.registry, &next);
+                    // A harness registered now, not at startup: follow its
+                    // logins' sign-in states as `assemble` does for one there
+                    // from the start (a removed one's follower ends with it).
+                    if active && !was_active {
+                        crate::provider_run::follow_sign_in_states(&self.registry, &self.doc_host);
+                    }
+                    if let Err(error) = self
+                        .workspace
+                        .set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, active)
+                    {
+                        tracing::warn!(%error, "provider-run capability update failed");
+                    }
+                    next
+                };
                 let status = crate::claude_cloud_sessions::status(&self.registry, next).await;
                 RpcReply::value(&status)
             }
@@ -6987,8 +6993,18 @@ mod context_usage_tests {
         let doc = Arc::new(zeron_doc::SessionDoc::init("cloud-chat").unwrap());
         let (tx, rx) = watch::channel(crate::doc_host::TranscriptSnapshot::default());
         let mut stream = doc_messages_stream(rx, doc.clone());
-        // None yet: the key stays off the opening frame.
-        assert!(stream.next().await.unwrap().get("providerState").is_none());
+        // None yet: the opening frame says so (an explicit null).
+        let opening = stream.next().await.unwrap();
+        assert!(opening.get("providerState").is_some_and(|s| s.is_null()));
+        // An unchanged state stays off later frames.
+        doc.update_context_usage(Some(1), Some(200_000)).unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        let usage_only = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage_only["contextUsage"]["tokens"], 1);
+        assert!(usage_only.get("providerState").is_none());
         let state = ProviderChatState::SignInAgain {
             email: "a@example.test".into(),
         };
@@ -7011,5 +7027,13 @@ mod context_usage_tests {
             .unwrap();
         assert!(cleared["providerState"].is_null());
         assert!(cleared.get("providerState").is_some());
+
+        // A viewer that reconnects after a state cleared while it was away
+        // gets the null on its opening frame, so its stale notice goes.
+        doc.set_provider_chat_state(Some(&state)).unwrap();
+        doc.set_provider_chat_state(None).unwrap();
+        let mut reconnect = doc_messages_stream(tx.subscribe(), doc.clone());
+        let opening = reconnect.next().await.unwrap();
+        assert!(opening.get("providerState").is_some_and(|s| s.is_null()));
     }
 }

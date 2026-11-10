@@ -238,18 +238,17 @@ fn done(status: DoneStatus, error: Option<String>) -> AgentEvent {
     }
 }
 
-/// End the run errored: the error shown (when `shown`), then `Done`.
+/// End the run errored: the error shown (when `shown`), then `Done`. A shown
+/// error isn't repeated on `Done`, which would draw it a second time (as the
+/// local Claude harness does).
 async fn fail(events: &Events, message: String, shown: bool) {
-    if shown {
-        let _ = send(
-            events,
-            AgentEvent::Error {
-                message: message.clone(),
-            },
-        )
-        .await;
-    }
-    let _ = send(events, done(DoneStatus::Errored, Some(message))).await;
+    let error = if shown {
+        let _ = send(events, AgentEvent::Error { message }).await;
+        None
+    } else {
+        Some(message)
+    };
+    let _ = send(events, done(DoneStatus::Errored, error)).await;
 }
 
 /// The wait before retry number `attempt` (from 0): doubling from `base`,

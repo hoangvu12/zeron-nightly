@@ -114,6 +114,10 @@ impl ClaudeCloudSettings {
 pub struct ClaudeCloudSessions {
     path: PathBuf,
     stored: Mutex<ClaudeCloudSettings>,
+    /// Held across a whole change (read, save, apply, capability), so two
+    /// changes at once can't leave the harness or capability out of step
+    /// with the saved setting.
+    changing: Mutex<()>,
     /// The sidebar's session list: its throttle and latest read.
     discovery: crate::provider_discovery::ProviderDiscovery,
 }
@@ -130,8 +134,15 @@ impl ClaudeCloudSessions {
         Self {
             path,
             stored: Mutex::new(stored),
+            changing: Mutex::new(()),
             discovery: Default::default(),
         }
+    }
+
+    /// Hold while making a change, from reading the current settings through
+    /// applying them. Never across an `.await`.
+    pub fn changing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.changing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn discovery(&self) -> &crate::provider_discovery::ProviderDiscovery {
