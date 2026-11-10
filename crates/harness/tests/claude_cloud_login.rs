@@ -101,6 +101,7 @@ async fn create_with(harness: &ClaudeCloudHarness) -> Result<ProviderSession, Pr
             prompt_uuid: uuid::Uuid::new_v4().to_string(),
             model: None,
             title: None,
+            source: None,
         })
         .await
 }

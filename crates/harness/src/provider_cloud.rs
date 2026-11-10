@@ -93,6 +93,18 @@ pub struct CreateSession {
     pub prompt_uuid: String,
     pub model: Option<String>,
     pub title: Option<String>,
+    /// The repository the session works on; `None`: an empty sandbox ("No
+    /// project").
+    pub source: Option<SessionSource>,
+}
+
+/// The GitHub repository a new session clones, and the branch it starts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSource {
+    /// `owner/name` on github.com.
+    pub github_repo: String,
+    /// `None`: the repository's default branch.
+    pub branch: Option<String>,
 }
 
 /// What a fresh run of a provider-run chat needs to know: its session and
@@ -149,8 +161,45 @@ pub struct ProviderResume {
     pub open_prompts: Vec<String>,
 }
 
+/// What a session is doing, as the provider's session list says
+/// (docs/design/provider-run-chats.md §6: shown over the chat, never written
+/// to its row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionActivity {
+    /// A turn is running.
+    Working,
+    /// The session waits on the person (a question or a permission prompt).
+    WaitingForYou,
+    Idle,
+}
+
+/// One session from the provider's session list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSession {
+    /// The session and the account whose list it came from.
+    pub session: ProviderSession,
+    pub title: Option<String>,
+    pub activity: SessionActivity,
+    /// Archived at the provider (claude.ai, the phone, or Zeron's delete).
+    pub archived: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_event_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[async_trait]
 pub trait ProviderCloud: Send + Sync {
+    /// The sessions of every account enabled on this device whose last
+    /// activity is at or after `since`, archived ones included, newest
+    /// activity first. Reads each account's list from its first page,
+    /// following its cursor until it reaches sessions older than `since`.
+    /// One call is one read of the list; how often to call is the caller's
+    /// business (at most once a minute, design §7).
+    async fn list_sessions(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ListedSession>, ProviderCloudError>;
+
     /// Create one provider cloud session in this device's own login, with
     /// `request.prompt` as its first message. NOT idempotent: two calls make
     /// two sessions, so callers never retry it on their own.

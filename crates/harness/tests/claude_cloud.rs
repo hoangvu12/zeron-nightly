@@ -145,6 +145,7 @@ async fn create_playing(rig: &Rig, first: Turn, prompt: &str, uuid: &str) -> Pro
             prompt_uuid: uuid.into(),
             model: None,
             title: None,
+            source: None,
         })
         .await
         .expect("session created")
@@ -465,6 +466,18 @@ fn done_status(events: &[AgentEvent]) -> Option<DoneStatus> {
     match events.last() {
         Some(AgentEvent::Done { status, .. }) => Some(*status),
         _ => None,
+    }
+}
+
+/// The run's error is drawn once: one `Error` event naming it, and a `Done`
+/// that doesn't repeat it (each becomes an error card in the chat).
+#[track_caller]
+fn error_shown_once(events: &[AgentEvent], needle: &str) {
+    let errors = count(events, |e| matches!(e, AgentEvent::Error { message } if message.contains(needle)));
+    assert_eq!(errors, 1, "one error event for {needle:?}");
+    match events.last() {
+        Some(AgentEvent::Done { error, .. }) => assert_eq!(error, &None, "Done repeats the shown error"),
+        other => panic!("the run didn't end with Done: {other:?}"),
     }
 }
 
@@ -1025,8 +1038,7 @@ async fn a_stream_that_keeps_dropping_is_reconnected_a_bounded_number_of_times_w
     // 200 + 400 + 800 + 1600 ms.
     assert!(dropped_at.elapsed() >= Duration::from_millis(2500));
     assert_eq!(streams(&rig) - opened, 5, "reconnect attempts");
-    assert!(events.iter().any(|e| matches!(e,
-        AgentEvent::Error { message } if message.contains("connection to the Claude cloud session was lost"))));
+    error_shown_once(&events, "connection to the Claude cloud session was lost");
     assert_eq!(done_status(&events), Some(DoneStatus::Errored));
     gate.release();
 }
@@ -1085,6 +1097,7 @@ async fn an_account_without_a_cloud_environment_is_told_so() {
             prompt_uuid: FIRST.into(),
             model: None,
             title: None,
+            source: None,
         })
         .await
         .unwrap_err();
@@ -1173,8 +1186,7 @@ async fn a_stop_that_cant_be_delivered_is_an_error_not_a_stop() {
     interrupt.cancel();
     let events = turn(&mut stream).await;
     assert_eq!(done_status(&events), Some(DoneStatus::Errored));
-    assert!(events.iter().any(|e| matches!(e,
-        AgentEvent::Error { message } if message.contains("may still be working"))));
+    error_shown_once(&events, "may still be working");
     assert!(rig.fake.turn_playing(&session.session_id));
     gate.release();
 }

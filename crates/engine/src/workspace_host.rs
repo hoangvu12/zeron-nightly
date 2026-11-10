@@ -433,7 +433,16 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(zeron_sync::StaticUrl(url.to_string())), None, None);
+        self.connect_registry_via(Arc::new(zeron_sync::StaticUrl(url.to_string())));
+    }
+
+    /// Test seam: join a registry room whose address `url` gives on each
+    /// dial, as [`Self::connect_registry_url`]. A provider that refuses
+    /// every dial leaves the host expecting a room it never hears from (a
+    /// stale replica), with no network involved.
+    #[doc(hidden)]
+    pub fn connect_registry_via(&self, url: Arc<dyn zeron_sync::UrlProvider>) {
+        self.spawn_join(url, None, None);
     }
 
     fn spawn_join(
@@ -754,6 +763,19 @@ impl WorkspaceHost {
     /// The chat row as currently known (overlay view).
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, EngineError> {
         Ok(self.read(|doc| doc.chat(chat_id))?)
+    }
+
+    /// Whether `chat_id`'s row was deleted here (a tombstone), not merely
+    /// unknown.
+    pub fn chat_deleted(&self, chat_id: &str) -> bool {
+        self.read(|doc| doc.chat_deleted(chat_id))
+    }
+
+    /// Whether this replica's registry can be trusted to name a chat's host:
+    /// it has heard from the relay since it connected (or it has no relay).
+    /// A room that exists but hasn't synced yet may be arbitrarily behind.
+    pub fn registry_current(&self) -> bool {
+        self.registry_synced()
     }
 
     /// Whether `chat_id`'s parent is unknown here yet: this host claimed its
@@ -1246,9 +1268,11 @@ impl WorkspaceHost {
     /// `providerSession` in the same row op that creates it: a crash can't
     /// leave a provider-run row that has no session (it could never run).
     /// Idempotent like [`Self::create_chat_hosted`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_provider_run_chat(
         &self,
         chat_id: &str,
+        space_id: Option<&str>,
         config: ChatConfig,
         cwd: String,
         parent_chat_id: Option<String>,
@@ -1257,9 +1281,11 @@ impl WorkspaceHost {
     ) -> Result<(), EngineError> {
         let device_id = self.device_id().to_owned();
         self.note_provider_chat(chat_id);
+        // In a project (any device's checkout of a GitHub repository, or one
+        // living at the provider), still hosted here.
         self.create_chat_row(
             chat_id,
-            None,
+            space_id,
             Some(&device_id),
             Some(&device_id),
             Some(config),
@@ -1408,7 +1434,9 @@ impl WorkspaceHost {
     /// A project that lives only on Cloud: owned by the logical Cloud device
     /// (which has no engine to stamp it), so its GitHub repository is set
     /// here. Every session in it runs on a Cloud machine cloning that
-    /// repository. Idempotent like [`Self::create_space`]; also a no-op when
+    /// repository. Also a project living only at a provider cloud (owned by
+    /// [`zeron_proto::provider_cloud::PROJECTS_DEVICE`]), whose chats are
+    /// provider-run sessions cloning it. Idempotent like [`Self::create_space`]; also a no-op when
     /// Cloud already has a project for the repository.
     pub fn create_cloud_space(
         &self,
@@ -1418,11 +1446,17 @@ impl WorkspaceHost {
         name: Option<String>,
         github_repo: &str,
     ) -> Result<(), EngineError> {
-        if !device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX) {
+        if !zeron_proto::provider_cloud::is_repository_only_device(device_id) {
             return Err(EngineError::Other(
                 "Only Cloud projects name their repository.".into(),
             ));
         }
+        let github_repo = &zeron_proto::provider_cloud::github_repo_from_input(github_repo)
+            .ok_or_else(|| {
+                EngineError::Other(format!(
+                    "\"{github_repo}\" isn't a GitHub repository (owner/name)."
+                ))
+            })?;
         let spaces = self.read(|doc| doc.read_spaces())?;
         if spaces.iter().any(|s| {
             s.id == space_id
@@ -1541,7 +1575,7 @@ impl WorkspaceHost {
         let stale: Vec<Space> = self
             .read(|doc| doc.read_spaces())?
             .into_iter()
-            .filter(|s| s.device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX))
+            .filter(|s| zeron_proto::provider_cloud::is_repository_only_device(&s.device_id))
             .filter(|s| {
                 s.github_repo
                     .as_deref()

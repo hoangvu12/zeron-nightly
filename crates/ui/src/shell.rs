@@ -2326,6 +2326,14 @@ pub struct Shell {
     /// Short debounce that aggregates providers finishing the same check at
     /// slightly different times into one banner.
     harness_update_banner_task: Option<Task<()>>,
+    /// Asks the local engine to sync its Claude cloud sessions while the
+    /// sidebar is on screen (see [`provider_discovery_loop`]).
+    _provider_discovery: Task<()>,
+    /// The window the shell renders in, once it has.
+    window: Option<gpui::AnyWindowHandle>,
+    /// Whether a window is on screen ([`platform_window_shown`]; tests
+    /// stand in for the platform).
+    window_shown: fn(&Window) -> bool,
     /// Independent watches retain device identity across selection changes.
     harness_update_devices: std::collections::BTreeMap<String, harness_updates::DeviceUpdates>,
     harness_update_expanded: bool,
@@ -2713,6 +2721,7 @@ impl Shell {
         let transcript_invalidation = cx.observe_self(|shell, cx| {
             shell.transcript.update(cx, |_, cx| cx.notify());
         });
+        let provider_discovery = cx.spawn(provider_discovery_loop);
         let shell = cx.entity();
         let sidebar_pane = cx.new(|cx| SidebarPane {
             shell: shell.downgrade(),
@@ -2862,6 +2871,13 @@ impl Shell {
             attention_sound_gate: Default::default(),
             harness_update_seen: std::collections::HashSet::new(),
             harness_update_banner_task: None,
+            _provider_discovery: provider_discovery,
+            window: None,
+            window_shown: if cfg!(test) {
+                |_| true
+            } else {
+                platform_window_shown
+            },
             harness_update_devices: Default::default(),
             harness_update_expanded: false,
             harness_update_transition: None,
@@ -13740,6 +13756,7 @@ fn header_icon_button_with(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window = Some(window.window_handle());
         // Every repaint (state frame, input, or the clock firing) reschedules
         // the next clock-driven one; the sidebar and transcript follow this
         // view's notifications.
@@ -20094,5 +20111,262 @@ impl Shell {
         } else {
             self.close_settings(cx);
         }
+    }
+}
+
+/// How often the shell asks the engine to sync its Claude cloud sessions
+/// while the sidebar shows. The engine reads the provider's list at most once a
+/// minute however often it is asked; this only bounds how soon a newly
+/// shown sidebar picks the list up.
+const PROVIDER_DISCOVERY_TICK: Duration = Duration::from_secs(15);
+
+/// While the sidebar is on screen, ask the local engine to sync its Claude
+/// cloud sessions (`SyncProviderSessions`, docs/design/provider-run-chats.md
+/// §6) and lay the answer over the provider-run chats. Only on a device
+/// eligible to host them, and never while the sidebar is collapsed or the
+/// window is minimised or hidden, so the engine reads nothing then. Ends
+/// with the shell.
+async fn provider_discovery_loop(this: gpui::WeakEntity<Shell>, cx: &mut gpui::AsyncApp) {
+    loop {
+        let engine = match this.update(cx, |shell, cx| shell.provider_sync_engine(cx)) {
+            Ok(engine) => engine,
+            Err(_) => return,
+        };
+        if let Some(engine) = engine {
+            let reply = engine
+                .client()
+                .call(
+                    zeron_rpc::methods::SYNC_PROVIDER_SESSIONS,
+                    serde_json::json!({}),
+                )
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<zeron_engine::provider_discovery::DiscoveryReply>(
+                        value,
+                    )
+                    .ok()
+                });
+            if let Some(reply) = reply {
+                let applied = this.update(cx, |shell, cx| {
+                    shell.state.update(cx, |state, cx| {
+                        if state.apply_provider_overlay(reply.sessions) {
+                            cx.notify();
+                        }
+                    });
+                });
+                if applied.is_err() {
+                    return;
+                }
+            }
+        }
+        cx.background_executor()
+            .timer(PROVIDER_DISCOVERY_TICK)
+            .await;
+    }
+}
+
+impl Shell {
+    /// The engine to ask for a session sync now (see
+    /// [`provider_discovery_loop`]): the local one, when this device can host
+    /// provider-run chats and the sidebar is on screen, in a window that is
+    /// shown and not minimised.
+    fn provider_sync_engine(&self, cx: &mut App) -> Option<crate::state::EngineHandle> {
+        let state = self.state.read(cx);
+        if !state.provider_run_eligible() || self.settled_fit().1 <= 0.0 {
+            return None;
+        }
+        let engine = state.engine().cloned()?;
+        let shown = self.window_shown;
+        let on_screen = cx
+            .update_window(self.window?, |_, window, _| shown(window))
+            .unwrap_or(false);
+        on_screen.then_some(engine)
+    }
+}
+
+/// Whether `window` is on screen: shown (not hidden) and not minimised.
+fn platform_window_shown(window: &Window) -> bool {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+        if let Ok(handle) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            let hwnd = HWND(handle.hwnd.get() as *mut _);
+            // SAFETY: the handle is this live window's own.
+            return unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() };
+        }
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::AppKit(handle) = handle.as_raw()
+        {
+            // SAFETY: the handle is this live window's content view, on the
+            // main thread GPUI runs on.
+            let view: &objc2_app_kit::NSView = unsafe { handle.ns_view.cast().as_ref() };
+            return view
+                .window()
+                .is_some_and(|window| window.isVisible() && !window.isMiniaturized());
+        }
+        true
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = window;
+        true
+    }
+}
+
+#[cfg(test)]
+mod provider_sync_tests {
+    use super::*;
+
+    fn test_shell(
+        cx: &mut gpui::TestAppContext,
+        path: &std::path::Path,
+    ) -> gpui::WindowHandle<Shell> {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: path.into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: HarnessId::Mock,
+                },
+                cx,
+            )
+        })
+    }
+
+    fn local_device(capabilities: &[&str]) -> zeron_proto::Device {
+        zeron_proto::Device {
+            id: "local".into(),
+            name: "Local".into(),
+            platform: "windows".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+        }
+    }
+
+    /// The `SyncProviderSessions` requests the shell sent since the last
+    /// look, answering each with an empty list.
+    fn syncs(
+        runtime: &tokio::runtime::Runtime,
+        requests: &mut tokio::sync::mpsc::Receiver<String>,
+        replies: &tokio::sync::mpsc::Sender<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut sent = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            if request["method"] != methods::SYNC_PROVIDER_SESSIONS {
+                continue;
+            }
+            let reply = serde_json::json!({"id": request["id"], "ok": {"sessions": []}});
+            runtime.block_on(async {
+                replies.send(reply.to_string()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while replies.capacity() < replies.max_capacity() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            sent.push(request["params"].clone());
+        }
+        sent
+    }
+
+    #[gpui::test]
+    fn the_sidebar_syncs_cloud_sessions_only_while_it_is_on_screen(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel(16);
+        let (replies, inbound) = tokio::sync::mpsc::channel(16);
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.set_test_engine(engine);
+                    state.local_device_id = Some("local".into());
+                    state.devices = vec![local_device(&[])];
+                });
+            })
+            .unwrap();
+        let mut tick = |cx: &mut gpui::TestAppContext| {
+            cx.executor().advance_clock(PROVIDER_DISCOVERY_TICK);
+            cx.run_until_parked();
+            syncs(&runtime, &mut requests, &replies)
+        };
+
+        // A device that can't host provider-run chats never asks.
+        assert!(tick(cx).is_empty());
+
+        // An eligible device asks while the sidebar shows, with no
+        // parameters.
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.devices =
+                        vec![local_device(&[zeron_proto::capabilities::PROVIDER_RUN_V1])];
+                });
+            })
+            .unwrap();
+        assert_eq!(tick(cx), vec![serde_json::json!({})]);
+        assert_eq!(tick(cx).len(), 1);
+
+        // Minimised or hidden: nothing.
+        window
+            .update(cx, |shell, _, _| shell.window_shown = |_| false)
+            .unwrap();
+        assert!(tick(cx).is_empty());
+        assert!(tick(cx).is_empty());
+
+        // On screen with the sidebar collapsed: nothing.
+        window
+            .update(cx, |shell, _, _| {
+                shell.window_shown = |_| true;
+                shell.settings.sidebar_collapsed = true;
+            })
+            .unwrap();
+        assert!(tick(cx).is_empty());
+
+        // The sidebar back: it asks again.
+        window
+            .update(cx, |shell, _, _| shell.settings.sidebar_collapsed = false)
+            .unwrap();
+        assert_eq!(tick(cx).len(), 1);
     }
 }

@@ -323,6 +323,72 @@ impl FakeSessionServer {
             .push((seed.id, Session::new(info)));
     }
 
+    /// A session someone started outside Zeron (claude.ai, the phone), with
+    /// `prompt` as its first message: it plays the next queued turn, as a
+    /// create does. Not counted in [`Self::created_sessions`]. Returns its id.
+    pub fn start_elsewhere(&self, title: &str, prompt: &str) -> String {
+        let mut inner = lock(&self.state);
+        let id = format!("cse_elsewhere{:04}", inner.sessions.len() + 1);
+        let created_at = now();
+        let info = json!({
+            "id": id,
+            "environment_id": "env_fake0001",
+            "environment_kind": "anthropic_cloud",
+            "status": "active",
+            "title": title,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "last_event_at": created_at,
+            "tags": ["config:no-git-repo"],
+            "config": {"sources": [], "outcomes": []},
+            "session_url": format!("https://claude.ai/code/{id}"),
+        });
+        inner.sessions.push((id.clone(), Session::new(info)));
+        let payload = json!({
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "session_id": id,
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": prompt},
+        });
+        let _ = accept_events(&self.state, &mut inner, &id, vec![payload]);
+        id
+    }
+
+    /// Set when a session was created and last active (RFC 3339): an old
+    /// session, or an old one resumed.
+    pub fn set_times(&self, session_id: &str, created_at: &str, last_event_at: &str) {
+        if let Some(session) = lock(&self.state).session(session_id) {
+            session.info["created_at"] = json!(created_at);
+            session.info["last_event_at"] = json!(last_event_at);
+            session.info["updated_at"] = json!(last_event_at);
+        }
+    }
+
+    /// Archive a session, as claude.ai's archive does.
+    pub fn archive(&self, session_id: &str) {
+        if let Some(session) = lock(&self.state).session(session_id) {
+            session.info["status"] = json!("archived");
+        }
+    }
+
+    /// Rename a session, as claude.ai's rename does.
+    pub fn set_title(&self, session_id: &str, title: &str) {
+        if let Some(session) = lock(&self.state).session(session_id) {
+            session.info["title"] = json!(title);
+        }
+    }
+
+    /// The list reads served so far (`GET /v1/code/sessions`, every page).
+    pub fn list_reads(&self) -> Vec<RecordedRequest> {
+        lock(&self.state)
+            .requests
+            .iter()
+            .filter(|r| r.method == "GET" && r.path.trim_end_matches('/') == "/v1/code/sessions")
+            .cloned()
+            .collect()
+    }
+
     /// The next message a session accepts (a create's first prompt, or a
     /// posted `user` event that isn't a repeat) plays `turn`. Turns play in
     /// the order queued.
@@ -622,7 +688,27 @@ fn list(state: &State, req: &RecordedRequest) -> Response<Body> {
         .and_then(|c| c.strip_prefix("off-").and_then(|n| n.parse().ok()))
         .unwrap_or(0);
     let inner = lock(state);
-    let mut all: Vec<&Value> = inner.sessions.iter().map(|(_, s)| &s.info).collect();
+    // What the worker is doing shows in the list's status: `running` while a
+    // turn plays, `requires_action` while a prompt waits for an answer,
+    // `idle` otherwise; `archived` stays.
+    let mut all: Vec<Value> = inner
+        .sessions
+        .iter()
+        .map(|(_, s)| {
+            let mut info = s.info.clone();
+            if !s.archived() {
+                let waiting = s.prompts.iter().any(|id| !s.answers.contains_key(id));
+                info["status"] = json!(if waiting {
+                    "requires_action"
+                } else if s.playing.is_some() {
+                    "running"
+                } else {
+                    "idle"
+                });
+            }
+            info
+        })
+        .collect();
     // Newest activity first, as the real list orders.
     all.sort_by(|a, b| {
         b["last_event_at"]
@@ -630,12 +716,7 @@ fn list(state: &State, req: &RecordedRequest) -> Response<Body> {
             .unwrap_or("")
             .cmp(a["last_event_at"].as_str().unwrap_or(""))
     });
-    let page: Vec<Value> = all
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|v| (*v).clone())
-        .collect();
+    let page: Vec<Value> = all.iter().skip(offset).take(limit).cloned().collect();
     let mut body = json!({ "data": page, "resume_token": "fake-resume-token" });
     if offset + limit < all.len() {
         body["next_cursor"] = json!(format!("off-{}", offset + limit));
@@ -660,7 +741,12 @@ fn create(state: &State, body: Value) -> Response<Body> {
         "created_at": created_at,
         "updated_at": created_at,
         "last_event_at": created_at,
-        "tags": ["config:no-git-repo"],
+        // A session on a repository isn't tagged repo-less.
+        "tags": if body["config"]["sources"].as_array().is_some_and(|s| !s.is_empty()) {
+            json!([])
+        } else {
+            json!(["config:no-git-repo"])
+        },
         "config": body["config"].clone(),
         "session_url": format!("https://claude.ai/code/{id}"),
     });

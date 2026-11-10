@@ -263,7 +263,7 @@ pub fn project_key(space: &Space) -> String {
 pub fn cloud_repository_id(spaces: &[Space], github_repo: &str) -> String {
     spaces
         .iter()
-        .filter(|s| !s.device_id.starts_with(crate::CLOUD_DEVICE_PREFIX))
+        .filter(|s| !crate::provider_cloud::is_repository_only_device(&s.device_id))
         .filter(|s| {
             s.github_repo
                 .as_deref()
