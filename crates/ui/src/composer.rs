@@ -9281,6 +9281,13 @@ impl Composer {
             cx.notify();
             return;
         };
+        // A GitHub project: the session clones its repository at the branch
+        // the chip shows (the checkout's current one unless another was
+        // picked). No project: an empty sandbox.
+        let space_id = self.state.read(cx).selected_space_row().map(|s| s.id.clone());
+        let branch = space_id
+            .as_ref()
+            .and_then(|_| self.pickers.read(cx).provider_cloud_branch());
         let key = self.current_key.clone();
         let comments = self.state.update(cx, |state, cx| {
             let taken = state.take_review_comments(&key);
@@ -9302,7 +9309,7 @@ impl Composer {
         self.failure_key = None;
         self.sending = true;
         cx.notify();
-        let mutate = serde_json::json!({
+        let mut mutate = serde_json::json!({
             "op": "createChat",
             // The engine names the chat after its session; this id is unused.
             "chatId": uuid::Uuid::new_v4().to_string(),
@@ -9311,6 +9318,12 @@ impl Composer {
             "prompt": prompt,
             "messageId": message_id,
         });
+        if let Some(space_id) = space_id {
+            mutate["spaceId"] = space_id.into();
+        }
+        if let Some(branch) = branch {
+            mutate["branch"] = branch.into();
+        }
         self.send_task = Some(cx.spawn(async move |this, cx| {
             // Creation lists the account's sessions, then creates one: a few
             // seconds. Exactly one attempt (it isn't idempotent).
@@ -12256,11 +12269,7 @@ impl Render for Composer {
                 })
             })
             .flatten();
-        let has_new_thread_git_selectors = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .is_some_and(|space| space.git_detected);
+        let has_new_thread_git_selectors = self.pickers.read(cx).offers_git_chips(cx);
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.

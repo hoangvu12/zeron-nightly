@@ -358,7 +358,24 @@ impl ProviderCloud for ClaudeCloudHarness {
                         .into(),
                 )
             })?;
-        let mut config = json!({ "sources": [], "outcomes": [] });
+        // A GitHub project's session clones its repository at the branch
+        // (no revision: the default branch). Where the session pushes its
+        // work (`outcomes`) is left to the session, as "No project" leaves it.
+        let sources: Vec<serde_json::Value> = request
+            .source
+            .iter()
+            .map(|source| {
+                let mut repo = json!({
+                    "type": "git_repository",
+                    "url": format!("https://github.com/{}", source.github_repo),
+                });
+                if let Some(branch) = source.branch.as_deref().filter(|b| !b.is_empty()) {
+                    repo["revision"] = json!(branch);
+                }
+                repo
+            })
+            .collect();
+        let mut config = json!({ "sources": sources, "outcomes": [] });
         if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
             config["model"] = json!(model);
         }

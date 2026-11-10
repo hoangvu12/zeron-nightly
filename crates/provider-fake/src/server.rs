@@ -594,7 +594,12 @@ fn create(state: &State, body: Value) -> Response<Body> {
         "created_at": created_at,
         "updated_at": created_at,
         "last_event_at": created_at,
-        "tags": ["config:no-git-repo"],
+        // A session on a repository isn't tagged repo-less.
+        "tags": if body["config"]["sources"].as_array().is_some_and(|s| !s.is_empty()) {
+            json!([])
+        } else {
+            json!(["config:no-git-repo"])
+        },
         "config": body["config"].clone(),
         "session_url": format!("https://claude.ai/code/{id}"),
     });

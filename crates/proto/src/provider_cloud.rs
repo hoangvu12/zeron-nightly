@@ -132,9 +132,91 @@ pub fn title_from_prompt(prompt: &str) -> String {
     title
 }
 
+/// The logical device that owns projects living only at a provider cloud:
+/// a GitHub repository no device has cloned ("New project from GitHub…" under
+/// Anthropic cloud). Like Zeron Cloud's logical device it has no engine and
+/// is never listed, dialed or forwarded to; its projects run provider-run
+/// chats only.
+pub const PROJECTS_DEVICE: &str = "provider-cloud";
+
+/// Whether `device_id` owns projects that are only a GitHub repository, with
+/// no folder on any device: Zeron Cloud's and [`PROJECTS_DEVICE`]'s.
+pub fn is_repository_only_device(device_id: &str) -> bool {
+    device_id == PROJECTS_DEVICE || device_id.starts_with(crate::CLOUD_DEVICE_PREFIX)
+}
+
+/// The GitHub repository (`owner/name`) that `input` names: `owner/name`, or
+/// a github.com remote (https, `git@github.com:`, `ssh://`), with or
+/// without `.git` and a trailing slash. `None` for anything else.
+pub fn github_repo_from_input(input: &str) -> Option<String> {
+    let input = input.trim();
+    let rest = [
+        "https://github.com/",
+        "http://github.com/",
+        "https://www.github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| {
+        input
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &input[prefix.len()..])
+    })
+    .unwrap_or(input);
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_repos_read_from_what_people_paste() {
+        for input in [
+            "acme/app",
+            " acme/app ",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app.git",
+            "https://github.com/acme/app/",
+            "git@github.com:acme/app.git",
+            "ssh://git@github.com/acme/app",
+            "github.com/acme/app",
+        ] {
+            assert_eq!(
+                github_repo_from_input(input).as_deref(),
+                Some("acme/app"),
+                "{input}"
+            );
+        }
+        for input in [
+            "app",
+            "",
+            "https://github.com/acme",
+            "https://gitlab.com/acme/app",
+            "acme/app/tree/main",
+            "a b/c",
+            "../app",
+        ] {
+            assert_eq!(github_repo_from_input(input), None, "{input}");
+        }
+        assert!(is_repository_only_device(PROJECTS_DEVICE));
+        assert!(is_repository_only_device("cloud-org1"));
+        assert!(!is_repository_only_device("laptop"));
+    }
 
     #[test]
     fn titles_come_from_the_first_line() {
