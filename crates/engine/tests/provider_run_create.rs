@@ -16,6 +16,7 @@ use std::time::Duration;
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::claude_cloud::credentials::ClaudeConfigDir;
+use zeron_harness::claude_cloud::api::Timeouts;
 use zeron_harness::claude_cloud::{ClaudeCloudConfig, ClaudeCloudHarness};
 use zeron_proto::HarnessId;
 use zeron_provider_fake::{
@@ -32,6 +33,7 @@ struct Rig {
     _stub: StubClaude,
     core: EngineCore,
     client: zeron_rpc::RpcClient,
+    harness: Arc<ClaudeCloudHarness>,
 }
 
 async fn rig() -> Rig {
@@ -46,14 +48,15 @@ async fn rig() -> Rig {
     );
     let stub = StubClaude::install(tmp.path().join("bin"), &FakeAccount::a());
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(
+    let harness = Arc::new(
         ClaudeCloudHarness::new(ClaudeCloudConfig {
             base_url: fake.base_url().to_owned(),
             login: ClaudeConfigDir::at(login.dir()),
             claude_executable: Some(stub.path().to_owned()),
         })
         .expect("harness builds"),
-    ));
+    );
+    registry.register(harness.clone());
     let data = tmp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     ClaudeCloudSessions::open(&data)
@@ -72,6 +75,7 @@ async fn rig() -> Rig {
         _stub: stub,
         core,
         client,
+        harness,
     }
 }
 
@@ -290,5 +294,50 @@ async fn a_refused_create_is_a_plain_failure() {
     assert!(matches!(result, Err(RpcError::Failed(_))), "{result:?}");
     assert!(rig.fake.list_reads().len() <= 1, "no tag lookup after a refusal");
     assert_eq!(rig.creates(), 1);
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_answered_too_late_is_found_by_its_tag_and_adopted() {
+    let rig = rig().await;
+    rig.fake.queue_turn(Turn::text_zulu());
+    // The session is made at once, but its answer takes longer than the
+    // create may.
+    rig.fake.delay_create_answers(Some(Duration::from_secs(20)));
+    rig.harness.client().set_timeouts(Timeouts {
+        create: Duration::from_millis(500),
+        ..Timeouts::default()
+    });
+
+    let created = rig
+        .create(&uuid::Uuid::new_v4().to_string())
+        .await
+        .expect("adopted");
+    assert_eq!(rig.creates(), 1, "never retried");
+    assert_eq!(rig.fake.created_sessions().len(), 1);
+    assert_eq!(
+        created["providerSession"]["sessionId"],
+        rig.fake.created_sessions()[0].as_str()
+    );
+    rig.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_has_one_deadline_shorter_than_the_composers_wait() {
+    let rig = rig().await;
+    // The answer would come long after the engine's own bound on the whole
+    // create (the harness's own bound on the request is longer still).
+    rig.fake.delay_create_answers(Some(Duration::from_secs(30)));
+    rig.core.set_provider_create_deadline(Duration::from_secs(2));
+    let started = std::time::Instant::now();
+
+    assert!(uncertain(rig.create(&uuid::Uuid::new_v4().to_string()).await));
+
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "answered within its deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(rig.creates(), 1, "never retried");
     rig.core.shutdown().await;
 }

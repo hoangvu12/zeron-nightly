@@ -768,6 +768,12 @@ impl WorkspaceHost {
         self.read(|doc| doc.chat_deleted_at(chat_id))
     }
 
+    /// When `chat_id` was last unarchived in Zeron, if it was
+    /// ([`RegistryDoc::chat_unarchived_at`]).
+    pub fn chat_unarchived_at(&self, chat_id: &str) -> Option<chrono::DateTime<Utc>> {
+        self.read(|doc| doc.chat_unarchived_at(chat_id))
+    }
+
     /// Bring a deleted chat back with a real clock that beats its tombstone
     /// ([`RegistryDoc::revive_chat`]).
     pub fn revive_chat(&self, chat: &Chat) -> Result<(), EngineError> {

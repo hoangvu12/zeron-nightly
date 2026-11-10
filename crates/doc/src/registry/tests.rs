@@ -1130,6 +1130,21 @@ fn a_revive_beats_the_tombstone_it_saw_and_says_when_it_was_deleted() {
 }
 
 #[test]
+fn an_unarchive_is_told_apart_from_a_chat_never_archived() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    doc.upsert_chat_at(&chat("chat-2", "dev-a"), ts(2_000)).unwrap();
+    assert_eq!(doc.chat_unarchived_at("chat-1"), None, "created, never archived");
+    assert_eq!(doc.chat_unarchived_at("chat-2"), None, "imported, never archived");
+    doc.set_chat_archived("chat-1", true).unwrap();
+    assert_eq!(doc.chat_unarchived_at("chat-1"), None, "archived now");
+    let before = Utc::now() - chrono::Duration::seconds(1);
+    doc.set_chat_archived("chat-1", false).unwrap();
+    let at = doc.chat_unarchived_at("chat-1").expect("unarchived");
+    assert!(at >= before && at <= Utc::now());
+}
+
+#[test]
 fn explicit_clock_writes_work_on_a_local_only_replica() {
     let mut doc = RegistryDoc::new("dev-a");
     doc.set_local_only(true);

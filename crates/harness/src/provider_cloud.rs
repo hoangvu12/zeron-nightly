@@ -186,6 +186,9 @@ pub struct ListedSession {
     pub activity: SessionActivity,
     /// Archived at the provider (claude.ai, the phone, or Zeron's delete).
     pub archived: bool,
+    /// The first prompt uuid of the Zeron create that made the session, from
+    /// its `zeron:<uuid>` tag; `None` for a session started elsewhere.
+    pub created_by: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_event_at: chrono::DateTime<chrono::Utc>,
 }
@@ -229,9 +232,12 @@ pub trait ProviderCloud: Send + Sync {
     /// Archiving an archived session changes nothing.
     async fn archive_session(&self, session: &ProviderSession) -> Result<(), ProviderCloudError>;
 
-    /// Whether the session is archived at the provider now.
-    async fn session_archived(&self, session: &ProviderSession)
-    -> Result<bool, ProviderCloudError>;
+    /// The session as the provider describes it now (its archived state and
+    /// last activity), whatever its age: one read of that session alone.
+    async fn read_session(
+        &self,
+        session: &ProviderSession,
+    ) -> Result<ListedSession, ProviderCloudError>;
 
     /// Tie the chat's next fresh run to its session. Called by the engine
     /// before every fresh dispatch; replaces any earlier binding for the

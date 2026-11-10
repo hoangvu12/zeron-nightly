@@ -733,6 +733,14 @@ impl EngineCore {
         }
     }
 
+    /// Test seam: bound a provider-run create, start to finish, by
+    /// `deadline` instead of [`provider_run::CREATE_DEADLINE`].
+    pub fn set_provider_create_deadline(&self, deadline: std::time::Duration) {
+        if let Some(store) = self.sessions.registry().claude_cloud() {
+            store.set_create_deadline(deadline);
+        }
+    }
+
     pub async fn shutdown(&self) {
         // Stop the runner heartbeat + credential refresher first.
         self.cloud

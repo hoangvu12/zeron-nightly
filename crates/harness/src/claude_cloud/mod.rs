@@ -111,16 +111,46 @@ fn listed_session(
         activity: session_activity(&info),
         archived: info.archived(),
         title: info.title.clone().filter(|t| !t.trim().is_empty()),
-        session: ProviderSession {
-            provider: zeron_proto::provider_cloud::CLAUDE.to_owned(),
-            session_id: info.id,
-            account_uuid: account.account_uuid.clone(),
-            account_email: account.email.clone(),
-            org_id: account.org_id.clone(),
-        },
+        created_by: info
+            .tags
+            .iter()
+            .find_map(|tag| zeron_proto::provider_cloud::prompt_of_create_tag(tag))
+            .map(str::to_owned),
+        session: session_of(info.id, account),
         created_at,
         last_event_at,
     })
+}
+
+/// Read the device's own login's session list from its first page, newest
+/// activity first, handing each entry to `visit` until it says to stop
+/// (`false`), the list ends, or [`LIST_PAGES`] pages were read. Every page
+/// read is bounded by the client's list timeout.
+async fn walk_list(
+    client: &CloudClient,
+    account: &credentials::ClaudeAccount,
+    mut visit: impl FnMut(api::SessionInfo) -> bool,
+) -> Result<(), ProviderCloudError> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..LIST_PAGES {
+        let page = client
+            .list_sessions(account, LIST_PAGE_SIZE, cursor.as_deref())
+            .await
+            .map_err(provider_error)?;
+        if page.data.is_empty() {
+            return Ok(());
+        }
+        for info in page.data {
+            if !visit(info) {
+                return Ok(());
+            }
+        }
+        cursor = page.next_cursor.filter(|c| !c.is_empty());
+        if cursor.is_none() {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Where and as whom the harness talks to the session API.
@@ -447,24 +477,36 @@ impl ProviderCloud for ClaudeCloudHarness {
             .map_err(|e| provider_error(ApiError::Credentials(e)))?;
         // Zeron never calls the environment endpoints: a new session goes in
         // the account's existing cloud environment, the one its sessions use.
-        let mut environment = None;
-        let mut cursor: Option<String> = None;
-        for _ in 0..ENVIRONMENT_PAGES {
-            let page = self
-                .client
-                .list_sessions(&account, ENVIRONMENT_PAGE_SIZE, cursor.as_deref())
-                .await
-                .map_err(provider_error)?;
-            environment = page
-                .data
-                .iter()
-                .find(|s| s.environment_kind.as_deref() == Some("anthropic_cloud"))
-                .and_then(|s| s.environment_id.clone());
-            cursor = page.next_cursor.filter(|c| !c.is_empty());
-            if environment.is_some() || cursor.is_none() {
-                break;
+        // Bounded as a whole: nothing has been created yet, so running out of
+        // time here is a plain failure.
+        let timeouts = self.client.timeouts();
+        let environment = tokio::time::timeout(timeouts.lookup, async {
+            let mut environment = None;
+            let mut cursor: Option<String> = None;
+            for _ in 0..ENVIRONMENT_PAGES {
+                let page = self
+                    .client
+                    .list_sessions(&account, ENVIRONMENT_PAGE_SIZE, cursor.as_deref())
+                    .await
+                    .map_err(provider_error)?;
+                environment = page
+                    .data
+                    .iter()
+                    .find(|s| s.environment_kind.as_deref() == Some("anthropic_cloud"))
+                    .and_then(|s| s.environment_id.clone());
+                cursor = page.next_cursor.filter(|c| !c.is_empty());
+                if environment.is_some() || cursor.is_none() {
+                    break;
+                }
             }
-        }
+            Ok::<_, ProviderCloudError>(environment)
+        })
+        .await
+        .map_err(|_| {
+            ProviderCloudError::Other(
+                "Claude cloud didn't answer in time; nothing was created.".into(),
+            )
+        })??;
         let environment = environment.ok_or_else(|| {
                 ProviderCloudError::Other(
                     "This Claude account has no cloud environment yet. Open claude.ai/code once, then try again."
@@ -501,10 +543,16 @@ impl ProviderCloud for ClaudeCloudHarness {
         if TAGS_KEPT {
             body["tags"] = json!([zeron_proto::provider_cloud::create_tag(&request.prompt_uuid)]);
         }
-        let created = self
-            .client
-            .create_session(&account, &body)
+        // One bound over the create, a CLI renewal and its one resend
+        // included: past it, the outcome is unknown.
+        let created = tokio::time::timeout(timeouts.create, self.client.create_session(&account, &body))
             .await
+            .map_err(|_| {
+                ProviderCloudError::Uncertain(
+                    "Zeron couldn't tell whether Claude created the session (no answer in time)."
+                        .into(),
+                )
+            })?
             .map_err(create_error)?;
         let session = session_of(created.id, &account);
         self.bindings
@@ -526,38 +574,27 @@ impl ProviderCloud for ClaudeCloudHarness {
             .account()
             .await
             .map_err(|e| provider_error(ApiError::Credentials(e)))?;
-        let tag = zeron_proto::provider_cloud::create_tag(prompt_uuid);
-        let mut cursor: Option<String> = None;
-        for _ in 0..LIST_PAGES {
-            let page = self
-                .client
-                .list_sessions(&account, LIST_PAGE_SIZE, cursor.as_deref())
-                .await
-                .map_err(provider_error)?;
-            let mut reached_older = page.data.is_empty();
-            for info in page.data {
-                if info.tags.contains(&tag) && !info.id.is_empty() {
-                    let session = session_of(info.id, &account);
-                    // Every session starts on the model it was created with;
-                    // which one is unknown here, so no model change is assumed.
-                    self.bindings
-                        .created(session.clone(), prompt_uuid.to_owned(), None);
-                    return Ok(Some(session));
-                }
-                let last = parse_time(info.last_event_at.as_deref())
-                    .or_else(|| parse_time(info.created_at.as_deref()));
-                if last.is_some_and(|at| at < since) {
-                    // Newest activity first: the create's session (whose first
-                    // event is no older than the attempt) can't come later.
-                    reached_older = true;
-                }
+        let mut found = None;
+        walk_list(&self.client, &account, |info| {
+            let Some(listed) = listed_session(info, &account) else {
+                return true;
+            };
+            if listed.created_by.as_deref() == Some(prompt_uuid) {
+                found = Some(listed.session);
+                return false;
             }
-            cursor = page.next_cursor.filter(|c| !c.is_empty());
-            if reached_older || cursor.is_none() {
-                break;
-            }
+            // Newest activity first: the create's session (whose first event
+            // is no older than the attempt) can't come later.
+            listed.last_event_at >= since
+        })
+        .await?;
+        if let Some(session) = &found {
+            // Every session starts on the model it was created with; which
+            // one is unknown here, so no model change is assumed.
+            self.bindings
+                .created(session.clone(), prompt_uuid.to_owned(), None);
         }
-        Ok(None)
+        Ok(found)
     }
 
     async fn archive_session(&self, session: &ProviderSession) -> Result<(), ProviderCloudError> {
@@ -567,15 +604,19 @@ impl ProviderCloud for ClaudeCloudHarness {
             .map_err(provider_error)
     }
 
-    async fn session_archived(
+    async fn read_session(
         &self,
         session: &ProviderSession,
-    ) -> Result<bool, ProviderCloudError> {
-        self.client
-            .session(&session::account_of(session), &session.session_id)
+    ) -> Result<ListedSession, ProviderCloudError> {
+        let account = session::account_of(session);
+        let info = self
+            .client
+            .session(&account, &session.session_id)
             .await
-            .map(|info| info.archived())
-            .map_err(provider_error)
+            .map_err(provider_error)?;
+        listed_session(info, &account).ok_or_else(|| {
+            ProviderCloudError::Other("Claude cloud described the session without its times.".into())
+        })
     }
 
     async fn list_sessions(
@@ -591,30 +632,18 @@ impl ProviderCloud for ClaudeCloudHarness {
             .await
             .map_err(|e| provider_error(ApiError::Credentials(e)))?;
         let mut listed = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..LIST_PAGES {
-            let page = self
-                .client
-                .list_sessions(&account, LIST_PAGE_SIZE, cursor.as_deref())
-                .await
-                .map_err(provider_error)?;
-            let mut reached_older = page.data.is_empty();
-            for info in page.data {
-                let Some(found) = listed_session(info, &account) else {
-                    continue;
-                };
-                if found.last_event_at < since {
-                    // Newest activity first: everything after is older.
-                    reached_older = true;
-                    continue;
-                }
-                listed.push(found);
+        walk_list(&self.client, &account, |info| {
+            let Some(found) = listed_session(info, &account) else {
+                return true;
+            };
+            if found.last_event_at < since {
+                // Newest activity first: everything after is older.
+                return false;
             }
-            cursor = page.next_cursor.filter(|c| !c.is_empty());
-            if reached_older || cursor.is_none() {
-                break;
-            }
-        }
+            listed.push(found);
+            true
+        })
+        .await?;
         Ok(listed)
     }
 

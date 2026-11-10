@@ -84,6 +84,12 @@ fn refused(message: impl Into<String>) -> EngineError {
 /// provider's clock may run behind this device's).
 const CREATE_LOOKBACK: chrono::Duration = chrono::Duration::minutes(5);
 
+/// The bound on one provider-run create, from the request through the
+/// lookup by its tag: clearly inside the composer's wait (150 s), so the
+/// composer never shows "Creation uncertain" while the engine still works on
+/// it. Past it, the outcome is unknown and nothing is retried.
+pub(crate) const CREATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(110);
+
 /// Why [`create_chat`] made no chat.
 #[derive(Debug)]
 pub(crate) enum CreateFailure {
@@ -124,11 +130,6 @@ pub(crate) async fn create_chat(
     let cloud = harness
         .provider_cloud()
         .ok_or_else(|| refused("Claude cloud sessions are off on this device."))?;
-    let source = match new.space_id.as_deref() {
-        Some(space_id) => Some(github_source(workspace, repos, space_id, new.branch).await?),
-        None => None,
-    };
-    let branch = source.as_ref().and_then(|s| s.branch.clone());
     let message_id = new
         .message_id
         .filter(|id| !id.trim().is_empty())
@@ -138,38 +139,64 @@ pub(crate) async fn create_chat(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| zeron_proto::provider_cloud::title_from_prompt(&prompt));
     let prompt_uuid = zeron_proto::provider_cloud::event_uuid(&message_id);
-    let attempted = chrono::Utc::now();
-    // Not idempotent: exactly one attempt. A refusal created nothing; an
-    // unknown outcome is looked up by the create's tag, never retried.
-    let created = cloud
-        .create_session(CreateSession {
-            prompt: prompt.clone(),
-            prompt_uuid: prompt_uuid.clone(),
-            model: new.config.model.clone(),
-            title: Some(title.clone()),
-            source,
-        })
-        .await;
-    let session = match created {
-        Ok(session) => session,
-        Err(ProviderCloudError::Uncertain(why)) => {
-            tracing::warn!(reason = %why, "a Claude cloud create's outcome is unknown; looking for its session");
-            match cloud
-                .find_created(&prompt_uuid, attempted - CREATE_LOOKBACK)
-                .await
-            {
-                Ok(Some(session)) => session,
-                Ok(None) => return Err(CreateFailure::Uncertain),
-                Err(error) => {
-                    tracing::warn!(%error, "couldn't look for the created session");
-                    return Err(CreateFailure::Uncertain);
+    let deadline = registry
+        .claude_cloud()
+        .map_or(CREATE_DEADLINE, |store| store.create_deadline());
+    // Whether the create request may have gone out: past that, running out
+    // of time is "Creation uncertain", before it a plain failure.
+    let sent = std::sync::atomic::AtomicBool::new(false);
+    let obtained = tokio::time::timeout(deadline, async {
+        let source = match new.space_id.as_deref() {
+            Some(space_id) => Some(github_source(workspace, repos, space_id, new.branch).await?),
+            None => None,
+        };
+        let branch = source.as_ref().and_then(|s| s.branch.clone());
+        let attempted = chrono::Utc::now();
+        sent.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Not idempotent: exactly one attempt. A refusal created nothing; an
+        // unknown outcome is looked up by the create's tag, never retried.
+        let created = cloud
+            .create_session(CreateSession {
+                prompt: prompt.clone(),
+                prompt_uuid: prompt_uuid.clone(),
+                model: new.config.model.clone(),
+                title: Some(title.clone()),
+                source,
+            })
+            .await;
+        let session = match created {
+            Ok(session) => session,
+            Err(ProviderCloudError::Uncertain(why)) => {
+                tracing::warn!(reason = %why, "a Claude cloud create's outcome is unknown; looking for its session");
+                match cloud
+                    .find_created(&prompt_uuid, attempted - CREATE_LOOKBACK)
+                    .await
+                {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return Err(CreateFailure::Uncertain),
+                    Err(error) => {
+                        tracing::warn!(%error, "couldn't look for the created session");
+                        return Err(CreateFailure::Uncertain);
+                    }
                 }
             }
+            Err(ProviderCloudError::Provider { message, .. }) => {
+                return Err(CreateFailure::Refused(refused(message)));
+            }
+            Err(other) => return Err(CreateFailure::Refused(refused(other.to_string()))),
+        };
+        Ok::<_, CreateFailure>((session, branch))
+    })
+    .await;
+    let (session, branch) = match obtained {
+        Ok(obtained) => obtained?,
+        Err(_) if sent.load(std::sync::atomic::Ordering::SeqCst) => {
+            tracing::warn!("a Claude cloud create ran out of time; its outcome is unknown");
+            return Err(CreateFailure::Uncertain);
         }
-        Err(ProviderCloudError::Provider { message, .. }) => {
-            return Err(CreateFailure::Refused(refused(message)));
+        Err(_) => {
+            return Err(refused("Claude cloud didn't answer in time; nothing was created.").into());
         }
-        Err(other) => return Err(CreateFailure::Refused(refused(other.to_string()))),
     };
     let chat_id = zeron_proto::provider_cloud::chat_id_for(&session);
     let cwd = zeron_proto::provider_cloud::claude_cwd(&session.session_id);

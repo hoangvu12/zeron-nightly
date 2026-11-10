@@ -607,9 +607,10 @@ impl SessionDoc {
         Ok(())
     }
 
-    /// What a provider-run chat shows because its host can't act for the
-    /// chat's account ("Sign in again", "Sign in as <email> to continue"),
-    /// written by the host. One atomic value; `None` when all is well.
+    /// What a provider-run chat shows about its session beyond the
+    /// transcript: a sign-in state ("Sign in again", "Sign in as <email> to
+    /// continue") or "Archived on claude.ai". One atomic value; `None` when
+    /// all is well.
     pub fn provider_chat_state(&self) -> Option<zeron_proto::provider_cloud::ProviderChatState> {
         let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
             self.doc.get_map("meta").get("providerState")

@@ -35,9 +35,34 @@ pub const REJECTED_AFTER_RENEWAL: &str = "Claude cloud sessions turned off on th
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 
-/// How long a create may take before its outcome counts as unknown (the
-/// session may exist: the caller looks for it by its tag, never retries).
-const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long requests may take. The stream has no overall bound (it follows
+/// the session live); everything else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Making a connection at all.
+    pub connect: std::time::Duration,
+    /// One read of a session-list page (or of one session).
+    pub list: std::time::Duration,
+    /// Looking up the account's cloud environment before a create, all
+    /// pages: past it nothing was created.
+    pub lookup: std::time::Duration,
+    /// A create, a CLI renewal and its one resend included: past it the
+    /// outcome is unknown (the session may exist; the caller looks for it by
+    /// its tag, never retries).
+    pub create: std::time::Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        use std::time::Duration;
+        Self {
+            connect: Duration::from_secs(10),
+            list: Duration::from_secs(15),
+            lookup: Duration::from_secs(20),
+            create: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Zeron's identity on every request.
 pub fn user_agent() -> String {
@@ -216,6 +241,7 @@ pub struct CloudClient {
     credentials: Arc<Credentials>,
     /// The accounts' sign-in states and the kill switch.
     status: watch::Sender<ProviderCloudStatus>,
+    timeouts: std::sync::Mutex<Timeouts>,
 }
 
 impl CloudClient {
@@ -223,7 +249,9 @@ impl CloudClient {
     /// `User-Agent`: no request may go out unnamed.
     pub fn new(base_url: &str, credentials: Arc<Credentials>) -> Result<Self, ApiError> {
         let base = base_url.trim_end_matches('/').to_owned();
-        let mut builder = reqwest::Client::builder().user_agent(user_agent());
+        let mut builder = reqwest::Client::builder()
+            .user_agent(user_agent())
+            .connect_timeout(Timeouts::default().connect);
         // A loopback base (tests) must never go through a system proxy.
         if is_loopback(&base) {
             builder = builder.no_proxy();
@@ -236,7 +264,24 @@ impl CloudClient {
             base,
             credentials,
             status: watch::Sender::new(ProviderCloudStatus::default()),
+            timeouts: std::sync::Mutex::new(Timeouts::default()),
         })
+    }
+
+    /// The bounds requests run under ([`Timeouts`]).
+    pub fn timeouts(&self) -> Timeouts {
+        *self
+            .timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test seam: shorter bounds (the connect bound is fixed at build).
+    pub fn set_timeouts(&self, timeouts: Timeouts) {
+        *self
+            .timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeouts;
     }
 
     pub fn credentials(&self) -> &Arc<Credentials> {
@@ -374,9 +419,10 @@ impl CloudClient {
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor.to_owned()));
         }
+        let bound = self.timeouts().list;
         let response = self
             .execute(reqwest::Method::GET, "/v1/code/sessions", account, |r| {
-                r.query(&query)
+                r.query(&query).timeout(bound)
             })
             .await?;
         self.send_json(response).await
@@ -394,9 +440,10 @@ impl CloudClient {
             #[serde(default)]
             id: Option<String>,
         }
+        let bound = self.timeouts().create;
         let response = self
             .execute(reqwest::Method::POST, "/v1/code/sessions", account, |r| {
-                r.json(body).timeout(CREATE_TIMEOUT)
+                r.json(body).timeout(bound)
             })
             .await?;
         let created: Created = self.send_json(response).await?;
@@ -419,12 +466,13 @@ impl CloudClient {
         account: &ClaudeAccount,
         session_id: &str,
     ) -> Result<SessionInfo, ApiError> {
+        let bound = self.timeouts().list;
         let response = self
             .execute(
                 reqwest::Method::GET,
                 &format!("/v1/code/sessions/{}", path_segment(session_id)),
                 account,
-                |r| r,
+                |r| r.timeout(bound),
             )
             .await?;
         self.send_json(response).await
@@ -433,12 +481,13 @@ impl CloudClient {
     /// `POST /v1/code/sessions/{id}/archive`. Archiving an archived session
     /// changes nothing.
     pub async fn archive(&self, account: &ClaudeAccount, session_id: &str) -> Result<(), ApiError> {
+        let bound = self.timeouts().list;
         let response = self
             .execute(
                 reqwest::Method::POST,
                 &format!("/v1/code/sessions/{}/archive", path_segment(session_id)),
                 account,
-                |r| r.json(&json!({})),
+                |r| r.json(&json!({})).timeout(bound),
             )
             .await?;
         let _: Value = self.send_json(response).await?;

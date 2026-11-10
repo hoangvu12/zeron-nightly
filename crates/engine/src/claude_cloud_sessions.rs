@@ -120,6 +120,12 @@ pub struct ClaudeCloudSessions {
     changing: Mutex<()>,
     /// The sidebar's session list: its throttle and latest read.
     discovery: crate::provider_discovery::ProviderDiscovery,
+    /// The provider-run chats this device knows and the archives their
+    /// deletes still owe, kept across restarts.
+    archives: crate::provider_archive::ArchiveLedger,
+    /// The bound on one provider-run create, start to finish
+    /// ([`crate::provider_run::CREATE_DEADLINE`]; shortened only by tests).
+    create_deadline: Mutex<std::time::Duration>,
 }
 
 impl ClaudeCloudSessions {
@@ -136,7 +142,27 @@ impl ClaudeCloudSessions {
             stored: Mutex::new(stored),
             changing: Mutex::new(()),
             discovery: Default::default(),
+            archives: crate::provider_archive::ArchiveLedger::open(data_dir),
+            create_deadline: Mutex::new(crate::provider_run::CREATE_DEADLINE),
         }
+    }
+
+    pub(crate) fn archives(&self) -> &crate::provider_archive::ArchiveLedger {
+        &self.archives
+    }
+
+    pub(crate) fn create_deadline(&self) -> std::time::Duration {
+        *self
+            .create_deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_create_deadline(&self, deadline: std::time::Duration) {
+        *self
+            .create_deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = deadline;
     }
 
     /// Hold while making a change, from reading the current settings through

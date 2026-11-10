@@ -4113,7 +4113,9 @@ impl RpcService for EngineRpc {
                             .await
                         })
                         .await
-                        .map_err(|e| RpcError::Failed(format!("creating the chat failed: {e}")))?
+                        // The task died mid-way: whether it created the
+                        // session is unknown.
+                        .unwrap_or(Err(crate::provider_run::CreateFailure::Uncertain))
                         .map_err(|failure| match failure {
                             crate::provider_run::CreateFailure::Refused(e) => {
                                 RpcError::Failed(e.to_string())

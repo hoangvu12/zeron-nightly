@@ -96,12 +96,16 @@ impl HlcClock {
 /// The largest ms an HLC can carry: the room's `validateOp` wants 13 digits.
 const MAX_HLC_MS: i64 = 9_999_999_999_999;
 
+/// The wall-clock ms an HLC carries; `None` for a malformed clock.
+fn hlc_ms(clock: &str) -> Option<i64> {
+    clock.split('-').next()?.parse().ok()
+}
+
 /// One past `clock` for `device`: the next counter at the same ms, carried
 /// into the next ms like [`HlcClock`]. `None` for a malformed clock.
 fn hlc_after(clock: &str, device: &str) -> Option<String> {
-    let mut parts = clock.splitn(3, '-');
-    let ms: i64 = parts.next()?.parse().ok()?;
-    let counter: u32 = parts.next()?.parse().ok()?;
+    let ms = hlc_ms(clock)?;
+    let counter: u32 = clock.splitn(3, '-').nth(1)?.parse().ok()?;
     Some(if counter >= 999_999 {
         encode_hlc((ms + 1).min(MAX_HLC_MS), 0, device)
     } else {
@@ -1166,8 +1170,24 @@ impl RegistryDoc {
         let row = self
             .overlay_row_or_tombstone(KIND_CHATS, id)
             .filter(|r| r.deleted)?;
-        let ms: i64 = row.del_hlc?.split('-').next()?.parse().ok()?;
-        DateTime::<Utc>::from_timestamp_millis(ms)
+        DateTime::<Utc>::from_timestamp_millis(hlc_ms(row.del_hlc.as_deref()?)?)
+    }
+
+    /// When `id`'s chat was last unarchived, if it was: the row reads
+    /// unarchived and its `archived` field was written after the row itself
+    /// (a create, an import or a full upsert writes every field at one
+    /// clock). `None` for a chat archived now or never unarchived.
+    pub fn chat_unarchived_at(&self, id: &str) -> Option<DateTime<Utc>> {
+        let row = self.overlay_row(KIND_CHATS, id)?;
+        if row.fields.get("archived") != Some(&Value::Bool(false)) {
+            return None;
+        }
+        let archived = row.clocks.get("archived")?;
+        let created = row.clocks.get("id")?;
+        if archived <= created {
+            return None;
+        }
+        DateTime::<Utc>::from_timestamp_millis(hlc_ms(archived)?)
     }
 
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {

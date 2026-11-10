@@ -232,6 +232,10 @@ struct Inner {
     lost_creates: usize,
     /// Whether a create keeps the custom tags it was sent (on by default).
     keep_tags: bool,
+    /// How long a create's answer is held after the session is made.
+    create_delay: Option<std::time::Duration>,
+    /// Archive requests still to fail with a 500 (the session stays active).
+    failed_archives: usize,
 }
 
 impl Inner {
@@ -395,6 +399,18 @@ impl FakeSessionServer {
     /// lost on the way back (the client sees a 502).
     pub fn lose_create_answers(&self, times: usize) {
         lock(&self.state).lost_creates = times;
+    }
+
+    /// From now on a create makes its session at once but holds its answer
+    /// for `delay` (a slow gateway); `None` answers at once.
+    pub fn delay_create_answers(&self, delay: Option<std::time::Duration>) {
+        lock(&self.state).create_delay = delay;
+    }
+
+    /// The next `times` archive requests fail with a 500 and archive
+    /// nothing.
+    pub fn fail_archives(&self, times: usize) {
+        lock(&self.state).failed_archives = times;
     }
 
     /// Whether creates keep the custom tags they're sent (they do unless
@@ -633,7 +649,14 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     Ok(match (method.as_str(), segments.as_slice()) {
         ("GET", ["v1", "code", "sessions"]) => list(&state, &recorded),
-        ("POST", ["v1", "code", "sessions"]) => create(&state, body),
+        ("POST", ["v1", "code", "sessions"]) => {
+            let response = create(&state, body);
+            let delay = lock(&state).create_delay;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            response
+        }
         ("GET", ["v1", "code", "sessions", id]) => match lock(&state).session(id) {
             Some(session) => json_response(StatusCode::OK, session.info.clone()),
             None => not_found(),
@@ -643,6 +666,11 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
         ("GET", ["v1", "code", "sessions", id, "events", "stream"]) => {
             stream(&state, id, &recorded)
         }
+        ("POST", ["v1", "code", "sessions", _, "archive"]) if take_failed_archive(&state) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "archive failed",
+        ),
         ("POST", ["v1", "code", "sessions", id, "archive"]) => match lock(&state).session(id) {
             Some(session) => {
                 session.info["status"] = json!("archived");
@@ -652,6 +680,17 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
         },
         _ => not_found(),
     })
+}
+
+/// Whether this archive request is one [`FakeSessionServer::fail_archives`]
+/// set to fail (counting it).
+fn take_failed_archive(state: &State) -> bool {
+    let mut inner = lock(state);
+    if inner.failed_archives == 0 {
+        return false;
+    }
+    inner.failed_archives -= 1;
+    true
 }
 
 fn not_found() -> Response<Body> {

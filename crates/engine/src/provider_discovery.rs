@@ -91,9 +91,6 @@ pub struct ProviderDiscovery {
     state: tokio::sync::Mutex<State>,
     /// [`LIST_INTERVAL`], shortened only by tests.
     interval: std::sync::Mutex<Duration>,
-    /// Chats this device deleted because their session was archived at the
-    /// provider: their delete archives nothing.
-    pub(crate) deleted_for_archive: crate::provider_archive::DeletedForArchive,
 }
 
 impl Default for ProviderDiscovery {
@@ -101,7 +98,6 @@ impl Default for ProviderDiscovery {
         Self {
             state: Default::default(),
             interval: std::sync::Mutex::new(LIST_INTERVAL),
-            deleted_for_archive: Default::default(),
         }
     }
 }
@@ -155,14 +151,7 @@ impl ProviderDiscovery {
         match cloud.list_sessions(read_at - window()).await {
             Ok(listed) => {
                 let revived = if workspace.registry_current() {
-                    crate::provider_archive::reconcile(
-                        sessions,
-                        doc_host,
-                        &workspace,
-                        &harness,
-                        &self.deleted_for_archive,
-                        &listed,
-                    )
+                    crate::provider_archive::reconcile(sessions, doc_host, &workspace, &listed)
                 } else {
                     Vec::new()
                 };

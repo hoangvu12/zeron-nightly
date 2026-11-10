@@ -59,7 +59,7 @@ async fn the_server_keeps_zerons_create_tag() {
     let config = ClaudeCloudConfig::device_default().expect("a home folder");
     let harness = ClaudeCloudHarness::new(config).expect("harness builds");
     let prompt_uuid = uuid::Uuid::new_v4().to_string();
-    let tag = format!("zeron:{prompt_uuid}");
+    let tag = zeron_proto::provider_cloud::create_tag(&prompt_uuid);
     let since = chrono::Utc::now() - chrono::Duration::minutes(5);
 
     let created = harness
@@ -143,7 +143,7 @@ async fn the_server_keeps_zerons_create_tag() {
             .ok(),
         Err(_) => None,
     };
-    let archived_now = harness.session_archived(&session).await;
+    let archived_now = harness.read_session(&session).await.map(|s| s.archived);
 
     eprintln!("checks ran to the end: {}", checks.is_ok());
     eprintln!("single-session read worked: {:?}", findings.single_read);
@@ -160,7 +160,7 @@ async fn the_server_keeps_zerons_create_tag() {
         }
     }
     eprintln!(
-        "session_archived after archive: {:?}",
+        "read as archived after archive: {:?}",
         archived_now.as_ref().map_err(kind)
     );
 

@@ -93,6 +93,11 @@ pub fn create_tag(prompt_uuid: &str) -> String {
     format!("zeron:{prompt_uuid}")
 }
 
+/// The first prompt uuid a [`create_tag`] names; `None` for any other tag.
+pub fn prompt_of_create_tag(tag: &str) -> Option<&str> {
+    tag.strip_prefix("zeron:").filter(|uuid| !uuid.is_empty())
+}
+
 /// Where the person sees a session on claude.ai.
 pub fn claude_session_url(session_id: &str) -> String {
     format!("https://claude.ai/code/{session_id}")
@@ -323,6 +328,12 @@ mod tests {
             create_tag("6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70"),
             "zeron:6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70"
         );
+        assert_eq!(
+            prompt_of_create_tag("zeron:6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70"),
+            Some("6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70")
+        );
+        assert_eq!(prompt_of_create_tag("config:no-git-repo"), None);
+        assert_eq!(prompt_of_create_tag("zeron:"), None);
     }
 
     #[test]

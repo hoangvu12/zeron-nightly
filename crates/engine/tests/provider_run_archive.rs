@@ -95,6 +95,21 @@ impl World {
         sid
     }
 
+    /// The session quiet for ten days: outside the list's window.
+    fn old(&self, sid: &str) {
+        let ten_days_ago = (chrono::Utc::now() - chrono::Duration::days(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        self.fake.set_times(sid, &ten_days_ago, &ten_days_ago);
+    }
+
+    /// The session's last activity `by` from now, by the provider's clock.
+    fn later(&self, sid: &str, by: chrono::Duration) {
+        let created = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let at = (chrono::Utc::now() + by).to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        self.fake.set_times(sid, &created, &at);
+    }
+
     /// The session resumed on the phone: active again, with a new turn.
     async fn resume_elsewhere(&self, sid: &str) {
         self.fake.queue_turn(Turn::text_zulu());
@@ -348,7 +363,7 @@ async fn deleting_in_zeron_archives_the_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_delete_its_host_missed_is_archived_by_the_next_list_read() {
+async fn deleting_an_old_chat_away_from_its_host_archives_the_session() {
     let world = World::new().await;
     let sid = world.started_elsewhere("Host was away").await;
     let a = world.engine("dev-a");
@@ -356,6 +371,8 @@ async fn a_delete_its_host_missed_is_archived_by_the_next_list_read() {
     let room = bridge(&[&a, &b]).await;
     let chat = a.import(&sid).await;
     wait_for("B knows the chat", || b.chat(&chat).is_some()).await;
+    // Quiet for ten days: past the list's window.
+    world.old(&sid);
     // A, the host, is off; the person deletes the chat on B.
     a.core.shutdown().await;
     b.core.workspace.delete_chat(&chat).unwrap();
@@ -363,18 +380,77 @@ async fn a_delete_its_host_missed_is_archived_by_the_next_list_read() {
         room.row("chats", &chat).is_some_and(|r| r.deleted)
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        world.fake.archive_requests().is_empty(),
-        "B doesn't host it: nothing yet"
-    );
 
-    b.discover().await;
+    // B knew the chat: it archives the session itself, reading it alone (it
+    // is outside the list's window).
     wait_for("the session archived", || {
         world.fake.session_status(&sid).as_deref() == Some("archived")
     })
     .await;
     assert!(b.chat(&chat).is_none(), "and it stays deleted");
+    b.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_a_delete_owes_survives_a_restart() {
+    let world = World::new().await;
+    let sid = world.started_elsewhere("Archive me later").await;
+    let a = world.engine("dev-a");
+    let chat = a.import(&sid).await;
+    world.old(&sid);
+    // The archive fails while A runs.
+    world.fake.fail_archives(usize::MAX);
+    a.core.workspace.delete_chat(&chat).unwrap();
+    wait_for("the archive tried", || !world.fake.archive_requests().is_empty()).await;
+    assert_eq!(world.fake.session_status(&sid).as_deref(), Some("active"));
+    a.core.shutdown().await;
+    drop(a);
+
+    // After a restart (no list read: the session is outside its window
+    // anyway), the archive is tried again and done.
+    world.fake.fail_archives(0);
+    let again = world.engine("dev-a");
+    wait_for("the session archived after the restart", || {
+        world.fake.session_status(&sid).as_deref() == Some("archived")
+    })
+    .await;
+    assert!(again.chat(&chat).is_none());
+    assert!(world.fake.list_reads().len() <= 1, "no list read needed");
+    again.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_unarchived_while_its_host_was_away_is_kept_and_says_so() {
+    let world = World::new().await;
+    let sid = world.started_elsewhere("Unarchived elsewhere").await;
+    let a = world.engine("dev-a");
+    let b = world.engine("dev-b");
+    let room = bridge(&[&a, &b]).await;
+    let chat = a.import(&sid).await;
+    a.set_archived(&chat, true);
+    wait_for("B sees it archived", || b.chat(&chat).is_some_and(|c| c.archived)).await;
+    // A, the host, is off. The session is archived on claude.ai, then the
+    // person unarchives the chat on B.
+    a.core.shutdown().await;
+    drop(a);
+    world.fake.archive(&sid);
+    b.set_archived(&chat, false);
+    wait_for("the unarchive at the relay", || {
+        room.row("chats", &chat)
+            .is_some_and(|r| r.fields.get("archived") == Some(&json!(false)))
+    })
+    .await;
+
+    // A comes back and reads the list: the chat stays, and says why it
+    // can't take messages.
+    let a = world.engine("dev-a");
+    a.core.workspace.connect_registry_url(&room.url());
+    wait_for("A sees it unarchived", || a.chat(&chat).is_some_and(|c| !c.archived)).await;
+    a.discover().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(a.chat(&chat).is_some(), "kept");
+    assert_eq!(a.state(&chat), Some(archived_on_claude(&sid)));
+    a.core.shutdown().await;
     b.core.shutdown().await;
 }
 
@@ -394,10 +470,12 @@ async fn a_session_active_again_after_its_delete_comes_back_with_its_history() {
     })
     .await;
     wait_for("B knows of the delete", || b.deleted(&chat)).await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let archives_before = world.fake.archive_requests().len();
 
-    // Then resumed on the phone.
+    // Then resumed on the phone, well after the delete (later than the
+    // clocks' disagreement a revive allows for).
     world.resume_elsewhere(&sid).await;
+    world.later(&sid, chrono::Duration::minutes(5));
     b.discover().await;
     let back = b.chat(&chat).expect("the chat is back");
     assert_eq!(back.device_id, "dev-b", "hosted by the device that brought it back");
@@ -423,9 +501,29 @@ async fn a_session_active_again_after_its_delete_comes_back_with_its_history() {
     .await;
     wait_for("A sees it back too", || a.chat(&chat).is_some()).await;
     // Bringing it back archived nothing.
-    assert_eq!(world.fake.archive_requests(), vec![sid.clone()]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(world.fake.archive_requests().len(), archives_before);
+    assert_eq!(world.fake.session_status(&sid).as_deref(), Some("active"));
     a.core.shutdown().await;
     b.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activity_just_after_a_delete_does_not_revive_it() {
+    let world = World::new().await;
+    let sid = world.started_elsewhere("Within the clocks' slack").await;
+    let a = world.engine("dev-a");
+    let chat = a.import(&sid).await;
+    world.fake.fail_archives(usize::MAX);
+    a.core.workspace.delete_chat(&chat).unwrap();
+    wait_for("the archive tried", || !world.fake.archive_requests().is_empty()).await;
+    // Resumed a moment later: by the provider's clock, maybe before the
+    // delete by this device's.
+    world.resume_elsewhere(&sid).await;
+    a.discover().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(a.chat(&chat).is_none(), "not revived on activity this close");
+    a.core.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -444,18 +542,6 @@ async fn unarchiving_a_chat_whose_session_was_archived_says_so_with_a_link() {
     // is archived in Zeron; the person unarchives the second before any.
     world.fake.archive(&seen);
     world.fake.archive(&unseen);
-    // At a person's pace: the chat list has shown it archived before the
-    // unarchive (an archive and unarchive within one publish of the chat
-    // list read as no change at all).
-    let mut chats = a.core.workspace.watch_chats();
-    wait_for("the chat list shows it archived", || {
-        chats
-            .borrow_and_update()
-            .iter()
-            .any(|c| c.id == unseen_chat && c.archived)
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     a.set_archived(&unseen_chat, false);
     wait_for("the unarchived chat says its session is archived", || {
         a.state(&unseen_chat) == Some(archived_on_claude(&unseen))
