@@ -143,7 +143,7 @@ struct Device {
 }
 
 /// What a device can do with provider-run chats.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 enum Kind {
     /// Claude cloud sessions on, signed in as this account.
     Cloud(fn() -> FakeAccount),
@@ -187,6 +187,16 @@ async fn fleet(devices: &[(&str, &str, Kind)]) -> Fleet {
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(data.join("device-id"), id).unwrap();
+        if let Kind::Cloud(_) = kind {
+            // "Claude cloud sessions" on, so the engine keeps the harness.
+            use zeron_engine::claude_cloud_sessions::{ClaudeCloudSessions, ClaudeCloudSettings};
+            ClaudeCloudSessions::open(&data)
+                .save(ClaudeCloudSettings {
+                    enabled: true,
+                    ..ClaudeCloudSettings::default()
+                })
+                .expect("setting saves");
+        }
         let core =
             EngineCore::assemble(&data, Arc::new(registry), HarnessId::ClaudeCodeCloud, None)
                 .expect("engine core assembles");
@@ -580,7 +590,32 @@ async fn two_devices_claiming_at_once_converge_and_the_session_hears_each_messag
     } else {
         (vps, laptop)
     };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     wait_for("both messages sent", || {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stored {} {}; host {} run {} posted {}; other {} run {} posted {}; hosts {:?} {:?}; commands {:?}",
+            fleet.stored_messages(&session, SECOND),
+            fleet.stored_messages(&session, THIRD),
+            host.id,
+            host.core.sessions.has_run(&chat),
+            fleet.posted_by(&host.id).len(),
+            other.id,
+            other.core.sessions.has_run(&chat),
+            fleet.posted_by(&other.id).len(),
+            host.host_of(&chat),
+            other.host_of(&chat),
+            host.core
+                .doc_host
+                .open(&chat)
+                .unwrap()
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .map(|c| (c.issued_by.clone(), c.status, c.resolution.clone()))
+                .collect::<Vec<_>>()
+        );
         fleet.stored_messages(&session, SECOND) == 1
             && fleet.stored_messages(&session, THIRD) == 1
             && host.entries(&chat).iter().any(|e| e.id == SECOND)

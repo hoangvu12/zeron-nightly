@@ -335,9 +335,7 @@ impl ProviderHosting {
                     if !first && (before.is_some() || claimed.is_some()) {
                         self.became_host(chat, before, claimed);
                     }
-                } else if !hosts_now && (hosted_before || self.inner.sessions.has_run(chat)) {
-                    // Lost it, or a run outlived the loss (it started as the
-                    // demotion landed).
+                } else if hosted_before && !hosts_now {
                     self.demoted(chat, host.clone());
                 } else if !hosts_now {
                     // A claim the room never made good on is forgotten in
@@ -416,10 +414,8 @@ impl ProviderHosting {
                 tracing::warn!(chat = %chat, %error, "couldn't resume the provider-run chat");
             }
             if !workspace.is_host(&chat) {
-                // Another claim won meanwhile (two devices claimed at once):
-                // whatever started here stops.
+                // The chat moved on meanwhile: whatever started here stops.
                 hosting.demoted(&chat, workspace.provider_chat_host(&chat));
-                return;
             }
         });
     }
