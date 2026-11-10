@@ -26,7 +26,7 @@ use gpui::{
 use zeron_engine::registry::{HarnessDescriptor, TitleSettings};
 use zeron_proto::{
     AccessMode, ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
-    Space,
+    Space, SpaceHome,
 };
 use zeron_rpc::methods;
 
@@ -959,6 +959,11 @@ pub struct Pickers {
     github_entry: bool,
     /// Why the last "New project from GitHub…" failed, shown in that menu.
     github_entry_error: Option<SharedString>,
+    /// A new project from GitHub is being created: a second Enter waits.
+    github_entry_busy: bool,
+    /// The branch a GitHub link named, for the project it picked: applied
+    /// once the project switch has reset the branch draft.
+    pending_branch: Option<(String, String)>,
     /// The device whose harness/model catalogs are loaded (see
     /// [`Self::catalog_device`]).
     catalog_owner: Option<String>,
@@ -1184,6 +1189,12 @@ impl Pickers {
                 this.held_ref = this.selected_ref().cloned().or(this.held_ref.take());
                 this.refs_task = None;
                 this.config.branch = None;
+                // A GitHub link's branch, for the project it picked.
+                if let Some((space, branch)) = this.pending_branch.take()
+                    && this.space_owner.as_deref() == Some(space.as_str())
+                {
+                    this.config.branch = Some(branch);
+                }
                 this.config.checkout = match state.read(cx).selected_space_row() {
                     // A Cloud project runs nowhere else.
                     Some(space) if zeron_proto::is_cloud_device(&space.device_id, "") => {
@@ -1212,12 +1223,13 @@ impl Pickers {
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
             }
-            // A project living only at the provider runs nowhere else: picking
-            // it makes "Anthropic cloud" the place, while this device can.
+            // A project living only at the provider cloud runs nowhere else:
+            // picking it makes "Anthropic cloud" the place, while this device
+            // can.
             let provider_project = {
                 let s = state.read(cx);
                 s.selected_space_row()
-                    .is_some_and(|space| space.device_id == PROVIDER_PROJECTS_DEVICE)
+                    .is_some_and(|space| space.home() == SpaceHome::ProviderCloud)
                     && s.provider_run_eligible()
             };
             if provider_project && !this.config.provider_cloud {
@@ -1326,6 +1338,8 @@ impl Pickers {
             checkout_by_space: HashMap::new(),
             github_entry: false,
             github_entry_error: None,
+            github_entry_busy: false,
+            pending_branch: None,
             catalog_owner,
             target_generation: 0,
             menu_geometry: HashMap::new(),
@@ -2363,7 +2377,7 @@ impl Pickers {
         };
         // A project living at Anthropic cloud has no folder to read: its
         // sessions start on the repository's default branch.
-        if !space.git_detected || space.device_id == PROVIDER_PROJECTS_DEVICE {
+        if !space.git_detected || space.home() == SpaceHome::ProviderCloud {
             return;
         }
         // Cloud picked: the branches the session can start from are the
@@ -3073,6 +3087,19 @@ impl Pickers {
         let Some(refs) = self.refs.ready() else {
             return Vec::new();
         };
+        // Anthropic cloud clones from GitHub: a branch never pushed isn't
+        // one it can start from.
+        let pushed: Vec<RepoRef>;
+        let refs = if self.config.provider_cloud {
+            pushed = refs
+                .iter()
+                .filter(|r| r.on_origin != Some(false))
+                .cloned()
+                .collect();
+            &pushed
+        } else {
+            refs
+        };
         let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
         let query = self.search.read(cx).text().to_string();
         popover::filter_indices(&query, &names)
@@ -3230,6 +3257,19 @@ impl Pickers {
     /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
     /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
     fn ref_label(&self) -> SharedString {
+        // Anthropic cloud's session clones the repository at this branch;
+        // the current one when GitHub doesn't have it can't be, so the
+        // session starts on the default branch and the chip says why.
+        if self.config.provider_cloud && self.refs.ready().is_some() {
+            return match (self.provider_cloud_branch(), self.selected_ref()) {
+                (Some(name), _) => format!("From {name}"),
+                (None, Some(current)) if current.on_origin == Some(false) => {
+                    format!("From default branch ({} isn't on GitHub)", current.name)
+                }
+                (None, _) => "From default branch".to_string(),
+            }
+            .into();
+        }
         let name = self
             .config
             .branch
@@ -3304,8 +3344,8 @@ impl Pickers {
         let rows = self.filtered_project_rows(cx);
         if self.config.provider_cloud && self.state.read(cx).selected_space_row().is_none() {
             // Anthropic cloud's "No project" row sits under "New project from
-            // GitHub…".
-            return rows.len() + 1;
+            // GitHub…" (when offered).
+            return rows.len() + usize::from(self.offers_github_entry(cx));
         }
         if self.state.read(cx).no_project {
             return rows.len();
@@ -3384,10 +3424,13 @@ impl Pickers {
 
     fn pick_no_project(&mut self, cx: &mut Context<Self>) {
         // Anthropic cloud's empty sandbox is created on this device; so is a
-        // chat leaving a project that lives at a cloud (no device to run on).
+        // chat leaving a project that lives at a provider cloud (no device to
+        // run on).
         let local = {
             let state = self.state.read(cx);
-            let off_device = state.effective_device_id().as_deref() == Some(PROVIDER_PROJECTS_DEVICE);
+            let off_device = state
+                .selected_space_row()
+                .is_some_and(|space| space.home() == SpaceHome::ProviderCloud);
             (self.config.provider_cloud || off_device)
                 .then(|| state.local_device_id.clone())
                 .flatten()
@@ -3405,8 +3448,18 @@ impl Pickers {
         self.close(cx);
     }
 
+    /// Whether the project menu offers "New project from GitHub…": under
+    /// Anthropic cloud, when this app's engine understands projects living
+    /// at a provider cloud.
+    fn offers_github_entry(&self, cx: &App) -> bool {
+        self.config.provider_cloud && self.state.read(cx).provider_projects_supported()
+    }
+
     /// "New project from GitHub…": the project menu asks for a repository.
     fn open_github_entry(&mut self, cx: &mut Context<Self>) {
+        if !self.offers_github_entry(cx) {
+            return;
+        }
         self.github_entry = true;
         self.github_entry_error = None;
         self.active = 0;
@@ -3420,21 +3473,28 @@ impl Pickers {
         cx.notify();
     }
 
-    /// The repository the GitHub entry names, if it names one.
-    fn github_entry_repo(&self, cx: &App) -> Option<String> {
-        zeron_proto::provider_cloud::github_repo_from_input(self.search.read(cx).text())
+    /// The repository (and branch, from a `…/tree/<branch>` link) the GitHub
+    /// entry names, if it names one.
+    fn github_entry_input(&self, cx: &App) -> Option<zeron_proto::provider_cloud::GithubInput> {
+        zeron_proto::provider_cloud::github_input(self.search.read(cx).text())
     }
 
     /// Make the typed repository the canvas's project for Anthropic cloud:
     /// the project that already has it, else a new one living at Anthropic
-    /// cloud (no device clones it). The menu stays open on a failure.
+    /// cloud (no device clones it). A branch link's branch is the one the
+    /// session starts from. The menu stays open while the engine answers
+    /// (a second Enter does nothing) and on a failure.
     fn create_github_project(&mut self, cx: &mut Context<Self>) {
-        let Some(repo) = self.github_entry_repo(cx) else {
+        if self.github_entry_busy {
+            return;
+        }
+        let Some(input) = self.github_entry_input(cx) else {
             self.github_entry_error =
                 Some("Type a GitHub repository: owner/name, or its URL.".into());
             cx.notify();
             return;
         };
+        let repo = input.repo;
         let existing = {
             let state = self.state.read(cx);
             state
@@ -3445,11 +3505,11 @@ impl Pickers {
                         .as_deref()
                         .is_some_and(|own| own.eq_ignore_ascii_case(&repo))
                 })
-                .find(|s| provider_member(state, s).is_some())
-                .map(zeron_proto::view::project_key)
+                .find_map(|s| provider_member(state, s))
         };
-        if let Some(key) = existing {
-            self.pick_project(key, cx);
+        if let Some(space_id) = existing {
+            self.github_entry = false;
+            self.pick_space_from(space_id, input.branch, cx);
             return;
         }
         let Some(engine) = self.engine(cx) else {
@@ -3468,38 +3528,25 @@ impl Pickers {
                 &self.state.read(cx).spaces,
                 &repo,
             )),
-            github_repo: Some(repo.clone()),
+            github_repo: Some(repo),
             icon: None,
             created_at: chrono::Utc::now(),
         };
-        let params = serde_json::json!({
-            "op": "createSpace",
-            "spaceId": space_id,
-            "deviceId": PROVIDER_PROJECTS_DEVICE,
-            "path": repo,
-            "gitDetected": true,
-            "githubRepo": repo,
-        });
         self.github_entry_error = None;
+        self.github_entry_busy = true;
+        // Shows at once; rolled back if the engine refuses it.
+        let created = crate::state::create_space(&self.state, engine, space, cx);
+        let branch = input.branch;
         cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, params).await;
+            let result = created.await;
             this.update(cx, |pickers, cx| {
+                pickers.github_entry_busy = false;
                 match result {
-                    Ok(_) => {
-                        // The watch frame carrying the real row replaces this
-                        // echo by id.
-                        pickers.state.update(cx, |s, cx| {
-                            if !s.spaces.iter().any(|existing| existing.id == space.id) {
-                                s.spaces.push(space);
-                            }
-                            cx.notify();
-                        });
+                    Ok(()) => {
                         pickers.github_entry = false;
-                        pickers.pick_space(space_id, cx);
+                        pickers.pick_space_from(space_id, branch, cx);
                     }
-                    Err(err) => {
-                        pickers.github_entry_error = Some(err.to_string().into());
-                    }
+                    Err(err) => pickers.github_entry_error = Some(err.into()),
                 }
                 cx.notify();
             })
@@ -3508,10 +3555,54 @@ impl Pickers {
         .detach();
     }
 
+    /// [`Self::pick_space`], starting the session from `branch` when one is
+    /// named (kept through the project switch's reset).
+    fn pick_space_from(
+        &mut self,
+        space_id: String,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.state.read(cx).selected_space.as_deref() == Some(space_id.as_str());
+        match branch {
+            // No project switch resets the draft: name the branch now.
+            Some(branch) if selected => self.config.branch = Some(branch),
+            branch => self.pending_branch = branch.map(|branch| (space_id.clone(), branch)),
+        }
+        self.pick_space(space_id, cx);
+    }
+
+    /// A project-menu row with the GitHub mark: `label`, and a faint
+    /// `detail` on the right.
+    fn github_row(
+        &self,
+        id: &'static str,
+        label: SharedString,
+        detail: Option<&'static str>,
+        highlighted: bool,
+        theme: &Theme,
+    ) -> gpui::Stateful<gpui::Div> {
+        popover::picker_row(theme, false, highlighted, id.to_string())
+            .id(id)
+            .child(popover::picker_icon_slot(
+                crate::icons::icon(crate::icons::GITHUB_MARK)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+            ))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .children(detail.map(|detail| {
+                div()
+                    .flex_none()
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(detail))
+            }))
+    }
+
     /// The project menu while it asks for a GitHub repository.
     fn render_github_entry(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let typed = !self.search.read(cx).text().trim().is_empty();
-        let repo = self.github_entry_repo(cx);
+        let input = self.github_entry_input(cx);
         let note = |text: SharedString, color| {
             div()
                 .p(px(Theme::SPACE_SM))
@@ -3520,42 +3611,35 @@ impl Pickers {
                 .child(text)
                 .into_any_element()
         };
-        let body = match (&self.github_entry_error, repo) {
+        let body = match (&self.github_entry_error, input) {
             (Some(error), _) => note(error.clone(), theme.text_muted),
-            (None, Some(repo)) => popover::picker_row(
-                theme,
-                false,
-                self.active == 0,
-                "project-github-create".to_string(),
-            )
-            .id("project-github-create")
-            .on_click(cx.listener(|this, _, _, cx| this.create_github_project(cx)))
-            .child(popover::picker_icon_slot(
-                crate::icons::icon(crate::icons::GITHUB_MARK)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from(repo)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.text_faint)
-                    .child(SharedString::from("New project")),
-            )
-            .into_any_element(),
+            (None, Some(input)) => {
+                let label = match &input.branch {
+                    Some(branch) => format!("{} · {branch}", input.repo),
+                    None => input.repo,
+                };
+                let detail = if self.github_entry_busy {
+                    "Creating…"
+                } else {
+                    "New project"
+                };
+                self.github_row(
+                    "project-github-create",
+                    label.into(),
+                    Some(detail),
+                    self.active == 0,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.create_github_project(cx)))
+                .into_any_element()
+            }
             (None, None) if typed => note(
                 "That isn't a GitHub repository (owner/name).".into(),
                 theme.text_faint,
             ),
             (None, None) => note(
-                "Type a GitHub repository, like owner/name, or paste its URL. Anthropic cloud clones it; no device needs a copy."
+                "Type a GitHub repository, like owner/name, or paste its URL. \
+                 Anthropic cloud clones it; no device needs a copy."
                     .into(),
                 theme.text_faint,
             ),
@@ -3613,9 +3697,7 @@ impl Pickers {
             let members: Vec<_> = state
                 .project_members(space)
                 .into_iter()
-                .filter(|member| {
-                    !zeron_proto::provider_cloud::is_repository_only_device(&member.device_id)
-                })
+                .filter(|member| member.home() == SpaceHome::Device)
                 .collect();
             return members
                 .iter()
@@ -4027,9 +4109,20 @@ impl Pickers {
                 .children(scrollbar)
                 .into_any_element()
         };
+        // Anthropic cloud: "New project from GitHub…" (when the engine can
+        // make one) comes before "No project", which is selected whenever
+        // no project is.
+        let provider = self.config.provider_cloud;
+        let github_entry = self.offers_github_entry(cx);
+        let no_project_index = no_project_index + usize::from(github_entry);
+        let no_project_selected = if provider {
+            self.state.read(cx).selected_space_row().is_none()
+        } else {
+            self.state.read(cx).no_project
+        };
         let no_project = popover::picker_row(
             &theme,
-            self.state.read(cx).no_project,
+            no_project_selected,
             active == no_project_index,
             "project-none".to_string(),
         )
@@ -4041,13 +4134,11 @@ impl Pickers {
                 .text_color(theme.text_muted)
                 .into_any_element(),
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child("Don't work in a project"),
-        );
+        .child(div().flex_1().min_w_0().truncate().child(if provider {
+            "No project"
+        } else {
+            "Don't work in a project"
+        }));
         // Action row under a hairline: mint a project.
         let new_project = popover::picker_row(&theme, false, false, "project-new".to_string())
             .id("project-new")
@@ -4068,54 +4159,22 @@ impl Pickers {
                     .truncate()
                     .child(SharedString::from("New project")),
             );
-        if self.config.provider_cloud {
+        if provider {
             // A repository no device has cloned becomes a project here.
-            let from_github = popover::picker_row(
-                &theme,
-                false,
-                active == no_project_index,
-                "project-new-github".to_string(),
-            )
-            .id("project-new-github")
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_github_entry(cx);
-                let handle = this.search.read(cx).focus_handle(cx);
-                window.focus(&handle, cx);
-            }))
-            .child(popover::picker_icon_slot(
-                crate::icons::icon(crate::icons::GITHUB_MARK)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from(NEW_PROJECT_FROM_GITHUB)),
-            );
-            let no_project = popover::picker_row(
-                &theme,
-                self.state.read(cx).selected_space_row().is_none(),
-                active == no_project_index + 1,
-                "project-none".to_string(),
-            )
-            .id("project-none")
-            .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
-            .child(popover::picker_icon_slot(
-                crate::icons::icon(crate::icons::CLOSE)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child("No project"),
-            );
+            let from_github = github_entry.then(|| {
+                self.github_row(
+                    "project-new-github",
+                    NEW_PROJECT_FROM_GITHUB.into(),
+                    None,
+                    active == no_project_index - 1,
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_github_entry(cx);
+                    let handle = this.search.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }))
+            });
             return div()
                 .flex()
                 .flex_col()
@@ -4127,7 +4186,7 @@ impl Pickers {
                         .gap(px(2.0))
                         .child(body)
                         .child(popover::picker_divider())
-                        .child(from_github)
+                        .children(from_github)
                         .child(no_project),
                 )
                 .into_any_element();
@@ -4163,9 +4222,9 @@ impl Pickers {
                 self.create_github_project(cx);
             } else if let Some(row) = rows.get(self.active) {
                 self.pick_project(row.key.clone(), cx);
-            } else if self.config.provider_cloud && self.active == rows.len() {
+            } else if self.offers_github_entry(cx) && self.active == rows.len() {
                 self.open_github_entry(cx);
-            } else if self.active == rows.len() + usize::from(self.config.provider_cloud) {
+            } else if self.active == rows.len() + usize::from(self.offers_github_entry(cx)) {
                 self.pick_no_project(cx);
             }
         }
@@ -4302,7 +4361,7 @@ impl Pickers {
                     Some(PickerKind::Space) => {
                         self.filtered_project_rows(cx).len()
                             + 1
-                            + usize::from(self.config.provider_cloud)
+                            + usize::from(self.offers_github_entry(cx))
                     }
                     Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
                     None => 0,
@@ -4832,24 +4891,58 @@ impl Pickers {
     }
 
     /// Whether the new-chat canvas shows its git chips: the picked project
-    /// has git, and (under Anthropic cloud) a folder somewhere to list
-    /// branches from.
+    /// has git, and a folder somewhere to list branches from, unless a
+    /// GitHub link named the branch of a project living at the provider
+    /// cloud (shown, not picked).
     pub fn offers_git_chips(&self, cx: &App) -> bool {
         self.state
             .read(cx)
             .selected_space_row()
-            .is_some_and(|space| {
-                space.git_detected
-                    && !(self.config.provider_cloud && space.device_id == PROVIDER_PROJECTS_DEVICE)
+            .is_some_and(|space| match space.home() {
+                SpaceHome::ProviderCloud => self.config.branch.is_some(),
+                _ => space.git_detected,
             })
     }
 
+    /// Whether the picked project lives at the provider cloud (no folder).
+    fn provider_project_selected(&self, cx: &App) -> bool {
+        self.state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.home() == SpaceHome::ProviderCloud)
+    }
+
     /// The branch an "Anthropic cloud" session in a GitHub project starts
-    /// from: the one picked, else the checkout's current branch; `None` lets
-    /// the engine decide (this device's checkout, else the default branch).
+    /// from: the one picked, else the checkout's current branch when GitHub
+    /// has it; `None`: the repository's default branch (a branch never
+    /// pushed can't be cloned), or the engine decides while refs load.
     pub fn provider_cloud_branch(&self) -> Option<String> {
-        self.effective_ref_name()
-            .filter(|name| !name.is_empty() && name != "HEAD")
+        let usable = |name: &String| !name.is_empty() && name != "HEAD";
+        if let Some(branch) = self.config.branch.clone() {
+            return Some(branch).filter(usable);
+        }
+        self.selected_ref()
+            .filter(|current| current.on_origin != Some(false))
+            .map(|current| current.name.clone())
+            .filter(usable)
+    }
+
+    /// The read-only "From <branch>" a GitHub link names for a project
+    /// living at the provider cloud.
+    fn provider_project_branch_row(&self, theme: &Theme) -> AnyElement {
+        let label = self
+            .config
+            .branch
+            .clone()
+            .map(|branch| format!("From {branch}"))
+            .unwrap_or_else(|| "From default branch".into());
+        workspace_footer_row()
+            .child(Self::footer_label(
+                crate::icons::GIT_BRANCH,
+                label.into(),
+                theme,
+            ))
+            .into_any_element()
     }
 
     /// New-session Git controls. Checkout mode and branch form the original
@@ -4860,6 +4953,10 @@ impl Pickers {
     ) -> Option<AnyElement> {
         if !self.offers_git_chips(cx) {
             return None;
+        }
+        if self.provider_project_selected(cx) {
+            let theme = Theme::of(cx).clone();
+            return Some(self.provider_project_branch_row(&theme));
         }
         self.ensure_refs(false, cx);
         let theme = Theme::of(cx).clone();
@@ -5038,6 +5135,9 @@ impl Pickers {
         // project live in the row above the pill now).
         if !self.offers_git_chips(cx) {
             return None;
+        }
+        if self.provider_project_selected(cx) {
+            return Some(self.provider_project_branch_row(&theme));
         }
         // Refs feed the draft labels — eager + idempotent.
         self.ensure_refs(false, cx);
@@ -7395,15 +7495,11 @@ fn provider_member(state: &AppState, space: &Space) -> Option<String> {
     members
         .iter()
         .find(|m| local == Some(m.device_id.as_str()))
-        .or_else(|| {
-            members.iter().find(|m| {
-                !zeron_proto::provider_cloud::is_repository_only_device(&m.device_id)
-            })
-        })
+        .or_else(|| members.iter().find(|m| m.home() == SpaceHome::Device))
         .or_else(|| {
             members
                 .iter()
-                .find(|m| m.device_id == PROVIDER_PROJECTS_DEVICE)
+                .find(|m| m.home() == SpaceHome::ProviderCloud)
         })
         .map(|m| m.id.clone())
 }
@@ -9041,10 +9137,14 @@ mod tests {
     }
 
     fn provider_run_device(eligible: bool) -> zeron_proto::Device {
+        // This build's engine understands provider cloud projects either way.
         let capabilities: Vec<&str> = if eligible {
-            vec![zeron_proto::capabilities::PROVIDER_RUN_V1]
+            vec![
+                zeron_proto::capabilities::PROVIDER_RUN_V1,
+                zeron_proto::capabilities::PROVIDER_PROJECTS_V1,
+            ]
         } else {
-            Vec::new()
+            vec![zeron_proto::capabilities::PROVIDER_PROJECTS_V1]
         };
         serde_json::from_value(serde_json::json!({
             "id": "mac", "name": "Studio", "platform": "macos", "lastSeenAt": null,
@@ -9139,7 +9239,8 @@ mod tests {
                     pickers.selected_device_index(cx),
                     pickers.device_rows(cx).len() - 1
                 );
-                // The Project menu offers "No project" alone.
+                // "app" has no GitHub remote: the Project menu lists no
+                // projects (just its GitHub and "No project" rows).
                 assert!(pickers.filtered_project_rows(cx).is_empty());
                 assert_eq!(
                     pickers.resolved(cx).chat_config().map(|c| c.harness),
@@ -9256,7 +9357,10 @@ mod tests {
                 // This device creates the session and runs its agents, though
                 // the checkout is on the PC.
                 assert_eq!(pickers.space_target(cx), None);
-                assert_eq!(pickers.effective_harness(cx), Some(HarnessId::ClaudeCodeCloud));
+                assert_eq!(
+                    pickers.effective_harness(cx),
+                    Some(HarnessId::ClaudeCodeCloud)
+                );
                 // The device menu marks Anthropic cloud, not the PC's checkout.
                 let rows = pickers.device_rows(cx);
                 assert!(rows[pickers.selected_device_index(cx)].provider_cloud);
@@ -9341,7 +9445,10 @@ mod tests {
                 pickers.search.update(cx, |input, cx| {
                     input.set_text("https://github.com/ACME/app.git", cx)
                 });
-                assert_eq!(pickers.github_entry_repo(cx).as_deref(), Some("ACME/app"));
+                assert_eq!(
+                    pickers.github_entry_input(cx).map(|input| input.repo),
+                    Some("ACME/app".into())
+                );
                 // A repository a project already has is that project.
                 pickers.on_search_submit(cx);
             })
@@ -9355,6 +9462,236 @@ mod tests {
                     Some("app")
                 );
                 assert_eq!(pickers.state.read(cx).spaces.len(), 1);
+            })
+            .unwrap();
+        // An engine that doesn't know provider cloud projects isn't offered
+        // "New project from GitHub…": the rows are app, then "No project".
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.state.update(cx, |state, _| {
+                    state.devices = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "mac", "name": "Studio", "platform": "macos",
+                            "lastSeenAt": null,
+                            "capabilities": [zeron_proto::capabilities::PROVIDER_RUN_V1],
+                        }))
+                        .unwrap(),
+                    ];
+                });
+                assert!(!pickers.offers_github_entry(cx));
+                pickers.open.open(PickerKind::Space);
+                pickers
+                    .search
+                    .update(cx, |input, cx| input.set_text("", cx));
+                pickers.active = 1;
+                pickers.on_search_submit(cx);
+                assert!(!pickers.github_entry);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |pickers, _, cx| {
+                assert!(pickers.state.read(cx).selected_space_row().is_none());
+            })
+            .unwrap();
+    }
+
+    /// "New project from GitHub…" for a repository no project has: one
+    /// `createSpace` on the provider cloud's projects device (a second Enter
+    /// while the engine answers sends nothing), then the new project is the
+    /// canvas's, starting from the branch a link named. A refusal takes the
+    /// project back out and says why.
+    #[gpui::test]
+    fn new_project_from_github_creates_one_project_at_the_provider_cloud(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("mac".into());
+                state.devices = vec![provider_run_device(true)];
+                state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                    zeron_rpc::RpcClient::new(out, inbound),
+                ));
+                state
+            });
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                let row = pickers.device_rows(cx).pop().unwrap();
+                pickers.pick_device_row(row, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // The next createSpace sent (other requests pass by unanswered).
+        let next_create = |requests: &mut tokio::sync::mpsc::Receiver<String>| {
+            for _ in 0..400 {
+                while let Ok(frame) = requests.try_recv() {
+                    let frame = serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap();
+                    if frame.params["op"] == "createSpace" {
+                        return Some(frame);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            None
+        };
+        for (typed, ok) in [
+            ("https://github.com/acme/broken", false),
+            ("https://github.com/acme/web/tree/feature/x", true),
+        ] {
+            handle
+                .update(cx, |pickers, _, cx| {
+                    pickers.open.open(PickerKind::Space);
+                    pickers.github_entry = false;
+                    pickers.active = pickers.filtered_project_rows(cx).len();
+                    pickers.on_search_submit(cx);
+                    assert!(pickers.github_entry);
+                    pickers
+                        .search
+                        .update(cx, |input, cx| input.set_text(typed, cx));
+                    pickers.on_search_submit(cx);
+                    // A second Enter while the engine answers does nothing.
+                    pickers.on_search_submit(cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let create = next_create(&mut requests).expect("a createSpace");
+            assert_eq!(create.params["op"], "createSpace");
+            assert_eq!(create.params["deviceId"], PROVIDER_PROJECTS_DEVICE);
+            let repo = if ok { "acme/web" } else { "acme/broken" };
+            assert_eq!(create.params["githubRepo"], repo);
+            assert_eq!(create.params["path"], repo);
+            let space_id = create.params["spaceId"].as_str().unwrap().to_owned();
+            // The project shows while the engine answers.
+            handle
+                .update(cx, |pickers, _, cx| {
+                    let spaces = &pickers.state.read(cx).spaces;
+                    assert!(spaces.iter().any(|s| s.id == space_id));
+                })
+                .unwrap();
+            let reply = if ok {
+                serde_json::json!({"id": create.id, "ok": {"ok": true}})
+            } else {
+                serde_json::json!({"id": create.id, "err": "refused by the test"})
+            };
+            replies.blocking_send(reply.to_string()).unwrap();
+            let mut settled = false;
+            for _ in 0..400 {
+                cx.run_until_parked();
+                settled = handle
+                    .update(cx, |pickers, _, _| !pickers.github_entry_busy)
+                    .unwrap();
+                if settled {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(settled, "the engine's answer never landed");
+            handle
+                .update(cx, |pickers, _, cx| {
+                    let state = pickers.state.read(cx);
+                    if ok {
+                        assert_eq!(state.selected_space.as_deref(), Some(space_id.as_str()));
+                        let space = state.selected_space_row().unwrap();
+                        assert_eq!(space.home(), SpaceHome::ProviderCloud);
+                        assert_eq!(space.github_repo.as_deref(), Some("acme/web"));
+                        assert!(!pickers.github_entry);
+                    } else {
+                        assert!(!state.spaces.iter().any(|s| s.id == space_id));
+                        assert!(pickers.github_entry);
+                        assert_eq!(
+                            pickers.github_entry_error.as_ref().map(|e| e.to_string()),
+                            Some("refused by the test".into())
+                        );
+                    }
+                })
+                .unwrap();
+            // Exactly one createSpace for the two Enters.
+            assert!(next_create(&mut requests).is_none());
+        }
+        // The link's branch is the one the session starts from, shown on the
+        // canvas; the project reads as Anthropic cloud's, never offline.
+        cx.run_until_parked();
+        handle
+            .update(cx, |pickers, _, cx| {
+                assert!(pickers.provider_cloud_draft(cx));
+                assert_eq!(
+                    pickers.provider_cloud_branch().as_deref(),
+                    Some("feature/x")
+                );
+                assert!(pickers.offers_git_chips(cx));
+                let state = pickers.state.read(cx);
+                let space = state.selected_space_row().unwrap();
+                assert_eq!(
+                    state.space_device_tag(space, chrono::Utc::now()),
+                    (format!("@ {PROVIDER_CLOUD_LABEL}"), false)
+                );
+            })
+            .unwrap();
+    }
+
+    /// Anthropic cloud starts from the checkout's current branch only when
+    /// GitHub has it; the branch menu lists only pushed branches.
+    #[gpui::test]
+    fn an_unpushed_branch_starts_on_the_default_branch(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("mac".into());
+                state.devices = vec![provider_run_device(true)];
+                state.spaces = vec![github_space("app", "mac", "/code/app", Some("acme/app"))];
+                state.selected_space = Some("app".into());
+                state
+            });
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                let row = pickers.device_rows(cx).pop().unwrap();
+                pickers.pick_device_row(row, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |pickers, _, cx| {
+                assert!(pickers.provider_cloud_draft(cx));
+                let pushed = |name: &str, current: bool, on_origin: bool| RepoRef {
+                    on_origin: Some(on_origin),
+                    ..repo_ref(name, current, None)
+                };
+                pickers.refs = Loadable::Ready(vec![
+                    pushed("main", false, true),
+                    pushed("wip", true, false),
+                ]);
+                assert_eq!(pickers.provider_cloud_branch(), None);
+                assert_eq!(
+                    pickers.ref_label().to_string(),
+                    "From default branch (wip isn't on GitHub)"
+                );
+                let names: Vec<String> = pickers
+                    .filtered_ref_rows(cx)
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect();
+                assert_eq!(names, ["main"]);
+                // Pushed, it's the one.
+                pickers.refs =
+                    Loadable::Ready(vec![pushed("main", false, true), pushed("wip", true, true)]);
+                assert_eq!(pickers.provider_cloud_branch().as_deref(), Some("wip"));
+                assert_eq!(pickers.ref_label().to_string(), "From wip");
             })
             .unwrap();
     }
@@ -9592,6 +9929,7 @@ mod tests {
             name: name.into(),
             current,
             worktree_path: worktree.map(str::to_string),
+            on_origin: None,
         }
     }
 

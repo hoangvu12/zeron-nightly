@@ -205,7 +205,32 @@ impl SpaceIcon {
     }
 }
 
+/// Where a project lives ([`Space::home`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceHome {
+    /// A folder on one of the person's devices.
+    Device,
+    /// A GitHub repository on Zeron Cloud (its logical device).
+    ZeronCloud,
+    /// A GitHub repository at a provider cloud
+    /// ([`crate::provider_cloud::PROJECTS_DEVICE`]): only provider-run chats
+    /// work in it.
+    ProviderCloud,
+}
+
 impl Space {
+    /// Where this project lives: a device's folder, or a GitHub repository
+    /// on Zeron Cloud or a provider cloud (no folder on any device).
+    pub fn home(&self) -> SpaceHome {
+        if self.device_id == crate::provider_cloud::PROJECTS_DEVICE {
+            SpaceHome::ProviderCloud
+        } else if self.device_id.starts_with(crate::CLOUD_DEVICE_PREFIX) {
+            SpaceHome::ZeronCloud
+        } else {
+            SpaceHome::Device
+        }
+    }
+
     /// Name override, else basename(path), else the path itself.
     /// Lives here (proto) so UI and engine agree on the derivation.
     pub fn display_name(&self) -> &str {
@@ -775,6 +800,11 @@ pub struct RepoRef {
     /// Path of the linked worktree this branch is checked out in, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// Whether the `origin` remote has this branch (it was pushed): only a
+    /// branch there can be cloned elsewhere (Anthropic cloud). `None` from
+    /// older engines, or where nobody checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_origin: Option<bool>,
 }
 
 /// Public Git reference attached to a commit in the history graph.

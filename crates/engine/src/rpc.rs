@@ -712,18 +712,26 @@ enum MutateParams {
     #[serde(rename_all = "camelCase")]
     CreateChat {
         chat_id: String,
-        /// The project the chat is created in — fixes host device + base cwd.
-        /// `None` mints a project-less chat: `deviceId` picks the host and the
-        /// cwd defaults to `~` (expanded on the host at run time).
+        /// The project the chat is created in — fixes host device + base cwd,
+        /// except for a provider-run chat (`config.harness` runs in a
+        /// provider cloud), which the device creating it hosts in the
+        /// session's pseudo cwd, and a Cloud chat (`cloud`), which runs on
+        /// its own machine. `None` mints a project-less chat: `deviceId`
+        /// picks the host and the cwd defaults to `~` (expanded on the host
+        /// at run time).
         #[serde(default)]
         space_id: Option<String>,
-        /// Host device for a project-less chat; ignored when `spaceId` is set.
+        /// Host device for a project-less chat; ignored when `spaceId` is
+        /// set, except by a provider-run chat, where it must name this
+        /// device (the one creating the session).
         #[serde(default)]
         device_id: Option<String>,
         #[serde(default)]
         config: Option<ChatConfig>,
         /// The picked ref, named on the row from the first frame (the footer
-        /// read "Select ref" until the diff reconciler stamped it).
+        /// read "Select ref" until the diff reconciler stamped it). For a
+        /// provider-run chat in a GitHub project: the branch its session
+        /// clones.
         #[serde(default)]
         branch: Option<String>,
         /// Cwd override (isolated-worktree path); default = the space's folder.
@@ -1199,6 +1207,8 @@ impl EngineRpc {
                 current: p.default_branch.as_deref() == Some(name.as_str()),
                 name,
                 worktree_path: None,
+                // GitHub's own branches.
+                on_origin: Some(true),
             })
             .collect();
         RpcReply::value(&refs)

@@ -1216,6 +1216,7 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: None,
+            on_origin: None,
         }
     }
 
@@ -1224,6 +1225,7 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: Some(path.into()),
+            on_origin: None,
         }
     }
 

@@ -1122,6 +1122,17 @@ impl WorkspaceHost {
             },
             None => None,
         };
+        // A project living at a provider cloud has no device to run on: only
+        // a provider-run chat (hosted where it was created) works in it.
+        if space
+            .as_ref()
+            .is_some_and(|s| s.home() == zeron_proto::SpaceHome::ProviderCloud)
+            && provider_session.is_none()
+        {
+            return Err(EngineError::Other(
+                "This project lives at Anthropic cloud: start its chats there.".into(),
+            ));
+        }
         let host_device = match (&space, device_id, host) {
             // An explicit host always wins: a side chat of a Cloud chat runs
             // on that machine, never on the computer that asked for it.

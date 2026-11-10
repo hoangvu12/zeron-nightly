@@ -3187,6 +3187,10 @@ impl AppState {
     /// call sites (user request), never words in the tag. A sleeping Cloud
     /// device is not stale — it wakes when a chat opens there.
     pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
+        // A project living at a provider cloud has no device to be offline.
+        if space.home() == zeron_proto::SpaceHome::ProviderCloud {
+            return (format!("@ {}", crate::pickers::PROVIDER_CLOUD_LABEL), false);
+        }
         let offline = self.device_presence(&space.device_id, now).warns();
         let device = self
             .device_name(&space.device_id)
@@ -3541,6 +3545,20 @@ impl AppState {
         chat_id: &str,
     ) -> Option<&zeron_proto::provider_cloud::ProviderChatState> {
         self.provider_chat_states.get(chat_id)
+    }
+
+    /// Whether the engine this app talks to understands projects living at
+    /// a provider cloud (`provider-projects-v1` on its device row): only
+    /// then is "New project from GitHub…" offered (an older engine would
+    /// store the repository as a folder on a device that doesn't exist).
+    pub(crate) fn provider_projects_supported(&self) -> bool {
+        let Some(local) = self.local_device_id.as_deref() else {
+            return false;
+        };
+        self.devices
+            .iter()
+            .find(|device| device.id == local)
+            .is_some_and(|device| device.supports(zeron_proto::capabilities::PROVIDER_PROJECTS_V1))
     }
 
     /// Whether this device can start provider-run chats ("Anthropic cloud"
@@ -5058,6 +5076,52 @@ fn spawn_subagent_watch(
             }
             cx.background_executor().timer(RETRY_DELAY).await;
         }
+    })
+}
+
+/// Create project `space` through `engine` (`createSpace`): it shows in
+/// `state` at once, and is taken back out if the engine refuses it. The
+/// task ends with the engine's answer. A project living on Zeron Cloud or a
+/// provider cloud sends its GitHub repository (no device stamps one there).
+pub(crate) fn create_space(
+    state: &Entity<AppState>,
+    engine: EngineHandle,
+    space: Space,
+    cx: &mut App,
+) -> Task<Result<(), String>> {
+    let mut params = serde_json::json!({
+        "op": "createSpace",
+        "spaceId": space.id,
+        "deviceId": space.device_id,
+        "path": space.path,
+        "gitDetected": space.git_detected,
+    });
+    if space.home() != zeron_proto::SpaceHome::Device
+        && let Some(repo) = &space.github_repo
+    {
+        params["githubRepo"] = serde_json::Value::String(repo.clone());
+    }
+    let space_id = space.id.clone();
+    // Optimistic echo: the watch frame carrying the real row replaces it by
+    // id (apply_spaces re-sorts; same-id upsert is idempotent).
+    state.update(cx, |s, cx| {
+        if !s.spaces.iter().any(|existing| existing.id == space.id) {
+            s.spaces.push(space);
+        }
+        cx.notify();
+    });
+    let state = state.downgrade();
+    cx.spawn(async move |cx| {
+        let result = engine.client().call(methods::MUTATE, params).await;
+        if result.is_err() {
+            state
+                .update(cx, |s, cx| {
+                    s.spaces.retain(|space| space.id != space_id);
+                    cx.notify();
+                })
+                .ok();
+        }
+        result.map(drop).map_err(|err| err.to_string())
     })
 }
 

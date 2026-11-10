@@ -51,6 +51,14 @@ pub mod capabilities {
     /// row while that holds, so not in [`CURRENT`]; separate from the Cloud
     /// session machines' `cloud-session`.
     pub const PROVIDER_RUN_V1: &str = "provider-run-v1";
+    /// The engine understands projects living at a provider cloud: a
+    /// `createSpace` on the logical
+    /// [`crate::provider_cloud::PROJECTS_DEVICE`] with a `githubRepo` makes
+    /// a GitHub-only project, and `createChat` keeps local runs out of one.
+    /// An older engine would store `owner/name` as a folder on a device that
+    /// doesn't exist, so clients offer "New project from GitHub…" only when
+    /// the engine they talk to advertises this.
+    pub const PROVIDER_PROJECTS_V1: &str = "provider-projects-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -66,6 +74,7 @@ pub mod capabilities {
         BACKGROUND_TASKS_V1,
         ZGX_INTERFACE_V1,
         UPDATE_ABILITY_V1,
+        PROVIDER_PROJECTS_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -160,6 +169,7 @@ mod tests {
                     "background-tasks-v1",
                     "zgx-interface-v1",
                     "update-ability-v1",
+                    "provider-projects-v1",
                     "voice-client-media-v1"
                 ],
             })

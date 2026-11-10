@@ -188,9 +188,11 @@ pub(crate) async fn create_chat(
 /// project's GitHub repository (its owner stamps it; this device's own
 /// checkout is asked directly, so a project just added works at once), and
 /// the branch the composer named, else the one this device's checkout has
-/// out, else (another device's checkout, a project living at the provider,
-/// a detached head) the repository's default branch. A project without a
-/// GitHub remote is refused before anything reaches the provider.
+/// out, else (another device's checkout, a project living at the provider
+/// cloud, a detached head, a branch never pushed) the repository's default
+/// branch. A project without a GitHub remote, and a named branch this
+/// device's checkout shows isn't on GitHub, are refused before anything
+/// reaches the provider.
 async fn github_source(
     workspace: &WorkspaceHost,
     repos: &Repos,
@@ -200,8 +202,8 @@ async fn github_source(
     let space = workspace
         .space(space_id)?
         .ok_or_else(|| refused("That project no longer exists."))?;
-    let checkout = (space.device_id == workspace.device_id())
-        .then(|| std::path::PathBuf::from(&space.path));
+    let checkout =
+        (space.device_id == workspace.device_id()).then(|| std::path::PathBuf::from(&space.path));
     let mut github_repo = space.github_repo.clone();
     if github_repo.is_none()
         && let Some(path) = &checkout
@@ -214,16 +216,35 @@ async fn github_source(
             space.display_name()
         ))
     })?;
-    let mut branch = branch.filter(|b| !b.trim().is_empty());
-    if branch.is_none()
-        && let Some(path) = &checkout
-    {
-        branch = repos
-            .current_branch(path)
-            .await
-            .ok()
-            .filter(|b| b != "HEAD" && !b.is_empty());
-    }
+    let named = branch.filter(|b| !b.trim().is_empty());
+    let branch = match (named, &checkout) {
+        // Only a branch GitHub has can be cloned: a named one this checkout
+        // shows was never pushed is refused (the create would be used up on
+        // a clone that fails).
+        (Some(named), Some(path)) => {
+            if !repos.branch_on_origin(path, &named).await {
+                return Err(refused(format!(
+                    "{named} isn't on GitHub yet: push it, or start from a branch that is."
+                )));
+            }
+            Some(named)
+        }
+        // Another device's checkout: the composer checked its refs.
+        (Some(named), None) => Some(named),
+        // The branch checked out here, when it was pushed; else the
+        // repository's default branch.
+        (None, Some(path)) => match repos.current_branch(path).await {
+            Ok(current)
+                if current != "HEAD"
+                    && !current.is_empty()
+                    && repos.branch_on_origin(path, &current).await =>
+            {
+                Some(current)
+            }
+            _ => None,
+        },
+        (None, None) => None,
+    };
     Ok(SessionSource {
         github_repo,
         branch,
