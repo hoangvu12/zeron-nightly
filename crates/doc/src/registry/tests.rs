@@ -1102,6 +1102,34 @@ fn low_clock_upsert_does_not_revive_a_newer_tombstone() {
 }
 
 #[test]
+fn a_revive_beats_the_tombstone_it_saw_and_says_when_it_was_deleted() {
+    let mut host = RegistryDoc::new("dev-b");
+    host.upsert_chat(&chat("chat-1", "dev-b")).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut host]);
+    assert_eq!(host.chat_deleted_at("chat-1"), None);
+    let before = Utc::now() - chrono::Duration::seconds(1);
+    host.delete_chat("chat-1").unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host]);
+    let deleted_at = host.chat_deleted_at("chat-1").expect("a tombstone time");
+    assert!(deleted_at >= before && deleted_at <= Utc::now());
+
+    // Another device that knows the tombstone revives the chat.
+    let mut reviver = RegistryDoc::new("dev-a");
+    let _ = reviver.apply_rows(seq, server.values().cloned().collect());
+    assert!(reviver.chat_deleted("chat-1"));
+    let mut back = chat("chat-1", "dev-a");
+    back.title = Some("back".into());
+    reviver.revive_chat(&back).unwrap();
+    assert_eq!(reviver.chat("chat-1").unwrap(), Some(back.clone()));
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut reviver]);
+    assert!(!relay_row(&server, "chat-1").deleted);
+    assert_eq!(host.chat("chat-1").unwrap(), Some(back));
+    assert_eq!(host.chat_deleted_at("chat-1"), None);
+}
+
+#[test]
 fn explicit_clock_writes_work_on_a_local_only_replica() {
     let mut doc = RegistryDoc::new("dev-a");
     doc.set_local_only(true);

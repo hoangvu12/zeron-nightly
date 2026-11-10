@@ -12,9 +12,14 @@
 //!   `created_at`): it creates a truly missing row and loses every field to
 //!   any real write and the row to a delete's tombstone, so a device with a
 //!   stale registry can't move a chat or overwrite its fields. A chat that
-//!   exists, or was deleted, is never written (deleted chats come back with
-//!   ticket #10). Two devices importing one session write the same chat id
-//!   (UUIDv5 of the session) and converge on one row.
+//!   exists, or was deleted, is never written by the import. Two devices
+//!   importing one session write the same chat id (UUIDv5 of the session)
+//!   and converge on one row.
+//! - **Archive, delete and revive** ([`crate::provider_archive::reconcile`],
+//!   once the registry is current): a session archived at the provider
+//!   deletes its chat; a chat deleted in Zeron whose session is still active
+//!   archives it, unless the session was active again since the delete, which
+//!   brings the chat back with its history.
 //! - **History.** A chat this device hosts whose transcript is still empty
 //!   is claimed (its importer is its default host: a host-field-only write
 //!   with a real clock, so a later stale low-clock import can't tie-break
@@ -86,6 +91,9 @@ pub struct ProviderDiscovery {
     state: tokio::sync::Mutex<State>,
     /// [`LIST_INTERVAL`], shortened only by tests.
     interval: std::sync::Mutex<Duration>,
+    /// Chats this device deleted because their session was archived at the
+    /// provider: their delete archives nothing.
+    pub(crate) deleted_for_archive: crate::provider_archive::DeletedForArchive,
 }
 
 impl Default for ProviderDiscovery {
@@ -93,6 +101,7 @@ impl Default for ProviderDiscovery {
         Self {
             state: Default::default(),
             interval: std::sync::Mutex::new(LIST_INTERVAL),
+            deleted_for_archive: Default::default(),
         }
     }
 }
@@ -145,9 +154,21 @@ impl ProviderDiscovery {
         let read_at = Utc::now();
         match cloud.list_sessions(read_at - window()).await {
             Ok(listed) => {
+                let revived = if workspace.registry_current() {
+                    crate::provider_archive::reconcile(
+                        sessions,
+                        doc_host,
+                        &workspace,
+                        &harness,
+                        &self.deleted_for_archive,
+                        &listed,
+                    )
+                } else {
+                    Vec::new()
+                };
                 let live: Vec<ListedSession> = listed.into_iter().filter(|s| !s.archived).collect();
                 import(&workspace, &live);
-                mirror_new(sessions, doc_host, &workspace, &live);
+                mirror_new(sessions, doc_host, &workspace, &live, revived);
                 state.reply = DiscoveryReply {
                     sessions: live.iter().map(overlay).collect(),
                     read_at: Some(read_at),
@@ -175,7 +196,7 @@ fn overlay(listed: &ListedSession) -> ProviderSessionOverlay {
 
 /// The row a discovered session's chat starts as. Its prompts are asked,
 /// never answered by an access mode the person didn't pick.
-fn discovered_row(device_id: &str, listed: &ListedSession) -> Chat {
+pub(crate) fn discovered_row(device_id: &str, listed: &ListedSession) -> Chat {
     let session_id = &listed.session.session_id;
     Chat {
         id: zeron_proto::provider_cloud::chat_id_for(&listed.session),
@@ -230,24 +251,25 @@ fn import(workspace: &WorkspaceHost, listed: &[ListedSession]) {
 }
 
 /// Bring in the history of listed sessions this device hosts whose chats
-/// have none yet (see module docs).
+/// have none yet, and of chats `revived` here (see module docs).
 fn mirror_new(
     sessions: &SessionsEngine,
     doc_host: &DocHost,
     workspace: &WorkspaceHost,
     listed: &[ListedSession],
+    revived: Vec<String>,
 ) {
     if !workspace.registry_current() {
         return;
     }
-    let mut chats = Vec::new();
+    let mut chats = revived;
     for session in listed {
         let chat_id = zeron_proto::provider_cloud::chat_id_for(&session.session);
         let hosted = workspace.chat(&chat_id).ok().flatten().is_some_and(|chat| {
             chat.device_id == workspace.device_id()
                 && chat.provider_session.as_ref() == Some(&session.session)
         });
-        if !hosted || sessions.has_run(&chat_id) {
+        if !hosted || sessions.has_run(&chat_id) || chats.contains(&chat_id) {
             continue;
         }
         let Ok(handle) = doc_host.open(&chat_id) else {

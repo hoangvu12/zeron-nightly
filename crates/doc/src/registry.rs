@@ -1160,6 +1160,16 @@ impl RegistryDoc {
             .is_some_and(|r| r.deleted)
     }
 
+    /// When `id`'s chat row was deleted, by its tombstone's clock; `None`
+    /// when it isn't deleted (or the clock can't be read).
+    pub fn chat_deleted_at(&self, id: &str) -> Option<DateTime<Utc>> {
+        let row = self
+            .overlay_row_or_tombstone(KIND_CHATS, id)
+            .filter(|r| r.deleted)?;
+        let ms: i64 = row.del_hlc?.split('-').next()?.parse().ok()?;
+        DateTime::<Utc>::from_timestamp_millis(ms)
+    }
+
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
         let mut devices: Vec<Device> = self
             .read_kind::<crate::workspace::RawDevice>(KIND_DEVICES)
@@ -1319,6 +1329,32 @@ impl RegistryDoc {
             set: Some(set),
             hlc,
             clocks: Some(clocks),
+        }]);
+        Ok(())
+    }
+
+    /// Revive a deleted chat (docs/design/provider-run-chats.md §6,
+    /// "Revived"): the full row as an upsert with a real clock, never
+    /// earlier than one past the tombstone's, so it wins over the delete
+    /// even when the deleting device's clock ran ahead. On a live or unknown
+    /// row it is a plain [`Self::upsert_chat`].
+    pub fn revive_chat(&mut self, chat: &Chat) -> Result<(), DocError> {
+        let mut set = Self::chat_fields(chat)?;
+        self.add_provider_session(chat, &mut set)?;
+        let floor = self
+            .overlay_row_or_tombstone(KIND_CHATS, &chat.id)
+            .filter(|r| r.deleted)
+            .and_then(|r| r.del_hlc)
+            .and_then(|del| hlc_after(&del, &self.device_id));
+        let now = self.next_hlc();
+        let hlc = floor.map_or(now.clone(), |floor| floor.max(now));
+        self.enqueue_ops(vec![RowOp {
+            kind: KIND_CHATS.to_string(),
+            id: chat.id.clone(),
+            op: OpKind::Upsert,
+            set: Some(set),
+            hlc,
+            clocks: None,
         }]);
         Ok(())
     }

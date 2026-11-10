@@ -63,6 +63,7 @@ mod plugin_agents;
 pub mod plugins;
 pub mod profile;
 pub mod project_actions;
+mod provider_archive;
 pub mod provider_discovery;
 mod provider_run;
 pub mod registry;
@@ -364,6 +365,7 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         provider_run::follow_sign_in_states(&registry, &doc_host);
+        provider_archive::follow_chats(&sessions, &doc_host);
         // Provider-run chats this device hosts that a shutdown or crash cut
         // off mid-turn (or with a prompt open) catch up now. Like recovery,
         // not while a new version is on trial.

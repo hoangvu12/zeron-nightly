@@ -732,6 +732,18 @@ impl WorkspaceHost {
         self.read(|doc| doc.chat_deleted(chat_id))
     }
 
+    /// When `chat_id`'s row was deleted (its tombstone's clock); `None` when
+    /// it isn't deleted.
+    pub fn chat_deleted_at(&self, chat_id: &str) -> Option<chrono::DateTime<Utc>> {
+        self.read(|doc| doc.chat_deleted_at(chat_id))
+    }
+
+    /// Bring a deleted chat back with a real clock that beats its tombstone
+    /// ([`RegistryDoc::revive_chat`]).
+    pub fn revive_chat(&self, chat: &Chat) -> Result<(), EngineError> {
+        Ok(self.mutate(|doc| doc.revive_chat(chat))?)
+    }
+
     /// Whether this replica's registry can be trusted to name a chat's host:
     /// it has heard from the relay since it connected (or it has no relay).
     /// A room that exists but hasn't synced yet may be arbitrarily behind.
