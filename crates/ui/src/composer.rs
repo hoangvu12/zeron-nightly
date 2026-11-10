@@ -605,11 +605,63 @@ fn should_publish_optimistic_echo(queue: bool) -> bool {
     !queue
 }
 
+/// How an "Anthropic cloud" create ended, when it made no chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreateOutcome {
+    /// Nothing was created (the message says why).
+    Failed(String),
+    /// Whether Claude created the session is unknown: the engine said so,
+    /// or it didn't answer in time (it may still be creating).
+    Uncertain,
+}
+
+/// How long the composer waits on a provider-run create: past the engine's
+/// own bound on it (a minute for the create, then the lookup by its tag).
+const PROVIDER_CREATE_WAIT: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// `Mutate createChat` for a provider-run chat: the new chat's id, or why
+/// there is none.
+async fn provider_create(
+    engine: &crate::state::EngineHandle,
+    executor: &gpui::BackgroundExecutor,
+    mutate: serde_json::Value,
+) -> Result<String, CreateOutcome> {
+    let call = engine.client().call(methods::MUTATE, mutate);
+    let timer = executor.timer(PROVIDER_CREATE_WAIT);
+    futures::pin_mut!(call);
+    let reply = match futures::future::select(call, timer).await {
+        futures::future::Either::Left((reply, _)) => reply,
+        futures::future::Either::Right(_) => return Err(CreateOutcome::Uncertain),
+    };
+    create_outcome(reply)
+}
+
+fn create_outcome(
+    reply: Result<serde_json::Value, zeron_rpc::RpcError>,
+) -> Result<String, CreateOutcome> {
+    match reply {
+        Ok(reply) => reply
+            .get("chatId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| CreateOutcome::Failed("The engine didn't name the new chat.".into())),
+        Err(zeron_rpc::RpcError::Capability(code))
+            if code == zeron_rpc::capability_errors::PROVIDER_CREATION_UNCERTAIN =>
+        {
+            Err(CreateOutcome::Uncertain)
+        }
+        Err(error) => Err(CreateOutcome::Failed(error.to_string())),
+    }
+}
+
 /// The composer's one caption line about the chat's path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinkNotice {
     text: SharedString,
     glyph: NoticeGlyph,
+    /// A page the caption links to ("Archived on claude.ai").
+    link: Option<SharedString>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -633,7 +685,13 @@ fn link_notice(
     loader_shown: bool,
 ) -> Option<LinkNotice> {
     use crate::state::LinkSync;
-    let notice = |text: SharedString, glyph| Some(LinkNotice { text, glyph });
+    let notice = |text: SharedString, glyph| {
+        Some(LinkNotice {
+            text,
+            glyph,
+            link: None,
+        })
+    };
     match link.sync {
         LinkSync::Offline if intent => notice(
             "Offline — messages will send when you're back online.".into(),
@@ -6369,6 +6427,10 @@ pub struct Composer {
     /// under their own chat — a blanket clear-on-switch erased the one
     /// visible trace of a failed send (2026-08-19).
     failure_key: Option<String>,
+    /// The draft (its key) whose "Anthropic cloud" create ended with no word
+    /// on whether Claude created the session: "Creation uncertain", with a
+    /// link to claude.ai and "Create again". Nothing retries on its own.
+    creation_uncertain: Option<String>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -6686,6 +6748,7 @@ impl Composer {
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
             failure_key: None,
+            creation_uncertain: None,
             action_task: None,
             advance_task: None,
             send_task: None,
@@ -6952,17 +7015,19 @@ impl Composer {
         let runs_on_cloud = self.pickers.read(cx).runs_on_cloud(cx);
         let draft = self.has_draft(cx);
         let state = self.state.read(cx);
-        // A provider-run chat whose login can't act for it says so, in the
-        // same quiet caption ("Sign in again", "Sign in as <email> to
-        // continue").
-        if let Some(sign_in) = state
+        // A provider-run chat whose login can't act for it, or whose session
+        // was archived on claude.ai, says so in the same quiet caption ("Sign
+        // in again", "Sign in as <email> to continue", "Archived on
+        // claude.ai" with a link to the session).
+        if let Some(provider) = state
             .selected_chat
             .as_deref()
             .and_then(|id| state.provider_chat_state(id))
         {
             return Some(LinkNotice {
-                text: sign_in.label().into(),
+                text: provider.label().into(),
                 glyph: NoticeGlyph::WarningDot,
+                link: provider.link().map(|url| SharedString::from(url.to_owned())),
             });
         }
         let now = crate::state::clock_now();
@@ -9247,6 +9312,25 @@ impl Composer {
         }
     }
 
+    /// "Create again" under "Creation uncertain": the person's own choice to
+    /// create a new session with the message handed back to the draft (a
+    /// new create, under a new message id).
+    fn create_again(&mut self, cx: &mut Context<Self>) {
+        self.creation_uncertain = None;
+        let text = self.input.read(cx).text().to_string();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            self.failure_key = None;
+            cx.notify();
+            return;
+        };
+        if text.trim().is_empty() {
+            cx.notify();
+            return;
+        }
+        self.send_provider_cloud(engine, text, cx);
+    }
+
     /// Start a provider-run chat ("Anthropic cloud" in the place chip): this
     /// device creates the Claude cloud session with the first message, and
     /// the engine names the chat after the session and queues that message
@@ -9300,12 +9384,12 @@ impl Composer {
         self.drafts.remove(&key);
         self.failure = None;
         self.failure_key = None;
+        self.creation_uncertain = None;
         self.sending = true;
         cx.notify();
+        // No chat id: the engine names the chat after its session.
         let mutate = serde_json::json!({
             "op": "createChat",
-            // The engine names the chat after its session; this id is unused.
-            "chatId": uuid::Uuid::new_v4().to_string(),
             "deviceId": device_id,
             "config": config,
             "prompt": prompt,
@@ -9313,25 +9397,18 @@ impl Composer {
         });
         self.send_task = Some(cx.spawn(async move |this, cx| {
             // Creation lists the account's sessions, then creates one: a few
-            // seconds. Exactly one attempt (it isn't idempotent).
-            let result = attachments::call_with_timeout(
-                &engine,
-                cx.background_executor(),
-                methods::MUTATE,
-                mutate,
-                std::time::Duration::from_secs(90),
-            )
-            .await
-            .and_then(|reply| {
-                reply
-                    .get("chatId")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .ok_or_else(|| "The engine didn't name the new chat.".to_string())
-            });
+            // seconds. Exactly one attempt (it isn't idempotent); the engine
+            // bounds it and finishes it even if this side stops waiting.
+            let result = provider_create(&engine, cx.background_executor(), mutate).await;
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                if matches!(result, Err(CreateOutcome::Uncertain)) {
+                    composer.creation_uncertain = Some(key.clone());
+                }
+                let result = result.map_err(|outcome| match outcome {
+                    CreateOutcome::Uncertain => String::new(),
+                    CreateOutcome::Failed(message) => message,
+                });
                 match result {
                     Ok(chat_id) => {
                         let echo = SessionMessageEntry {
@@ -9361,8 +9438,12 @@ impl Composer {
                         });
                     }
                     Err(message) => {
-                        composer.failure = Some(message.into());
-                        composer.failure_key = Some(key.clone());
+                        // An uncertain create shows its own notice; the text
+                        // comes back either way, for "Create again".
+                        if !message.is_empty() {
+                            composer.failure = Some(message.into());
+                            composer.failure_key = Some(key.clone());
+                        }
                         composer.state.update(cx, |s, cx| {
                             for comment in &comments {
                                 s.add_review_comment(&key, comment.clone());
@@ -11664,10 +11745,73 @@ impl Render for Composer {
                             .line_height(px(14.0))
                             .text_color(theme.text_faint)
                             .child(glyph)
-                            .child(div().min_w_0().truncate().child(notice.text)),
+                            .child(div().min_w_0().truncate().child(notice.text))
+                            .when_some(notice.link, |row, url| {
+                                row.child(
+                                    div()
+                                        .id("composer-queue-notice-link")
+                                        .flex_none()
+                                        .cursor_pointer()
+                                        .text_color(theme.text_muted)
+                                        .hover(|s| s.underline())
+                                        .on_click(move |_, _, cx| cx.open_url(&url))
+                                        .child("Open on claude.ai"),
+                                )
+                            }),
                     ))
                 },
             );
+        let uncertain = self
+            .creation_uncertain
+            .as_ref()
+            .is_some_and(|key| *key == self.current_key);
+        let container = container.when(uncertain, |el| {
+            let link_button = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.warning.opacity(0.24))
+                    .hover(|s| s.bg(theme.warning.opacity(0.12)))
+                    .child(label)
+            };
+            let actions = div()
+                .flex()
+                .gap(px(8.0))
+                .child(
+                    link_button("composer-uncertain-open", "Open claude.ai").on_click(
+                        |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(zeron_proto::provider_cloud::CLAUDE_SESSIONS_URL);
+                        },
+                    ),
+                )
+                .child(
+                    link_button("composer-uncertain-again", "Create again").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.create_again(cx);
+                        }),
+                    ),
+                )
+                .into_any_element();
+            el.child(
+                crate::notice::notice_chip_with_action(
+                    &theme,
+                    true,
+                    "Creation uncertain",
+                    "Zeron couldn't tell whether Claude created the session. Check claude.ai before you create it again.",
+                    NoticeChipIcon::Plain,
+                    Some(actions),
+                )
+                .id("composer-creation-uncertain")
+                .mx(px(4.0))
+                .mt(px(6.0)),
+            )
+        });
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
@@ -17501,3 +17645,31 @@ impl Composer {
 #[cfg(test)]
 #[path = "composer_dictation_tests.rs"]
 mod dictation_tests;
+
+#[cfg(test)]
+mod provider_create_tests {
+    use super::{CreateOutcome, create_outcome};
+    use zeron_rpc::{RpcError, capability_errors};
+
+    #[test]
+    fn an_uncertain_create_is_told_apart_from_a_failed_one() {
+        assert_eq!(
+            create_outcome(Ok(serde_json::json!({"chatId": "c1"}))),
+            Ok("c1".to_string())
+        );
+        assert_eq!(
+            create_outcome(Err(RpcError::Capability(
+                capability_errors::PROVIDER_CREATION_UNCERTAIN.into()
+            ))),
+            Err(CreateOutcome::Uncertain)
+        );
+        assert!(matches!(
+            create_outcome(Err(RpcError::Failed("Claude cloud returned 400".into()))),
+            Err(CreateOutcome::Failed(message)) if message.contains("400")
+        ));
+        assert!(matches!(
+            create_outcome(Ok(serde_json::json!({}))),
+            Err(CreateOutcome::Failed(_))
+        ));
+    }
+}
