@@ -713,9 +713,17 @@ fn create(state: &State, body: Value) -> Response<Body> {
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    // The provider's own tag, then the create's (the real API keeps custom
-    // tags: checked live for ticket #11).
-    let mut tags = vec![json!("config:no-git-repo")];
+    // The provider's own tag (a session on a repository isn't tagged
+    // repo-less), then the create's (whether the real API keeps custom tags
+    // is the ticket #11 live check).
+    let on_repo = body["config"]["sources"]
+        .as_array()
+        .is_some_and(|s| !s.is_empty());
+    let mut tags = if on_repo {
+        Vec::new()
+    } else {
+        vec![json!("config:no-git-repo")]
+    };
     if inner.keep_tags {
         tags.extend(
             body["tags"]

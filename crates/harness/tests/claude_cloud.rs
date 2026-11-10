@@ -145,6 +145,7 @@ async fn create_playing(rig: &Rig, first: Turn, prompt: &str, uuid: &str) -> Pro
             prompt_uuid: uuid.into(),
             model: None,
             title: None,
+            source: None,
         })
         .await
         .expect("session created")
@@ -1087,6 +1088,7 @@ async fn an_account_without_a_cloud_environment_is_told_so() {
             prompt_uuid: FIRST.into(),
             model: None,
             title: None,
+            source: None,
         })
         .await
         .unwrap_err();

@@ -1110,9 +1110,11 @@ impl WorkspaceHost {
     /// `providerSession` in the same row op that creates it: a crash can't
     /// leave a provider-run row that has no session (it could never run).
     /// Idempotent like [`Self::create_chat_hosted`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_provider_run_chat(
         &self,
         chat_id: &str,
+        space_id: Option<&str>,
         config: ChatConfig,
         cwd: String,
         parent_chat_id: Option<String>,
@@ -1120,9 +1122,11 @@ impl WorkspaceHost {
         session: &zeron_proto::ProviderSession,
     ) -> Result<(), EngineError> {
         let device_id = self.device_id().to_owned();
+        // In a project (any device's checkout of a GitHub repository, or one
+        // living at the provider), still hosted here.
         self.create_chat_row(
             chat_id,
-            None,
+            space_id,
             Some(&device_id),
             Some(&device_id),
             Some(config),
@@ -1271,7 +1275,9 @@ impl WorkspaceHost {
     /// A project that lives only on Cloud: owned by the logical Cloud device
     /// (which has no engine to stamp it), so its GitHub repository is set
     /// here. Every session in it runs on a Cloud machine cloning that
-    /// repository. Idempotent like [`Self::create_space`]; also a no-op when
+    /// repository. Also a project living only at a provider cloud (owned by
+    /// [`zeron_proto::provider_cloud::PROJECTS_DEVICE`]), whose chats are
+    /// provider-run sessions cloning it. Idempotent like [`Self::create_space`]; also a no-op when
     /// Cloud already has a project for the repository.
     pub fn create_cloud_space(
         &self,
@@ -1281,11 +1287,17 @@ impl WorkspaceHost {
         name: Option<String>,
         github_repo: &str,
     ) -> Result<(), EngineError> {
-        if !device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX) {
+        if !zeron_proto::provider_cloud::is_repository_only_device(device_id) {
             return Err(EngineError::Other(
                 "Only Cloud projects name their repository.".into(),
             ));
         }
+        let github_repo = &zeron_proto::provider_cloud::github_repo_from_input(github_repo)
+            .ok_or_else(|| {
+                EngineError::Other(format!(
+                    "\"{github_repo}\" isn't a GitHub repository (owner/name)."
+                ))
+            })?;
         let spaces = self.read(|doc| doc.read_spaces())?;
         if spaces.iter().any(|s| {
             s.id == space_id
@@ -1404,7 +1416,7 @@ impl WorkspaceHost {
         let stale: Vec<Space> = self
             .read(|doc| doc.read_spaces())?
             .into_iter()
-            .filter(|s| s.device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX))
+            .filter(|s| zeron_proto::provider_cloud::is_repository_only_device(&s.device_id))
             .filter(|s| {
                 s.github_repo
                     .as_deref()

@@ -57,7 +57,8 @@ async fn main() {
     // (a persistent 401: the chat shows "Sign in again").
     let reject = folder.join("reject-token");
     let mut rejected = false;
-    let mut last_report = String::new();
+    let mut reported = 0;
+    let mut archives_reported = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if !rejected && reject.exists() {
@@ -93,15 +94,25 @@ async fn main() {
             });
             println!("the next create fails before making anything (502)");
         }
-        let report = format!(
-            "sessions created: {:?}; archive requests: {:?}",
-            fake.created_sessions(),
-            fake.archive_requests()
-        );
-        if report != last_report {
-            println!("{report}");
-            last_report = report;
+        let archives = fake.archive_requests();
+        for id in archives.iter().skip(archives_reported) {
+            println!("archive requested by Zeron: {id}");
         }
+        archives_reported = archives.len();
+        // Each create once, with the repository it clones (`[]`: no project).
+        let creates: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/code/sessions")
+            .collect();
+        let created = fake.created_sessions();
+        for (id, create) in created.iter().zip(&creates).skip(reported) {
+            println!(
+                "session created: {id} sources={}",
+                create.body["config"]["sources"]
+            );
+        }
+        reported = reported.max(created.len().min(creates.len()));
     }
 }
 

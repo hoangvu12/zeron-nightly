@@ -2,11 +2,13 @@
 //! a Zeron chat tied to one provider cloud session (Claude Code cloud), whose
 //! host device mirrors the session and sends to it.
 //!
-//! - [`create_chat`]: `createChat` with harness `claude-code-cloud` and no
-//!   project. The session is created synchronously on this device (never
-//!   queued, never retried). A create whose answer is lost is looked for in
-//!   the session list by its tag (`zeron:<first prompt uuid>`) and adopted
-//!   when found; otherwise it is "Creation uncertain"
+//! - [`create_chat`]: `createChat` with harness `claude-code-cloud`, in no
+//!   project (an empty sandbox) or a GitHub project (the session clones its
+//!   repository at a branch, [`github_source`]; the chat sits in the project
+//!   but is hosted here). The session is created synchronously on this
+//!   device (never queued, never retried). A create whose answer is lost is
+//!   looked for in the session list by its tag (`zeron:<first prompt uuid>`)
+//!   and adopted when found; otherwise it is "Creation uncertain"
 //!   ([`CreateFailure::Uncertain`]) and only the person may create again.
 //!   Then the row is written: chat id = UUIDv5 of
 //!   `claude:<session id>`, `cwd = claude-cloud://<session id>`,
@@ -30,13 +32,14 @@ use std::collections::{HashMap, HashSet};
 use zeron_doc::{SessionCommandPayload, SessionDoc};
 use zeron_harness::provider_cloud::{
     AccountLogin, CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus,
-    ProviderResume, RunBinding,
+    ProviderResume, RunBinding, SessionSource,
 };
 use zeron_proto::{Chat, ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
 
 use crate::EngineError;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
+use crate::repos::Repos;
 use crate::sessions::SessionsEngine;
 use crate::workspace_host::WorkspaceHost;
 
@@ -46,7 +49,12 @@ pub(crate) struct NewProviderChat {
     /// The device the request named, if any: it must be this one (the
     /// device the person is on creates the session).
     pub device_id: Option<String>,
+    /// The project: a GitHub one (any device's checkout, or one living at
+    /// the provider). `None`: an empty sandbox.
     pub space_id: Option<String>,
+    /// The branch the session starts on, as the composer named it; `None`:
+    /// the branch this device's checkout has out, else the default branch.
+    pub branch: Option<String>,
     pub config: ChatConfig,
     /// The first message (required: a session is created with it).
     pub prompt: Option<String>,
@@ -98,13 +106,11 @@ impl From<EngineError> for CreateFailure {
 pub(crate) async fn create_chat(
     registry: &HarnessRegistry,
     workspace: &WorkspaceHost,
+    repos: &Repos,
     doc_host: &DocHost,
     new: NewProviderChat,
 ) -> Result<CreatedProviderChat, CreateFailure> {
     let device_id = workspace.device_id().to_owned();
-    if new.space_id.is_some() {
-        return Err(refused("Provider-run chats start with no project for now.").into());
-    }
     if new.device_id.as_deref().is_some_and(|d| d != device_id) {
         return Err(refused("A provider-run chat is created on the device you're using.").into());
     }
@@ -118,6 +124,11 @@ pub(crate) async fn create_chat(
     let cloud = harness
         .provider_cloud()
         .ok_or_else(|| refused("Claude cloud sessions are off on this device."))?;
+    let source = match new.space_id.as_deref() {
+        Some(space_id) => Some(github_source(workspace, repos, space_id, new.branch).await?),
+        None => None,
+    };
+    let branch = source.as_ref().and_then(|s| s.branch.clone());
     let message_id = new
         .message_id
         .filter(|id| !id.trim().is_empty())
@@ -136,6 +147,7 @@ pub(crate) async fn create_chat(
             prompt_uuid: prompt_uuid.clone(),
             model: new.config.model.clone(),
             title: Some(title.clone()),
+            source,
         })
         .await;
     let session = match created {
@@ -169,6 +181,7 @@ pub(crate) async fn create_chat(
     workspace
         .create_provider_run_chat(
             &chat_id,
+            new.space_id.as_deref(),
             new.config.clone(),
             cwd.clone(),
             new.parent_chat_id,
@@ -185,6 +198,12 @@ pub(crate) async fn create_chat(
         return Err(recorded(refused("the chat names another provider session")).into());
     }
     workspace.rename_chat(&chat_id, &title).map_err(recorded)?;
+    // The branch the session started from: the chat's "project · branch".
+    if let Some(branch) = &branch {
+        workspace
+            .set_chat_branch(&chat_id, branch)
+            .map_err(recorded)?;
+    }
     let handle = doc_host.open(&chat_id).map_err(recorded)?;
     handle
         .doc()
@@ -205,6 +224,52 @@ pub(crate) async fn create_chat(
         cwd,
         message_id,
         session,
+    })
+}
+
+/// The repository and branch a session in project `space_id` clones: the
+/// project's GitHub repository (its owner stamps it; this device's own
+/// checkout is asked directly, so a project just added works at once), and
+/// the branch the composer named, else the one this device's checkout has
+/// out, else (another device's checkout, a project living at the provider,
+/// a detached head) the repository's default branch. A project without a
+/// GitHub remote is refused before anything reaches the provider.
+async fn github_source(
+    workspace: &WorkspaceHost,
+    repos: &Repos,
+    space_id: &str,
+    branch: Option<String>,
+) -> Result<SessionSource, EngineError> {
+    let space = workspace
+        .space(space_id)?
+        .ok_or_else(|| refused("That project no longer exists."))?;
+    let checkout = (space.device_id == workspace.device_id())
+        .then(|| std::path::PathBuf::from(&space.path));
+    let mut github_repo = space.github_repo.clone();
+    if github_repo.is_none()
+        && let Some(path) = &checkout
+    {
+        github_repo = repos.github_repo(path).await;
+    }
+    let github_repo = github_repo.ok_or_else(|| {
+        refused(format!(
+            "{} has no GitHub remote, so Anthropic cloud can't work on it.",
+            space.display_name()
+        ))
+    })?;
+    let mut branch = branch.filter(|b| !b.trim().is_empty());
+    if branch.is_none()
+        && let Some(path) = &checkout
+    {
+        branch = repos
+            .current_branch(path)
+            .await
+            .ok()
+            .filter(|b| b != "HEAD" && !b.is_empty());
+    }
+    Ok(SessionSource {
+        github_repo,
+        branch,
     })
 }
 

@@ -68,6 +68,7 @@ async fn the_server_keeps_zerons_create_tag() {
             prompt_uuid: prompt_uuid.clone(),
             model: None,
             title: Some("Zeron tag check (archive me)".into()),
+            source: None,
         })
         .await;
     let session = match created {

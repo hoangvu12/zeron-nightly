@@ -1979,10 +1979,17 @@ impl EngineRpc {
                 git_detected,
                 github_repo,
             } => match github_repo {
-                Some(repo) if device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX) => self
-                    .workspace
-                    .create_cloud_space(&space_id, &device_id, &path, name, &repo)
-                    .map_err(failed),
+                Some(repo)
+                    if zeron_proto::provider_cloud::is_repository_only_device(&device_id) =>
+                {
+                    self.workspace
+                        .create_cloud_space(&space_id, &device_id, &path, name, &repo)
+                        .map_err(failed)
+                }
+                // A provider cloud's project is only ever a GitHub repository.
+                None if device_id == zeron_proto::provider_cloud::PROJECTS_DEVICE => Err(
+                    RpcError::BadParams("a provider cloud project needs its githubRepo".into()),
+                ),
                 _ => self
                     .workspace
                     .create_space(&space_id, &device_id, &path, name, git_detected)
@@ -4062,6 +4069,7 @@ impl RpcService for EngineRpc {
                         space_id,
                         device_id,
                         config: Some(config),
+                        branch,
                         parent_chat_id,
                         child_kind,
                         prompt,
@@ -4072,6 +4080,7 @@ impl RpcService for EngineRpc {
                         let new = crate::provider_run::NewProviderChat {
                             device_id,
                             space_id,
+                            branch,
                             config,
                             prompt,
                             message_id,
@@ -4083,14 +4092,17 @@ impl RpcService for EngineRpc {
                         // Its own task: a caller that gives up waiting (or
                         // disconnects) can't cut a create off between the
                         // session being made and its chat being recorded.
-                        let (registry, workspace, doc_host) = (
+                        let (registry, workspace, repos, doc_host) = (
                             self.registry.clone(),
                             self.workspace.clone(),
+                            self.repos.clone(),
                             self.doc_host.clone(),
                         );
                         let created = tokio::spawn(async move {
-                            crate::provider_run::create_chat(&registry, &workspace, &doc_host, new)
-                                .await
+                            crate::provider_run::create_chat(
+                                &registry, &workspace, &repos, &doc_host, new,
+                            )
+                            .await
                         })
                         .await
                         .map_err(|e| RpcError::Failed(format!("creating the chat failed: {e}")))?
