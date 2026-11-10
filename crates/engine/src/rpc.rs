@@ -711,6 +711,9 @@ struct CloudHost {
 enum MutateParams {
     #[serde(rename_all = "camelCase")]
     CreateChat {
+        /// The new chat's id. Required, except for a provider-run chat,
+        /// which the engine names after its session (UUIDv5).
+        #[serde(default)]
         chat_id: String,
         /// The project the chat is created in — fixes host device + base cwd.
         /// `None` mints a project-less chat: `deviceId` picks the host and the
@@ -4060,24 +4063,39 @@ impl RpcService for EngineRpc {
                         title,
                         ..
                     } if config.harness.runs_in_provider_cloud() => {
-                        let created = crate::provider_run::create_chat(
-                            &self.registry,
-                            &self.workspace,
-                            &self.doc_host,
-                            crate::provider_run::NewProviderChat {
-                                device_id,
-                                space_id,
-                                config,
-                                prompt,
-                                message_id,
-                                title,
-                                parent_chat_id: parent_chat_id
-                                    .filter(|parent| !zeron_proto::voice::is_orchestrator_chat(parent)),
-                                child_kind,
-                            },
-                        )
+                        let new = crate::provider_run::NewProviderChat {
+                            device_id,
+                            space_id,
+                            config,
+                            prompt,
+                            message_id,
+                            title,
+                            parent_chat_id: parent_chat_id
+                                .filter(|parent| !zeron_proto::voice::is_orchestrator_chat(parent)),
+                            child_kind,
+                        };
+                        // Its own task: a caller that gives up waiting (or
+                        // disconnects) can't cut a create off between the
+                        // session being made and its chat being recorded.
+                        let (registry, workspace, doc_host) = (
+                            self.registry.clone(),
+                            self.workspace.clone(),
+                            self.doc_host.clone(),
+                        );
+                        let created = tokio::spawn(async move {
+                            crate::provider_run::create_chat(&registry, &workspace, &doc_host, new)
+                                .await
+                        })
                         .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        .map_err(|e| RpcError::Failed(format!("creating the chat failed: {e}")))?
+                        .map_err(|failure| match failure {
+                            crate::provider_run::CreateFailure::Refused(e) => {
+                                RpcError::Failed(e.to_string())
+                            }
+                            crate::provider_run::CreateFailure::Uncertain => RpcError::Capability(
+                                zeron_rpc::capability_errors::PROVIDER_CREATION_UNCERTAIN.into(),
+                            ),
+                        })?;
                         return RpcReply::value(&serde_json::json!({
                             "ok": true,
                             "chatId": created.chat_id,
@@ -4089,6 +4107,13 @@ impl RpcService for EngineRpc {
                     }
                     other => other,
                 };
+                // Only a provider-run chat is named by the engine (after its
+                // session); every other chat brings its id.
+                if let MutateParams::CreateChat { chat_id, .. } = &p
+                    && chat_id.trim().is_empty()
+                {
+                    return Err(RpcError::BadParams("chatId is required".into()));
+                }
                 if let MutateParams::CreateChat {
                     chat_id,
                     space_id,

@@ -4,7 +4,11 @@
 //!
 //! - [`create_chat`]: `createChat` with harness `claude-code-cloud` and no
 //!   project. The session is created synchronously on this device (never
-//!   queued, never retried), then the row is written: chat id = UUIDv5 of
+//!   queued, never retried). A create whose answer is lost is looked for in
+//!   the session list by its tag (`zeron:<first prompt uuid>`) and adopted
+//!   when found; otherwise it is "Creation uncertain"
+//!   ([`CreateFailure::Uncertain`]) and only the person may create again.
+//!   Then the row is written: chat id = UUIDv5 of
 //!   `claude:<session id>`, `cwd = claude-cloud://<session id>`,
 //!   `providerSession` on the row and in the chat document's metadata. The
 //!   first prompt rode the create request; it is queued as the chat's first
@@ -68,23 +72,41 @@ fn refused(message: impl Into<String>) -> EngineError {
     EngineError::Other(message.into())
 }
 
+/// How far before a create's start its session is looked for (the
+/// provider's clock may run behind this device's).
+const CREATE_LOOKBACK: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Why [`create_chat`] made no chat.
+#[derive(Debug)]
+pub(crate) enum CreateFailure {
+    /// Nothing was created (or the session was created but its chat
+    /// couldn't be recorded: the message says so).
+    Refused(EngineError),
+    /// The create's outcome is unknown, and the session list has no
+    /// session with its tag: "Creation uncertain". Only the person may
+    /// create again (a new create, with a new first-message id).
+    Uncertain,
+}
+
+impl From<EngineError> for CreateFailure {
+    fn from(error: EngineError) -> Self {
+        Self::Refused(error)
+    }
+}
+
 /// Create the provider session, then the chat for it (see module docs).
 pub(crate) async fn create_chat(
     registry: &HarnessRegistry,
     workspace: &WorkspaceHost,
     doc_host: &DocHost,
     new: NewProviderChat,
-) -> Result<CreatedProviderChat, EngineError> {
+) -> Result<CreatedProviderChat, CreateFailure> {
     let device_id = workspace.device_id().to_owned();
     if new.space_id.is_some() {
-        return Err(refused(
-            "Provider-run chats start with no project for now.",
-        ));
+        return Err(refused("Provider-run chats start with no project for now.").into());
     }
     if new.device_id.as_deref().is_some_and(|d| d != device_id) {
-        return Err(refused(
-            "A provider-run chat is created on the device you're using.",
-        ));
+        return Err(refused("A provider-run chat is created on the device you're using.").into());
     }
     let prompt = new
         .prompt
@@ -104,20 +126,39 @@ pub(crate) async fn create_chat(
         .title
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| zeron_proto::provider_cloud::title_from_prompt(&prompt));
-    // Not idempotent: exactly one attempt. A failure here created nothing
-    // Zeron knows about.
-    let session = cloud
+    let prompt_uuid = zeron_proto::provider_cloud::event_uuid(&message_id);
+    let attempted = chrono::Utc::now();
+    // Not idempotent: exactly one attempt. A refusal created nothing; an
+    // unknown outcome is looked up by the create's tag, never retried.
+    let created = cloud
         .create_session(CreateSession {
             prompt: prompt.clone(),
-            prompt_uuid: zeron_proto::provider_cloud::event_uuid(&message_id),
+            prompt_uuid: prompt_uuid.clone(),
             model: new.config.model.clone(),
             title: Some(title.clone()),
         })
-        .await
-        .map_err(|error| match error {
-            ProviderCloudError::Provider { message, .. } => refused(message),
-            other => refused(other.to_string()),
-        })?;
+        .await;
+    let session = match created {
+        Ok(session) => session,
+        Err(ProviderCloudError::Uncertain(why)) => {
+            tracing::warn!(reason = %why, "a Claude cloud create's outcome is unknown; looking for its session");
+            match cloud
+                .find_created(&prompt_uuid, attempted - CREATE_LOOKBACK)
+                .await
+            {
+                Ok(Some(session)) => session,
+                Ok(None) => return Err(CreateFailure::Uncertain),
+                Err(error) => {
+                    tracing::warn!(%error, "couldn't look for the created session");
+                    return Err(CreateFailure::Uncertain);
+                }
+            }
+        }
+        Err(ProviderCloudError::Provider { message, .. }) => {
+            return Err(CreateFailure::Refused(refused(message)));
+        }
+        Err(other) => return Err(CreateFailure::Refused(refused(other.to_string()))),
+    };
     let chat_id = zeron_proto::provider_cloud::chat_id_for(&session);
     let cwd = zeron_proto::provider_cloud::claude_cwd(&session.session_id);
     let recorded = |error: EngineError| {
@@ -141,7 +182,7 @@ pub(crate) async fn create_chat(
         .set_chat_provider_session(&chat_id, &session)
         .map_err(recorded)?
     {
-        return Err(recorded(refused("the chat names another provider session")));
+        return Err(recorded(refused("the chat names another provider session")).into());
     }
     workspace.rename_chat(&chat_id, &title).map_err(recorded)?;
     let handle = doc_host.open(&chat_id).map_err(recorded)?;
@@ -443,9 +484,18 @@ fn record_states(
         if written.get(&chat.id) == Some(&state) {
             continue;
         }
-        let recorded = host
-            .open(&chat.id)
-            .and_then(|handle| Ok(handle.doc().set_provider_chat_state(state.as_ref())?));
+        // A fact about the session ("Archived on claude.ai") isn't the
+        // login's to replace or clear.
+        let recorded = host.open(&chat.id).and_then(|handle| {
+            let doc = handle.doc();
+            if doc
+                .provider_chat_state()
+                .is_some_and(|current| !current.is_sign_in())
+            {
+                return Ok(());
+            }
+            Ok(doc.set_provider_chat_state(state.as_ref())?)
+        });
         match recorded {
             Ok(()) => {
                 written.insert(chat.id.clone(), state);
