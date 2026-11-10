@@ -87,6 +87,13 @@ pub mod methods {
     /// device only (it creates the sessions), never forwarded.
     pub const GET_CLAUDE_CLOUD_SESSIONS: &str = "GetClaudeCloudSessions";
     pub const SET_CLAUDE_CLOUD_SESSIONS: &str = "SetClaudeCloudSessions";
+    /// The sidebar's view of this device's Claude cloud sessions:
+    /// `{visible}` → `{sessions: [{chatId, sessionId, title, activity,
+    /// lastEventAt}], readAt, error}`. While `visible`, and at most once a
+    /// minute, the engine reads the session list and imports sessions it
+    /// has no chat for; otherwise it answers from its last read. This
+    /// device only, never forwarded.
+    pub const DISCOVER_PROVIDER_SESSIONS: &str = "DiscoverProviderSessions";
     /// Which providers on this device run without their own subagents
     /// (`{switchable, off}`; set with `{harness, enabled}`).
     pub const GET_NATIVE_SUBAGENTS: &str = "GetNativeSubagents";

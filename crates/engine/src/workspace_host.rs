@@ -753,6 +753,19 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.chat(chat_id))?)
     }
 
+    /// Whether `chat_id`'s row was deleted here (a tombstone), not merely
+    /// unknown.
+    pub fn chat_deleted(&self, chat_id: &str) -> bool {
+        self.read(|doc| doc.chat_deleted(chat_id))
+    }
+
+    /// Whether this replica's registry can be trusted to name a chat's host:
+    /// it has heard from the relay since it connected (or it has no relay).
+    /// A room that exists but hasn't synced yet may be arbitrarily behind.
+    pub fn registry_current(&self) -> bool {
+        self.registry_synced()
+    }
+
     /// Whether `chat_id`'s parent is unknown here yet: this host claimed its
     /// row for a command that arrived first ([`Self::claim_chat`]), and its
     /// `createChat` hasn't landed ([`RegistryDoc::chat_parent_recorded`]).

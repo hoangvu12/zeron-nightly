@@ -118,6 +118,8 @@ pub struct ClaudeCloudSessions {
     /// changes at once can't leave the harness or capability out of step
     /// with the saved setting.
     changing: Mutex<()>,
+    /// The sidebar's session list: its throttle and latest read.
+    discovery: crate::provider_discovery::ProviderDiscovery,
 }
 
 impl ClaudeCloudSessions {
@@ -133,6 +135,7 @@ impl ClaudeCloudSessions {
             path,
             stored: Mutex::new(stored),
             changing: Mutex::new(()),
+            discovery: Default::default(),
         }
     }
 
@@ -140,6 +143,10 @@ impl ClaudeCloudSessions {
     /// applying them. Never across an `.await`.
     pub fn changing(&self) -> std::sync::MutexGuard<'_, ()> {
         self.changing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn discovery(&self) -> &crate::provider_discovery::ProviderDiscovery {
+        &self.discovery
     }
 
     pub fn settings(&self) -> ClaudeCloudSettings {
@@ -179,7 +186,7 @@ fn available() -> bool {
 /// can send a real login's token anywhere but Anthropic.
 const API_OVERRIDE_ENV: &str = "ZERON_CLAUDE_CLOUD_API";
 
-fn local_api_override() -> Option<String> {
+pub(crate) fn local_api_override() -> Option<String> {
     let url = std::env::var(API_OVERRIDE_ENV).ok()?;
     let url = url.trim().trim_end_matches('/');
     let rest = url.strip_prefix("http://")?;

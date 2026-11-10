@@ -2326,6 +2326,9 @@ pub struct Shell {
     /// Short debounce that aggregates providers finishing the same check at
     /// slightly different times into one banner.
     harness_update_banner_task: Option<Task<()>>,
+    /// Asks the local engine for its Claude cloud sessions while the
+    /// sidebar is on screen (see [`provider_discovery_loop`]).
+    _provider_discovery: Task<()>,
     /// Independent watches retain device identity across selection changes.
     harness_update_devices: std::collections::BTreeMap<String, harness_updates::DeviceUpdates>,
     harness_update_expanded: bool,
@@ -2713,6 +2716,7 @@ impl Shell {
         let transcript_invalidation = cx.observe_self(|shell, cx| {
             shell.transcript.update(cx, |_, cx| cx.notify());
         });
+        let provider_discovery = cx.spawn(provider_discovery_loop);
         let shell = cx.entity();
         let sidebar_pane = cx.new(|cx| SidebarPane {
             shell: shell.downgrade(),
@@ -2862,6 +2866,7 @@ impl Shell {
             attention_sound_gate: Default::default(),
             harness_update_seen: std::collections::HashSet::new(),
             harness_update_banner_task: None,
+            _provider_discovery: provider_discovery,
             harness_update_devices: Default::default(),
             harness_update_expanded: false,
             harness_update_transition: None,
@@ -20094,5 +20099,58 @@ impl Shell {
         } else {
             self.close_settings(cx);
         }
+    }
+}
+
+/// How often the shell asks the engine for its Claude cloud sessions while
+/// the sidebar shows. The engine reads the provider's list at most once a
+/// minute however often it is asked; this only bounds how soon a newly
+/// shown sidebar picks the list up.
+const PROVIDER_DISCOVERY_TICK: Duration = Duration::from_secs(15);
+
+/// While the sidebar is on screen, ask the local engine for its Claude cloud
+/// sessions (`DiscoverProviderSessions`, docs/design/provider-run-chats.md
+/// §6) and lay the answer over the provider-run chats. A hidden sidebar asks
+/// nothing, so the engine reads nothing. Ends with the shell.
+async fn provider_discovery_loop(this: gpui::WeakEntity<Shell>, cx: &mut gpui::AsyncApp) {
+    loop {
+        let due = this.update(cx, |shell, cx| {
+            let visible = shell.settled_fit().1 > 0.0;
+            let engine = shell.state.read(cx).engine().cloned();
+            engine.filter(|_| visible)
+        });
+        let engine = match due {
+            Ok(engine) => engine,
+            Err(_) => return,
+        };
+        if let Some(engine) = engine {
+            let reply = engine
+                .client()
+                .call(
+                    zeron_rpc::methods::DISCOVER_PROVIDER_SESSIONS,
+                    serde_json::json!({ "visible": true }),
+                )
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<zeron_engine::provider_discovery::DiscoveryReply>(
+                        value,
+                    )
+                    .ok()
+                });
+            if let Some(reply) = reply {
+                let applied = this.update(cx, |shell, cx| {
+                    shell.state.update(cx, |state, cx| {
+                        if state.apply_provider_overlay(reply.sessions) {
+                            cx.notify();
+                        }
+                    });
+                });
+                if applied.is_err() {
+                    return;
+                }
+            }
+        }
+        cx.background_executor().timer(PROVIDER_DISCOVERY_TICK).await;
     }
 }

@@ -36,7 +36,8 @@ use zeron_proto::{
 };
 
 use crate::provider_cloud::{
-    CreateSession, HostCheck, ProviderCloud, ProviderCloudError, ProviderResume, RunBinding,
+    CreateSession, HostCheck, ListedSession, ProviderCloud, ProviderCloudError, ProviderResume,
+    RunBinding, SessionActivity,
 };
 use crate::{Harness, HarnessError, RunControls};
 use api::{ApiError, CloudClient};
@@ -55,6 +56,66 @@ pub fn enabled() -> bool {
 /// environment before concluding it has none.
 const ENVIRONMENT_PAGES: usize = 10;
 const ENVIRONMENT_PAGE_SIZE: usize = 50;
+
+/// The session list's page size, and the most pages one read follows.
+const LIST_PAGE_SIZE: usize = 20;
+const LIST_PAGES: usize = 25;
+
+/// What the list's status says the session is doing. Archived and plain
+/// lifecycle states read as idle; the working and waiting words are not
+/// verified against the real API yet (the live smoke test checks them).
+fn session_activity(info: &api::SessionInfo) -> SessionActivity {
+    let says = |word: &str| {
+        [info.worker_status.as_deref(), info.status.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|s| s.eq_ignore_ascii_case(word))
+    };
+    if ["requires_action", "waiting", "waiting_for_input", "awaiting_input"]
+        .into_iter()
+        .any(says)
+    {
+        SessionActivity::WaitingForYou
+    } else if ["running", "working", "busy"].into_iter().any(says) {
+        SessionActivity::Working
+    } else {
+        SessionActivity::Idle
+    }
+}
+
+fn parse_time(at: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(at?.trim())
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// One list entry, as `account`'s session. `None` without an id or any
+/// time to place it by.
+fn listed_session(
+    info: api::SessionInfo,
+    account: &credentials::ClaudeAccount,
+) -> Option<ListedSession> {
+    if info.id.is_empty() {
+        return None;
+    }
+    let last_event_at = parse_time(info.last_event_at.as_deref())
+        .or_else(|| parse_time(info.created_at.as_deref()))?;
+    let created_at = parse_time(info.created_at.as_deref()).unwrap_or(last_event_at);
+    Some(ListedSession {
+        activity: session_activity(&info),
+        archived: info.archived(),
+        title: info.title.clone().filter(|t| !t.trim().is_empty()),
+        session: ProviderSession {
+            provider: zeron_proto::provider_cloud::CLAUDE.to_owned(),
+            session_id: info.id,
+            account_uuid: account.account_uuid.clone(),
+            account_email: account.email.clone(),
+            org_id: account.org_id.clone(),
+        },
+        created_at,
+        last_event_at,
+    })
+}
 
 /// Where and as whom the harness talks to the session API.
 #[derive(Debug, Clone)]
@@ -398,6 +459,46 @@ impl ProviderCloud for ClaudeCloudHarness {
         self.bindings
             .created(session.clone(), request.prompt_uuid, request.model);
         Ok(session)
+    }
+
+    async fn list_sessions(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ListedSession>, ProviderCloudError> {
+        // Only the device's own login for now; added accounts (ticket #14)
+        // each get their own read.
+        let account = self
+            .client
+            .credentials()
+            .account()
+            .await
+            .map_err(|e| provider_error(ApiError::Credentials(e)))?;
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..LIST_PAGES {
+            let page = self
+                .client
+                .list_sessions(&account, LIST_PAGE_SIZE, cursor.as_deref())
+                .await
+                .map_err(provider_error)?;
+            let mut reached_older = page.data.is_empty();
+            for info in page.data {
+                let Some(found) = listed_session(info, &account) else {
+                    continue;
+                };
+                if found.last_event_at < since {
+                    // Newest activity first: everything after is older.
+                    reached_older = true;
+                    continue;
+                }
+                listed.push(found);
+            }
+            cursor = page.next_cursor.filter(|c| !c.is_empty());
+            if reached_older || cursor.is_none() {
+                break;
+            }
+        }
+        Ok(listed)
     }
 
     fn bind_run(&self, binding: RunBinding) {

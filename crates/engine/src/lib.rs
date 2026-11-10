@@ -63,6 +63,7 @@ mod plugin_agents;
 pub mod plugins;
 pub mod profile;
 pub mod project_actions;
+pub mod provider_discovery;
 mod provider_host;
 mod provider_run;
 pub mod registry;
@@ -719,6 +720,15 @@ impl EngineCore {
     /// it is the caller's job.
     pub async fn resume_provider_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
         provider_run::resume_as_host(&self.sessions, &self.doc_host, chat_id).await
+    }
+
+    /// Test seam: let `DiscoverProviderSessions` read the session list as
+    /// often as every `interval` (production: once a minute).
+    #[doc(hidden)]
+    pub fn set_provider_list_interval(&self, interval: std::time::Duration) {
+        if let Some(store) = self.sessions.registry().claude_cloud() {
+            store.discovery().set_interval(interval);
+        }
     }
 
     pub async fn shutdown(&self) {
