@@ -447,6 +447,18 @@ impl FakeSessionServer {
         }
     }
 
+    /// Send every stream open on session `session_id` one raw SSE event
+    /// (a shape the real API might start sending, say).
+    pub fn send_raw(&self, session_id: &str, event: &'static str, data: &str) {
+        if let Some(session) = lock(&self.state).session(session_id) {
+            let _ = session.live.send(Live {
+                event,
+                id: None,
+                data: data.to_owned(),
+            });
+        }
+    }
+
     /// Whether a turn is playing on the session now.
     pub fn turn_playing(&self, session_id: &str) -> bool {
         lock(&self.state)

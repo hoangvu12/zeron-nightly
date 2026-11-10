@@ -31,6 +31,11 @@ use crate::provider_cloud::{AccountLogin, ProviderCloudStatus};
 /// Why the feature turns itself off after a 401 survives a renewal.
 pub const REJECTED_AFTER_RENEWAL: &str = "Claude cloud sessions turned off on this device: Claude refused the login even after the Claude CLI renewed it.";
 
+/// Why the feature is off when its `DISABLED` file is in place and says
+/// nothing itself.
+pub const DISABLED_BY_FILE: &str =
+    "Claude cloud sessions are off on this device: its DISABLED file is in place.";
+
 /// The production API.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -172,6 +177,9 @@ pub enum StreamItem {
     Ephemeral(Value),
     /// Anything else the stream says (`session_update`, `delivery_update`).
     Other { event: String },
+    /// A stored or live event in a shape Zeron doesn't know (which event):
+    /// the API changed, and the feature turns itself off.
+    Unrecognised(String),
 }
 
 /// The session API, acting for one login folder.
@@ -181,6 +189,11 @@ pub struct CloudClient {
     credentials: Arc<Credentials>,
     /// The accounts' sign-in states and the kill switch.
     status: watch::Sender<ProviderCloudStatus>,
+    /// The kill switch's file (`DISABLED` in the feature's data folder):
+    /// in place, the feature is off, saying what it says; a trip writes
+    /// its reason there, so the feature stays off across restarts until
+    /// the file is removed.
+    kill_switch: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl CloudClient {
@@ -201,7 +214,50 @@ impl CloudClient {
             base,
             credentials,
             status: watch::Sender::new(ProviderCloudStatus::default()),
+            kill_switch: std::sync::Mutex::default(),
         })
+    }
+
+    /// Where the kill switch's file is (see the field); it is read now, and
+    /// again before every request.
+    pub fn set_kill_switch(&self, path: std::path::PathBuf) {
+        *self
+            .kill_switch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+        self.check_kill_switch();
+    }
+
+    fn kill_switch_path(&self) -> Option<std::path::PathBuf> {
+        self.kill_switch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Off when the kill switch's file is in place, for the reason it gives.
+    fn check_kill_switch(&self) {
+        if self.disabled().is_some() {
+            return;
+        }
+        let Some(path) = self.kill_switch_path() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let reason = text.trim();
+        self.trip(if reason.is_empty() {
+            DISABLED_BY_FILE
+        } else {
+            reason
+        });
+    }
+
+    /// Turn the feature off on this device, saying why (an event in a shape
+    /// Zeron doesn't know, say).
+    pub(crate) fn disable(&self, reason: &str) {
+        self.trip(reason);
     }
 
     pub fn credentials(&self) -> &Arc<Credentials> {
@@ -229,9 +285,10 @@ impl CloudClient {
         });
     }
 
-    /// Turn the feature off on this device, saying why.
+    /// Turn the feature off on this device, saying why, and keep it off
+    /// (the kill switch's file says why from now on).
     fn trip(&self, reason: &str) {
-        self.status.send_if_modified(|status| {
+        let tripped = self.status.send_if_modified(|status| {
             if status.disabled.is_some() {
                 return false;
             }
@@ -239,6 +296,35 @@ impl CloudClient {
             status.disabled = Some(reason.to_owned());
             true
         });
+        if let (true, Some(path)) = (tripped, self.kill_switch_path())
+            && !path.exists()
+        {
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, format!("{reason}\n")));
+            if let Err(error) = written {
+                tracing::error!(target: "zeron_harness::claude_cloud", %error, "couldn't keep Claude cloud sessions off");
+            }
+        }
+    }
+
+    /// A 403 or 404 for the session list or create, with a login whose
+    /// identity checked out: Anthropic changed or blocked the API, so the
+    /// feature turns off (a single session's refusals don't come here).
+    fn refused(
+        &self,
+        what: &str,
+        result: Result<reqwest::Response, ApiError>,
+    ) -> Result<reqwest::Response, ApiError> {
+        let response = result?;
+        let status = response.status().as_u16();
+        if matches!(status, 403 | 404) {
+            self.trip(&format!(
+                "Claude cloud sessions turned off on this device: Claude refused {what} ({status}), so its API may have changed or be blocked."
+            ));
+        }
+        Ok(response)
     }
 
     /// Send one request acting for `account`, `build` adding its query and
@@ -251,6 +337,7 @@ impl CloudClient {
         account: &ClaudeAccount,
         build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ApiError> {
+        self.check_kill_switch();
         if let Some(reason) = self.disabled() {
             return Err(ApiError::Disabled(reason));
         }
@@ -340,7 +427,8 @@ impl CloudClient {
             .execute(reqwest::Method::GET, "/v1/code/sessions", account, |r| {
                 r.query(&query)
             })
-            .await?;
+            .await;
+        let response = self.refused("the session list", response)?;
         self.send_json(response).await
     }
 
@@ -360,7 +448,8 @@ impl CloudClient {
             .execute(reqwest::Method::POST, "/v1/code/sessions", account, |r| {
                 r.json(body)
             })
-            .await?;
+            .await;
+        let response = self.refused("a new session", response)?;
         let created: Created = self.send_json(response).await?;
         match created {
             Created {
@@ -492,25 +581,42 @@ impl CloudClient {
     }
 }
 
+/// One SSE event off the session stream. A stored event (`client_event`)
+/// must carry a sequence number and an object payload, a live one
+/// (`ephemeral_event`) an object payload: anything else in those envelopes
+/// is a shape Zeron doesn't know ([`StreamItem::Unrecognised`]). Other
+/// event names (`session_update`, `delivery_update`, and any new ones) say
+/// nothing the mirror needs.
 fn stream_item(event: &str, data: &str) -> StreamItem {
+    let unrecognised = || StreamItem::Unrecognised(event.to_owned());
     match event {
         "client_event" => match serde_json::from_str::<StoredEvent>(data) {
-            Ok(stored) => StreamItem::Stored(stored),
-            Err(_) => StreamItem::Other {
-                event: event.to_owned(),
-            },
+            Ok(stored) if stored.sequence_num.is_some() && stored.payload.is_object() => {
+                StreamItem::Stored(stored)
+            }
+            _ => unrecognised(),
         },
         "ephemeral_event" => {
-            let payload = serde_json::from_str::<Value>(data)
+            match serde_json::from_str::<Value>(data)
                 .ok()
                 .and_then(|mut v| v.get_mut("payload").map(Value::take))
-                .unwrap_or(Value::Null);
-            StreamItem::Ephemeral(payload)
+            {
+                Some(payload) if payload.is_object() => StreamItem::Ephemeral(payload),
+                _ => unrecognised(),
+            }
         }
         other => StreamItem::Other {
             event: other.to_owned(),
         },
     }
+}
+
+/// Why the feature turns off on a stream event in a shape Zeron doesn't
+/// know.
+pub fn unrecognised_reason(event: &str) -> String {
+    format!(
+        "Claude cloud sessions turned off on this device: a session sent an event in a shape Zeron doesn't know ({event}), so its API may have changed."
+    )
 }
 
 /// A session id as one URL path segment (ids are `cse_…`; anything else is

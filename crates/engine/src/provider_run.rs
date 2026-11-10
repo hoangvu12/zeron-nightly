@@ -522,8 +522,19 @@ pub(crate) fn follow_sign_in_states(registry: &HarnessRegistry, doc_host: &DocHo
         // What each chat's document was last given, so a chat-list change
         // only opens the documents whose state moves.
         let mut written: HashMap<String, Option<ProviderChatState>> = HashMap::new();
+        let mut withdrawn = false;
         loop {
             let current = status.borrow_and_update().clone();
+            // Turned off (the kill switch): this device no longer offers to
+            // host provider-run chats.
+            if current.disabled.is_some() && !withdrawn {
+                withdrawn = true;
+                if let Err(error) =
+                    workspace.set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, false)
+                {
+                    tracing::warn!(%error, "provider-run capability update failed");
+                }
+            }
             let rows = chats.borrow_and_update().clone();
             record_states(&host, &current, &rows, &mut written);
             tokio::select! {

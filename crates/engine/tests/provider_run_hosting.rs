@@ -739,7 +739,9 @@ async fn a_host_signed_into_another_account_says_so_and_hands_the_chat_over() {
     .await;
     assert_eq!(fleet.stored_messages(&session, SECOND), 0);
 
-    // Opened on the laptop: it takes the chat over and clears the flag.
+    // Opened on the laptop: it takes the chat over and clears the flag, and
+    // the message the PC couldn't send goes now (ticket #13).
+    fleet.fake.queue_turn(Turn::text_zulu());
     laptop.open(&chat).await;
     wait_for("the laptop hosting", || laptop.hosts(&chat)).await;
     wait_for("the flag cleared", || {
@@ -755,14 +757,17 @@ async fn a_host_signed_into_another_account_says_so_and_hands_the_chat_over() {
     fleet.fake.queue_turn(Turn::text_zulu());
     laptop.send(&chat, &cwd, THIRD, "Reply with the single word ZULU.");
     wait_for("the reply", || {
-        laptop.settled(&chat)
+        fleet.stored_messages(&session, THIRD) == 1
+            && !fleet.fake.turn_playing(&session)
+            && laptop.settled(&chat)
             && laptop
                 .entries(&chat)
                 .last()
-                .is_some_and(|e| e.role == MessageRole::Assistant && text_of(e).trim() == "ZULU")
+                .is_some_and(|e| e.role == MessageRole::Assistant && text_of(e).contains("ZULU"))
     })
     .await;
     assert_eq!(fleet.stored_messages(&session, THIRD), 1);
+    assert_eq!(fleet.stored_messages(&session, SECOND), 1);
     assert!(fleet.posted_by(PC).is_empty(), "nothing went as account B");
     fleet.shutdown().await;
 }

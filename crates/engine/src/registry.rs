@@ -364,6 +364,7 @@ impl HarnessRegistry {
     /// `claude-code-cloud` harness is registered).
     pub fn provider_run_active(&self) -> bool {
         self.is_registered(HarnessId::ClaudeCodeCloud)
+            && crate::claude_cloud_sessions::disabled(self).is_none()
     }
 
     /// Fill `request.env` for a spawn of `harness` (no-op without a provider),

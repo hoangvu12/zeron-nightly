@@ -416,6 +416,10 @@ impl ProviderCloud for ClaudeCloudHarness {
         self.client.status()
     }
 
+    fn set_kill_switch(&self, path: PathBuf) {
+        self.client.set_kill_switch(path);
+    }
+
     /// The folder's signed-in account, read from its file now.
     async fn has_login(&self, account_uuid: &str) -> bool {
         self.client

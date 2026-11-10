@@ -741,6 +741,13 @@ impl RunSession {
                     }
                 }
                 item = self.stream.next(), if reconnect_at.is_none() => match item {
+                    // The API changed under Zeron: the feature turns off.
+                    Some(Ok(StreamItem::Unrecognised(event))) => {
+                        let reason = super::api::unrecognised_reason(&event);
+                        self.client.disable(&reason);
+                        fail(&self.events, reason, true).await;
+                        break 'main;
+                    }
                     Some(Ok(item)) => {
                         let mapped = self.mirror.map(item);
                         self.bindings.note_seq(&session_id, self.mirror.last_seq());

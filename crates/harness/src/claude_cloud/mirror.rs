@@ -183,7 +183,7 @@ impl Mirror {
                 )
             }
             StreamItem::Ephemeral(payload) => (payload, None, None, None),
-            StreamItem::Other { .. } => return Mapped::default(),
+            StreamItem::Other { .. } | StreamItem::Unrecognised(_) => return Mapped::default(),
         };
         let control = match traffic(&payload, seq) {
             // A replayed prompt the transcript shows answered stays answered.

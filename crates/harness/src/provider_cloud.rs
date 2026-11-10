@@ -66,9 +66,12 @@ pub struct ProviderCloudStatus {
     /// Each account this device acted for, by account uuid. Accounts not
     /// tried yet are absent.
     pub accounts: BTreeMap<String, AccountLogin>,
-    /// Set once the feature turned itself off on this device, saying why
-    /// (a 401 that persisted after the CLI renewed the login). Every later
-    /// request is refused until the engine restarts.
+    /// Set once the feature turned itself off on this device, saying why:
+    /// its `DISABLED` file is in place, a 401 persisted after the CLI
+    /// renewed the login, the session list or create was refused (403 or
+    /// 404), or a session sent an event in a shape Zeron doesn't know. Every
+    /// later request is refused; the reason is kept in the `DISABLED` file,
+    /// so it stays off until that file is removed.
     pub disabled: Option<String>,
 }
 
@@ -171,6 +174,13 @@ pub trait ProviderCloud: Send + Sync {
 
     /// The logins' states and the kill switch, current and as they change.
     fn status(&self) -> tokio::sync::watch::Receiver<ProviderCloudStatus>;
+
+    /// Where the kill switch's file is: the feature is off while it is in
+    /// place (checked before every request), and a trip writes its reason
+    /// there, so the feature stays off until the file is removed.
+    fn set_kill_switch(&self, path: std::path::PathBuf) {
+        let _ = path;
+    }
 
     /// Whether this device has a login for the account with `account_uuid`
     /// now (a local check, no request): what makes it eligible to host that

@@ -12,6 +12,14 @@
 //!
 //! Only the device's own login (`~/.claude`) exists until more accounts land
 //! (ticket #14); it is enabled by default.
+//!
+//! The kill switch (ticket #15) is the file `claude-cloud/DISABLED` in the
+//! engine's data folder: while it is in place the feature is off on this
+//! device, saying what the file says (checked before every request, so
+//! placing it acts at once), and the device doesn't offer to host. When the
+//! feature turns itself off (a refused login, list or create, an event in a
+//! shape Zeron doesn't know), the reason is written there, so it stays off
+//! across restarts until the person removes the file.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -24,6 +32,9 @@ use crate::EngineError;
 use crate::registry::HarnessRegistry;
 
 const FILE_NAME: &str = "claude-cloud-sessions.json";
+/// The feature's data folder, and its kill switch in it.
+const DATA_FOLDER: &str = "claude-cloud";
+const KILL_SWITCH: &str = "DISABLED";
 
 /// The account id of the device's own Claude login.
 pub const DEVICE_LOGIN: &str = "device";
@@ -70,6 +81,10 @@ pub struct ClaudeCloudStatus {
     /// `ZERON_CLAUDE_CLOUD_SESSIONS=1` keeps the feature on.
     #[serde(default)]
     pub forced: bool,
+    /// Why the feature is off on this device although it's on in the
+    /// settings: its kill switch (see the module docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
     /// False on a Cloud machine, which never offers it.
     #[serde(default = "yes")]
     pub available: bool,
@@ -129,6 +144,15 @@ impl ClaudeCloudSessions {
             path,
             stored: Mutex::new(stored),
         }
+    }
+
+    /// The kill switch: `claude-cloud/DISABLED` next to the settings file.
+    pub fn kill_switch(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(DATA_FOLDER)
+            .join(KILL_SWITCH)
     }
 
     pub fn settings(&self) -> ClaudeCloudSettings {
@@ -205,7 +229,21 @@ pub fn apply(registry: &HarnessRegistry, settings: &ClaudeCloudSettings) -> bool
     } else if !wanted && registered {
         registry.remove_provider_cloud(HarnessId::ClaudeCodeCloud);
     }
-    registry.is_registered(HarnessId::ClaudeCodeCloud)
+    if let (Some(store), Ok(harness)) = (
+        registry.claude_cloud(),
+        registry.resolve(HarnessId::ClaudeCodeCloud),
+    ) && let Some(cloud) = harness.provider_cloud()
+    {
+        cloud.set_kill_switch(store.kill_switch());
+    }
+    registry.provider_run_active()
+}
+
+/// Why the registered harness turned the feature off, if it did.
+pub fn disabled(registry: &HarnessRegistry) -> Option<String> {
+    let harness = registry.resolve(HarnessId::ClaudeCodeCloud).ok()?;
+    let cloud = harness.provider_cloud()?;
+    cloud.status().borrow().disabled.clone()
 }
 
 /// The status the settings page shows. Reads the device login's account
@@ -226,8 +264,9 @@ pub async fn status(registry: &HarnessRegistry, settings: ClaudeCloudSettings) -
             email,
             enabled: settings.device_login,
         }],
-        active: available() && registry.is_registered(HarnessId::ClaudeCodeCloud),
+        active: available() && registry.provider_run_active(),
         forced: zeron_harness::claude_cloud::enabled(),
+        disabled: disabled(registry),
         available: available(),
         settings,
     }

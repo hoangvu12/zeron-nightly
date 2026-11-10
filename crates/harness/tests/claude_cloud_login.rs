@@ -428,8 +428,10 @@ async fn only_a_successful_request_clears_sign_in_again() {
     assert_eq!(rig.state_of_a(), Some(AccountLogin::SignInAgain));
 
     // A fresh token, but the server fails the request: nothing learned.
+    // (Not a 403 or 404: from the list or create, those turn the feature
+    // off, ticket #15.)
     rig.login.set_token("token-a-2", in_ms(3_600_000));
-    for status in [503, 403] {
+    for status in [503, 429] {
         rig.fake.inject(Fault {
             method: None,
             path_contains: "/v1/code/sessions".into(),
