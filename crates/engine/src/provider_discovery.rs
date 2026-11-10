@@ -3,10 +3,10 @@
 //! with activity in the last 7 days becomes a provider-run chat, wherever it
 //! was started, with its history.
 //!
-//! - **When.** Only while the sidebar is visible (the app says so on each
-//!   `DiscoverProviderSessions` call) and at most once a minute: a call
-//!   inside the minute answers from the last read. The engine never reads
-//!   the list on its own.
+//! - **When.** Only when the app asks (`SyncProviderSessions`, which it
+//!   sends only while the sidebar is on screen) and at most once a minute: a
+//!   call inside the minute answers from the last read. The engine never
+//!   reads the list on its own.
 //! - **Rows.** A session with no chat gets one through the low-clock upsert
 //!   ([`WorkspaceHost::upsert_chat_at`], clocked at the session's
 //!   `created_at`): it creates a truly missing row and loses every field to
@@ -43,10 +43,8 @@ use crate::workspace_host::WorkspaceHost;
 /// The shortest time between two reads of the session list (design §7).
 pub const LIST_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How far back the sidebar shows sessions, by last activity.
-pub fn window() -> chrono::Duration {
-    chrono::Duration::days(7)
-}
+/// How far back the sidebar shows sessions, by last activity, in days.
+pub const SESSION_LIST_WINDOW_DAYS: i64 = 7;
 
 /// One session as the sidebar shows it over its chat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +58,7 @@ pub struct ProviderSessionOverlay {
     pub last_event_at: DateTime<Utc>,
 }
 
-/// `DiscoverProviderSessions` reply.
+/// `SyncProviderSessions` reply.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryReply {
@@ -118,17 +116,15 @@ impl ProviderDiscovery {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The sidebar asks (see module docs). `visible`: whether the sidebar is
-    /// on screen now; a hidden sidebar never causes a read.
+    /// The sidebar asks (see module docs).
     pub(crate) async fn refresh(
         &self,
         sessions: &SessionsEngine,
         doc_host: &DocHost,
-        visible: bool,
     ) -> DiscoveryReply {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        if !visible || !read_due(state.last_read, now, self.interval()) {
+        if !read_due(state.last_read, now, self.interval()) {
             return state.reply.clone();
         }
         let Ok(harness) = sessions.registry().resolve(HarnessId::ClaudeCodeCloud) else {
@@ -143,13 +139,21 @@ impl ProviderDiscovery {
         // Spent whatever the outcome: nothing reads in a loop.
         state.last_read = Some(now);
         let read_at = Utc::now();
-        match cloud.list_sessions(read_at - window()).await {
+        let since = read_at - chrono::Duration::days(SESSION_LIST_WINDOW_DAYS);
+        match cloud.list_sessions(since).await {
             Ok(listed) => {
-                let live: Vec<ListedSession> = listed.into_iter().filter(|s| !s.archived).collect();
+                let live: Vec<Listed> = listed
+                    .into_iter()
+                    .filter(|s| !s.archived)
+                    .map(|listed| Listed {
+                        chat_id: zeron_proto::provider_cloud::chat_id_for(&listed.session),
+                        listed,
+                    })
+                    .collect();
                 import(&workspace, &live);
                 mirror_new(sessions, doc_host, &workspace, &live);
                 state.reply = DiscoveryReply {
-                    sessions: live.iter().map(overlay).collect(),
+                    sessions: live.iter().map(Listed::overlay).collect(),
                     read_at: Some(read_at),
                     error: None,
                 };
@@ -163,58 +167,68 @@ impl ProviderDiscovery {
     }
 }
 
-fn overlay(listed: &ListedSession) -> ProviderSessionOverlay {
-    ProviderSessionOverlay {
-        chat_id: zeron_proto::provider_cloud::chat_id_for(&listed.session),
-        session_id: listed.session.session_id.clone(),
-        title: listed.title.clone(),
-        activity: listed.activity,
-        last_event_at: listed.last_event_at,
-    }
+/// A listed session with its chat's id (the same on every device).
+struct Listed {
+    chat_id: String,
+    listed: ListedSession,
 }
 
-/// The row a discovered session's chat starts as. Its prompts are asked,
-/// never answered by an access mode the person didn't pick.
-fn discovered_row(device_id: &str, listed: &ListedSession) -> Chat {
-    let session_id = &listed.session.session_id;
-    Chat {
-        id: zeron_proto::provider_cloud::chat_id_for(&listed.session),
-        device_id: device_id.to_owned(),
-        title: listed.title.clone(),
-        archived: false,
-        cwd: Some(zeron_proto::provider_cloud::claude_cwd(session_id)),
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: Some(ChatConfig {
-            harness: HarnessId::ClaudeCodeCloud,
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            access: AccessMode::Supervised,
-            plan: false,
-        }),
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: listed.created_at,
-        harness_session_id: None,
-        harness_session_cwd: None,
-        harness_session_harness: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: Some(2),
-        parent_chat_id: None,
-        child_kind: None,
-        sleep: None,
-        provider_session: Some(listed.session.clone()),
+impl Listed {
+    fn overlay(&self) -> ProviderSessionOverlay {
+        let listed = &self.listed;
+        ProviderSessionOverlay {
+            chat_id: self.chat_id.clone(),
+            session_id: listed.session.session_id.clone(),
+            title: listed.title.clone(),
+            activity: listed.activity,
+            last_event_at: listed.last_event_at,
+        }
+    }
+
+    /// The row the session's chat starts as. Its prompts are asked, never
+    /// answered by an access mode the person didn't pick.
+    fn row(&self, device_id: &str) -> Chat {
+        let listed = &self.listed;
+        let session_id = &listed.session.session_id;
+        Chat {
+            id: self.chat_id.clone(),
+            device_id: device_id.to_owned(),
+            title: listed.title.clone(),
+            archived: false,
+            cwd: Some(zeron_proto::provider_cloud::claude_cwd(session_id)),
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: Some(ChatConfig {
+                harness: HarnessId::ClaudeCodeCloud,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                access: AccessMode::Supervised,
+                plan: false,
+            }),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: listed.created_at,
+            harness_session_id: None,
+            harness_session_cwd: None,
+            harness_session_harness: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: Some(2),
+            parent_chat_id: None,
+            child_kind: None,
+            sleep: None,
+            provider_session: Some(listed.session.clone()),
+        }
     }
 }
 
 /// Create the rows of sessions with no chat (low clock; see module docs).
-fn import(workspace: &WorkspaceHost, listed: &[ListedSession]) {
+fn import(workspace: &WorkspaceHost, listed: &[Listed]) {
     for session in listed {
-        let row = discovered_row(workspace.device_id(), session);
+        let row = session.row(workspace.device_id());
         let known = match workspace.chat(&row.id) {
             Ok(found) => found.is_some(),
             // Unreadable: write nothing.
@@ -223,7 +237,7 @@ fn import(workspace: &WorkspaceHost, listed: &[ListedSession]) {
         if known || workspace.chat_deleted(&row.id) {
             continue;
         }
-        if let Err(error) = workspace.upsert_chat_at(&row, session.created_at) {
+        if let Err(error) = workspace.upsert_chat_at(&row, session.listed.created_at) {
             tracing::warn!(chat = %row.id, %error, "couldn't import the Claude cloud session");
         }
     }
@@ -235,14 +249,18 @@ fn mirror_new(
     sessions: &SessionsEngine,
     doc_host: &DocHost,
     workspace: &WorkspaceHost,
-    listed: &[ListedSession],
+    listed: &[Listed],
 ) {
     if !workspace.registry_current() {
         return;
     }
     let mut chats = Vec::new();
-    for session in listed {
-        let chat_id = zeron_proto::provider_cloud::chat_id_for(&session.session);
+    for Listed {
+        chat_id,
+        listed: session,
+    } in listed
+    {
+        let chat_id = chat_id.clone();
         let hosted = workspace.chat(&chat_id).ok().flatten().is_some_and(|chat| {
             chat.device_id == workspace.device_id()
                 && chat.provider_session.as_ref() == Some(&session.session)

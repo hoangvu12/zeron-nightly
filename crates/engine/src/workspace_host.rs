@@ -430,7 +430,16 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(zeron_sync::StaticUrl(url.to_string())), None, None);
+        self.connect_registry_via(Arc::new(zeron_sync::StaticUrl(url.to_string())));
+    }
+
+    /// Test seam: join a registry room whose address `url` gives on each
+    /// dial, as [`Self::connect_registry_url`]. A provider that refuses
+    /// every dial leaves the host expecting a room it never hears from (a
+    /// stale replica), with no network involved.
+    #[doc(hidden)]
+    pub fn connect_registry_via(&self, url: Arc<dyn zeron_sync::UrlProvider>) {
+        self.spawn_join(url, None, None);
     }
 
     fn spawn_join(

@@ -536,7 +536,9 @@ fn path_segment(id: &str) -> String {
         .collect()
 }
 
-fn is_loopback(base: &str) -> bool {
+/// Whether `base` names this machine (`127.0.0.1`, `localhost` or `::1`),
+/// with or without a scheme and port.
+pub fn is_loopback(base: &str) -> bool {
     let rest = base
         .strip_prefix("http://")
         .or_else(|| base.strip_prefix("https://"))

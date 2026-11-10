@@ -1,7 +1,7 @@
 //! Sessions from claude.ai in the sidebar (ticket #9;
 //! docs/design/provider-run-chats.md §6, "Session list").
 //!
-//! Real engines through their public surface (`DiscoverProviderSessions`, as
+//! Real engines through their public surface (`SyncProviderSessions`, as
 //! the sidebar calls it), against the fake Claude Code session server. Two
 //! engines share the workspace through the in-memory registry room, as in
 //! `workspace_sync.rs`. Assertions are on what is visible: the chat rows,
@@ -97,15 +97,12 @@ struct Host {
 }
 
 impl Host {
-    /// The sidebar's call.
-    async fn discover(&self, visible: bool) -> Value {
+    /// The sidebar's call (made while it's on screen).
+    async fn discover(&self) -> Value {
         self.client
-            .call(
-                methods::DISCOVER_PROVIDER_SESSIONS,
-                json!({ "visible": visible }),
-            )
+            .call(methods::SYNC_PROVIDER_SESSIONS, json!({}))
             .await
-            .expect("DiscoverProviderSessions")
+            .expect("SyncProviderSessions")
     }
 
     fn chat(&self, chat: &str) -> Option<Chat> {
@@ -141,7 +138,7 @@ impl Host {
     }
 }
 
-/// The sidebar entry for session `sid` in a `DiscoverProviderSessions` reply.
+/// The sidebar entry for session `sid` in a `SyncProviderSessions` reply.
 fn listed<'a>(reply: &'a Value, sid: &str) -> Option<&'a Value> {
     reply["sessions"]
         .as_array()?
@@ -175,6 +172,34 @@ fn rfc3339(at: chrono::DateTime<chrono::Utc>) -> String {
     at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
+/// A registry address that refuses every dial, in memory: a host told to
+/// join it expects a room it never hears from (a stale replica).
+struct Refused;
+
+impl zeron_sync::UrlProvider for Refused {
+    fn url(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, zeron_sync::SyncError>> + Send>,
+    > {
+        Box::pin(std::future::ready(Err(
+            zeron_sync::SyncError::TemporarilyUnavailable("refused by the test".into()),
+        )))
+    }
+}
+
+/// Wait until everything `from` wrote so far has reached `to`: the relay
+/// delivers a device's writes in order, so once a rename `from` makes after
+/// them lands on `to`, they have too.
+async fn settle(from: &Host, to: &Host, chat_id: &str, marker: &str) {
+    from.core.workspace.rename_chat(chat_id, marker).unwrap();
+    wait_for("the marker rename on the other device", || {
+        to.chat(chat_id)
+            .is_some_and(|chat| chat.title.as_deref() == Some(marker))
+    })
+    .await;
+}
+
 async fn bridge(hosts: &[&Host]) -> zeron_sync::registry::mock_server::MockRegistryServer {
     let server = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
     for host in hosts {
@@ -189,7 +214,7 @@ async fn a_session_started_elsewhere_appears_with_its_full_history() {
     let sid = world.started_elsewhere("Started on claude.ai").await;
     let a = world.engine("dev-a");
 
-    let reply = a.discover(true).await;
+    let reply = a.discover().await;
     let shown = listed(&reply, &sid).expect("the session is in the sidebar");
     assert_eq!(shown["title"], "Started on claude.ai");
     let chat_id = shown["chatId"].as_str().unwrap().to_owned();
@@ -267,7 +292,7 @@ async fn old_sessions_stay_out_and_a_resumed_old_one_comes_in_across_pages() {
     }
     let a = world.engine("dev-a");
 
-    let reply = a.discover(true).await;
+    let reply = a.discover().await;
     assert!(listed(&reply, &resumed).is_some(), "{reply:#}");
     assert!(listed(&reply, &old).is_none(), "{reply:#}");
     assert!(a.chat_of(&resumed).is_some());
@@ -297,7 +322,7 @@ async fn two_devices_discovering_one_session_end_with_one_chat() {
     let a = world.engine("dev-a");
     let b = world.engine("dev-b");
     // Both import before either has heard of the other's row.
-    let (from_a, from_b) = tokio::join!(a.discover(true), b.discover(true));
+    let (from_a, from_b) = tokio::join!(a.discover(), b.discover());
     assert_eq!(
         listed(&from_a, &sid).unwrap()["chatId"],
         listed(&from_b, &sid).unwrap()["chatId"],
@@ -319,11 +344,18 @@ async fn two_devices_discovering_one_session_end_with_one_chat() {
     a.core.set_provider_list_interval(Duration::ZERO);
     b.core.set_provider_list_interval(Duration::ZERO);
     let host = a.chat_of(&sid).unwrap().device_id;
-    b.discover(true).await;
-    a.discover(true).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(a.provider_chats().len(), 1);
-    assert_eq!(b.chat_of(&sid).unwrap().device_id, host);
+    let chat_id = a.chat_of(&sid).unwrap().id;
+    let reads = world.fake.list_reads().len();
+    b.discover().await;
+    a.discover().await;
+    assert_eq!(world.fake.list_reads().len(), reads + 2, "both read again");
+    // Whatever either read wrote has reached the other device.
+    settle(&b, &a, &chat_id, "Barrier from B").await;
+    settle(&a, &b, &chat_id, "Barrier from A").await;
+    for device in [&a, &b] {
+        assert_eq!(device.provider_chats().len(), 1);
+        assert_eq!(device.chat_of(&sid).unwrap().device_id, host);
+    }
     a.core.shutdown().await;
     b.core.shutdown().await;
 }
@@ -336,7 +368,7 @@ async fn a_stale_registry_cannot_move_a_chat_or_overwrite_its_fields() {
     let b = world.engine("dev-b");
     let room = bridge(&[&a]).await;
     // A has the chat, and the person renamed it.
-    let chat_id = listed(&a.discover(true).await, &sid).unwrap()["chatId"]
+    let chat_id = listed(&a.discover().await, &sid).unwrap()["chatId"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -348,16 +380,14 @@ async fn a_stale_registry_cannot_move_a_chat_or_overwrite_its_fields() {
 
     // B, just started and not yet synced (its relay isn't answering), knows
     // nothing of the chat. It discovers the same session and writes its row.
-    b.core
-        .workspace
-        .connect_registry_url("ws://127.0.0.1:9/unreachable");
-    b.discover(true).await;
+    b.core.workspace.connect_registry_via(Arc::new(Refused));
+    b.discover().await;
     assert_eq!(b.chat(&chat_id).unwrap().device_id, "dev-b");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        b.entries(&chat_id).is_empty(),
-        "a stale device doesn't start mirroring the chat"
-    );
+    // A stale device doesn't start mirroring the chat: mirroring begins by
+    // recording the session on the chat document, before the call returns.
+    let doc = b.core.doc_host.open(&chat_id).unwrap();
+    assert!(doc.doc().provider_run_session().is_none());
+    assert!(b.entries(&chat_id).is_empty());
     b.core.workspace.connect_registry_url(&room.url());
 
     wait_for("both devices agree with A's writes", || {
@@ -378,7 +408,7 @@ async fn title_status_and_activity_follow_the_list_without_touching_the_row() {
     let sid = world.started_elsewhere("First title").await;
     let a = world.engine("dev-a");
     a.core.set_provider_list_interval(Duration::ZERO);
-    let reply = a.discover(true).await;
+    let reply = a.discover().await;
     let first = listed(&reply, &sid).unwrap().clone();
     assert_eq!(first["activity"], "idle");
     let chat_id = first["chatId"].as_str().unwrap().to_owned();
@@ -402,7 +432,7 @@ async fn title_status_and_activity_follow_the_list_without_touching_the_row() {
     while now["activity"] != "waitingForYou" {
         assert!(tokio::time::Instant::now() < deadline, "{now:#}");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        now = listed(&a.discover(true).await, &sid).unwrap().clone();
+        now = listed(&a.discover().await, &sid).unwrap().clone();
     }
     assert_eq!(now["title"], "Renamed on claude.ai");
     assert!(
@@ -419,27 +449,27 @@ async fn title_status_and_activity_follow_the_list_without_touching_the_row() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_list_is_read_only_while_visible_and_at_most_once_a_minute() {
+async fn the_list_is_read_only_when_asked_and_at_most_once_a_minute() {
     let world = World::new().await;
     let sid = world.started_elsewhere("Throttled").await;
     let a = world.engine("dev-a");
 
-    // Hidden: nothing is read, and the engine never reads on its own.
-    let hidden = a.discover(false).await;
-    assert!(hidden["sessions"].as_array().is_none_or(Vec::is_empty));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The engine never reads on its own: assembling it and answering the
+    // settings page read nothing.
+    a.client
+        .call(methods::GET_CLAUDE_CLOUD_SESSIONS, json!({}))
+        .await
+        .expect("GetClaudeCloudSessions");
     assert!(world.fake.list_reads().is_empty());
 
-    // Visible: one read, however often (and however concurrently) asked
-    // within the minute; later calls answer from it.
-    let (first, second) = tokio::join!(a.discover(true), a.discover(true));
-    let third = a.discover(true).await;
+    // Asked (the sidebar asks only while on screen): one read, however often
+    // (and however concurrently) asked within the minute; later calls
+    // answer from it.
+    let (first, second) = tokio::join!(a.discover(), a.discover());
+    let third = a.discover().await;
     assert_eq!(world.fake.list_reads().len(), 1);
     assert!(listed(&first, &sid).is_some());
     assert_eq!(first, second);
     assert_eq!(first, third);
-    // Hidden again still answers from the last read, reading nothing.
-    assert_eq!(a.discover(false).await, first);
-    assert_eq!(world.fake.list_reads().len(), 1);
     a.core.shutdown().await;
 }

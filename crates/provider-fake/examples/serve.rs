@@ -15,9 +15,7 @@
 //! `<folder>/reject-token` makes the server refuse that login from then on.
 //! Runs until killed.
 
-use zeron_provider_fake::{
-    ClaudeLogin, FakeAccount, FakeSessionServer, SeedSession, StubClaude, Turn,
-};
+use zeron_provider_fake::{ClaudeLogin, FakeAccount, FakeSessionServer, SeedSession, StubClaude, Turn};
 
 #[tokio::main]
 async fn main() {
