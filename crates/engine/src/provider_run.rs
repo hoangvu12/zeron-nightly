@@ -307,6 +307,43 @@ pub(crate) async fn resume_as_host(
     Ok(true)
 }
 
+/// "Queued, waiting for an eligible device" on `chat_id` (ticket #13): the
+/// person used the chat on a device that can't take it over while its host
+/// is offline. Shown only while a message of the chat waits to run.
+pub(crate) fn show_queued(doc_host: &DocHost, chat_id: &str) {
+    let Ok(handle) = doc_host.open(chat_id) else {
+        return;
+    };
+    let doc = handle.doc();
+    let waiting = doc
+        .read_commands()
+        .unwrap_or_default()
+        .iter()
+        .any(|command| {
+            command.status == zeron_doc::SessionCommandStatus::Pending
+                && matches!(
+                    command.payload,
+                    SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+                )
+        });
+    if !waiting || doc.provider_chat_state().is_some() {
+        return;
+    }
+    if let Err(error) = doc.set_provider_chat_state(Some(&ProviderChatState::Queued)) {
+        tracing::warn!(chat = %chat_id, %error, "couldn't show the chat as queued");
+    }
+}
+
+/// The host acts on the chat's commands: nothing waits for an eligible
+/// device any more.
+pub(crate) fn clear_queued(doc: &SessionDoc) {
+    if doc.provider_chat_state() == Some(ProviderChatState::Queued)
+        && let Err(error) = doc.set_provider_chat_state(None)
+    {
+        tracing::warn!(%error, "couldn't clear the queued state");
+    }
+}
+
 /// The chat's configuration, from its row (a default one when the row has
 /// none).
 fn chat_config(workspace: Option<&WorkspaceHost>, chat_id: &str) -> ChatConfig {
@@ -564,6 +601,7 @@ fn record_states(
             continue;
         }
         hosted.insert(chat.id.as_str());
+        restore_config(host, chat);
         let login = status.accounts.get(&session.account_uuid).copied();
         crate::provider_host::publish_host_unavailable(host, &chat.id, login);
         let state = match login {
@@ -589,6 +627,35 @@ fn record_states(
         }
     }
     written.retain(|chat, _| hosted.contains(chat.as_str()));
+}
+
+/// A provider-run chat this device hosts whose settings an older build wiped
+/// or replaced (its `config` gone, or naming another harness): its harness
+/// is restored from `providerSession` (ticket #15), the rest of what it
+/// says kept. A field-only update: the row's host is never written.
+fn restore_config(host: &DocHost, chat: &Chat) {
+    let Some(workspace) = host.workspace() else {
+        return;
+    };
+    if chat.provider_session.is_none()
+        || chat
+            .config
+            .as_ref()
+            .is_some_and(|config| config.harness == HarnessId::ClaudeCodeCloud)
+    {
+        return;
+    }
+    let mut config = chat_config(None, &chat.id);
+    if let Some(wiped) = &chat.config {
+        config = ChatConfig {
+            harness: HarnessId::ClaudeCodeCloud,
+            ..wiped.clone()
+        };
+    }
+    tracing::info!(chat = %chat.id, "restoring the provider-run chat's settings");
+    if let Err(error) = workspace.set_chat_config(&chat.id, &config) {
+        tracing::warn!(chat = %chat.id, %error, "couldn't restore the chat's settings");
+    }
 }
 
 /// A provider-run chat's run in the engine's event loop: what the mirror

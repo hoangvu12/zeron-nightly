@@ -85,10 +85,11 @@ pub fn answer_uuid(request_id: &str) -> String {
     uuid::Uuid::new_v5(&NAMESPACE, format!("answer:{request_id}").as_bytes()).to_string()
 }
 
-/// What a provider-run chat shows when its host can't act for the chat's
-/// account (docs/design/provider-run-chats.md §3). The host records it in
-/// the chat document's metadata (`providerState`) and clears it once a
-/// request for that account works again.
+/// What a provider-run chat shows when its messages can't reach the
+/// session right now (docs/design/provider-run-chats.md §3): its host can't
+/// act for the chat's account, or no device that can is hosting it. Recorded
+/// in the chat document's metadata (`providerState`), so every device shows
+/// it, and cleared once that's over.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ProviderChatState {
@@ -102,6 +103,12 @@ pub enum ProviderChatState {
     /// the feature off.
     #[serde(rename_all = "camelCase")]
     SignInAs { email: String },
+    /// A message waits for the chat's host, which is offline, and the device
+    /// it was sent from can't take the chat over: "Queued, waiting for an
+    /// eligible device". Written by that device; cleared by the host as it
+    /// acts on the chat's commands. A queued message that outlives its
+    /// expiry shows as a failed send (its command expires unsent).
+    Queued,
 }
 
 impl ProviderChatState {
@@ -110,6 +117,7 @@ impl ProviderChatState {
         match self {
             Self::SignInAgain { .. } => "Sign in again".to_owned(),
             Self::SignInAs { email } => format!("Sign in as {email} to continue"),
+            Self::Queued => "Queued, waiting for an eligible device".to_owned(),
         }
     }
 }

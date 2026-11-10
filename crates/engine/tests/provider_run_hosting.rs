@@ -1103,3 +1103,132 @@ async fn a_host_dying_before_its_send_was_stored_is_covered_by_the_new_host() {
 async fn a_host_dying_before_its_send_was_acknowledged_is_covered_by_the_new_host() {
     host_dies_mid_send(true).await;
 }
+
+/// Ticket #13: a message sent while the chat's host is offline, from a
+/// device that can't take the chat over (it has another account's login),
+/// shows "Queued, waiting for an eligible device", reaches nobody, and is
+/// delivered once the host is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_no_eligible_device_can_take_is_queued_until_the_host_returns() {
+    let fleet = fleet(&[
+        (PC, "PC", cloud_a()),
+        (LAPTOP, "Laptop", Kind::Cloud(FakeAccount::b)),
+    ])
+    .await;
+    let (chat, cwd, session) = chat_on(&fleet, PC).await;
+    let (pc, laptop) = (fleet.device(PC), fleet.device(LAPTOP));
+
+    fleet.go_offline(PC);
+    laptop.send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
+    wait_for("Queued", || {
+        laptop.state(&chat) == Some(ProviderChatState::Queued)
+    })
+    .await;
+    assert_eq!(
+        ProviderChatState::Queued.label(),
+        "Queued, waiting for an eligible device"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fleet.stored_messages(&session, SECOND), 0);
+    assert_eq!(fleet.requests_by(LAPTOP), 0);
+    assert_eq!(laptop.host_of(&chat).as_deref(), Some(PC));
+
+    fleet.fake.queue_turn(Turn::text_zulu());
+    fleet.come_back(PC);
+    wait_for("the reply, and the queue cleared everywhere", || {
+        fleet.stored_messages(&session, SECOND) == 1
+            && pc.replies(&chat) == 2
+            && pc.settled(&chat)
+            && pc.state(&chat).is_none()
+            && laptop.state(&chat).is_none()
+    })
+    .await;
+    assert_eq!(fleet.requests_by(LAPTOP), 0);
+    fleet.shutdown().await;
+}
+
+/// Ticket #13: a queued message that outlives its expiry is a failed send:
+/// the host, back, expires it unsent, and the chat no longer says queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_message_that_expires_fails_and_is_never_sent() {
+    let fleet = fleet(&[
+        (PC, "PC", cloud_a()),
+        (LAPTOP, "Laptop", Kind::Cloud(FakeAccount::b)),
+    ])
+    .await;
+    let (chat, cwd, session) = chat_on(&fleet, PC).await;
+    let (pc, laptop) = (fleet.device(PC), fleet.device(LAPTOP));
+
+    fleet.go_offline(PC);
+    let now = chrono::Utc::now().timestamp_millis();
+    let command = zeron_doc::SessionCommandEntry {
+        id: "queued-command".into(),
+        payload: SessionCommandPayload::Run {
+            request: RunRequest {
+                mcp: None,
+                prompt: "Reply with the single word ZULU.".into(),
+                harness: None,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: cwd.clone(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
+                access: Default::default(),
+                plan: false,
+                attachments: Vec::new(),
+                worktree: None,
+                resume: None,
+                env: Default::default(),
+                extra_mcp: Vec::new(),
+            },
+            message_id: SECOND.into(),
+        },
+        issued_by: LAPTOP.into(),
+        issued_at: now,
+        based_on: None,
+        expires_at: Some(now + 1_000),
+        status: zeron_doc::SessionCommandStatus::Pending,
+        resolution: None,
+    };
+    laptop
+        .core
+        .doc_host
+        .open(&chat)
+        .unwrap()
+        .doc()
+        .queue_command(&command)
+        .unwrap();
+    laptop.open(&chat).await;
+    wait_for("Queued", || {
+        laptop.state(&chat) == Some(ProviderChatState::Queued)
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    fleet.come_back(PC);
+    let status = |device: &Device| {
+        device
+            .core
+            .doc_host
+            .open(&chat)
+            .ok()
+            .and_then(|h| h.doc().read_commands().ok())
+            .and_then(|commands| {
+                commands
+                    .into_iter()
+                    .find(|c| c.id == "queued-command")
+                    .map(|c| c.status)
+            })
+    };
+    wait_for("expired, everywhere, and no longer queued", || {
+        status(pc) == Some(zeron_doc::SessionCommandStatus::Expired)
+            && status(laptop) == Some(zeron_doc::SessionCommandStatus::Expired)
+            && laptop.state(&chat).is_none()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fleet.stored_messages(&session, SECOND), 0);
+    assert!(!laptop.entries(&chat).iter().any(|e| e.id == SECOND));
+    fleet.shutdown().await;
+}

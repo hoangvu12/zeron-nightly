@@ -5439,6 +5439,9 @@ impl DocHost {
                 }
                 CommandDisposition::Expired => {
                     self.resolve_command(handle, &entry.id, SessionCommandStatus::Expired, None);
+                    // A queued message that expired unsent shows failed,
+                    // not queued.
+                    crate::provider_run::clear_queued(&handle.doc);
                 }
                 CommandDisposition::Superseded => {
                     self.resolve_command(handle, &entry.id, SessionCommandStatus::Superseded, None);
@@ -5647,6 +5650,8 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        // The host acts on the chat: a provider-run chat's "Queued" is over.
+        crate::provider_run::clear_queued(&handle.doc);
         if let Some(message_id) = self.cancelled_by_stop(handle, entry) {
             // Still the user's message: it stays in the transcript, unrun.
             let prompt = match &entry.payload {

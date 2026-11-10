@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zeron_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionCommandStatus,
+    SessionMessageEntry,
 };
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::claude_cloud::credentials::ClaudeConfigDir;
@@ -66,6 +67,13 @@ impl World {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("device-id"), "dev-a").unwrap();
         let registry = HarnessRegistry::new();
+        // The local Claude Code harness too, as on any device, pointed at a
+        // harmless executable: an accidental local launch must fail before
+        // it starts anything.
+        registry.register(Arc::new(
+            zeron_harness::ClaudeHarness::new()
+                .with_executable(std::env::current_exe().expect("test binary")),
+        ));
         registry.register(Arc::new(
             ClaudeCloudHarness::new(ClaudeCloudConfig {
                 base_url: self.fake.base_url().to_owned(),
@@ -174,6 +182,18 @@ impl Host {
     }
 
     fn send(&self, chat: &str, cwd: &str, message_id: &str, prompt: &str) {
+        self.send_with(chat, cwd, message_id, prompt, None);
+    }
+
+    /// A message whose request names `harness` (an older client's).
+    fn send_with(
+        &self,
+        chat: &str,
+        cwd: &str,
+        message_id: &str,
+        prompt: &str,
+        harness: Option<HarnessId>,
+    ) {
         self.core
             .doc_host
             .queue_command(
@@ -182,7 +202,7 @@ impl Host {
                     request: RunRequest {
                         mcp: None,
                         prompt: prompt.into(),
-                        harness: None,
+                        harness,
                         model: None,
                         reasoning: None,
                         model_options: Default::default(),
@@ -201,6 +221,22 @@ impl Host {
                 },
             )
             .expect("queue message");
+    }
+
+    fn outcome(&self, chat: &str) -> Vec<(SessionCommandStatus, Option<String>)> {
+        self.core
+            .doc_host
+            .open(chat)
+            .ok()
+            .and_then(|h| h.doc().read_commands().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.status, c.resolution))
+            .collect()
+    }
+
+    fn config(&self, chat: &str) -> Option<zeron_proto::ChatConfig> {
+        self.core.workspace.chat(chat).ok().flatten()?.config
     }
 }
 
@@ -403,5 +439,136 @@ async fn a_404_for_one_session_ends_only_that_chat() {
             .any(|e| e.role == MessageRole::Assistant)
     })
     .await;
+    host.core.shutdown().await;
+}
+
+/// An older build wiped the chat's settings (its harness is another one
+/// now): the host restores them from the chat's provider session, and the
+/// chat keeps working.
+#[tokio::test(flavor = "multi_thread")]
+async fn wiped_settings_are_restored_and_the_chat_keeps_working() {
+    let world = World::new().await;
+    let host = world.engine();
+    let (chat, cwd) = chat(&world, &host).await;
+    let mut wiped = host.config(&chat).expect("config");
+    wiped.harness = HarnessId::ClaudeCode;
+    wiped.model = Some("claude-sonnet-5".into());
+    host.client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({"op": "setChatConfig", "chatId": chat, "config": wiped}),
+        )
+        .await
+        .expect("an older client's write");
+    wait_for("the settings restored", || {
+        host.config(&chat)
+            .is_some_and(|c| c.harness == HarnessId::ClaudeCodeCloud)
+    })
+    .await;
+    // Only the harness changes back; the rest of what was written stands.
+    assert_eq!(
+        host.config(&chat).unwrap().model.as_deref(),
+        Some("claude-sonnet-5")
+    );
+    assert_eq!(
+        host.core.workspace.chat(&chat).unwrap().unwrap().device_id,
+        host.core.device_id
+    );
+
+    world.fake.queue_turn(Turn::text_zulu());
+    host.send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
+    wait_for("the reply", || {
+        host.settled(&chat)
+            && host
+                .entries(&chat)
+                .last()
+                .is_some_and(|e| e.role == MessageRole::Assistant)
+            && host.entries(&chat).iter().any(|e| e.id == SECOND)
+    })
+    .await;
+    host.core.shutdown().await;
+}
+
+/// A chat an older client copied from a provider-run one: it names the
+/// harness (and the session's pseudo folder) but has no provider session.
+/// It refuses to run, and nothing reaches Anthropic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copied_chat_without_its_provider_session_refuses_to_run() {
+    let world = World::new().await;
+    let host = world.engine();
+    let (chat, cwd) = chat(&world, &host).await;
+    let config = host.config(&chat).expect("config");
+    host.core
+        .workspace
+        .create_chat(
+            "copy-1",
+            None,
+            Some(&host.core.device_id),
+            Some(config),
+            Some(cwd.clone()),
+        )
+        .expect("the copy");
+    let before = world.fake.requests().len();
+
+    host.send("copy-1", &cwd, SECOND, "Reply with the single word ZULU.");
+    wait_for("the send refused", || {
+        host.outcome("copy-1")
+            .iter()
+            .any(|(status, _)| *status == SessionCommandStatus::Rejected)
+    })
+    .await;
+    let outcome = host.outcome("copy-1");
+    assert!(
+        outcome.iter().any(|(_, why)| why
+            .as_deref()
+            .is_some_and(|w| w.contains("no Claude cloud session"))),
+        "{outcome:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(world.fake.requests().len(), before, "nothing sent");
+    host.core.shutdown().await;
+}
+
+/// A provider-run chat launched locally by mistake (an older client's
+/// message naming the local Claude Code harness): its working directory is
+/// the session's pseudo path, which exists nowhere, so the launch fails
+/// before anything runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accidental_local_launch_fails_on_its_missing_folder() {
+    let world = World::new().await;
+    let host = world.engine();
+    let (chat, cwd) = chat(&world, &host).await;
+    assert!(cwd.starts_with("claude-cloud://"), "{cwd}");
+    assert!(!std::path::Path::new(&cwd).is_dir());
+    let before = world.fake.requests().len();
+
+    host.send_with(
+        &chat,
+        &cwd,
+        SECOND,
+        "Reply with the single word ZULU.",
+        Some(HarnessId::ClaudeCode),
+    );
+    wait_for("the launch failed", || {
+        let errors = host.errors(&chat);
+        let refused = host
+            .outcome(&chat)
+            .into_iter()
+            .any(|(status, why)| status == SessionCommandStatus::Rejected && why.is_some());
+        !errors.is_empty() || refused
+    })
+    .await;
+    let said: Vec<String> = host
+        .errors(&chat)
+        .into_iter()
+        .chain(host.outcome(&chat).into_iter().filter_map(|(_, why)| why))
+        .collect();
+    assert!(
+        said.iter()
+            .any(|s| s.contains("working directory") || s.contains("claude-cloud://")),
+        "{said:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(world.fake.requests().len(), before, "nothing sent");
     host.core.shutdown().await;
 }

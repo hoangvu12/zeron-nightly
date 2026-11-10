@@ -239,7 +239,9 @@ impl ProviderHosting {
         if !self.can_host_here(&session).await {
             // A host that is only offline keeps the chat waiting for it. One
             // that can't run it, with no login for it here either: nobody can.
-            if reason != TakeoverReason::Offline {
+            if reason == TakeoverReason::Offline {
+                crate::provider_run::show_queued(&self.inner.doc_host, chat_id);
+            } else {
                 self.show_sign_in_as(chat_id, &session);
             }
             return;
@@ -416,7 +418,7 @@ impl ProviderHosting {
             };
             if matches!(
                 handle.doc().provider_chat_state(),
-                Some(ProviderChatState::SignInAs { .. })
+                Some(ProviderChatState::SignInAs { .. } | ProviderChatState::Queued)
             ) && let Err(error) = handle.doc().set_provider_chat_state(None)
             {
                 tracing::warn!(chat = %chat, %error, "couldn't clear the sign-in state");
