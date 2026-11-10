@@ -371,7 +371,7 @@ impl EngineCore {
             ProviderHosting::new(sessions.clone(), doc_host.clone(), workspace.clone());
         {
             let hosting = provider_hosting.clone();
-            doc_host.set_used_hook(Arc::new(move |chat_id: &str| hosting.used(chat_id)));
+            doc_host.set_used_hook(Arc::new(move |chat_id: &str| hosting.on_chat_used(chat_id)));
         }
         provider_hosting.start();
         // Provider-run chats this device hosts that a shutdown or crash cut

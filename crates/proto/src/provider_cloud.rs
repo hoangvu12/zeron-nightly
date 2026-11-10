@@ -123,13 +123,20 @@ impl ProviderChatState {
 #[serde(rename_all = "camelCase")]
 pub struct HostUnavailable {
     pub device_id: String,
-    /// Why ([`HOST_UNAVAILABLE_ACCOUNT`]).
-    pub reason: String,
+    pub reason: HostUnavailableReason,
 }
 
-/// [`HostUnavailable::reason`]: the host's login isn't the chat's account
-/// (switched, or signed out of it).
-pub const HOST_UNAVAILABLE_ACCOUNT: &str = "account";
+/// Why a host can't host a provider-run chat ([`HostUnavailable::reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostUnavailableReason {
+    /// The host's login isn't the chat's account (switched, or signed out
+    /// of it).
+    Account,
+    /// A reason from a newer build.
+    #[serde(other)]
+    Other,
+}
 
 /// A provider session's title from its first prompt: the first non-empty
 /// line, at most 80 characters.
@@ -176,6 +183,16 @@ mod tests {
         let elsewhere: ProviderChatState =
             serde_json::from_str(r#"{"kind":"signInAs","email":"a@example.test"}"#).unwrap();
         assert_eq!(elsewhere.label(), "Sign in as a@example.test to continue");
+    }
+
+    #[test]
+    fn host_unavailable_reads_reasons_it_doesnt_know() {
+        let known: HostUnavailable =
+            serde_json::from_str(r#"{"deviceId":"pc","reason":"account"}"#).unwrap();
+        assert_eq!(known.reason, HostUnavailableReason::Account);
+        let newer: HostUnavailable =
+            serde_json::from_str(r#"{"deviceId":"pc","reason":"quota"}"#).unwrap();
+        assert_eq!(newer.reason, HostUnavailableReason::Other);
     }
 
     #[test]
