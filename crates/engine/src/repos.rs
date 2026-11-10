@@ -810,14 +810,47 @@ impl Repos {
                 }
             }
         }
+        // Which branches `origin` has (as last fetched): only those can be
+        // cloned elsewhere.
+        let on_origin: Option<HashSet<String>> = self
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remotes/origin/",
+                ],
+                Some(repo_path),
+            )
+            .await
+            .ok()
+            .map(|out| {
+                out.lines()
+                    .filter_map(|l| l.trim().strip_prefix("refs/remotes/origin/"))
+                    .filter(|b| *b != "HEAD")
+                    .map(str::to_string)
+                    .collect()
+            });
         Ok(names
             .into_iter()
             .map(|name| RepoRef {
                 current: current.as_deref() == Some(name.as_str()),
                 worktree_path: worktrees.get(&name).cloned(),
+                on_origin: on_origin.as_ref().map(|set| set.contains(&name)),
                 name,
             })
             .collect())
+    }
+
+    /// Whether `origin` has `branch` (`refs/remotes/origin/<branch>`, as
+    /// last fetched).
+    pub async fn branch_on_origin(&self, repo_path: &Path, branch: &str) -> bool {
+        let reference = format!("refs/remotes/origin/{branch}");
+        self.git(
+            &["rev-parse", "--verify", "--quiet", &reference],
+            Some(repo_path),
+        )
+        .await
+        .is_ok_and(|sha| !sha.is_empty())
     }
 
     /// Public commit history in topological order. Only user-facing branches,

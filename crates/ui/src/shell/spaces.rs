@@ -7274,8 +7274,6 @@ impl Shell {
         flow.submit_busy = true;
         flow.error = None;
         let space_id = uuid::Uuid::new_v4().to_string();
-        // Optimistic echo: the watch frame carrying the real row replaces it
-        // by id (apply_spaces re-sorts; same-id upsert is idempotent).
         let space = Space {
             id: space_id.clone(),
             device_id: device.id.clone(),
@@ -7291,41 +7289,23 @@ impl Shell {
             icon: None,
             created_at: Utc::now(),
         };
-        self.state.update(cx, |s, cx| {
-            if !s.spaces.iter().any(|existing| existing.id == space.id) {
-                s.spaces.push(space);
-            }
-            cx.notify();
-        });
-        let mut params = serde_json::json!({
-            "op": "createSpace",
-            "spaceId": space_id,
-            "deviceId": device.id,
-            "path": path,
-            "gitDetected": git_detected,
-        });
-        if let Some(repo) = github_repo {
-            params["githubRepo"] = serde_json::Value::String(repo);
-        }
+        // Shows at once; rolled back if the engine refuses it.
+        let created = crate::state::create_space(&self.state, engine, space, cx);
         let submit_id = space_id.clone();
         let task = cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, params).await;
+            let result = created.await;
             this.update(cx, |shell, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(()) => {
                         shell.close_add_space(cx);
                         shell.land_in_space(submit_id.clone(), cx);
                     }
                     Err(err) => {
-                        // Roll the optimistic row back; surface the error inline.
-                        shell.state.update(cx, |s, cx| {
-                            s.spaces.retain(|space| space.id != submit_id);
-                            cx.notify();
-                        });
+                        // Surface the error inline (the row is already gone).
                         if let Some(flow) = shell.add_space.as_mut() {
                             flow.submit_busy = false;
                             flow.cloning = None;
-                            flow.error = Some(format!("{err}").into());
+                            flow.error = Some(err.into());
                         }
                     }
                 }

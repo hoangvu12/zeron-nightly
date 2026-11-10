@@ -169,17 +169,31 @@ pub fn is_repository_only_device(device_id: &str) -> bool {
     device_id == PROJECTS_DEVICE || device_id.starts_with(crate::CLOUD_DEVICE_PREFIX)
 }
 
-/// The GitHub repository (`owner/name`) that `input` names: `owner/name`, or
-/// a github.com remote (https, `git@github.com:`, `ssh://`), with or
-/// without `.git` and a trailing slash. `None` for anything else.
-pub fn github_repo_from_input(input: &str) -> Option<String> {
+/// A GitHub repository someone named, and the branch their link pointed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubInput {
+    /// `owner/name`.
+    pub repo: String,
+    /// From a `…/tree/<branch>` link; `None`: the default branch.
+    pub branch: Option<String>,
+}
+
+/// The GitHub repository that `input` names: `owner/name`, or a github.com
+/// address (https or http, with or without `www.`, `git@github.com:`,
+/// `ssh://git@github.com[:22]/`), with or without `.git`, a trailing slash,
+/// and a `/tree/<branch>` (whose branch it keeps). `None` for anything else.
+pub fn github_input(input: &str) -> Option<GithubInput> {
     let input = input.trim();
+    let input = input.split(['?', '#']).next().unwrap_or(input);
     let rest = [
         "https://github.com/",
         "http://github.com/",
         "https://www.github.com/",
+        "http://www.github.com/",
+        "www.github.com/",
         "git@github.com:",
         "ssh://git@github.com/",
+        "ssh://git@github.com:22/",
         "github.com/",
     ]
     .iter()
@@ -191,8 +205,20 @@ pub fn github_repo_from_input(input: &str) -> Option<String> {
     })
     .unwrap_or(input);
     let rest = rest.trim_end_matches('/');
-    let rest = rest.strip_suffix(".git").unwrap_or(rest);
-    let (owner, name) = rest.split_once('/')?;
+    let mut parts = rest.splitn(3, '/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    let branch = match parts.next() {
+        None => None,
+        Some(tail) => {
+            let branch = tail.strip_prefix("tree/")?.trim_matches('/');
+            if branch.is_empty() || branch.chars().any(char::is_whitespace) {
+                return None;
+            }
+            Some(branch.to_owned())
+        }
+    };
+    let name = name.strip_suffix(".git").unwrap_or(name);
     let valid = |part: &str| {
         !part.is_empty()
             && part != "."
@@ -201,7 +227,15 @@ pub fn github_repo_from_input(input: &str) -> Option<String> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
-    (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
+    (valid(owner) && valid(name)).then(|| GithubInput {
+        repo: format!("{owner}/{name}"),
+        branch,
+    })
+}
+
+/// [`github_input`]'s repository (`owner/name`).
+pub fn github_repo_from_input(input: &str) -> Option<String> {
+    github_input(input).map(|input| input.repo)
 }
 
 #[cfg(test)]
@@ -218,7 +252,11 @@ mod tests {
             "https://github.com/acme/app/",
             "git@github.com:acme/app.git",
             "ssh://git@github.com/acme/app",
+            "ssh://git@github.com:22/acme/app.git",
+            "https://www.github.com/acme/app",
+            "www.github.com/acme/app",
             "github.com/acme/app",
+            "https://github.com/acme/app?tab=readme",
         ] {
             assert_eq!(
                 github_repo_from_input(input).as_deref(),
@@ -231,11 +269,27 @@ mod tests {
             "",
             "https://github.com/acme",
             "https://gitlab.com/acme/app",
-            "acme/app/tree/main",
+            "https://github.com/acme/app/pulls",
+            "https://github.com/acme/app/tree/",
             "a b/c",
             "../app",
         ] {
             assert_eq!(github_repo_from_input(input), None, "{input}");
+        }
+        // A link to a branch keeps the branch, slashes and all.
+        for (input, branch) in [
+            ("https://github.com/acme/app/tree/main", "main"),
+            ("https://github.com/acme/app/tree/feature/x/", "feature/x"),
+            ("acme/app/tree/release-2", "release-2"),
+        ] {
+            assert_eq!(
+                github_input(input),
+                Some(GithubInput {
+                    repo: "acme/app".into(),
+                    branch: Some(branch.into())
+                }),
+                "{input}"
+            );
         }
         assert!(is_repository_only_device(PROJECTS_DEVICE));
         assert!(is_repository_only_device("cloud-org1"));

@@ -9284,7 +9284,11 @@ impl Composer {
         // A GitHub project: the session clones its repository at the branch
         // the chip shows (the checkout's current one unless another was
         // picked). No project: an empty sandbox.
-        let space_id = self.state.read(cx).selected_space_row().map(|s| s.id.clone());
+        let space_id = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .map(|s| s.id.clone());
         let branch = space_id
             .as_ref()
             .and_then(|_| self.pickers.read(cx).provider_cloud_branch());
