@@ -114,6 +114,10 @@ impl ClaudeCloudSettings {
 pub struct ClaudeCloudSessions {
     path: PathBuf,
     stored: Mutex<ClaudeCloudSettings>,
+    /// Held across a whole change (read, save, apply, capability), so two
+    /// changes at once can't leave the harness or capability out of step
+    /// with the saved setting.
+    changing: Mutex<()>,
 }
 
 impl ClaudeCloudSessions {
@@ -128,7 +132,14 @@ impl ClaudeCloudSessions {
         Self {
             path,
             stored: Mutex::new(stored),
+            changing: Mutex::new(()),
         }
+    }
+
+    /// Hold while making a change, from reading the current settings through
+    /// applying them. Never across an `.await`.
+    pub fn changing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.changing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn settings(&self) -> ClaudeCloudSettings {
