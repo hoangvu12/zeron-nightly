@@ -45,11 +45,11 @@ pub mod capabilities {
     /// device can update it (`install`, `canApplyRemotely`, and why not).
     /// Older hosts don't say: a client can't tell without trying.
     pub const UPDATE_ABILITY_V1: &str = "update-ability-v1";
-    /// The engine can host provider-run chats (docs/design/provider-run-chats.md
-    /// §4): it has the `claude-code-cloud` harness on, claims and gives up
-    /// hosting by the rules there. Advertised only by engines with the
-    /// harness on, so not in [`CURRENT`]; separate from the Cloud session
-    /// capability.
+    /// The device can create and host provider-run chats (Claude cloud
+    /// sessions, docs/design/provider-run-chats.md): the setting is on and a
+    /// Claude login is enabled there. Advertised on the device's registry
+    /// row while that holds, so not in [`CURRENT`]; separate from the Cloud
+    /// session machines' `cloud-session`.
     pub const PROVIDER_RUN_V1: &str = "provider-run-v1";
 
     pub const CURRENT: &[&str] = &[

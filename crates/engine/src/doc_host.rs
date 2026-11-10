@@ -669,6 +669,10 @@ pub struct ChatDocHandle {
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
+    /// Another device's changes to the transcript (`messages`) arrived:
+    /// the host of a provider-run chat sweeps duplicates
+    /// ([`DocHost::sweep_provider_duplicates_if_host`]).
+    remote_messages: Arc<AtomicBool>,
     _sub: loro::Subscription,
 }
 
@@ -1144,6 +1148,26 @@ impl DocHost {
             },
             runtime,
         );
+    }
+
+    /// A provider-run chat's transcript changed from another device: if this
+    /// device hosts the chat, the duplicates go (docs/design/provider-run-chats.md
+    /// §5, "Deduplication": the host sweeps on remote transcript changes).
+    /// Failing closed: no row means not host.
+    pub(crate) fn sweep_provider_duplicates_if_host(&self, handle: &ChatDocHandle) {
+        if !zeron_doc::is_provider_run(handle.doc().doc()) {
+            return;
+        }
+        let hosted = self
+            .workspace()
+            .and_then(|ws| ws.chat(&handle.chat_id).ok().flatten())
+            .is_some_and(|chat| chat.device_id == self.device_id());
+        if !hosted {
+            return;
+        }
+        if let Err(err) = handle.doc().sweep_provider_duplicates() {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "duplicate sweep failed");
+        }
     }
 
     /// The sessions engine, once wired. `None` before assembly or after
@@ -1766,7 +1790,17 @@ impl DocHost {
         let history = transcript_history.clone();
         let watched = messages_tx.clone();
         let weak_doc = Arc::downgrade(&doc);
+        let remote_messages = Arc::new(AtomicBool::new(false));
+        let remote_seen = remote_messages.clone();
         let sub = doc.doc().subscribe_root(Arc::new(move |diff| {
+            if diff.triggered_by == loro::EventTriggerKind::Import
+                && diff.events.iter().any(|change| {
+                    matches!(change.path.first(),
+                        Some((_, loro::Index::Key(root))) if root.as_str() == "messages")
+                })
+            {
+                remote_seen.store(true, Ordering::Release);
+            }
             // This callback runs before the change worker can publish. The
             // import origin belongs to the event, so concurrent local commits
             // cannot inherit a remote replay's presentation classification.
@@ -1830,6 +1864,7 @@ impl DocHost {
             chat2_pending_local: Mutex::new(Vec::new()),
             publication_failed: AtomicBool::new(false),
             chat2_local_sub: Mutex::new(None),
+            remote_messages,
             _sub: sub,
         });
         // Snapshot recovery may restore several independently edited rows.
@@ -6715,6 +6750,9 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break; // doc handle (and its change sender) is gone
                 }
                 let Some(handle) = weak.upgrade() else { break };
+                if handle.remote_messages.swap(false, Ordering::AcqRel) {
+                    host.sweep_provider_duplicates_if_host(&handle);
+                }
                 let publishing = handle.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     publishing.publish_messages_if_watched();

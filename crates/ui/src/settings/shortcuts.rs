@@ -101,6 +101,8 @@ pub struct ShortcutsPage {
     /// Settings → General's thread naming card (its own title-bound picker).
     thread_naming: Entity<crate::settings::thread_naming::ThreadNamingCard>,
     worktrees: Entity<super::worktrees::WorktreeSettingsCard>,
+    /// Provider-run chats ("Claude cloud sessions"), this device's setting.
+    claude_cloud: Entity<super::claude_cloud::ClaudeCloudSessionsCard>,
     _state: Entity<AppState>,
 }
 
@@ -146,6 +148,8 @@ impl ShortcutsPage {
                 cx.new(|cx| crate::settings::thread_naming::ThreadNamingCard::new(state, cx))
             },
             worktrees: cx.new(|cx| super::worktrees::WorktreeSettingsCard::new(state.clone(), cx)),
+            claude_cloud: cx
+                .new(|cx| super::claude_cloud::ClaudeCloudSessionsCard::new(state.clone(), cx)),
             _state: state,
         }
     }
@@ -987,7 +991,8 @@ impl Render for ShortcutsPage {
                                             .child(pull_request_destination_row),
                                     ))
                                     .child(self.thread_naming.clone())
-                                    .child(self.worktrees.clone()),
+                                    .child(self.worktrees.clone())
+                                    .child(self.claude_cloud.clone()),
                             ),
                     )
                     .fade_overflow_y(&self.scroll.scroll),

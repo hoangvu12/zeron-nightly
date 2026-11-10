@@ -142,6 +142,10 @@ impl Composer {
     fn selected_background_tasks(&self, cx: &gpui::App) -> Option<Listed> {
         let state = self.state.read(cx);
         let chat_id = state.selected_chat.clone()?;
+        // A provider-run chat's processes run in its remote workspace.
+        if state.chat_remote_workspace(&chat_id) {
+            return None;
+        }
         let tasks =
             zeron_proto::view::background_tasks(state.session_for(&chat_id), chrono::Utc::now());
         if tasks.is_empty() {

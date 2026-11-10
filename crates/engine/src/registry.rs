@@ -221,6 +221,8 @@ pub struct HarnessRegistry {
     account_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Credits Zeron in agents' commits ([`crate::commit_credit`]).
     commit_credit: std::sync::OnceLock<Arc<crate::commit_credit::CommitCredit>>,
+    /// The "Claude cloud sessions" setting ([`crate::claude_cloud_sessions`]).
+    claude_cloud: std::sync::OnceLock<Arc<crate::claude_cloud_sessions::ClaudeCloudSessions>>,
 }
 
 impl Default for HarnessRegistry {
@@ -306,6 +308,7 @@ impl HarnessRegistry {
             run_environment: Mutex::new(None),
             account_environment: Mutex::new(None),
             commit_credit: std::sync::OnceLock::new(),
+            claude_cloud: std::sync::OnceLock::new(),
         }
     }
 
@@ -339,6 +342,28 @@ impl HarnessRegistry {
 
     pub fn commit_credit(&self) -> Option<&Arc<crate::commit_credit::CommitCredit>> {
         self.commit_credit.get()
+    }
+
+    /// Load the device's "Claude cloud sessions" setting from `data_dir` and
+    /// register (or not) the `claude-code-cloud` harness to match it.
+    pub fn open_claude_cloud(&self, data_dir: &Path) {
+        let store = self.claude_cloud.get_or_init(|| {
+            Arc::new(crate::claude_cloud_sessions::ClaudeCloudSessions::open(
+                data_dir,
+            ))
+        });
+        crate::claude_cloud_sessions::apply(self, &store.settings());
+    }
+
+    /// The "Claude cloud sessions" setting (absent in bare registries).
+    pub fn claude_cloud(&self) -> Option<&Arc<crate::claude_cloud_sessions::ClaudeCloudSessions>> {
+        self.claude_cloud.get()
+    }
+
+    /// Whether this device can create and host provider-run chats now (its
+    /// `claude-code-cloud` harness is registered).
+    pub fn provider_run_active(&self) -> bool {
+        self.is_registered(HarnessId::ClaudeCodeCloud)
     }
 
     /// Fill `request.env` for a spawn of `harness` (no-op without a provider),
@@ -719,6 +744,16 @@ impl HarnessRegistry {
         if self.slots().insert(id, slot).is_none() {
             self.order().push(id);
         }
+    }
+
+    /// Drop a provider-cloud harness's slot ("Claude cloud sessions" turned
+    /// off). Runs already holding the harness finish with it.
+    pub(crate) fn remove_provider_cloud(&self, id: HarnessId) {
+        if !id.runs_in_provider_cloud() {
+            return;
+        }
+        self.slots().remove(&id);
+        self.order().retain(|h| *h != id);
     }
 
     /// Forgets a registry agent removed from this device.

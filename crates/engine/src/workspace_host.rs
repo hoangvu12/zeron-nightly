@@ -950,20 +950,6 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_host_unavailable(chat_id, unavailable))?)
     }
 
-    /// Advertise `capability` on this device's row from now on (a field
-    /// write of the row's capabilities).
-    pub fn advertise_capability(&self, capability: &str) -> Result<(), EngineError> {
-        let me = self.inner.config.device_id.clone();
-        let Some(mut device) = self.read_devices()?.into_iter().find(|d| d.id == me) else {
-            return Ok(());
-        };
-        if device.capabilities.iter().any(|c| c == capability) {
-            return Ok(());
-        }
-        device.capabilities.push(capability.to_owned());
-        Ok(self.mutate(|doc| doc.upsert_device(&device))?)
-    }
-
     /// Every registry change (a local write, or a frame the room sent),
     /// including ones that leave the published lists as they were.
     pub fn watch_changes(&self) -> watch::Receiver<u64> {
@@ -1685,6 +1671,26 @@ impl WorkspaceHost {
     /// worktree). Resume is cwd-scoped — the next run there starts fresh.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_cwd(chat_id, cwd))?)
+    }
+
+    /// Advertise (`on`) or withdraw one capability on this device's own row.
+    /// Writes only when the row's list changes. `Ok(false)`: nothing to do.
+    pub fn set_own_capability(&self, capability: &str, on: bool) -> Result<bool, EngineError> {
+        let device_id = self.inner.config.device_id.clone();
+        Ok(self.mutate(|doc| -> Result<bool, zeron_doc::DocError> {
+            let Some(device) = doc.read_devices()?.into_iter().find(|d| d.id == device_id)
+            else {
+                return Ok(false);
+            };
+            let mut capabilities = device.capabilities;
+            let has = capabilities.iter().any(|c| c == capability);
+            match (on, has) {
+                (true, false) => capabilities.push(capability.to_string()),
+                (false, true) => capabilities.retain(|c| c != capability),
+                _ => return Ok(false),
+            }
+            doc.set_device_capabilities(&device_id, &capabilities)
+        })?)
     }
 
     /// Record a provider-run chat's provider session (`providerSession`, a

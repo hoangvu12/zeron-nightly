@@ -224,6 +224,15 @@ async fn send(events: &Events, event: AgentEvent) -> bool {
     events.send(Ok(event)).await.is_ok()
 }
 
+/// Send a stored event's marker, if it has one. `false`: the run's reader
+/// is gone.
+async fn send_mark(events: &Events, mark: Option<AgentEvent>) -> bool {
+    match mark {
+        Some(mark) => send(events, mark).await,
+        None => true,
+    }
+}
+
 fn done(status: DoneStatus, error: Option<String>) -> AgentEvent {
     AgentEvent::Done {
         status,
@@ -607,22 +616,20 @@ impl RunSession {
                     Some(Ok(item)) => {
                         let mapped = self.mirror.map(item);
                         self.bindings.note_seq(&session_id, self.mirror.last_seq());
+                        let earlier = mapped.seq().is_some_and(|seq| seq < floor);
                         if let Some(settings) = mapped.settings {
                             self.bindings.note_actual(&session_id, settings);
                         }
                         // The stored event's marker goes after everything it
                         // mapped to (and after a prompt is up).
                         let mark = mapped.mark;
-                        let earlier = mapped.seq.is_some_and(|seq| seq < floor);
                         match mapped.control {
                             Some(Control::Prompt { request_id, request, seq }) => {
                                 if stop_deadline.is_some()
                                     || responded.contains(&request_id)
                                     || open.contains_key(&request_id)
                                 {
-                                    if let Some(mark) = mark
-                                        && !send(&self.events, mark).await
-                                    {
+                                    if !send_mark(&self.events, mark).await {
                                         break 'main;
                                     }
                                     continue 'main;
@@ -646,9 +653,7 @@ impl RunSession {
                                         }
                                     }
                                 }
-                                if let Some(mark) = mark
-                                    && !send(&self.events, mark).await
-                                {
+                                if !send_mark(&self.events, mark).await {
                                     break 'main;
                                 }
                                 continue 'main;
@@ -662,9 +667,7 @@ impl RunSession {
                                     task.abort();
                                 }
                                 responded.insert(request_id);
-                                if let Some(mark) = mark
-                                    && !send(&self.events, mark).await
-                                {
+                                if !send_mark(&self.events, mark).await {
                                     break 'main;
                                 }
                                 continue 'main;
@@ -698,15 +701,11 @@ impl RunSession {
                             reconnects = 0;
                             if stop_deadline.is_some() || !steering_open {
                                 // The turn's end is committed with its marker.
-                                if let Some(mark) = mark {
-                                    let _ = send(&self.events, mark).await;
-                                }
+                                send_mark(&self.events, mark).await;
                                 break 'main;
                             }
                         }
-                        if let Some(mark) = mark
-                            && !send(&self.events, mark).await
-                        {
+                        if !send_mark(&self.events, mark).await {
                             break 'main;
                         }
                     }

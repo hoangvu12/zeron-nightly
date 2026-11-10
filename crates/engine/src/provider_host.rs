@@ -155,25 +155,10 @@ impl ProviderHosting {
             .clone()
     }
 
-    /// Whether this engine can host provider-run chats at all: the harness
-    /// is on.
-    fn eligible_engine(&self) -> bool {
-        self.inner
-            .sessions
-            .registry()
-            .resolve(HarnessId::ClaudeCodeCloud)
-            .is_ok_and(|harness| harness.provider_cloud().is_some())
-    }
-
-    /// Advertise the capability (when eligible) and follow the chats' hosts
-    /// for as long as the engine runs.
+    /// Follow the chats' hosts for as long as the engine runs. (The device
+    /// row's `provider-run-v1` follows the "Claude cloud sessions" setting,
+    /// `crate::claude_cloud_sessions`.)
     pub(crate) fn start(&self) {
-        if !self.eligible_engine() {
-            return;
-        }
-        if let Err(error) = self.inner.workspace.advertise_capability(PROVIDER_RUN_V1) {
-            tracing::warn!(%error, "couldn't advertise provider-run hosting");
-        }
         let hosting = self.clone();
         self.inner
             .doc_host

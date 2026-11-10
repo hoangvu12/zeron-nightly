@@ -41,6 +41,7 @@ pub mod change_requests;
 mod chat2_checkpoint;
 pub mod chat2_host;
 mod chat_persistence;
+pub mod claude_cloud_sessions;
 mod cloud_accounts;
 pub mod cloud_client;
 pub mod commit_credit;
@@ -278,6 +279,8 @@ impl EngineCore {
         // This device's harness enablement (Settings → Providers) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
+        // "Claude cloud sessions" (provider-run chats): per-device too.
+        registry.open_claude_cloud(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
@@ -303,6 +306,13 @@ impl EngineCore {
                 local_only: matches!(profile.scope(), WorkspaceScope::Local),
             },
         )?;
+        // Eligibility for provider-run chats rides the device row.
+        if let Err(error) = workspace.set_own_capability(
+            zeron_proto::capabilities::PROVIDER_RUN_V1,
+            registry.provider_run_active(),
+        ) {
+            tracing::warn!(%error, "provider-run capability update failed");
+        }
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         let plugins = plugins::Plugins::new(data_dir, &device_id);

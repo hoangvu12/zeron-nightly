@@ -2637,8 +2637,9 @@ fn doc_messages_stream(
             doc,
             None,
             zeron_doc::TranscriptBaseline::default(),
+            None,
         ),
-        |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline)| async move {
+        |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline, mut previous_state)| async move {
             loop {
                 if prev.is_some() {
                     rx.changed().await.ok()?;
@@ -2682,17 +2683,33 @@ fn doc_messages_stream(
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
                 let usage = doc.context_usage();
-                if frame.is_empty_delta() && usage == previous_usage && replay_baseline.is_none() {
+                // A provider-run chat's sign-in state rides along
+                // (`providerState`; absent when none, and to older viewports
+                // an unknown key).
+                let state = doc.provider_chat_state();
+                let first = previous_state.is_none();
+                if frame.is_empty_delta()
+                    && usage == previous_usage
+                    && replay_baseline.is_none()
+                    && previous_state.as_ref() == Some(&state)
+                {
                     continue;
                 }
                 previous_usage = usage;
-                let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
+                let mut value = serde_json::to_value(zeron_doc::TranscriptUpdate {
                     frame,
                     context_usage: usage,
                     replay_baseline,
                 })
                 .ok()?;
-                return Some((value, (rx, prev, doc, previous_usage, opening_baseline)));
+                if state.is_some() || !first {
+                    value["providerState"] = serde_json::to_value(&state).ok()?;
+                }
+                previous_state = Some(state);
+                return Some((
+                    value,
+                    (rx, prev, doc, previous_usage, opening_baseline, previous_state),
+                ));
             }
         },
     )
@@ -2770,6 +2787,10 @@ async fn opening_doc_messages_stream(
         })
         .map_err(|e| crate::EngineError::Other(e.to_string()))?;
         preview["historyPending"] = serde_json::Value::Bool(true);
+        if let Some(state) = handle.doc().provider_chat_state() {
+            preview["providerState"] = serde_json::to_value(&state)
+                .map_err(|e| crate::EngineError::Other(e.to_string()))?;
+        }
         Ok::<_, crate::EngineError>((handle, preview))
     })
     .await
@@ -3145,6 +3166,46 @@ impl RpcService for EngineRpc {
                 let status = credit
                     .set(p.enabled)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&status)
+            }
+            methods::GET_CLAUDE_CLOUD_SESSIONS => {
+                let store = self.registry.claude_cloud().ok_or_else(|| {
+                    RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
+                })?;
+                let status =
+                    crate::claude_cloud_sessions::status(&self.registry, store.settings()).await;
+                RpcReply::value(&status)
+            }
+            methods::SET_CLAUDE_CLOUD_SESSIONS => {
+                let change: crate::claude_cloud_sessions::ClaudeCloudChange =
+                    parse_params(params)?;
+                let store = self.registry.claude_cloud().ok_or_else(|| {
+                    RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
+                })?;
+                if crate::runner::is_cloud_platform() {
+                    return Err(RpcError::Failed(
+                        "Cloud machines don't offer Claude cloud sessions.".into(),
+                    ));
+                }
+                let next = store.settings().with(&change);
+                store
+                    .save(next.clone())
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let was_active = self.registry.provider_run_active();
+                let active = crate::claude_cloud_sessions::apply(&self.registry, &next);
+                // A harness registered now, not at startup: follow its
+                // logins' sign-in states as `assemble` does for one there
+                // from the start (a removed one's follower ends with it).
+                if active && !was_active {
+                    crate::provider_run::follow_sign_in_states(&self.registry, &self.doc_host);
+                }
+                if let Err(error) = self
+                    .workspace
+                    .set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, active)
+                {
+                    tracing::warn!(%error, "provider-run capability update failed");
+                }
+                let status = crate::claude_cloud_sessions::status(&self.registry, next).await;
                 RpcReply::value(&status)
             }
             methods::SET_TITLE_SETTINGS => {
@@ -6913,5 +6974,37 @@ mod context_usage_tests {
         remote.clear_context_usage().unwrap();
         tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
         assert!(stream.next().await.unwrap()["contextUsage"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_provider_run_chats_sign_in_state_rides_the_transcript_watch() {
+        use zeron_proto::provider_cloud::ProviderChatState;
+        let doc = Arc::new(zeron_doc::SessionDoc::init("cloud-chat").unwrap());
+        let (tx, rx) = watch::channel(crate::doc_host::TranscriptSnapshot::default());
+        let mut stream = doc_messages_stream(rx, doc.clone());
+        // None yet: the key stays off the opening frame.
+        assert!(stream.next().await.unwrap().get("providerState").is_none());
+        let state = ProviderChatState::SignInAgain {
+            email: "a@example.test".into(),
+        };
+        doc.set_provider_chat_state(Some(&state)).unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProviderChatState>(update["providerState"].clone()).unwrap(),
+            state
+        );
+        // Cleared: an explicit null, so a viewer drops the notice.
+        doc.set_provider_chat_state(None).unwrap();
+        tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared["providerState"].is_null());
+        assert!(cleared.get("providerState").is_some());
     }
 }
