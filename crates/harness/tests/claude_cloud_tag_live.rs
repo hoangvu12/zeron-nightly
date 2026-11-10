@@ -49,6 +49,30 @@ struct Findings {
     before: Option<SessionInfo>,
 }
 
+/// Retry a call whose connection was refused or reset before anything was
+/// sent (`could not be reached`), up to 12 times. For a create that error is
+/// only `NotSent` (a lost answer is `Uncertain` and is never retried here);
+/// the other calls are reads or an idempotent archive.
+async fn retry<T, F, Fut>(what: &str, mut call: F) -> Result<T, ProviderCloudError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProviderCloudError>>,
+{
+    let mut attempt = 1;
+    loop {
+        match call().await {
+            Err(ProviderCloudError::Other(text))
+                if text.contains("could not be reached") && attempt < 12 =>
+            {
+                eprintln!("{what}: connection dropped before sending, retrying ({attempt})");
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "talks to the real Claude Code session API"]
 async fn the_server_keeps_zerons_create_tag() {
@@ -62,15 +86,16 @@ async fn the_server_keeps_zerons_create_tag() {
     let tag = format!("zeron:{prompt_uuid}");
     let since = chrono::Utc::now() - chrono::Duration::minutes(5);
 
-    let created = harness
-        .create_session(CreateSession {
+    let created = retry("create", || {
+        harness.create_session(CreateSession {
             prompt: "Reply with the single word OK.".into(),
             prompt_uuid: prompt_uuid.clone(),
             model: None,
             title: Some("Zeron tag check (archive me)".into()),
             source: None,
         })
-        .await;
+    })
+    .await;
     let session = match created {
         Ok(session) => {
             eprintln!("created: yes");
@@ -87,10 +112,10 @@ async fn the_server_keeps_zerons_create_tag() {
             }
             // It may still have made the session: find it by its tag and
             // archive it.
-            match harness.find_created(&prompt_uuid, since).await {
+            match retry("lookup", || harness.find_created(&prompt_uuid, since)).await {
                 Ok(Some(session)) => {
                     eprintln!("found the lost create by its tag: yes; archiving it");
-                    let archived = harness.archive_session(&session).await;
+                    let archived = retry("archive", || harness.archive_session(&session)).await;
                     eprintln!("archived: {}", archived.is_ok());
                 }
                 Ok(None) => eprintln!("no session with the tag: nothing to archive"),
@@ -119,7 +144,7 @@ async fn the_server_keeps_zerons_create_tag() {
             findings.status_before = info.status.clone();
         }
         findings.before = before.ok();
-        let found = harness.find_created(&prompt_uuid, since).await;
+        let found = retry("lookup", || harness.find_created(&prompt_uuid, since)).await;
         findings.found_by_tag =
             Some(matches!(&found, Ok(Some(s)) if s.session_id == session.session_id));
         if let Err(error) = &found {
@@ -130,7 +155,7 @@ async fn the_server_keeps_zerons_create_tag() {
     .await;
 
     // Always archive the one session this test made.
-    let archived = harness.archive_session(&session).await;
+    let archived = retry("archive", || harness.archive_session(&session)).await;
     eprintln!("archive call worked: {}", archived.is_ok());
     if let Err(error) = &archived {
         eprintln!("archive failed: {}", kind(error));
@@ -143,7 +168,7 @@ async fn the_server_keeps_zerons_create_tag() {
             .ok(),
         Err(_) => None,
     };
-    let archived_now = harness.session_archived(&session).await;
+    let archived_now = retry("archived?", || harness.session_archived(&session)).await;
 
     eprintln!("checks ran to the end: {}", checks.is_ok());
     eprintln!("single-session read worked: {:?}", findings.single_read);
