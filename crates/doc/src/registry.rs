@@ -1391,6 +1391,78 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// The chat's host as the room last sent it (`deviceId` of the merged
+    /// row, local writes not yet acknowledged left out); `None` when the
+    /// room has sent no live row for it. A claim counts only once this
+    /// names the claimant (docs/design/provider-run-chats.md §4).
+    pub fn chat_host_acked(&self, chat_id: &str) -> Option<String> {
+        self.authoritative
+            .get(KIND_CHATS)
+            .and_then(|rows| rows.get(chat_id))
+            .filter(|row| !row.deleted)
+            .and_then(|row| row.fields.get("deviceId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// The row's `hostUnavailable` (a provider-run chat's host saying it
+    /// can't host it right now); `None` when absent or unreadable.
+    pub fn chat_host_unavailable(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_proto::provider_cloud::HostUnavailable> {
+        let row = self.overlay_row(KIND_CHATS, chat_id)?;
+        serde_json::from_value(row.fields.get("hostUnavailable")?.clone()).ok()
+    }
+
+    /// Set (or, with `None`, clear) the row's `hostUnavailable`: a
+    /// field-only update. `false` when there is no such row.
+    pub fn set_chat_host_unavailable(
+        &mut self,
+        chat_id: &str,
+        unavailable: Option<&zeron_proto::provider_cloud::HostUnavailable>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        let value = match unavailable {
+            Some(unavailable) => serde_json::to_value(unavailable)?,
+            None => Value::Null,
+        };
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("hostUnavailable", value)]),
+        );
+        Ok(true)
+    }
+
+
+    /// Backdate a chat's activity timestamps with an update of those fields
+    /// alone. `false` when there is no such row.
+    pub fn set_chat_activity_fields(
+        &mut self,
+        chat_id: &str,
+        last_message_at: Option<DateTime<Utc>>,
+        created_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        let mut set = BTreeMap::new();
+        if let Some(at) = last_message_at {
+            set.insert("lastMessageAt".to_owned(), json!(at.timestamp_millis()));
+        }
+        if let Some(at) = created_at {
+            set.insert("createdAt".to_owned(), json!(at.timestamp_millis()));
+        }
+        if !set.is_empty() {
+            self.write(KIND_CHATS, chat_id, OpKind::Update, set);
+        }
+        Ok(true)
+    }
+
     /// Every field a full chat row writes (`None`s as clocked `Null`s).
     fn chat_fields(chat: &Chat) -> Result<BTreeMap<String, Value>, DocError> {
         let config = match &chat.config {

@@ -36,8 +36,8 @@ use zeron_proto::{
 };
 
 use crate::provider_cloud::{
-    CreateSession, ListedSession, ProviderCloud, ProviderCloudError, ProviderResume, RunBinding,
-    SessionActivity,
+    CreateSession, HostCheck, ListedSession, ProviderCloud, ProviderCloudError, ProviderResume,
+    RunBinding, SessionActivity,
 };
 use crate::{Harness, HarnessError, RunControls};
 use api::{ApiError, CloudClient};
@@ -228,9 +228,24 @@ pub(crate) struct RunStart {
 #[derive(Default)]
 pub(crate) struct Bindings {
     sessions: Mutex<HashMap<String, SessionState>>,
+    /// Whether this device still hosts each session's chat
+    /// ([`ProviderCloud::check_host`]).
+    hosts: Mutex<HashMap<String, HostCheck>>,
 }
 
 impl Bindings {
+    /// Whether this device may still send to session `session_id` (it
+    /// hosts the chat, or nothing said otherwise).
+    pub(crate) fn hosts(&self, session_id: &str) -> bool {
+        let check = self
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        check.is_none_or(|check| check.hosts())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionState>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -607,8 +622,25 @@ impl ProviderCloud for ClaudeCloudHarness {
         self.bindings.bind(binding);
     }
 
+    fn check_host(&self, session_id: &str, check: HostCheck) {
+        self.bindings
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session_id.to_owned(), check);
+    }
+
     fn status(&self) -> tokio::sync::watch::Receiver<crate::provider_cloud::ProviderCloudStatus> {
         self.client.status()
+    }
+
+    /// The folder's signed-in account, read from its file now.
+    async fn has_login(&self, account_uuid: &str) -> bool {
+        self.client
+            .credentials()
+            .account()
+            .await
+            .is_ok_and(|account| account.account_uuid == account_uuid)
     }
 }
 

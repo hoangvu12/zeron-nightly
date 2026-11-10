@@ -122,6 +122,27 @@ pub struct RunBinding {
     pub resume: Option<ProviderResume>,
 }
 
+/// Whether this device hosts a provider-run chat right now
+/// ([`ProviderCloud::check_host`]).
+#[derive(Clone)]
+pub struct HostCheck(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl HostCheck {
+    pub fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(check))
+    }
+
+    pub fn hosts(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for HostCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostCheck")
+    }
+}
+
 /// Where a fresh run's mirror picks up a session it (or another device)
 /// mirrored before (docs/design/provider-run-chats.md §5, "Replay
 /// watermark"), read from the chat document before connecting.
@@ -217,6 +238,21 @@ pub trait ProviderCloud: Send + Sync {
     /// same session.
     fn bind_run(&self, binding: RunBinding);
 
+    /// Ask `check` before every request a run of session `session_id`
+    /// sends (docs/design/provider-run-chats.md §4): once it says this
+    /// device no longer hosts the chat, the run sends nothing more and ends,
+    /// the session working on. Replaces an earlier check for the session.
+    fn check_host(&self, session_id: &str, check: HostCheck) {
+        let _ = (session_id, check);
+    }
+
     /// The logins' states and the kill switch, current and as they change.
     fn status(&self) -> tokio::sync::watch::Receiver<ProviderCloudStatus>;
+
+    /// Whether this device has a login for the account with `account_uuid`
+    /// now (a local check, no request): what makes it eligible to host that
+    /// account's chats. By default, unless a request found it can't.
+    async fn has_login(&self, account_uuid: &str) -> bool {
+        !self.status().borrow().cant_host(account_uuid)
+    }
 }
