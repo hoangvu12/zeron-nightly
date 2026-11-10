@@ -1446,11 +1446,6 @@ impl AppState {
         true
     }
 
-    /// The list's view of provider-run chat `chat_id`, if this device read it.
-    pub fn provider_overlay_for(&self, chat_id: &str) -> Option<&ProviderSessionOverlay> {
-        self.provider_overlay.get(chat_id)
-    }
-
     fn apply_overlaid_chats(&mut self, mut chats: Vec<Chat>) -> bool {
         for chat in &mut chats {
             if chat.provider_session.is_none() {

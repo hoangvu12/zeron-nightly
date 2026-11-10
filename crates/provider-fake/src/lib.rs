@@ -28,7 +28,7 @@ mod server;
 mod stub_claude;
 
 pub use login::{ClaudeLogin, FakeAccount, in_ms};
-pub use server::{FakeSessionServer, Fault, RecordedRequest, SeedSession, StoredEvent};
+pub use server::{FakeSessionServer, Fault, RecordedRequest, SeedSession, SessionRead, StoredEvent};
 pub use stub_claude::{StubCall, StubClaude};
 
 use std::sync::Arc;

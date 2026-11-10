@@ -3224,18 +3224,12 @@ impl RpcService for EngineRpc {
                 let status = crate::claude_cloud_sessions::status(&self.registry, next).await;
                 RpcReply::value(&status)
             }
-            methods::DISCOVER_PROVIDER_SESSIONS => {
-                #[derive(serde::Deserialize)]
-                struct Params {
-                    #[serde(default)]
-                    visible: bool,
-                }
-                let p: Params = parse_params(params)?;
+            methods::SYNC_PROVIDER_SESSIONS => {
                 let reply = match self.registry.claude_cloud() {
                     Some(store) => {
                         store
                             .discovery()
-                            .refresh(&self.sessions, &self.doc_host, p.visible)
+                            .refresh(&self.sessions, &self.doc_host)
                             .await
                     }
                     None => Default::default(),

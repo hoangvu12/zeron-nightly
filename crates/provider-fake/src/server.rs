@@ -236,6 +236,22 @@ struct Inner {
     create_delay: Option<std::time::Duration>,
     /// Archive requests still to fail with a 500 (the session stays active).
     failed_archives: usize,
+    /// How `GET /v1/code/sessions/{id}` answers.
+    session_read: SessionRead,
+}
+
+/// How the fake answers a single-session read (`GET /v1/code/sessions/{id}`),
+/// whose real shape isn't confirmed: the live check could read it but not
+/// decode it as the list's entries are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionRead {
+    /// The session as the list describes it.
+    #[default]
+    Plain,
+    /// Wrapped: `{"session": {...}}`.
+    Wrapped,
+    /// Something that describes no session Zeron can read.
+    Unreadable,
 }
 
 impl Inner {
@@ -273,7 +289,13 @@ impl Drop for FakeSessionServer {
 
 impl FakeSessionServer {
     pub async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        Self::start_at("127.0.0.1:0").await
+    }
+
+    /// [`Self::start`] on a chosen address (a test that refuses connections
+    /// to it first, then starts the server there).
+    pub async fn start_at(addr: &str) -> Self {
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
             .expect("fake session server binds");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -405,6 +427,20 @@ impl FakeSessionServer {
     /// for `delay` (a slow gateway); `None` answers at once.
     pub fn delay_create_answers(&self, delay: Option<std::time::Duration>) {
         lock(&self.state).create_delay = delay;
+    }
+
+    /// How single-session reads answer from now on.
+    pub fn session_read(&self, shape: SessionRead) {
+        lock(&self.state).session_read = shape;
+    }
+
+    /// The single-session reads served so far (`GET /v1/code/sessions/{id}`).
+    pub fn session_reads(&self) -> usize {
+        lock(&self.state)
+            .requests
+            .iter()
+            .filter(|r| r.method == "GET" && r.path.trim_matches('/').split('/').count() == 4)
+            .count()
     }
 
     /// The next `times` archive requests fail with a 500 and archive
@@ -657,10 +693,24 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             }
             response
         }
-        ("GET", ["v1", "code", "sessions", id]) => match lock(&state).session(id) {
-            Some(session) => json_response(StatusCode::OK, session.info.clone()),
-            None => not_found(),
-        },
+        ("GET", ["v1", "code", "sessions", id]) => {
+            let mut inner = lock(&state);
+            let shape = inner.session_read;
+            match inner.session(id) {
+                Some(session) => {
+                    let info = session.info.clone();
+                    json_response(
+                        StatusCode::OK,
+                        match shape {
+                            SessionRead::Plain => info,
+                            SessionRead::Wrapped => json!({ "session": info }),
+                            SessionRead::Unreadable => json!({ "kind": "session", "ok": true }),
+                        },
+                    )
+                }
+                None => not_found(),
+            }
+        }
         ("POST", ["v1", "code", "sessions", id, "events"]) => post_events(&state, id, body),
         ("GET", ["v1", "code", "sessions", id, "events"]) => history(&state, id, &recorded),
         ("GET", ["v1", "code", "sessions", id, "events", "stream"]) => {

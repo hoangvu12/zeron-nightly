@@ -724,7 +724,7 @@ impl EngineCore {
         provider_run::resume_as_host(&self.sessions, &self.doc_host, chat_id).await
     }
 
-    /// Test seam: let `DiscoverProviderSessions` read the session list as
+    /// Test seam: let `SyncProviderSessions` read the session list as
     /// often as every `interval` (production: once a minute).
     #[doc(hidden)]
     pub fn set_provider_list_interval(&self, interval: std::time::Duration) {

@@ -87,6 +87,8 @@ pub(crate) struct ArchiveLedger {
     deleted_here: Mutex<HashSet<String>>,
     /// One settling pass at a time.
     settling: tokio::sync::Mutex<()>,
+    /// Settling was asked for since the running pass began.
+    again: std::sync::atomic::AtomicBool,
 }
 
 impl ArchiveLedger {
@@ -101,6 +103,7 @@ impl ArchiveLedger {
             ledger: Mutex::new(ledger),
             deleted_here: Mutex::default(),
             settling: tokio::sync::Mutex::new(()),
+            again: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -202,13 +205,21 @@ impl ArchiveLedger {
     }
 
     /// Try every owed archive once (see module docs). A chat live again, a
-    /// session already archived or active well after the delete (a revive's
-    /// business), or one this device's login can't act for, settles without
+    /// session already archived or active since the delete (resumed
+    /// elsewhere), or one this device's login can't act for, settles without
     /// an archive; a failure stays owed.
     async fn settle(&self, workspace: &WorkspaceHost, harness: &Arc<dyn Harness>) {
+        // Asked again while a pass runs: that pass goes round once more.
+        self.again.store(true, std::sync::atomic::Ordering::SeqCst);
         let Ok(_one) = self.settling.try_lock() else {
             return;
         };
+        while self.again.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.settle_once(workspace, harness).await;
+        }
+    }
+
+    async fn settle_once(&self, workspace: &WorkspaceHost, harness: &Arc<dyn Harness>) {
         let Some(cloud) = harness.provider_cloud() else {
             return;
         };
@@ -231,11 +242,9 @@ impl ArchiveLedger {
                     self.settled(&chat_id);
                     continue;
                 }
-                Ok(now)
-                    if owed
-                        .deleted_at
-                        .is_some_and(|deleted| now.last_event_at > deleted + REVIVE_MARGIN) =>
-                {
+                // Active since the delete: resumed elsewhere (a revive's
+                // business once clearly so), not this delete's to archive.
+                Ok(now) if owed.deleted_at.is_some_and(|deleted| now.last_event_at > deleted) => {
                     self.settled(&chat_id);
                     continue;
                 }

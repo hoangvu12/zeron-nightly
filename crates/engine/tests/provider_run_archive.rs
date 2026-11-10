@@ -135,7 +135,7 @@ impl Host {
         })
         .await;
         self.client
-            .call(methods::DISCOVER_PROVIDER_SESSIONS, json!({ "visible": true }))
+            .call(methods::SYNC_PROVIDER_SESSIONS, json!({}))
             .await
             .expect("DiscoverProviderSessions")
     }

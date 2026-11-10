@@ -35,6 +35,14 @@ pub const REJECTED_AFTER_RENEWAL: &str = "Claude cloud sessions turned off on th
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 
+/// The waits before trying again a connection that couldn't be made (it
+/// sent nothing): a network that resets handshakes now and then.
+const CONNECT_RETRIES: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(750),
+    std::time::Duration::from_millis(1500),
+];
+
 /// How long requests may take. The stream has no overall bound (it follows
 /// the session live); everything else does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,29 +147,69 @@ fn de_seq<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Erro
 }
 
 /// One session as the list and create endpoints describe it.
+///
+/// Read leniently: every field may be missing or of another shape than
+/// expected (it then reads as absent), and unknown fields are ignored. The
+/// single-session read's real shape isn't known yet (the live check could
+/// read it but not decode it into the strict form).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SessionInfo {
+    #[serde(default, alias = "session_id", deserialize_with = "de_text")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub environment_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub environment_kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub status: Option<String>,
     /// What the worker is doing, in the list's (not verified live) words.
     /// A session the list doesn't describe reads as idle.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub worker_status: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_text")]
     pub last_event_at: Option<String>,
     /// The session's tags: the provider's own (`config:no-git-repo`) and
     /// the one Zeron's create sends (`zeron:<first prompt uuid>`).
     #[serde(default, deserialize_with = "de_tags")]
     pub tags: Vec<String>,
+}
+
+/// A text field; anything but a string reads as absent.
+fn de_opt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::String(text)) => Some(text),
+        _ => None,
+    })
+}
+
+/// A required text field read as [`de_opt_text`] (empty when absent).
+fn de_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(de_opt_text(d)?.unwrap_or_default())
+}
+
+/// The one session a single-session answer describes: the body itself, or
+/// a `session` or `data` object wrapping it. `None` when none holds it.
+fn single_session(body: Value, session_id: &str) -> Option<SessionInfo> {
+    let candidates = [
+        body.get("session").cloned(),
+        body.get("data").filter(|d| d.is_object()).cloned(),
+        Some(body),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .filter(Value::is_object)
+        .filter_map(|value| serde_json::from_value::<SessionInfo>(value).ok())
+        .find(|info| info.id.is_empty() || info.id == session_id)
+        .filter(|info| info.status.is_some() || info.last_event_at.is_some())
+        .map(|mut info| {
+            info.id = session_id.to_owned();
+            info
+        })
 }
 
 /// Tags as strings; anything else in the list is skipped.
@@ -347,6 +395,9 @@ impl CloudClient {
 
     /// The token is read for this request only and dropped once it's sent;
     /// a 401 has the CLI renew the login, then the request goes once more.
+    /// A connection that couldn't be made (refused, or reset during its
+    /// handshake) sent nothing, so it is tried again a few times, briefly;
+    /// nothing that may have reached the server is ever sent twice here.
     /// Only a successful response says the login works.
     async fn send_authorized(
         &self,
@@ -357,6 +408,7 @@ impl CloudClient {
     ) -> Result<reqwest::Response, ApiError> {
         let mut token = self.credentials.token_for(account).await?;
         let mut retried = false;
+        let mut reconnects = 0;
         loop {
             let sent = token.fingerprint();
             let request = build(
@@ -366,13 +418,19 @@ impl CloudClient {
                     .header("anthropic-version", API_VERSION),
             );
             drop(token);
-            let response = request.send().await.map_err(|e| {
-                if e.is_connect() || e.is_builder() {
-                    ApiError::NotSent(without_url(&e))
-                } else {
-                    ApiError::Transport(without_url(&e))
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(e) if e.is_connect() && reconnects < CONNECT_RETRIES.len() => {
+                    tokio::time::sleep(CONNECT_RETRIES[reconnects]).await;
+                    reconnects += 1;
+                    token = self.credentials.token_for(account).await?;
+                    continue;
                 }
-            })?;
+                Err(e) if e.is_connect() || e.is_builder() => {
+                    return Err(ApiError::NotSent(without_url(&e)));
+                }
+                Err(e) => return Err(ApiError::Transport(without_url(&e))),
+            };
             if response.status() != reqwest::StatusCode::UNAUTHORIZED {
                 if response.status().is_success() {
                     self.note(account, AccountLogin::Works);
@@ -475,7 +533,9 @@ impl CloudClient {
                 |r| r.timeout(bound),
             )
             .await?;
-        self.send_json(response).await
+        let body: Value = self.send_json(response).await?;
+        single_session(body, session_id)
+            .ok_or_else(|| ApiError::Decode("the session's description has no status".into()))
     }
 
     /// `POST /v1/code/sessions/{id}/archive`. Archiving an archived session
@@ -643,7 +703,9 @@ fn path_segment(id: &str) -> String {
         .collect()
 }
 
-fn is_loopback(base: &str) -> bool {
+/// Whether `base` names this machine (`127.0.0.1`, `localhost` or `::1`),
+/// with or without a scheme and port.
+pub fn is_loopback(base: &str) -> bool {
     let rest = base
         .strip_prefix("http://")
         .or_else(|| base.strip_prefix("https://"))

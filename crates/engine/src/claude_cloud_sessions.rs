@@ -210,14 +210,50 @@ fn available() -> bool {
 /// (`zeron-provider-fake`'s `serve` example) through
 /// `ZERON_CLAUDE_CLOUD_API`. Loopback addresses only, so no setting of it
 /// can send a real login's token anywhere but Anthropic.
-const API_OVERRIDE_ENV: &str = "ZERON_CLAUDE_CLOUD_API";
+pub const API_OVERRIDE_ENV: &str = "ZERON_CLAUDE_CLOUD_API";
 
-pub(crate) fn local_api_override() -> Option<String> {
-    let url = std::env::var(API_OVERRIDE_ENV).ok()?;
-    let url = url.trim().trim_end_matches('/');
-    let rest = url.strip_prefix("http://")?;
-    let host = rest.split([':', '/']).next()?;
-    matches!(host, "127.0.0.1" | "localhost").then(|| url.to_owned())
+/// The base URL [`API_OVERRIDE_ENV`] asks for: `Ok(None)` when it's unset
+/// (the production API), `Err` when it names anything but an
+/// `http(s)://` loopback address (the same hosts the API client treats as
+/// loopback).
+fn api_override(value: Option<&str>) -> Result<Option<String>, ()> {
+    let Some(url) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let url = url.trim_end_matches('/');
+    let schemed = url.starts_with("http://") || url.starts_with("https://");
+    if schemed && zeron_harness::claude_cloud::api::is_loopback(url) {
+        Ok(Some(url.to_owned()))
+    } else {
+        Err(())
+    }
+}
+
+/// The device's `claude-code-cloud` harness: the device's own login, on the
+/// production API unless [`API_OVERRIDE_ENV`] names a loopback fake. `None`
+/// when it can't be built, and when the override names anything else: a
+/// rejected override never falls back to the production API, or a hand
+/// check's fake login would go to Anthropic.
+pub(crate) fn device_harness() -> Option<zeron_harness::ClaudeCloudHarness> {
+    let Some(mut config) = zeron_harness::claude_cloud::ClaudeCloudConfig::device_default() else {
+        tracing::warn!("Claude cloud sessions: no home directory for the device's login");
+        return None;
+    };
+    match api_override(std::env::var(API_OVERRIDE_ENV).ok().as_deref()) {
+        Ok(Some(url)) => config.base_url = url,
+        Ok(None) => {}
+        Err(()) => {
+            tracing::error!(
+                "{API_OVERRIDE_ENV} names no loopback address; Claude cloud sessions stay off"
+            );
+            return None;
+        }
+    }
+    zeron_harness::ClaudeCloudHarness::new(config)
+        .inspect_err(
+            |error| tracing::error!(%error, "Claude cloud sessions are unavailable on this device"),
+        )
+        .ok()
 }
 
 /// Register or remove the `claude-code-cloud` harness to match `settings`
@@ -230,21 +266,8 @@ pub fn apply(registry: &HarnessRegistry, settings: &ClaudeCloudSettings) -> bool
     let wanted = settings.wants_harness() || zeron_harness::claude_cloud::enabled();
     let registered = registry.is_registered(HarnessId::ClaudeCodeCloud);
     if wanted && !registered {
-        match zeron_harness::claude_cloud::ClaudeCloudConfig::device_default() {
-            Some(mut config) => {
-                if let Some(url) = local_api_override() {
-                    config.base_url = url;
-                }
-                match zeron_harness::ClaudeCloudHarness::new(config) {
-                    Ok(harness) => registry.register(Arc::new(harness)),
-                    Err(error) => {
-                        tracing::error!(%error, "Claude cloud sessions are unavailable on this device")
-                    }
-                }
-            }
-            None => {
-                tracing::warn!("Claude cloud sessions: no home directory for the device's login");
-            }
+        if let Some(harness) = device_harness() {
+            registry.register(Arc::new(harness));
         }
     } else if !wanted && registered {
         registry.remove_provider_cloud(HarnessId::ClaudeCodeCloud);
@@ -314,6 +337,33 @@ mod tests {
             device_login: Some(false),
         });
         assert!(!without_login.wants_harness());
+    }
+
+    #[test]
+    fn the_api_override_takes_loopback_addresses_only() {
+        assert_eq!(api_override(None), Ok(None));
+        assert_eq!(api_override(Some("  ")), Ok(None));
+        for url in [
+            "http://127.0.0.1:4100",
+            "http://localhost:4100/",
+            "http://[::1]:4100",
+            "https://127.0.0.1",
+        ] {
+            assert_eq!(
+                api_override(Some(url)),
+                Ok(Some(url.trim_end_matches('/').to_owned())),
+                "{url}"
+            );
+        }
+        for url in [
+            "http://example.test",
+            "http://127.0.0.1.example.test",
+            "ftp://127.0.0.1",
+            "127.0.0.1:4100",
+            "https://api.anthropic.com",
+        ] {
+            assert_eq!(api_override(Some(url)), Err(()), "{url}");
+        }
     }
 
     #[test]

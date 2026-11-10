@@ -57,12 +57,6 @@ pub fn enabled() -> bool {
 const ENVIRONMENT_PAGES: usize = 10;
 const ENVIRONMENT_PAGE_SIZE: usize = 50;
 
-/// Whether the provider keeps the custom tag a create sends
-/// (`zeron:<first prompt uuid>`), so a create whose answer was lost can be
-/// found by it. Without it, such a create goes straight to "Creation
-/// uncertain". Checked against the real API once (ticket #11).
-const TAGS_KEPT: bool = true;
-
 /// The session list's page size, and the most pages one read follows.
 const LIST_PAGE_SIZE: usize = 20;
 const LIST_PAGES: usize = 25;
@@ -540,9 +534,9 @@ impl ProviderCloud for ClaudeCloudHarness {
             "events": [{ "payload": session::user_payload(&request.prompt_uuid, "", &request.prompt) }],
             "config": config,
         });
-        if TAGS_KEPT {
-            body["tags"] = json!([zeron_proto::provider_cloud::create_tag(&request.prompt_uuid)]);
-        }
+        // The provider keeps it (confirmed against the real API on
+        // 2026-11-10): a create whose answer is lost is found by it.
+        body["tags"] = json!([zeron_proto::provider_cloud::create_tag(&request.prompt_uuid)]);
         // One bound over the create, a CLI renewal and its one resend
         // included: past it, the outcome is unknown.
         let created = tokio::time::timeout(timeouts.create, self.client.create_session(&account, &body))
@@ -565,9 +559,6 @@ impl ProviderCloud for ClaudeCloudHarness {
         prompt_uuid: &str,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<ProviderSession>, ProviderCloudError> {
-        if !TAGS_KEPT {
-            return Ok(None);
-        }
         let account = self
             .client
             .credentials()
@@ -609,13 +600,34 @@ impl ProviderCloud for ClaudeCloudHarness {
         session: &ProviderSession,
     ) -> Result<ListedSession, ProviderCloudError> {
         let account = session::account_of(session);
-        let info = self
-            .client
-            .session(&account, &session.session_id)
-            .await
-            .map_err(provider_error)?;
-        listed_session(info, &account).ok_or_else(|| {
-            ProviderCloudError::Other("Claude cloud described the session without its times.".into())
+        match self.client.session(&account, &session.session_id).await {
+            Ok(info) => {
+                if let Some(found) = listed_session(info, &account) {
+                    return Ok(found);
+                }
+            }
+            // Not one this login can read, or the feature is off: no
+            // other read would do better.
+            Err(error @ (ApiError::Credentials(_) | ApiError::Disabled(_))) => {
+                return Err(provider_error(error));
+            }
+            Err(error) => {
+                tracing::debug!(%error, "the single-session read failed; looking in the list");
+            }
+        }
+        // The single-session read's shape isn't confirmed: find the session
+        // in the list instead, however old.
+        let mut found = None;
+        walk_list(&self.client, &account, |info| {
+            if info.id != session.session_id {
+                return true;
+            }
+            found = listed_session(info, &account);
+            false
+        })
+        .await?;
+        found.ok_or_else(|| {
+            ProviderCloudError::Other("Claude cloud's session list doesn't have that session.".into())
         })
     }
 
