@@ -1976,10 +1976,17 @@ impl EngineRpc {
                 git_detected,
                 github_repo,
             } => match github_repo {
-                Some(repo) if device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX) => self
-                    .workspace
-                    .create_cloud_space(&space_id, &device_id, &path, name, &repo)
-                    .map_err(failed),
+                Some(repo)
+                    if zeron_proto::provider_cloud::is_repository_only_device(&device_id) =>
+                {
+                    self.workspace
+                        .create_cloud_space(&space_id, &device_id, &path, name, &repo)
+                        .map_err(failed)
+                }
+                // A provider cloud's project is only ever a GitHub repository.
+                None if device_id == zeron_proto::provider_cloud::PROJECTS_DEVICE => Err(
+                    RpcError::BadParams("a provider cloud project needs its githubRepo".into()),
+                ),
                 _ => self
                     .workspace
                     .create_space(&space_id, &device_id, &path, name, git_detected)
@@ -4041,6 +4048,7 @@ impl RpcService for EngineRpc {
                         space_id,
                         device_id,
                         config: Some(config),
+                        branch,
                         parent_chat_id,
                         child_kind,
                         prompt,
@@ -4051,10 +4059,12 @@ impl RpcService for EngineRpc {
                         let created = crate::provider_run::create_chat(
                             &self.registry,
                             &self.workspace,
+                            &self.repos,
                             &self.doc_host,
                             crate::provider_run::NewProviderChat {
                                 device_id,
                                 space_id,
+                                branch,
                                 config,
                                 prompt,
                                 message_id,

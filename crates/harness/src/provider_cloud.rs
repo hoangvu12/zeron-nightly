@@ -90,6 +90,18 @@ pub struct CreateSession {
     pub prompt_uuid: String,
     pub model: Option<String>,
     pub title: Option<String>,
+    /// The repository the session works on; `None`: an empty sandbox ("No
+    /// project").
+    pub source: Option<SessionSource>,
+}
+
+/// The GitHub repository a new session clones, and the branch it starts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSource {
+    /// `owner/name` on github.com.
+    pub github_repo: String,
+    /// `None`: the repository's default branch.
+    pub branch: Option<String>,
 }
 
 /// What a fresh run of a provider-run chat needs to know: its session and
