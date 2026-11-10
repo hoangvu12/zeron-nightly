@@ -504,7 +504,7 @@ impl ProviderCloud for ClaudeCloudHarness {
                 .map_err(provider_error)?;
             let mut reached_older = page.data.is_empty();
             for info in page.data {
-                if info.tags.iter().any(|t| *t == tag) && !info.id.is_empty() {
+                if info.tags.contains(&tag) && !info.id.is_empty() {
                     let session = session_of(info.id, &account);
                     // Every session starts on the model it was created with;
                     // which one is unknown here, so no model change is assumed.
