@@ -35,6 +35,7 @@ async fn main() {
     // (a persistent 401: the chat shows "Sign in again").
     let reject = folder.join("reject-token");
     let mut rejected = false;
+    let mut reported = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         if !rejected && reject.exists() {
@@ -42,9 +43,19 @@ async fn main() {
             rejected = true;
             println!("rejecting the fake login's token");
         }
+        // Each create once, with the repository it clones (`[]`: no project).
+        let creates: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/code/sessions")
+            .collect();
         let created = fake.created_sessions();
-        if !created.is_empty() {
-            println!("sessions created: {created:?}");
+        for (id, create) in created.iter().zip(&creates).skip(reported) {
+            println!(
+                "session created: {id} sources={}",
+                create.body["config"]["sources"]
+            );
         }
+        reported = reported.max(created.len().min(creates.len()));
     }
 }
