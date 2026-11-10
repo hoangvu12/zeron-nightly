@@ -568,3 +568,54 @@ fn the_session_card_lands_with_a_chat_switch_and_eases_on_its_toggle(cx: &mut Te
         assert_eq!(cx.debug_bounds("session-info").is_some(), shown);
     }
 }
+
+#[gpui::test]
+fn a_provider_run_chat_hides_local_workspace_panels_without_its_harness_listed(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, shell, cx) = setup(cx);
+    // Chat a runs in Anthropic's cloud; this device's harness catalog never
+    // listed `claude-code-cloud` (the setting is off here, or it hasn't
+    // loaded yet). Chat b is a local chat.
+    change(&shell, cx, |shell, _, cx| {
+        shell.settings.session_info_hidden = false;
+        shell.state.update(cx, |state, cx| {
+            let row = state.chats.iter_mut().find(|c| c.id == "a").unwrap();
+            row.config = Some(zeron_proto::ChatConfig {
+                harness: zeron_proto::HarnessId::ClaudeCodeCloud,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
+            });
+            cx.notify();
+        });
+    });
+    settled(&shell, cx);
+    assert!(shell.read_with(cx, |s, cx| s.active_chat_remote_workspace(cx)));
+    // The session card shows, without its side chats and fork.
+    assert!(cx.debug_bounds("session-info").is_some());
+    assert!(cx.debug_bounds("session-lanes").is_none());
+
+    // Files, the terminal and the Changes pane stay shut, whatever asks.
+    change(&shell, cx, |s, window, cx| {
+        s.toggle_files_panel(window, cx);
+        s.toggle_terminal(window, cx);
+        s.add_terminal_surface(cx);
+    });
+    let frame = settled(&shell, cx);
+    near(frame.widths[1], 0.0);
+    shell.read_with(cx, |s, cx| {
+        assert!(!s.files_panel_open(cx));
+        assert!(!s.terminal_open(cx));
+        assert!(!s.space_git_detected(cx));
+    });
+
+    // A local chat keeps them.
+    change(&shell, cx, |s, _, cx| select(s, Some("b"), cx));
+    settled(&shell, cx);
+    assert!(!shell.read_with(cx, |s, cx| s.active_chat_remote_workspace(cx)));
+    assert!(cx.debug_bounds("session-lanes").is_some());
+}

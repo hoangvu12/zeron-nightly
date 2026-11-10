@@ -3501,10 +3501,13 @@ impl AppState {
         changed
     }
 
-    /// Whether `harness`'s chats work in a remote workspace, per its
-    /// descriptor (never its slug).
+    /// Whether `harness`'s chats work in a remote workspace: per a loaded
+    /// descriptor, or because the harness runs its chats in a provider cloud.
+    /// The fallback matters: with "Claude cloud sessions" off on this device,
+    /// before the catalog loads, or on another device, no descriptor lists
+    /// the harness, yet its chats still have no local workspace.
     pub(crate) fn harness_remote_workspace(&self, harness: HarnessId) -> bool {
-        self.remote_workspace_harnesses.contains(&harness)
+        self.remote_workspace_harnesses.contains(&harness) || harness.runs_in_provider_cloud()
     }
 
     /// Whether a chat works in a remote workspace (a provider-run chat): the
@@ -7719,7 +7722,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_workspace_follows_the_harness_descriptor_not_the_slug() {
+    fn remote_workspace_follows_the_descriptor_or_a_provider_cloud_harness() {
         let mut state = AppState::new();
         let with_harness = |id: &str, harness: HarnessId| {
             let mut row = chat(id, 0, None);
@@ -7738,8 +7741,11 @@ mod tests {
             with_harness("cloud", HarnessId::ClaudeCodeCloud),
             with_harness("local", HarnessId::ClaudeCode),
         ]);
-        // No catalog says so yet: the slug alone hides nothing.
-        assert!(!state.chat_remote_workspace("cloud"));
+        // No catalog lists it (the setting is off on this device, or the
+        // catalog hasn't loaded): a provider-cloud harness's chat is remote
+        // all the same.
+        assert!(state.chat_remote_workspace("cloud"));
+        assert!(!state.chat_remote_workspace("local"));
         let descriptor = |id: HarnessId, remote_workspace: bool| {
             serde_json::from_value::<zeron_engine::registry::HarnessDescriptor>(serde_json::json!({
                 "id": id, "name": "x", "supportsSteering": false,
