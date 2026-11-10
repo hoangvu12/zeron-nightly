@@ -955,6 +955,37 @@ impl WorkspaceHost {
         lock(&self.inner.provider_chats).contains(chat_id)
     }
 
+    /// Whether the chat's host was never really written: its `deviceId`
+    /// clock is still no later than `imported_at`, the low clock discovery
+    /// created the row with (docs/design/provider-run-chats.md §6).
+    pub fn chat_host_still_imported(
+        &self,
+        chat_id: &str,
+        imported_at: chrono::DateTime<Utc>,
+    ) -> bool {
+        self.read(|doc| doc.chat_host_clock(chat_id, false))
+            .is_some_and(|clock| hlc_at_most(&clock, imported_at))
+    }
+
+    /// Whether the room has echoed a real claim of the chat's host by this
+    /// device: the row it last sent names this device, with a clock past
+    /// the import's `imported_at`. With no room attached, the local row is
+    /// all there is.
+    pub fn host_claim_echoed(&self, chat_id: &str, imported_at: chrono::DateTime<Utc>) -> bool {
+        let room = self
+            .inner
+            .room_expected
+            .load(std::sync::atomic::Ordering::Acquire);
+        let doc_clock = |acked| self.read(|doc| doc.chat_host_clock(chat_id, acked));
+        if !room && self.inner.config.edge.is_none() {
+            return self.provider_chat_host(chat_id).as_deref() == Some(self.device_id())
+                && doc_clock(false).is_some_and(|c| !hlc_at_most(&c, imported_at));
+        }
+        let acked = self.read(|doc| doc.chat_host_acked(chat_id));
+        acked.as_deref() == Some(self.device_id())
+            && doc_clock(true).is_some_and(|c| !hlc_at_most(&c, imported_at))
+    }
+
     /// Whether `chat` is a provider-run chat: its row names a provider
     /// session, its config a provider-cloud harness (an older client's copy
     /// that lost the session), or this engine knows it as one.
@@ -2786,4 +2817,13 @@ mod tests {
         std::fs::write(odd.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         assert_eq!(linked_worktree_root(&odd), None);
     }
+}
+
+/// Whether an HLC string (`<ms>-<counter>-<device>`) is at or before `at`.
+fn hlc_at_most(clock: &str, at: chrono::DateTime<Utc>) -> bool {
+    clock
+        .split('-')
+        .next()
+        .and_then(|ms| ms.parse::<i64>().ok())
+        .is_some_and(|ms| ms <= at.timestamp_millis())
 }

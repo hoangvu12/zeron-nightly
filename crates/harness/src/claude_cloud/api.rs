@@ -3,9 +3,10 @@
 //!
 //! - says who it is: `User-Agent: zeron/<version>`, and never sends
 //!   `anthropic-client-platform` (or the CLI's / web app's User-Agent);
-//! - carries a token read from the login folder for that request
-//!   ([`super::credentials::Credentials::token_for`]), after the folder's
-//!   account was checked against the one the request acts for;
+//! - carries a token read for that request from the login folder that
+//!   holds the account it acts for ([`CloudClient::login_for`], then
+//!   [`super::credentials::Credentials::token_for`], which checks the
+//!   folder's account again on the read);
 //! - calls only the session endpoints (list, create, events, stream,
 //!   history, archive). Never the environment or settings endpoints.
 //!
@@ -186,11 +187,12 @@ pub enum StreamItem {
     Other { event: String },
 }
 
-/// The session API, acting for one login folder.
+/// The session API, acting for this device's login folders: the device's
+/// own login first, then any accounts added to it.
 pub struct CloudClient {
     http: reqwest::Client,
     base: String,
-    credentials: Arc<Credentials>,
+    logins: std::sync::RwLock<Vec<Arc<Credentials>>>,
     /// The accounts' sign-in states and the kill switch.
     status: watch::Sender<ProviderCloudStatus>,
 }
@@ -211,13 +213,62 @@ impl CloudClient {
         Ok(Self {
             http,
             base,
-            credentials,
+            logins: std::sync::RwLock::new(vec![credentials]),
             status: watch::Sender::new(ProviderCloudStatus::default()),
         })
     }
 
-    pub fn credentials(&self) -> &Arc<Credentials> {
-        &self.credentials
+    /// The login folders acting for this device, in order.
+    pub fn logins(&self) -> Vec<Arc<Credentials>> {
+        self.logins
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the login folders (the "Claude cloud sessions" accounts).
+    pub fn set_logins(&self, logins: Vec<Arc<Credentials>>) {
+        *self
+            .logins
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = logins;
+    }
+
+    /// The login folder signed in to `account` now (each folder's account
+    /// file is read again). When none is, this device has no login for the
+    /// account: it can't host the account's chats here, which never turns
+    /// the feature off.
+    pub async fn login_for(
+        &self,
+        account: &ClaudeAccount,
+    ) -> Result<Arc<Credentials>, CredentialError> {
+        let logins = self.logins();
+        let mut unreadable = None;
+        let mut signed_in = false;
+        for login in &logins {
+            match login.account().await {
+                Ok(found) if found.account_uuid == account.account_uuid => {
+                    return Ok(login.clone());
+                }
+                Ok(_) => signed_in = true,
+                Err(CredentialError::NoLogin(_)) => {}
+                Err(error) => {
+                    unreadable.get_or_insert(error);
+                }
+            }
+        }
+        Err(match unreadable {
+            Some(error) => error,
+            None if signed_in => CredentialError::AccountMismatch {
+                email: account.email.clone(),
+            },
+            None => CredentialError::NoLogin(
+                logins
+                    .first()
+                    .map(|l| l.folder().dir().display().to_string())
+                    .unwrap_or_else(|| "any enabled account".to_owned()),
+            ),
+        })
     }
 
     /// The accounts' sign-in states and the kill switch, as they change.
@@ -287,7 +338,8 @@ impl CloudClient {
         account: &ClaudeAccount,
         build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ApiError> {
-        let mut token = self.credentials.token_for(account).await?;
+        let login = self.login_for(account).await?;
+        let mut token = login.token_for(account).await?;
         let mut retried = false;
         loop {
             let sent = token.fingerprint();
@@ -313,7 +365,7 @@ impl CloudClient {
                 return Err(CredentialError::Rejected.into());
             }
             retried = true;
-            token = self.credentials.renew(account, sent).await?;
+            token = login.renew(account, sent).await?;
         }
     }
 

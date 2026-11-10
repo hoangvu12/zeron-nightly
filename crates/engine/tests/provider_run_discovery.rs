@@ -473,3 +473,53 @@ async fn the_list_is_read_only_when_asked_and_at_most_once_a_minute() {
     assert_eq!(first, third);
     a.core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_importer_claims_its_import_and_mirrors_only_once_the_room_echoes_it() {
+    let world = World::new().await;
+    let sid = world.started_elsewhere("Claimed on import").await;
+    let a = world.engine("dev-a");
+    let room = bridge(&[&a]).await;
+    wait_for("A synced", || a.core.workspace.registry_synced()).await;
+
+    let reply = a.discover().await;
+    let shown = listed(&reply, &sid).unwrap();
+    let chat_id = shown["chatId"].as_str().unwrap().to_owned();
+    wait_for("the history mirrored", || {
+        a.entries(&chat_id)
+            .iter()
+            .any(|e| e.role == MessageRole::Assistant && text_of(e).trim() == "ZULU")
+    })
+    .await;
+    // The room holds a real claim by A, clocked past the import's low clock
+    // (the session's creation), not the import itself.
+    let row = room.row("chats", &chat_id).expect("the row at the room");
+    assert_eq!(row.fields["deviceId"], "dev-a");
+    let created = a.chat(&chat_id).unwrap().created_at.timestamp_millis();
+    let clock: i64 = row.clocks["deviceId"]
+        .split('-')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(clock > created, "a claim, not the low-clock import");
+
+    // A chat whose host was really written elsewhere is never claimed by
+    // discovery: B, synced, imports nothing and claims nothing.
+    let b = world.engine("dev-b");
+    b.core.workspace.connect_registry_url(&room.url());
+    wait_for("B has A's row", || {
+        b.chat(&chat_id).is_some_and(|c| c.device_id == "dev-a")
+    })
+    .await;
+    b.core.set_provider_list_interval(Duration::ZERO);
+    let claimed = room.row("chats", &chat_id).unwrap().clocks["deviceId"].clone();
+    b.discover().await;
+    settle(&b, &a, &chat_id, "Barrier from B").await;
+    let row = room.row("chats", &chat_id).unwrap();
+    assert_eq!(row.fields["deviceId"], "dev-a");
+    assert_eq!(row.clocks["deviceId"], claimed, "B claimed nothing");
+    assert!(b.entries(&chat_id).is_empty());
+    a.core.shutdown().await;
+    b.core.shutdown().await;
+}

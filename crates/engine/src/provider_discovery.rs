@@ -15,14 +15,14 @@
 //!   exists, or was deleted, is never written (deleted chats come back with
 //!   ticket #10). Two devices importing one session write the same chat id
 //!   (UUIDv5 of the session) and converge on one row.
-//! - **History.** A chat this device hosts whose transcript is still empty
-//!   is claimed (its importer is its default host: a host-field-only write
-//!   with a real clock, so a later stale low-clock import can't tie-break
-//!   it away) and resumed as its host ([`provider_run::resume_as_host`]),
+//! - **History.** A chat whose row names this device only through its own
+//!   low-clock import, and whose transcript is still empty, is claimed (its
+//!   importer is its default host) and, once the room echoes the claim,
+//!   resumed as its host ([`ProviderHosting::host_imported`], #12's claim),
 //!   which replays the session's history from the start and mirrors what it
 //!   does next; the run's idle reaper ends the stream once nobody uses it.
-//!   Only once the registry is current, so a stale replica doesn't start
-//!   mirroring a chat another device hosts.
+//!   Only once the registry is current, so a stale replica doesn't claim a
+//!   chat another device hosts.
 //! - **Overlay.** Title, activity (working, waiting for you, idle) and the
 //!   last activity time come back to the app from the latest read and are
 //!   laid over the chat there; they are never written to the row.
@@ -36,7 +36,7 @@ use zeron_harness::provider_cloud::{ListedSession, SessionActivity};
 use zeron_proto::{AccessMode, Chat, ChatConfig, HarnessId, SandboxLevel};
 
 use crate::doc_host::DocHost;
-use crate::provider_run;
+use crate::provider_host::ProviderHosting;
 use crate::sessions::SessionsEngine;
 use crate::workspace_host::WorkspaceHost;
 
@@ -69,6 +69,11 @@ pub struct DiscoveryReply {
     /// Why the last read failed, for people (never a credential).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// "Keep <email>'s cloud chats working on this device?": the device's
+    /// Claude login was switched away from this account, which isn't added
+    /// here (`crate::claude_cloud_sessions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_offer: Option<String>,
 }
 
 #[derive(Default)]
@@ -121,6 +126,7 @@ impl ProviderDiscovery {
         &self,
         sessions: &SessionsEngine,
         doc_host: &DocHost,
+        hosting: &ProviderHosting,
     ) -> DiscoveryReply {
         let mut state = self.state.lock().await;
         let now = Instant::now();
@@ -151,11 +157,12 @@ impl ProviderDiscovery {
                     })
                     .collect();
                 import(&workspace, &live);
-                mirror_new(sessions, doc_host, &workspace, &live);
+                mirror_new(sessions, doc_host, hosting, &workspace, &live);
                 state.reply = DiscoveryReply {
                     sessions: live.iter().map(Listed::overlay).collect(),
                     read_at: Some(read_at),
                     error: None,
+                    account_offer: None,
                 };
             }
             Err(error) => {
@@ -248,13 +255,13 @@ fn import(workspace: &WorkspaceHost, listed: &[Listed]) {
 fn mirror_new(
     sessions: &SessionsEngine,
     doc_host: &DocHost,
+    hosting: &ProviderHosting,
     workspace: &WorkspaceHost,
     listed: &[Listed],
 ) {
     if !workspace.registry_current() {
         return;
     }
-    let mut chats = Vec::new();
     for Listed {
         chat_id,
         listed: session,
@@ -281,27 +288,8 @@ fn mirror_new(
             tracing::warn!(chat = %chat_id, %error, "couldn't record the chat's provider session");
             continue;
         }
-        // The importer is the chat's default host: it claims the host field
-        // with a real clock, so a stale device's low-clock import (which
-        // would otherwise tie on the clock and win by device id) can't move
-        // the chat it already mirrors.
-        if let Err(error) = workspace.claim_chat_host(&chat_id, Utc::now()) {
-            tracing::warn!(chat = %chat_id, %error, "couldn't claim the imported chat");
-            continue;
-        }
-        chats.push(chat_id);
+        hosting.host_imported(&chat_id, session.created_at);
     }
-    if chats.is_empty() {
-        return;
-    }
-    let (sessions, host) = (sessions.clone(), doc_host.clone());
-    doc_host.spawn_worker(async move {
-        for chat_id in chats {
-            if let Err(error) = provider_run::resume_as_host(&sessions, &host, &chat_id).await {
-                tracing::warn!(chat = %chat_id, %error, "couldn't bring in the session's history");
-            }
-        }
-    });
 }
 
 #[cfg(test)]

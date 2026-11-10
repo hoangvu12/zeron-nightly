@@ -80,6 +80,13 @@ impl ProviderCloudStatus {
     }
 }
 
+/// The account a login is signed in to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginAccount {
+    pub account_uuid: String,
+    pub email: String,
+}
+
 /// One new provider cloud session, created with its first prompt.
 #[derive(Debug, Clone)]
 pub struct CreateSession {
@@ -204,6 +211,36 @@ pub trait ProviderCloud: Send + Sync {
     /// the session working on. Replaces an earlier check for the session.
     fn check_host(&self, session_id: &str, check: HostCheck) {
         let _ = (session_id, check);
+    }
+
+    /// Act for these logins from now on: the device's own login (when
+    /// `device_login`), then the folders of accounts added to this device,
+    /// in order. Every request still finds the login signed in to its
+    /// account when it's sent.
+    fn set_logins(&self, device_login: bool, added: Vec<std::path::PathBuf>) {
+        let _ = (device_login, added);
+    }
+
+    /// The account the device's own login is signed in to now (a file
+    /// read; no request, no CLI).
+    async fn device_account(&self) -> Option<LoginAccount> {
+        None
+    }
+
+    /// The account the login folder `folder` is signed in to now.
+    async fn folder_account(&self, folder: &std::path::Path) -> Option<LoginAccount> {
+        let _ = folder;
+        None
+    }
+
+    /// Sign the new login folder `folder` in with the provider's own CLI
+    /// (the person finishes it in the browser), and say which account it
+    /// holds. Zeron never handles the login itself.
+    async fn sign_in(&self, folder: &std::path::Path) -> Result<LoginAccount, ProviderCloudError> {
+        let _ = folder;
+        Err(ProviderCloudError::Other(
+            "This provider can't add accounts.".into(),
+        ))
     }
 
     /// The logins' states and the kill switch, current and as they change.

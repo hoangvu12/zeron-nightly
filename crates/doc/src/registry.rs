@@ -1369,6 +1369,21 @@ impl RegistryDoc {
             .map(str::to_owned)
     }
 
+    /// The clock of the chat's `deviceId`: in the row as the room last sent
+    /// it (`acked`), or in the merged local row. `None` without a live row.
+    pub fn chat_host_clock(&self, chat_id: &str, acked: bool) -> Option<String> {
+        let row = if acked {
+            self.authoritative
+                .get(KIND_CHATS)
+                .and_then(|rows| rows.get(chat_id))
+                .filter(|row| !row.deleted)
+                .cloned()
+        } else {
+            self.overlay_row(KIND_CHATS, chat_id)
+        };
+        row?.clocks.get("deviceId").cloned()
+    }
+
     /// The row's `hostUnavailable` (a provider-run chat's host saying it
     /// can't host it right now); `None` when absent or unreadable.
     pub fn chat_host_unavailable(

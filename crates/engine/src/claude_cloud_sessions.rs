@@ -10,8 +10,22 @@
 //! both again. `ZERON_CLAUDE_CLOUD_SESSIONS=1` keeps the harness on whatever
 //! the setting says (tests and the dev rig).
 //!
-//! Only the device's own login (`~/.claude`) exists until more accounts land
-//! (ticket #14); it is enabled by default.
+//! The logins (docs/design/provider-run-chats.md §3, ticket #14):
+//!
+//! - **The device's own login** (`~/.claude`), on by default.
+//! - **Added accounts.** "Add account" runs the official `claude auth login`
+//!   into a new folder of this device's data dir (`claude-accounts/<id>`),
+//!   so another account's sessions show and run here too. Each is switched
+//!   on or off per device.
+//! - **Every request** finds the login signed in to its chat's account when
+//!   it's sent. When none is (the device's login was switched, say), this
+//!   device can't host the chat: it publishes `hostUnavailable` and stops,
+//!   and another device takes over on use. That never turns the feature
+//!   off.
+//! - **A switched device login.** The account the device's login was last
+//!   seen in is remembered; once it changes, Zeron offers to add the
+//!   previous account ("Keep <email>'s cloud chats working on this
+//!   device?"), until it's added or the offer is declined.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -24,6 +38,8 @@ use crate::EngineError;
 use crate::registry::HarnessRegistry;
 
 const FILE_NAME: &str = "claude-cloud-sessions.json";
+/// Where added accounts' login folders live, in the data dir.
+const ACCOUNTS_DIR: &str = "claude-accounts";
 
 /// The account id of the device's own Claude login.
 pub const DEVICE_LOGIN: &str = "device";
@@ -37,6 +53,16 @@ pub struct ClaudeCloudSettings {
     /// Whether the device's own Claude login shows its sessions and starts
     /// chats. On by default, so the common case needs no setup.
     pub device_login: bool,
+    /// Accounts added to this device, each signed in through the CLI into a
+    /// folder of its own.
+    pub accounts: Vec<AddedAccount>,
+    /// The account the device's own login was last seen signed in to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_account: Option<KnownAccount>,
+    /// The device login's account before it was switched, which Zeron
+    /// offers to add.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer: Option<KnownAccount>,
 }
 
 impl Default for ClaudeCloudSettings {
@@ -44,6 +70,35 @@ impl Default for ClaudeCloudSettings {
         Self {
             enabled: false,
             device_login: true,
+            accounts: Vec::new(),
+            device_account: None,
+            offer: None,
+        }
+    }
+}
+
+/// An account added to this device: its login folder is
+/// `claude-accounts/<id>` in the data dir.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddedAccount {
+    pub id: String,
+    pub enabled: bool,
+}
+
+/// A Claude account, as a login was seen signed in to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownAccount {
+    pub account_uuid: String,
+    pub email: String,
+}
+
+impl From<zeron_harness::provider_cloud::LoginAccount> for KnownAccount {
+    fn from(account: zeron_harness::provider_cloud::LoginAccount) -> Self {
+        Self {
+            account_uuid: account.account_uuid,
+            email: account.email,
         }
     }
 }
@@ -75,6 +130,10 @@ pub struct ClaudeCloudStatus {
     pub available: bool,
     #[serde(default)]
     pub accounts: Vec<ClaudeCloudAccount>,
+    /// "Keep <email>'s cloud chats working on this device?": the device's
+    /// login was switched away from this account, which isn't added here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer: Option<String>,
 }
 
 fn yes() -> bool {
@@ -89,6 +148,12 @@ pub struct ClaudeCloudChange {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub device_login: Option<bool>,
+    /// Switch one added account on or off.
+    #[serde(default)]
+    pub account: Option<AddedAccount>,
+    /// Decline the offer to add the device login's previous account.
+    #[serde(default)]
+    pub dismiss_offer: bool,
 }
 
 impl ClaudeCloudSettings {
@@ -100,13 +165,21 @@ impl ClaudeCloudSettings {
         if let Some(device_login) = change.device_login {
             self.device_login = device_login;
         }
+        if let Some(switch) = &change.account
+            && let Some(account) = self.accounts.iter_mut().find(|a| a.id == switch.id)
+        {
+            account.enabled = switch.enabled;
+        }
+        if change.dismiss_offer {
+            self.offer = None;
+        }
         self
     }
 
     /// Whether these settings put the harness on: the feature is on and a
     /// login acts for it.
     pub fn wants_harness(&self) -> bool {
-        self.enabled && self.device_login
+        self.enabled && (self.device_login || self.accounts.iter().any(|a| a.enabled))
     }
 }
 
@@ -147,6 +220,25 @@ impl ClaudeCloudSessions {
 
     pub(crate) fn discovery(&self) -> &crate::provider_discovery::ProviderDiscovery {
         &self.discovery
+    }
+
+    /// The login folder of added account `id`.
+    pub fn account_folder(&self, id: &str) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(ACCOUNTS_DIR)
+            .join(id)
+    }
+
+    /// The folders of the added accounts switched on, in order.
+    fn enabled_folders(&self, settings: &ClaudeCloudSettings) -> Vec<PathBuf> {
+        settings
+            .accounts
+            .iter()
+            .filter(|a| a.enabled)
+            .map(|a| self.account_folder(&a.id))
+            .collect()
     }
 
     pub fn settings(&self) -> ClaudeCloudSettings {
@@ -231,9 +323,14 @@ pub(crate) fn device_harness() -> Option<zeron_harness::ClaudeCloudHarness> {
 }
 
 /// Register or remove the `claude-code-cloud` harness to match `settings`
-/// (the environment switch keeps it registered). Returns whether the device
-/// can create and host provider-run chats now.
-pub fn apply(registry: &HarnessRegistry, settings: &ClaudeCloudSettings) -> bool {
+/// (the environment switch keeps it registered), and hand it the logins
+/// switched on. Returns whether the device can create and host
+/// provider-run chats now.
+pub fn apply(
+    registry: &HarnessRegistry,
+    store: &ClaudeCloudSessions,
+    settings: &ClaudeCloudSettings,
+) -> bool {
     if !available() {
         return false;
     }
@@ -246,32 +343,174 @@ pub fn apply(registry: &HarnessRegistry, settings: &ClaudeCloudSettings) -> bool
     } else if !wanted && registered {
         registry.remove_provider_cloud(HarnessId::ClaudeCodeCloud);
     }
+    if let Some(harness) = provider_harness(registry) {
+        let cloud = harness.provider_cloud().expect("a provider-cloud harness");
+        cloud.set_logins(settings.device_login, store.enabled_folders(settings));
+    }
     registry.is_registered(HarnessId::ClaudeCodeCloud)
 }
 
-/// The status the settings page shows. Reads the device login's account
-/// file for its email (no CLI call, no token read).
-pub async fn status(registry: &HarnessRegistry, settings: ClaudeCloudSettings) -> ClaudeCloudStatus {
-    let email = match zeron_harness::claude_cloud::credentials::ClaudeConfigDir::device_default() {
-        Some(folder) => zeron_harness::claude_cloud::credentials::Credentials::new(folder, None)
-            .account()
-            .await
-            .ok()
-            .map(|account| account.email)
-            .filter(|email| !email.is_empty()),
-        None => None,
+/// The registered `claude-code-cloud` harness, if any.
+fn provider_harness(registry: &HarnessRegistry) -> Option<Arc<dyn zeron_harness::Harness>> {
+    if !registry.is_registered(HarnessId::ClaudeCodeCloud) {
+        return None;
+    }
+    registry
+        .resolve(HarnessId::ClaudeCodeCloud)
+        .ok()
+        .filter(|harness| harness.provider_cloud().is_some())
+}
+
+/// The account the device's own login is signed in to now: the harness's
+/// device login while it's registered, else the CLI's default folder (a
+/// file read; no CLI call, no token read).
+async fn device_account(registry: &HarnessRegistry) -> Option<KnownAccount> {
+    if let Some(harness) = provider_harness(registry) {
+        let cloud = harness.provider_cloud()?;
+        return cloud.device_account().await.map(KnownAccount::from);
+    }
+    let folder = zeron_harness::claude_cloud::credentials::ClaudeConfigDir::device_default()?;
+    folder_account(folder).await
+}
+
+async fn folder_account(
+    folder: zeron_harness::claude_cloud::credentials::ClaudeConfigDir,
+) -> Option<KnownAccount> {
+    let account = zeron_harness::claude_cloud::credentials::Credentials::new(folder, None)
+        .account()
+        .await
+        .ok()?;
+    Some(KnownAccount {
+        account_uuid: account.account_uuid,
+        email: account.email,
+    })
+}
+
+/// Note the account the device's login is in now; when it differs from the
+/// one last seen, the previous one becomes the offer (see module docs).
+pub(crate) fn note_device_account(store: &ClaudeCloudSessions, now: Option<&KnownAccount>) {
+    let Some(now) = now else {
+        return; // signed out: nothing to compare
     };
+    let _changing = store.changing();
+    let mut next = store.settings();
+    match &next.device_account {
+        Some(seen) if seen == now => return,
+        Some(seen) if seen.account_uuid != now.account_uuid => {
+            next.offer = Some(seen.clone());
+        }
+        _ => {}
+    }
+    next.device_account = Some(now.clone());
+    if next
+        .offer
+        .as_ref()
+        .is_some_and(|offer| offer.account_uuid == now.account_uuid)
+    {
+        next.offer = None;
+    }
+    if let Err(error) = store.save(next) {
+        tracing::warn!(%error, "couldn't remember the device's Claude login");
+    }
+}
+
+/// The status the settings page shows. Reads the logins' account files for
+/// their emails (no CLI call, no token read), and notices a switched device
+/// login.
+pub async fn status(registry: &HarnessRegistry, store: &ClaudeCloudSessions) -> ClaudeCloudStatus {
+    let device = device_account(registry).await;
+    note_device_account(store, device.as_ref());
+    let settings = store.settings();
+    let mut accounts = vec![ClaudeCloudAccount {
+        id: DEVICE_LOGIN.to_owned(),
+        email: device
+            .as_ref()
+            .map(|a| a.email.clone())
+            .filter(|email| !email.is_empty()),
+        enabled: settings.device_login,
+    }];
+    let mut held: Vec<String> = device.iter().map(|a| a.account_uuid.clone()).collect();
+    for added in &settings.accounts {
+        let folder = zeron_harness::claude_cloud::credentials::ClaudeConfigDir::at(
+            store.account_folder(&added.id),
+        );
+        let account = folder_account(folder).await;
+        held.extend(account.iter().map(|a| a.account_uuid.clone()));
+        accounts.push(ClaudeCloudAccount {
+            id: added.id.clone(),
+            email: account.map(|a| a.email).filter(|email| !email.is_empty()),
+            enabled: added.enabled,
+        });
+    }
+    let offer = settings
+        .offer
+        .as_ref()
+        .filter(|offer| !held.contains(&offer.account_uuid))
+        .map(|offer| offer.email.clone());
     ClaudeCloudStatus {
-        accounts: vec![ClaudeCloudAccount {
-            id: DEVICE_LOGIN.to_owned(),
-            email,
-            enabled: settings.device_login,
-        }],
+        accounts,
+        offer,
         active: available() && registry.is_registered(HarnessId::ClaudeCodeCloud),
         forced: zeron_harness::claude_cloud::enabled(),
         available: available(),
         settings,
     }
+}
+
+/// "Add account": sign a new folder in with the official CLI (the person
+/// finishes in the browser) and add its account to this device. Fails,
+/// leaving nothing behind, when the sign-in doesn't finish or names an
+/// account this device already has.
+pub async fn add_account(
+    registry: &HarnessRegistry,
+    store: &ClaudeCloudSessions,
+) -> Result<KnownAccount, String> {
+    let harness = provider_harness(registry)
+        .ok_or_else(|| "Turn on Claude cloud sessions to add an account.".to_owned())?;
+    let cloud = harness.provider_cloud().expect("a provider-cloud harness");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let folder = store.account_folder(&id);
+    let signed_in = cloud.sign_in(&folder).await;
+    let forget = || {
+        if let Err(error) = std::fs::remove_dir_all(&folder) {
+            tracing::warn!(%error, "couldn't remove an unused Claude login folder");
+        }
+    };
+    let account: KnownAccount = match signed_in {
+        Ok(account) => account.into(),
+        Err(error) => {
+            forget();
+            return Err(error.to_string());
+        }
+    };
+    let mut held: Vec<String> = cloud
+        .device_account()
+        .await
+        .map(|a| a.account_uuid)
+        .into_iter()
+        .collect();
+    for added in store.settings().accounts {
+        if let Some(found) = cloud.folder_account(&store.account_folder(&added.id)).await {
+            held.push(found.account_uuid);
+        }
+    }
+    if held.contains(&account.account_uuid) {
+        forget();
+        return Err(format!("{} is already on this device.", account.email));
+    }
+    let _changing = store.changing();
+    let mut next = store.settings();
+    next.accounts.push(AddedAccount { id, enabled: true });
+    if next
+        .offer
+        .as_ref()
+        .is_some_and(|offer| offer.account_uuid == account.account_uuid)
+    {
+        next.offer = None;
+    }
+    store.save(next.clone()).map_err(|e| e.to_string())?;
+    apply(registry, store, &next);
+    Ok(account)
 }
 
 #[cfg(test)]
@@ -294,7 +533,7 @@ mod tests {
         let store = ClaudeCloudSessions::open(dir.path());
         let next = store.settings().with(&ClaudeCloudChange {
             enabled: Some(true),
-            device_login: None,
+            ..Default::default()
         });
         store.save(next).unwrap();
         let reopened = ClaudeCloudSessions::open(dir.path());
@@ -302,15 +541,30 @@ mod tests {
             reopened.settings(),
             ClaudeCloudSettings {
                 enabled: true,
-                device_login: true,
+                ..ClaudeCloudSettings::default()
             }
         );
         assert!(reopened.settings().wants_harness());
         let without_login = reopened.settings().with(&ClaudeCloudChange {
-            enabled: None,
             device_login: Some(false),
+            ..Default::default()
         });
         assert!(!without_login.wants_harness());
+        // An added account switched on is a login acting for it too.
+        let mut added = without_login.clone();
+        added.accounts.push(AddedAccount {
+            id: "x".into(),
+            enabled: false,
+        });
+        assert!(!added.wants_harness());
+        let added = added.with(&ClaudeCloudChange {
+            account: Some(AddedAccount {
+                id: "x".into(),
+                enabled: true,
+            }),
+            ..Default::default()
+        });
+        assert!(added.wants_harness());
     }
 
     #[test]
@@ -347,23 +601,26 @@ mod tests {
             return;
         }
         let registry = HarnessRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClaudeCloudSessions::open(dir.path());
         let on = ClaudeCloudSettings {
             enabled: true,
-            device_login: true,
+            ..ClaudeCloudSettings::default()
         };
-        assert!(apply(&registry, &on));
+        assert!(apply(&registry, &store, &on));
         let listed = registry.descriptors();
         let cloud = listed
             .iter()
             .find(|d| d.id == HarnessId::ClaudeCodeCloud)
             .expect("listed while on");
         assert!(cloud.remote_workspace);
-        assert!(!apply(&registry, &ClaudeCloudSettings::default()));
+        assert!(!apply(&registry, &store, &ClaudeCloudSettings::default()));
         assert!(!registry.is_registered(HarnessId::ClaudeCodeCloud));
         let no_login = ClaudeCloudSettings {
             enabled: true,
             device_login: false,
+            ..ClaudeCloudSettings::default()
         };
-        assert!(!apply(&registry, &no_login));
+        assert!(!apply(&registry, &store, &no_login));
     }
 }

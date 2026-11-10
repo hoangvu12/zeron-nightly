@@ -201,6 +201,10 @@ pub enum CredentialError {
         "Claude refused this device's login even after renewing it. Sign in again with `claude`."
     )]
     Rejected,
+    /// Adding an account: the CLI's sign-in didn't leave the new folder
+    /// signed in.
+    #[error("The Claude sign-in didn't finish: {0}")]
+    SignInFailed(String),
 }
 
 impl CredentialError {
@@ -208,7 +212,7 @@ impl CredentialError {
     /// `None` for a passing problem (a file unreadable twice).
     pub fn account_login(&self) -> Option<AccountLogin> {
         match self {
-            Self::Unreadable(_) => None,
+            Self::Unreadable(_) | Self::SignInFailed(_) => None,
             Self::NoLogin(_) | Self::AccountMismatch { .. } => Some(AccountLogin::CantHost),
             Self::Expired | Self::LoggedOut | Self::RenewFailed(_) | Self::Rejected => {
                 Some(AccountLogin::SignInAgain)
@@ -379,6 +383,55 @@ fn flight_for(dir: &Path) -> Arc<Flight> {
         .entry(dir.to_path_buf())
         .or_default()
         .clone()
+}
+
+/// The longest an account's sign-in may take (the person finishes it in the
+/// browser).
+pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Add an account: run the official `claude auth login` with
+/// `CLAUDE_CONFIG_DIR` naming `folder` (created), and say which account
+/// the folder holds once it exits. The CLI signs in and writes the files;
+/// nothing here reads or writes a token.
+pub async fn sign_in(
+    folder: &ClaudeConfigDir,
+    claude: Option<&Path>,
+) -> Result<ClaudeAccount, CredentialError> {
+    let claude = match claude {
+        Some(path) => path.to_path_buf(),
+        None => crate::claude::resolve_claude_executable().ok_or_else(|| {
+            CredentialError::SignInFailed("the `claude` command isn't installed".into())
+        })?,
+    };
+    tokio::fs::create_dir_all(&folder.dir)
+        .await
+        .map_err(|error| CredentialError::SignInFailed(error.to_string()))?;
+    let mut command = tokio::process::Command::new(&claude);
+    command
+        .args(["auth", "login"])
+        .env("CLAUDE_CONFIG_DIR", &folder.dir)
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        tracing::warn!(target: "zeron_harness::claude_cloud", %error, "claude auth login could not run");
+        CredentialError::SignInFailed("`claude auth login` could not run".into())
+    })?;
+    let status = match tokio::time::timeout(SIGN_IN_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => return Err(CredentialError::SignInFailed(error.to_string())),
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(CredentialError::SignInFailed("it took too long".into()));
+        }
+    };
+    if !status.success() {
+        return Err(CredentialError::SignInFailed(format!(
+            "`claude auth login` exited with {status}"
+        )));
+    }
+    Credentials::new(folder.clone(), None)
+        .account()
+        .await
+        .map_err(|_| CredentialError::SignInFailed("no account was signed in".into()))
 }
 
 /// What a caller sees when it arrives while an overdue run is being reaped.

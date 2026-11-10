@@ -129,6 +129,9 @@ struct Live {
 
 struct Session {
     info: Value,
+    /// The account the session belongs to ([`FakeSessionServer::own_token`]);
+    /// `None`: every account sees it.
+    owner: Option<String>,
     events: Vec<StoredEvent>,
     /// payload uuid → (event_id, sequence number).
     uuids: HashMap<String, (String, u64)>,
@@ -153,6 +156,7 @@ impl Session {
     fn new(info: Value) -> Self {
         Self {
             info,
+            owner: None,
             events: Vec::new(),
             uuids: HashMap::new(),
             live: broadcast::channel(4096).0,
@@ -228,6 +232,9 @@ struct Inner {
     faults: Vec<Fault>,
     /// Bearer tokens the server refuses with 401 (revoked or expired).
     rejected_tokens: std::collections::HashSet<String>,
+    /// Which account each bearer token acts for; a token not named here
+    /// sees every session.
+    owners: HashMap<String, String>,
 }
 
 impl Inner {
@@ -321,6 +328,26 @@ impl FakeSessionServer {
     /// `prompt` as its first message: it plays the next queued turn, as a
     /// create does. Not counted in [`Self::created_sessions`]. Returns its id.
     pub fn start_elsewhere(&self, title: &str, prompt: &str) -> String {
+        self.start_elsewhere_for(None, title, prompt)
+    }
+
+    /// [`Self::start_elsewhere`], in `owner`'s account: only tokens owned by
+    /// it ([`Self::own_token`]) list or reach it.
+    pub fn start_elsewhere_as(&self, owner: &str, title: &str, prompt: &str) -> String {
+        self.start_elsewhere_for(Some(owner), title, prompt)
+    }
+
+    /// From now on `token` acts for account `owner`: it lists only that
+    /// account's sessions (and those of no account), sessions it creates are
+    /// that account's, and another account's sessions are 404 to it, as
+    /// Anthropic keeps accounts apart.
+    pub fn own_token(&self, token: &str, owner: &str) {
+        lock(&self.state)
+            .owners
+            .insert(token.to_owned(), owner.to_owned());
+    }
+
+    fn start_elsewhere_for(&self, owner: Option<&str>, title: &str, prompt: &str) -> String {
         let mut inner = lock(&self.state);
         let id = format!("cse_elsewhere{:04}", inner.sessions.len() + 1);
         let created_at = now();
@@ -337,7 +364,9 @@ impl FakeSessionServer {
             "config": {"sources": [], "outcomes": []},
             "session_url": format!("https://claude.ai/code/{id}"),
         });
-        inner.sessions.push((id.clone(), Session::new(info)));
+        let mut session = Session::new(info);
+        session.owner = owner.map(str::to_owned);
+        inner.sessions.push((id.clone(), session));
         let payload = json!({
             "uuid": uuid::Uuid::new_v4().to_string(),
             "session_id": id,
@@ -583,10 +612,19 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             "OAuth token has expired",
         ));
     }
+    let caller = lock(&state).owners.get(token).cloned();
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if let ["v1", "code", "sessions", id, ..] = segments.as_slice() {
+        let other_account = lock(&state).session(id).is_some_and(
+            |s| matches!((&s.owner, &caller), (Some(owner), Some(caller)) if owner != caller),
+        );
+        if other_account {
+            return Ok(not_found());
+        }
+    }
     Ok(match (method.as_str(), segments.as_slice()) {
-        ("GET", ["v1", "code", "sessions"]) => list(&state, &recorded),
-        ("POST", ["v1", "code", "sessions"]) => create(&state, body),
+        ("GET", ["v1", "code", "sessions"]) => list(&state, &recorded, caller.as_deref()),
+        ("POST", ["v1", "code", "sessions"]) => create(&state, body, caller),
         ("GET", ["v1", "code", "sessions", id]) => match lock(&state).session(id) {
             Some(session) => json_response(StatusCode::OK, session.info.clone()),
             None => not_found(),
@@ -611,7 +649,7 @@ fn not_found() -> Response<Body> {
     error(StatusCode::NOT_FOUND, "not_found_error", "not found")
 }
 
-fn list(state: &State, req: &RecordedRequest) -> Response<Body> {
+fn list(state: &State, req: &RecordedRequest, caller: Option<&str>) -> Response<Body> {
     let limit: usize = req
         .query_param("limit")
         .and_then(|l| l.parse().ok())
@@ -628,6 +666,10 @@ fn list(state: &State, req: &RecordedRequest) -> Response<Body> {
     let mut all: Vec<Value> = inner
         .sessions
         .iter()
+        .filter(|(_, s)| match (&s.owner, caller) {
+            (Some(owner), Some(caller)) => owner == caller,
+            _ => true,
+        })
         .map(|(_, s)| {
             let mut info = s.info.clone();
             if !s.archived() {
@@ -658,7 +700,7 @@ fn list(state: &State, req: &RecordedRequest) -> Response<Body> {
     json_response(StatusCode::OK, body)
 }
 
-fn create(state: &State, body: Value) -> Response<Body> {
+fn create(state: &State, body: Value, caller: Option<String>) -> Response<Body> {
     let mut inner = lock(state);
     let id = format!("cse_fake{:04}", inner.created.len() + 1);
     let created_at = now();
@@ -687,7 +729,9 @@ fn create(state: &State, body: Value) -> Response<Body> {
         .map(|event| event["payload"].clone())
         .collect();
     inner.created.push(id.clone());
-    inner.sessions.push((id.clone(), Session::new(info)));
+    let mut session = Session::new(info);
+    session.owner = caller;
+    inner.sessions.push((id.clone(), session));
     let _ = accept_events(state, &mut inner, &id, events);
     let info = inner
         .session(&id)

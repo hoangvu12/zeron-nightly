@@ -884,6 +884,8 @@ pub struct EngineRpc {
     viewport_focus: crate::desktop_notify::ViewportFocus,
     /// The plugins service (absent in bare test assemblies).
     plugins: Option<crate::plugins::Plugins>,
+    /// Hosting provider-run chats (claims), for discovery's imports.
+    provider_hosting: Option<crate::ProviderHosting>,
     engine_info: EngineInfo,
 }
 
@@ -945,6 +947,7 @@ impl EngineRpc {
             credentials: None,
             viewport_focus: Default::default(),
             plugins: None,
+            provider_hosting: None,
             engine_info,
         }
     }
@@ -953,6 +956,42 @@ impl EngineRpc {
     pub fn with_plugins(mut self, plugins: crate::plugins::Plugins) -> Self {
         self.plugins = Some(plugins);
         self
+    }
+
+    pub fn with_provider_hosting(mut self, hosting: crate::ProviderHosting) -> Self {
+        self.provider_hosting = Some(hosting);
+        self
+    }
+
+    /// The "Claude cloud sessions" setting, on an engine that offers it.
+    fn claude_cloud_store(
+        &self,
+    ) -> Result<&std::sync::Arc<crate::claude_cloud_sessions::ClaudeCloudSessions>, RpcError> {
+        if crate::runner::is_cloud_platform() {
+            return Err(RpcError::Failed(
+                "Cloud machines don't offer Claude cloud sessions.".into(),
+            ));
+        }
+        self.registry.claude_cloud().ok_or_else(|| {
+            RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
+        })
+    }
+
+    /// After the setting changed: follow a newly registered harness's
+    /// sign-in states, and advertise `provider-run-v1` to match.
+    fn claude_cloud_applied(&self, was_active: bool, active: bool) {
+        // A harness registered now, not at startup: follow its logins'
+        // sign-in states as `assemble` does for one there from the start (a
+        // removed one's follower ends with it).
+        if active && !was_active {
+            crate::provider_run::follow_sign_in_states(&self.registry, &self.doc_host);
+        }
+        if let Err(error) = self
+            .workspace
+            .set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, active)
+        {
+            tracing::warn!(%error, "provider-run capability update failed");
+        }
     }
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
@@ -3172,57 +3211,54 @@ impl RpcService for EngineRpc {
                 let store = self.registry.claude_cloud().ok_or_else(|| {
                     RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
                 })?;
-                let status =
-                    crate::claude_cloud_sessions::status(&self.registry, store.settings()).await;
+                let status = crate::claude_cloud_sessions::status(&self.registry, store).await;
+                RpcReply::value(&status)
+            }
+            methods::ADD_CLAUDE_CLOUD_ACCOUNT => {
+                let store = self.claude_cloud_store()?;
+                let was_active = self.registry.provider_run_active();
+                crate::claude_cloud_sessions::add_account(&self.registry, store)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                self.claude_cloud_applied(was_active, self.registry.provider_run_active());
+                let status = crate::claude_cloud_sessions::status(&self.registry, store).await;
                 RpcReply::value(&status)
             }
             methods::SET_CLAUDE_CLOUD_SESSIONS => {
                 let change: crate::claude_cloud_sessions::ClaudeCloudChange =
                     parse_params(params)?;
-                let store = self.registry.claude_cloud().ok_or_else(|| {
-                    RpcError::Failed("Claude cloud sessions aren't available on this engine.".into())
-                })?;
-                if crate::runner::is_cloud_platform() {
-                    return Err(RpcError::Failed(
-                        "Cloud machines don't offer Claude cloud sessions.".into(),
-                    ));
-                }
+                let store = self.claude_cloud_store()?;
                 // One change at a time, from reading the settings through
                 // the capability update (the guard ends before the await).
-                let next = {
+                {
                     let _changing = store.changing();
                     let next = store.settings().with(&change);
                     store
                         .save(next.clone())
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     let was_active = self.registry.provider_run_active();
-                    let active = crate::claude_cloud_sessions::apply(&self.registry, &next);
-                    // A harness registered now, not at startup: follow its
-                    // logins' sign-in states as `assemble` does for one there
-                    // from the start (a removed one's follower ends with it).
-                    if active && !was_active {
-                        crate::provider_run::follow_sign_in_states(&self.registry, &self.doc_host);
-                    }
-                    if let Err(error) = self
-                        .workspace
-                        .set_own_capability(zeron_proto::capabilities::PROVIDER_RUN_V1, active)
-                    {
-                        tracing::warn!(%error, "provider-run capability update failed");
-                    }
-                    next
-                };
-                let status = crate::claude_cloud_sessions::status(&self.registry, next).await;
+                    let active = crate::claude_cloud_sessions::apply(&self.registry, store, &next);
+                    self.claude_cloud_applied(was_active, active);
+                }
+                let status = crate::claude_cloud_sessions::status(&self.registry, store).await;
                 RpcReply::value(&status)
             }
             methods::SYNC_PROVIDER_SESSIONS => {
-                let reply = match self.registry.claude_cloud() {
-                    Some(store) => {
-                        store
+                let reply = match (self.registry.claude_cloud(), &self.provider_hosting) {
+                    (Some(store), Some(hosting)) => {
+                        let mut reply = store
                             .discovery()
-                            .refresh(&self.sessions, &self.doc_host)
-                            .await
+                            .refresh(&self.sessions, &self.doc_host, hosting)
+                            .await;
+                        // A switched device login shows up here too, not
+                        // only once the settings page is open.
+                        reply.account_offer =
+                            crate::claude_cloud_sessions::status(&self.registry, store)
+                                .await
+                                .offer;
+                        reply
                     }
-                    None => Default::default(),
+                    _ => Default::default(),
                 };
                 RpcReply::value(&reply)
             }

@@ -352,7 +352,7 @@ impl HarnessRegistry {
                 data_dir,
             ))
         });
-        crate::claude_cloud_sessions::apply(self, &store.settings());
+        crate::claude_cloud_sessions::apply(self, store, &store.settings());
     }
 
     /// The "Claude cloud sessions" setting (absent in bare registries).

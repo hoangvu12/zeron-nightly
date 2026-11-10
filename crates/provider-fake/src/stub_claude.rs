@@ -11,6 +11,10 @@
 //!   `$CLAUDE_CONFIG_DIR/.credentials.json` after the wait (the CLI
 //!   refreshing; [`StubClaude::renew_with`]).
 //!
+//! - `login.claude.json` / `login.credentials.json`: what `auth login`
+//!   writes into `$CLAUDE_CONFIG_DIR` (the person finishing the sign-in in
+//!   the browser; [`StubClaude::sign_in_as`]). Without them it fails.
+//!
 //! Every call is logged to `calls.log` (`<args>|<CLAUDE_CONFIG_DIR>`) as it
 //! starts ([`StubClaude::calls`], [`StubClaude::call_count`]). Windows gets a
 //! `claude.cmd`, everything else a `claude` sh script.
@@ -40,6 +44,7 @@ const SCRIPT: &str = "@echo off\r\n\
 setlocal\r\n\
 set \"STUB=%~dp0\"\r\n\
 >>\"%STUB%calls.log\" echo %*^|%CLAUDE_CONFIG_DIR%\r\n\
+if \"%~1 %~2\"==\"auth login\" goto login\r\n\
 if not \"%~1 %~2 %~3\"==\"auth status --json\" (\r\n\
   echo unsupported 1>&2\r\n\
   exit /b 2\r\n\
@@ -52,12 +57,27 @@ if exist \"%STUB%renew.credentials.json\" if defined CLAUDE_CONFIG_DIR copy /y \
 type \"%STUB%status.json\"\r\n\
 set CODE=0\r\n\
 if exist \"%STUB%exit_code\" set /p CODE=<\"%STUB%exit_code\"\r\n\
-exit /b %CODE%\r\n";
+exit /b %CODE%\r\n\
+:login\r\n\
+if not defined CLAUDE_CONFIG_DIR exit /b 3\r\n\
+if not exist \"%STUB%login.claude.json\" exit /b 1\r\n\
+if not exist \"%CLAUDE_CONFIG_DIR%\" mkdir \"%CLAUDE_CONFIG_DIR%\"\r\n\
+copy /y \"%STUB%login.claude.json\" \"%CLAUDE_CONFIG_DIR%\\.claude.json\" >nul\r\n\
+copy /y \"%STUB%login.credentials.json\" \"%CLAUDE_CONFIG_DIR%\\.credentials.json\" >nul\r\n\
+exit /b 0\r\n";
 
 #[cfg(not(windows))]
 const SCRIPT: &str = r#"#!/bin/sh
 STUB="$(dirname "$0")"
 printf '%s|%s\n' "$*" "$CLAUDE_CONFIG_DIR" >> "$STUB/calls.log"
+if [ "$1 $2" = "auth login" ]; then
+  [ -n "$CLAUDE_CONFIG_DIR" ] || exit 3
+  [ -f "$STUB/login.claude.json" ] || exit 1
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  cp "$STUB/login.claude.json" "$CLAUDE_CONFIG_DIR/.claude.json"
+  cp "$STUB/login.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
 if [ "$1 $2 $3" != "auth status --json" ]; then
   echo unsupported >&2
   exit 2
@@ -141,6 +161,22 @@ impl StubClaude {
     /// bytes as the folder's `.credentials.json`.
     pub fn renew_with(&self, credentials_json: &str) {
         std::fs::write(self.dir.join("renew.credentials.json"), credentials_json).unwrap();
+    }
+
+    /// From now on `auth login` signs its folder in as `account` with
+    /// `token` (the person finishing the sign-in in the browser).
+    pub fn sign_in_as(&self, account: &FakeAccount, token: &str) {
+        let staged = crate::ClaudeLogin::create(self.dir.join("staged-login"), account, token);
+        std::fs::copy(
+            staged.dir().join(".claude.json"),
+            self.dir.join("login.claude.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            staged.credentials_file(),
+            self.dir.join("login.credentials.json"),
+        )
+        .unwrap();
     }
 
     pub fn calls(&self) -> Vec<StubCall> {

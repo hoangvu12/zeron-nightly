@@ -191,6 +191,52 @@ impl ProviderHosting {
         });
     }
 
+    /// A chat discovery imported here, whose row names this device (its
+    /// own low-clock import): claim it while its host field still carries
+    /// that low clock, `imported_at`, and mirror the session's history once
+    /// the room echoes the claim and the settle wait has passed with this
+    /// device still host, as every claim does (see module docs). A chat
+    /// whose host was ever really written is left where it is: discovery
+    /// never moves a chat.
+    pub(crate) fn host_imported(&self, chat_id: &str, imported_at: chrono::DateTime<chrono::Utc>) {
+        let workspace = &self.inner.workspace;
+        if !self.eligible_engine() || !workspace.chat_host_still_imported(chat_id, imported_at) {
+            return;
+        }
+        match workspace.claim_chat_host(chat_id, chrono::Utc::now() + CLAIM_LEAD) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "couldn't claim the imported chat");
+                return;
+            }
+        }
+        let hosting = self.clone();
+        let chat = chat_id.to_owned();
+        self.inner.doc_host.spawn_worker(async move {
+            let inner = &hosting.inner;
+            let workspace = &inner.workspace;
+            let deadline = tokio::time::Instant::now() + CLAIM_TTL;
+            while !workspace.host_claim_echoed(&chat, imported_at) {
+                let ours =
+                    workspace.provider_chat_host(&chat).as_deref() == Some(workspace.device_id());
+                if !ours || tokio::time::Instant::now() >= deadline {
+                    return; // another device's claim won, or the room never answered
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(PROVIDER_HOST_SETTLE + Duration::from_millis(50)).await;
+            if !workspace.is_host(&chat) || inner.sessions.has_run(&chat) {
+                return;
+            }
+            if let Err(error) =
+                crate::provider_run::resume_as_host(&inner.sessions, &inner.doc_host, &chat).await
+            {
+                tracing::warn!(chat = %chat, %error, "couldn't bring in the session's history");
+            }
+        });
+    }
+
     /// Whether this engine can host provider-run chats at all: the
     /// `claude-code-cloud` harness is on.
     fn eligible_engine(&self) -> bool {

@@ -22,7 +22,7 @@ mod session;
 pub mod sse;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -36,8 +36,8 @@ use zeron_proto::{
 };
 
 use crate::provider_cloud::{
-    CreateSession, HostCheck, ListedSession, ProviderCloud, ProviderCloudError, ProviderResume,
-    RunBinding, SessionActivity,
+    CreateSession, HostCheck, ListedSession, LoginAccount, ProviderCloud, ProviderCloudError,
+    ProviderResume, RunBinding, SessionActivity,
 };
 use crate::{Harness, HarnessError, RunControls};
 use api::{ApiError, CloudClient};
@@ -352,24 +352,115 @@ impl Bindings {
 pub struct ClaudeCloudHarness {
     client: Arc<CloudClient>,
     bindings: Arc<Bindings>,
+    /// The device's own login, and the `claude` its renewals and sign-ins
+    /// run.
+    device: ClaudeConfigDir,
+    claude: Option<PathBuf>,
 }
 
 impl ClaudeCloudHarness {
     /// Fails when its HTTP client (which names Zeron on every request) can't
     /// be built; there is no unnamed fallback.
     pub fn new(config: ClaudeCloudConfig) -> Result<Self, HarnessError> {
-        let credentials = Arc::new(Credentials::new(config.login, config.claude_executable));
+        let credentials = Arc::new(Credentials::new(
+            config.login.clone(),
+            config.claude_executable.clone(),
+        ));
         let client = CloudClient::new(&config.base_url, credentials).map_err(harness_error)?;
         Ok(Self {
             client: Arc::new(client),
             bindings: Arc::new(Bindings::default()),
+            device: config.login,
+            claude: config.claude_executable,
         })
     }
 
-    /// The session API client (its login folder included).
+    /// The session API client (its login folders included).
     pub fn client(&self) -> &Arc<CloudClient> {
         &self.client
     }
+
+    /// The account new sessions start in: the first login folder signed in
+    /// (the device's own login, unless it's off or signed out).
+    async fn creating_account(&self) -> Result<credentials::ClaudeAccount, ProviderCloudError> {
+        let mut first_error = None;
+        for login in self.client.logins() {
+            match login.account().await {
+                Ok(account) => return Ok(account),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let error =
+            first_error.unwrap_or_else(|| CredentialError::NoLogin("any enabled account".into()));
+        Err(provider_error(ApiError::Credentials(error)))
+    }
+
+    /// Every account this device's login folders are signed in to now, once
+    /// each, in folder order (a folder that can't say, as its error).
+    async fn accounts(&self) -> Vec<Result<credentials::ClaudeAccount, CredentialError>> {
+        let mut seen = HashSet::new();
+        let mut accounts = Vec::new();
+        for login in self.client.logins() {
+            match login.account().await {
+                Ok(account) => {
+                    if seen.insert(account.account_uuid.clone()) {
+                        accounts.push(Ok(account));
+                    }
+                }
+                Err(error) => accounts.push(Err(error)),
+            }
+        }
+        accounts
+    }
+
+    /// One account's sessions active since `since` (see
+    /// [`ProviderCloud::list_sessions`]).
+    async fn list_account(
+        &self,
+        account: &credentials::ClaudeAccount,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ListedSession>, ProviderCloudError> {
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..LIST_PAGES {
+            let page = self
+                .client
+                .list_sessions(account, LIST_PAGE_SIZE, cursor.as_deref())
+                .await
+                .map_err(provider_error)?;
+            let mut reached_older = page.data.is_empty();
+            for info in page.data {
+                let Some(found) = listed_session(info, account) else {
+                    continue;
+                };
+                if found.last_event_at < since {
+                    // Newest activity first: everything after is older.
+                    reached_older = true;
+                    continue;
+                }
+                listed.push(found);
+            }
+            cursor = page.next_cursor.filter(|c| !c.is_empty());
+            if reached_older || cursor.is_none() {
+                break;
+            }
+        }
+        Ok(listed)
+    }
+}
+
+/// The account `folder` is signed in to now, if any.
+async fn login_account(folder: &ClaudeConfigDir) -> Option<LoginAccount> {
+    let account = Credentials::new(folder.clone(), None)
+        .account()
+        .await
+        .ok()?;
+    Some(LoginAccount {
+        account_uuid: account.account_uuid,
+        email: account.email,
+    })
 }
 
 fn harness_error(error: ApiError) -> HarnessError {
@@ -402,12 +493,7 @@ impl ProviderCloud for ClaudeCloudHarness {
         &self,
         request: CreateSession,
     ) -> Result<ProviderSession, ProviderCloudError> {
-        let account = self
-            .client
-            .credentials()
-            .account()
-            .await
-            .map_err(|e| provider_error(ApiError::Credentials(e)))?;
+        let account = self.creating_account().await?;
         // Zeron never calls the environment endpoints: a new session goes in
         // the account's existing cloud environment, the one its sessions use.
         let mut environment = None;
@@ -465,40 +551,30 @@ impl ProviderCloud for ClaudeCloudHarness {
         &self,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<ListedSession>, ProviderCloudError> {
-        // Only the device's own login for now; added accounts (ticket #14)
-        // each get their own read.
-        let account = self
-            .client
-            .credentials()
-            .account()
-            .await
-            .map_err(|e| provider_error(ApiError::Credentials(e)))?;
+        // Each enabled account's list. One account that can't be read
+        // (signed out, say) leaves the others' sessions showing.
         let mut listed = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..LIST_PAGES {
-            let page = self
-                .client
-                .list_sessions(&account, LIST_PAGE_SIZE, cursor.as_deref())
-                .await
-                .map_err(provider_error)?;
-            let mut reached_older = page.data.is_empty();
-            for info in page.data {
-                let Some(found) = listed_session(info, &account) else {
-                    continue;
-                };
-                if found.last_event_at < since {
-                    // Newest activity first: everything after is older.
-                    reached_older = true;
-                    continue;
+        let mut first_error = None;
+        let mut read_any = false;
+        for account in self.accounts().await {
+            let result = match account {
+                Ok(account) => self.list_account(&account, since).await,
+                Err(error) => Err(provider_error(ApiError::Credentials(error))),
+            };
+            match result {
+                Ok(sessions) => {
+                    read_any = true;
+                    listed.extend(sessions);
                 }
-                listed.push(found);
-            }
-            cursor = page.next_cursor.filter(|c| !c.is_empty());
-            if reached_older || cursor.is_none() {
-                break;
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(listed)
+        match first_error {
+            Some(error) if !read_any => Err(error),
+            _ => Ok(listed),
+        }
     }
 
     fn bind_run(&self, binding: RunBinding) {
@@ -517,13 +593,44 @@ impl ProviderCloud for ClaudeCloudHarness {
         self.client.status()
     }
 
-    /// The folder's signed-in account, read from its file now.
+    /// Whether a login folder is signed in to the account, read from the
+    /// folders' files now.
     async fn has_login(&self, account_uuid: &str) -> bool {
-        self.client
-            .credentials()
-            .account()
+        self.accounts().await.iter().any(|account| {
+            account
+                .as_ref()
+                .is_ok_and(|a| a.account_uuid == account_uuid)
+        })
+    }
+
+    fn set_logins(&self, device_login: bool, added: Vec<PathBuf>) {
+        let folders = device_login
+            .then(|| self.device.clone())
+            .into_iter()
+            .chain(added.into_iter().map(ClaudeConfigDir::at));
+        self.client.set_logins(
+            folders
+                .map(|folder| Arc::new(Credentials::new(folder, self.claude.clone())))
+                .collect(),
+        );
+    }
+
+    async fn device_account(&self) -> Option<LoginAccount> {
+        login_account(&self.device).await
+    }
+
+    async fn folder_account(&self, folder: &Path) -> Option<LoginAccount> {
+        login_account(&ClaudeConfigDir::at(folder)).await
+    }
+
+    async fn sign_in(&self, folder: &Path) -> Result<LoginAccount, ProviderCloudError> {
+        let account = credentials::sign_in(&ClaudeConfigDir::at(folder), self.claude.as_deref())
             .await
-            .is_ok_and(|account| account.account_uuid == account_uuid)
+            .map_err(|e| provider_error(ApiError::Credentials(e)))?;
+        Ok(LoginAccount {
+            account_uuid: account.account_uuid,
+            email: account.email,
+        })
     }
 }
 

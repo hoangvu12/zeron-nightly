@@ -95,6 +95,11 @@ pub mod methods {
     /// read. The app calls it only while the sidebar is on screen. This
     /// device only, never forwarded.
     pub const SYNC_PROVIDER_SESSIONS: &str = "SyncProviderSessions";
+    /// "Add account" for Claude cloud sessions: `{}` → the
+    /// `GetClaudeCloudSessions` status once the official `claude auth login`
+    /// signed a new login folder in (the person finishes it in the browser;
+    /// it can take minutes). This device only, never forwarded.
+    pub const ADD_CLAUDE_CLOUD_ACCOUNT: &str = "AddClaudeCloudAccount";
     /// Which providers on this device run without their own subagents
     /// (`{switchable, off}`; set with `{harness, enabled}`).
     pub const GET_NATIVE_SUBAGENTS: &str = "GetNativeSubagents";

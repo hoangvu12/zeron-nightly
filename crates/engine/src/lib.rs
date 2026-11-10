@@ -651,7 +651,8 @@ impl EngineCore {
         .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_viewport_focus(self.viewport_focus.clone())
-        .with_plugins(self.plugins.clone());
+        .with_plugins(self.plugins.clone())
+        .with_provider_hosting(self.provider_hosting.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
