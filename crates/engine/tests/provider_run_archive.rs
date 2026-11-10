@@ -439,6 +439,18 @@ async fn unarchiving_a_chat_whose_session_was_archived_says_so_with_a_link() {
     // is archived in Zeron; the person unarchives the second before any.
     world.fake.archive(&seen);
     world.fake.archive(&unseen);
+    // At a person's pace: the chat list has shown it archived before the
+    // unarchive (an archive and unarchive within one publish of the chat
+    // list read as no change at all).
+    let mut chats = a.core.workspace.watch_chats();
+    wait_for("the chat list shows it archived", || {
+        chats
+            .borrow_and_update()
+            .iter()
+            .any(|c| c.id == unseen_chat && c.archived)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     a.set_archived(&unseen_chat, false);
     wait_for("the unarchived chat says its session is archived", || {
         a.state(&unseen_chat) == Some(archived_on_claude(&unseen))
