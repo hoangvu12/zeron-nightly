@@ -175,7 +175,7 @@ fn available() -> bool {
 /// can send a real login's token anywhere but Anthropic.
 const API_OVERRIDE_ENV: &str = "ZERON_CLAUDE_CLOUD_API";
 
-fn local_api_override() -> Option<String> {
+pub(crate) fn local_api_override() -> Option<String> {
     let url = std::env::var(API_OVERRIDE_ENV).ok()?;
     let url = url.trim().trim_end_matches('/');
     let rest = url.strip_prefix("http://")?;
