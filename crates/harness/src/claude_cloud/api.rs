@@ -59,6 +59,9 @@ pub enum ApiError {
     /// The feature turned itself off on this device (why).
     #[error("{0}")]
     Disabled(String),
+    /// Not sent: another device hosts the chat now.
+    #[error("Another device hosts this chat now.")]
+    NotHost,
 }
 
 impl ApiError {
