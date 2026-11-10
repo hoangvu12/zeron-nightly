@@ -4095,7 +4095,12 @@ impl RpcService for EngineRpc {
                             },
                         )
                         .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        .map_err(|e| match e {
+                            crate::EngineError::Capability { code, .. } => {
+                                RpcError::Capability(code.into())
+                            }
+                            other => RpcError::Failed(other.to_string()),
+                        })?;
                         return RpcReply::value(&serde_json::json!({
                             "ok": true,
                             "chatId": created.chat_id,

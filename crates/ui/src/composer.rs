@@ -35,7 +35,7 @@ use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::composer_markdown::{self, in_code};
 use crate::motion;
-use crate::notice::{NoticeChipIcon, notice_chip};
+use crate::notice::{NoticeChipIcon, notice_chip, notice_chip_with_action};
 use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
@@ -6364,6 +6364,9 @@ pub struct Composer {
     /// session navigation, which must continue to snap.
     launching_new_chat: bool,
     pub(crate) failure: Option<SharedString>,
+    /// A link the failure offers (its message, then (label, url)): shown
+    /// only while that failure is the one up.
+    failure_link: Option<(SharedString, (&'static str, &'static str))>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
     /// under their own chat — a blanket clear-on-switch erased the one
@@ -6682,6 +6685,7 @@ impl Composer {
             sending: false,
             launching_new_chat: false,
             failure: None,
+            failure_link: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
@@ -7013,6 +7017,11 @@ impl Composer {
                 .as_ref()
                 .is_none_or(|key| *key == self.current_key)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_link(&self) -> Option<(&'static str, &'static str)> {
+        self.failure_link.as_ref().map(|(_, link)| *link)
     }
 
     /// Show a dismissable failure chip for the current draft's session.
@@ -9374,7 +9383,10 @@ impl Composer {
                         });
                     }
                     Err(message) => {
-                        composer.failure = Some(message.into());
+                        let (message, link) = provider_create_failure(message);
+                        let message: SharedString = message.into();
+                        composer.failure_link = link.map(|link| (message.clone(), link));
+                        composer.failure = Some(message);
                         composer.failure_key = Some(key.clone());
                         composer.state.update(cx, |s, cx| {
                             for comment in &comments {
@@ -11638,13 +11650,37 @@ impl Render for Composer {
                 // connected), red with "Error" for send/run failures. Click
                 // dismisses.
                 let offline = message.as_ref() == "Engine not connected";
+                // A link the failure offers ("Open claude.ai").
+                let link = self
+                    .failure_link
+                    .as_ref()
+                    .filter(|(for_message, _)| *for_message == message)
+                    .map(|(_, (label, url))| {
+                        let danger = theme.danger;
+                        div()
+                            .id("composer-failure-link")
+                            .flex_none()
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .bg(danger.opacity(0.14))
+                            .text_color(theme.danger_muted)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(danger.opacity(0.22)))
+                            .on_click(move |_, _, cx| cx.open_url(url))
+                            .child(*label)
+                            .into_any_element()
+                    });
                 el.child(
-                    notice_chip(
+                    notice_chip_with_action(
                         &theme,
                         offline,
                         if offline { "Warning" } else { "Error" },
                         message,
                         NoticeChipIcon::Plain,
+                        link,
                     )
                     .id("composer-failure")
                     .mx(px(4.0))
@@ -12457,6 +12493,42 @@ mod modal_selection_tests;
 
 #[cfg(test)]
 mod attachment_chip_tests;
+
+/// What a failed "Anthropic cloud" `createChat` says, and the link it
+/// offers. An account that has never used claude.ai/code has no cloud
+/// environment Zeron can find (`provider_cloud.no_environment`): nothing was
+/// created, so it's a plain failure with a way forward, never "Creation
+/// uncertain", and nothing retries it.
+fn provider_create_failure(message: String) -> (String, Option<(&'static str, &'static str)>) {
+    if message.ends_with(zeron_rpc::capability_errors::PROVIDER_NO_ENVIRONMENT) {
+        return (
+            zeron_harness::provider_cloud::NO_ENVIRONMENT.to_owned(),
+            Some(("Open claude.ai", "https://claude.ai/code")),
+        );
+    }
+    (message, None)
+}
+
+#[cfg(test)]
+mod provider_create_failure_tests {
+    use super::*;
+
+    #[test]
+    fn no_cloud_environment_says_how_to_start_one_and_links_to_it() {
+        let error = zeron_rpc::RpcError::Capability(
+            zeron_rpc::capability_errors::PROVIDER_NO_ENVIRONMENT.into(),
+        );
+        let (message, link) = provider_create_failure(error.to_string());
+        assert_eq!(
+            message,
+            "Start one session on claude.ai/code first, then try again."
+        );
+        assert_eq!(link, Some(("Open claude.ai", "https://claude.ai/code")));
+        let (message, link) = provider_create_failure("Claude cloud returned 500".into());
+        assert_eq!(message, "Claude cloud returned 500");
+        assert_eq!(link, None);
+    }
+}
 
 #[cfg(test)]
 mod tests {

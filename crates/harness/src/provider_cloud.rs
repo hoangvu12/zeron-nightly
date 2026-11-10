@@ -36,10 +36,19 @@ pub enum ProviderCloudError {
     /// The feature turned itself off on this device (the reason).
     #[error("{0}")]
     Disabled(String),
+    /// The account has no cloud environment Zeron can find: it has never
+    /// used claude.ai/code (Zeron finds the environment from the account's
+    /// sessions and never calls the environment endpoints). Nothing was
+    /// created; never retried.
+    #[error("{NO_ENVIRONMENT}")]
+    NoEnvironment,
     /// Anything else (network, a response this build can't read).
     #[error("{0}")]
     Other(String),
 }
+
+/// What a create in an account with no cloud environment tells the person.
+pub const NO_ENVIRONMENT: &str = "Start one session on claude.ai/code first, then try again.";
 
 /// What this device's login means for one account's chats, as the last
 /// request for that account found it.

@@ -40,9 +40,17 @@ struct World {
 
 impl World {
     async fn new() -> Self {
+        let world = Self::without_sessions().await;
+        world
+            .fake
+            .seed_session(SeedSession::environment("env_fake0001"));
+        world
+    }
+
+    /// An account that has never used claude.ai/code: no sessions at all.
+    async fn without_sessions() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let fake = FakeSessionServer::start().await;
-        fake.seed_session(SeedSession::environment("env_fake0001"));
         let login = ClaudeLogin::create(tmp.path().join("claude-login"), &FakeAccount::a(), TOKEN);
         let stub = StubClaude::install(tmp.path().join("bin"), &FakeAccount::a());
         Self {
@@ -570,5 +578,70 @@ async fn an_accidental_local_launch_fails_on_its_missing_folder() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(world.fake.requests().len(), before, "nothing sent");
+    host.core.shutdown().await;
+}
+
+/// An account that has never used claude.ai/code has no cloud environment
+/// Zeron can find (it finds it from the account's sessions, and never calls
+/// the environment endpoints). Create says so in a form the app recognises
+/// ("Start one session on claude.ai/code first, then try again"), creates
+/// nothing, tries once, and leaves the feature on: it's not an uncertain
+/// creation and not a refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_with_no_cloud_environment_is_told_to_start_one_on_claude_ai() {
+    let world = World::without_sessions().await;
+    let host = world.engine();
+    let error = host
+        .client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": "client-picked-id",
+                "deviceId": host.core.device_id,
+                "config": {"harness": "claude-code-cloud", "model": null, "reasoning": null,
+                           "sandbox": "workspace-write", "access": "full-access"},
+                "prompt": FIRST_PROMPT,
+                "messageId": FIRST,
+            }),
+        )
+        .await
+        .expect_err("nothing to create in");
+    assert!(
+        matches!(&error, zeron_rpc::RpcError::Capability(code)
+            if code == zeron_rpc::capability_errors::PROVIDER_NO_ENVIRONMENT),
+        "{error:?}"
+    );
+    assert_eq!(
+        zeron_harness::provider_cloud::ProviderCloudError::NoEnvironment.to_string(),
+        "Start one session on claude.ai/code first, then try again."
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let requests = world.fake.requests();
+    assert!(world.fake.created_sessions().is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|r| !(r.method == "POST" && r.path == "/v1/code/sessions")),
+        "no create was sent"
+    );
+    assert!(
+        requests.iter().all(|r| !r.path.contains("environment")),
+        "no environment endpoint"
+    );
+    assert_eq!(
+        requests.iter().filter(|r| r.method == "GET").count(),
+        1,
+        "the session list read once, not retried"
+    );
+    assert_eq!(host.disabled().await, None, "the feature stays on");
+    assert!(
+        host.core
+            .workspace
+            .read_chats()
+            .unwrap_or_default()
+            .is_empty(),
+        "no chat was made"
+    );
     host.core.shutdown().await;
 }

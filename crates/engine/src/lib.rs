@@ -141,6 +141,14 @@ pub enum EngineError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Other(String),
+    /// A failure the app recognises by `code`
+    /// ([`zeron_rpc::capability_errors`]) and words itself; `message` is for
+    /// logs and older clients.
+    #[error("{message}")]
+    Capability {
+        code: &'static str,
+        message: String,
+    },
 }
 
 /// Epoch millis now — the doc/journal timestamp base.

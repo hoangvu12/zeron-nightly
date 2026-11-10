@@ -126,6 +126,10 @@ pub(crate) async fn create_chat(
         .await
         .map_err(|error| match error {
             ProviderCloudError::Provider { message, .. } => refused(message),
+            ProviderCloudError::NoEnvironment => EngineError::Capability {
+                code: zeron_rpc::capability_errors::PROVIDER_NO_ENVIRONMENT,
+                message: ProviderCloudError::NoEnvironment.to_string(),
+            },
             other => refused(other.to_string()),
         })?;
     let chat_id = zeron_proto::provider_cloud::chat_id_for(&session);

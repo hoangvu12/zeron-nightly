@@ -792,6 +792,11 @@ pub mod capability_errors {
     pub const TOOL_OUTPUT_UNAVAILABLE: &str = "tool_output.unavailable";
     /// `ReadToolOutput`: the command has no result yet.
     pub const TOOL_OUTPUT_NOT_FINISHED: &str = "tool_output.not_finished";
+    /// `createChat` on Anthropic cloud: the Claude account has never used
+    /// claude.ai/code, so Zeron can't find its cloud environment (it never
+    /// creates or reads environments itself). Nothing was created; the
+    /// person starts one session there, then tries again.
+    pub const PROVIDER_NO_ENVIRONMENT: &str = "provider_cloud.no_environment";
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -428,12 +428,8 @@ impl ProviderCloud for ClaudeCloudHarness {
                 break;
             }
         }
-        let environment = environment.ok_or_else(|| {
-                ProviderCloudError::Other(
-                    "This Claude account has no cloud environment yet. Open claude.ai/code once, then try again."
-                        .into(),
-                )
-            })?;
+        // An account that has never used claude.ai/code has none to find.
+        let environment = environment.ok_or(ProviderCloudError::NoEnvironment)?;
         // A GitHub project's session clones its repository at the branch
         // (no revision: the default branch). Where the session pushes its
         // work (`outcomes`) is left to the session, as "No project" leaves it.
