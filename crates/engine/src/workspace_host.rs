@@ -72,6 +72,11 @@ const RELAY_PROBE_INTERVAL_MS: u64 = 30_000;
 const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Debounce window for local snapshot saves after a change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+/// How long a provider-run chat that moved to this device waits before this
+/// device acts as its host (`WorkspaceHost::settled_host`).
+pub(crate) const PROVIDER_HOST_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// See `WorkspaceHostInner::provider_hosts`.
+type ProviderHosts = Mutex<std::collections::HashMap<String, (String, Option<std::time::Instant>)>>;
 
 /// Initial-join retry backoff (base, cap). A first registry-room join that
 /// fails must not strand the device offline until an app restart — retry until
@@ -217,6 +222,20 @@ struct WorkspaceHostInner {
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
     /// anyone's heartbeat yet, and that silence must not read as "offline".
     room_joined_at: std::sync::atomic::AtomicI64,
+    /// Provider-run chats this engine has seen (a row with a
+    /// `providerSession`, or one it created or was told of): for them a
+    /// missing row or a failed read means "not host", never "claimable"
+    /// (docs/design/provider-run-chats.md §4, "Failing closed").
+    provider_chats: Mutex<std::collections::HashSet<String>>,
+    /// Each provider-run chat's echoed host as last seen, and since when,
+    /// when it moved there from another device (`settled_host`).
+    provider_hosts: ProviderHosts,
+    /// A registry room was attached (the edge, or the test seam): rows read
+    /// before it synced may be stale.
+    room_expected: std::sync::atomic::AtomicBool,
+    /// For asking device relays whether a host is connected (the probe
+    /// task and [WorkspaceHost::relay_host_connected]).
+    relay_http: reqwest::Client,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -331,6 +350,12 @@ impl WorkspaceHost {
         })?;
 
         let state = doc.read_all()?;
+        let provider_chats = state
+            .chats
+            .iter()
+            .filter(|chat| chat.provider_session.is_some())
+            .map(|chat| chat.id.clone())
+            .collect();
         let (chats_tx, _) = watch::channel(state.chats);
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
@@ -367,6 +392,10 @@ impl WorkspaceHost {
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
+                provider_chats: Mutex::new(provider_chats),
+                provider_hosts: Mutex::default(),
+                room_expected: std::sync::atomic::AtomicBool::new(false),
+                relay_http: reqwest::Client::new(),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -416,6 +445,9 @@ impl WorkspaceHost {
         // A room will ack from here on (the test seam joins edge-less
         // hosts): queue writes again, re-seeding any folded local-only ones.
         self.mutate(|doc| doc.set_local_only(false));
+        self.inner
+            .room_expected
+            .store(true, std::sync::atomic::Ordering::Release);
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
@@ -648,7 +680,12 @@ impl WorkspaceHost {
     /// pre-heal, offline at boot), and "row absent locally" on such a view
     /// is not evidence of deletion.
     pub fn registry_synced(&self) -> bool {
-        if self.inner.config.edge.is_none() {
+        if self.inner.config.edge.is_none()
+            && !self
+                .inner
+                .room_expected
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return true;
         }
         lock(&self.inner.room)
@@ -831,15 +868,150 @@ impl WorkspaceHost {
 
     /// Writer discipline: the chat's host is its row's `deviceId`. Unknown chats
     /// are claimable — the first run command claims them via [`Self::claim_chat`].
+    ///
+    /// A provider-run chat is stricter (docs/design/provider-run-chats.md
+    /// §4): its host is the `deviceId` the room last sent, so a claim counts
+    /// only once echoed (until the room has sent the row at all, this
+    /// device's own new row counts), and a missing row or a failed read
+    /// means "not host". Until the room has answered this run
+    /// ([`Self::registry_synced`]) the local rows may be stale (another
+    /// device may have taken the chat over while this one was off), so it
+    /// hosts none.
     pub fn is_host(&self, chat_id: &str) -> bool {
-        match self.read(|doc| doc.chat(chat_id)) {
-            Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
-            Ok(None) => true,
+        let me = &self.inner.config.device_id;
+        let (row, acked) = self.read(|doc| (doc.chat(chat_id), doc.chat_host_acked(chat_id)));
+        match row {
+            Ok(Some(chat)) if self.is_provider_run(&chat) => {
+                self.note_provider_chat(chat_id);
+                if !self.registry_synced() {
+                    return false;
+                }
+                let host = acked.as_deref().unwrap_or(chat.device_id.as_str());
+                self.settled_host(chat_id, host)
+            }
+            Ok(Some(chat)) => chat.device_id == *me,
+            Ok(None) => !self.is_provider_chat(chat_id),
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
-                true
+                !self.is_provider_chat(chat_id)
             }
         }
+    }
+
+    /// Whether `host`, a provider-run chat's echoed host, makes this device
+    /// its host. A device the chat just moved to from another one hosts it
+    /// only once [`PROVIDER_HOST_SETTLE`] has passed with it still host:
+    /// devices that claimed at the same moment converge within that, so the
+    /// claimant that loses never starts work it then may not finish.
+    fn settled_host(&self, chat_id: &str, host: &str) -> bool {
+        let me = host == self.inner.config.device_id;
+        let mut seen = lock(&self.inner.provider_hosts);
+        match seen.get(chat_id) {
+            Some((last, since)) if last == host => {
+                me && since.is_none_or(|at| at.elapsed() >= PROVIDER_HOST_SETTLE)
+            }
+            previous => {
+                // First sight (boot, a new chat): as it is. A move: from now.
+                let since = previous.is_some().then(std::time::Instant::now);
+                seen.insert(chat_id.to_owned(), (host.to_owned(), since));
+                me && since.is_none()
+            }
+        }
+    }
+
+    /// The chat's host as the room last sent it, for a provider-run chat
+    /// ([`Self::is_host`]); the row's own `deviceId` until the room has sent
+    /// it. `None` without a row.
+    pub fn provider_chat_host(&self, chat_id: &str) -> Option<String> {
+        let (row, acked) = self.read(|doc| (doc.chat(chat_id), doc.chat_host_acked(chat_id)));
+        let row = row.ok().flatten()?;
+        Some(acked.unwrap_or(row.device_id))
+    }
+
+    /// Whether `chat_id` is a provider-run chat this engine knows of.
+    pub fn is_provider_chat(&self, chat_id: &str) -> bool {
+        lock(&self.inner.provider_chats).contains(chat_id)
+    }
+
+    /// Whether `chat` is a provider-run chat: its row names a provider
+    /// session, its config a provider-cloud harness (an older client's copy
+    /// that lost the session), or this engine knows it as one.
+    pub fn is_provider_run(&self, chat: &Chat) -> bool {
+        chat.provider_session.is_some()
+            || chat
+                .config
+                .as_ref()
+                .is_some_and(|c| c.harness.runs_in_provider_cloud())
+            || self.is_provider_chat(&chat.id)
+    }
+
+    /// [`Self::is_provider_run`] by id, whether or not its row is here.
+    pub fn is_provider_run_id(&self, chat_id: &str) -> bool {
+        self.is_provider_chat(chat_id)
+            || self
+                .chat(chat_id)
+                .ok()
+                .flatten()
+                .is_some_and(|chat| self.is_provider_run(&chat))
+    }
+
+    /// Remember `chat_id` as a provider-run chat (its document says so, or
+    /// it was just created here) for [`Self::is_host`].
+    pub fn note_provider_chat(&self, chat_id: &str) {
+        let mut chats = lock(&self.inner.provider_chats);
+        if !chats.contains(chat_id) {
+            chats.insert(chat_id.to_owned());
+        }
+    }
+
+    /// The row's `hostUnavailable`.
+    pub fn chat_host_unavailable(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_proto::provider_cloud::HostUnavailable> {
+        self.read(|doc| doc.chat_host_unavailable(chat_id))
+    }
+
+    /// Set or clear the row's `hostUnavailable` (a field-only update).
+    pub fn set_chat_host_unavailable(
+        &self,
+        chat_id: &str,
+        unavailable: Option<&zeron_proto::provider_cloud::HostUnavailable>,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_host_unavailable(chat_id, unavailable))?)
+    }
+
+    /// Every registry change (a local write, or a frame the room sent),
+    /// including ones that leave the published lists as they were.
+    pub fn watch_changes(&self) -> watch::Receiver<u64> {
+        self.inner.changed_tx.subscribe()
+    }
+
+    /// Whether `device_id`'s engine is connected to its device room right
+    /// now, as the relay itself tracks it (`hostConnected`; it reports a
+    /// host offline after 75 s without a ping). `None` when that can't be
+    /// asked (no edge) or got no answer.
+    pub async fn relay_host_connected(&self, device_id: &str) -> Option<bool> {
+        let edge = self.inner.config.edge.clone()?;
+        let bearer = edge.bearer().await.ok()?;
+        let url = format!(
+            "{}/device/{}/status",
+            edge.url.trim_end_matches('/'),
+            device_id
+        );
+        let response = self
+            .inner
+            .relay_http
+            .get(&url)
+            .bearer_auth(&bearer)
+            .timeout(RELAY_PROBE_TIMEOUT)
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success())?;
+        let body = response.json::<serde_json::Value>().await.ok()?;
+        body.get("hostConnected")
+            .and_then(serde_json::Value::as_bool)
     }
 
     /// Claim-on-first-command: create the chat row under OUR device id when a run
@@ -856,7 +1028,9 @@ impl WorkspaceHost {
     /// outruns createChat on the registry channel; the new row gets its own
     /// scratch folder either way.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
-        if self.read(|doc| doc.chat(chat_id))?.is_some() {
+        // A provider-run chat's row is never claimed this way: it is created
+        // with its session, and its host changes only by a host claim.
+        if self.is_provider_chat(chat_id) || self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(());
         }
         let now = Utc::now();
@@ -1084,6 +1258,7 @@ impl WorkspaceHost {
         session: &zeron_proto::ProviderSession,
     ) -> Result<(), EngineError> {
         let device_id = self.device_id().to_owned();
+        self.note_provider_chat(chat_id);
         // In a project (any device's checkout of a GitHub repository, or one
         // living at the provider), still hosted here.
         self.create_chat_row(
@@ -1430,6 +1605,13 @@ impl WorkspaceHost {
         let Some(mut chat) = self.read(|doc| doc.chat(chat_id))? else {
             return Ok(false);
         };
+        if self.is_provider_run(&chat) {
+            // Never a whole-row write (it would carry `deviceId`).
+            let at = |ms: Option<i64>| ms.and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+            return Ok(self.mutate(|doc| {
+                doc.set_chat_activity_fields(chat_id, at(last_message_at), at(created_at))
+            })?);
+        }
         if let Some(ms) = last_message_at {
             chat.last_message_at = chrono::DateTime::<Utc>::from_timestamp_millis(ms);
         }
@@ -1449,6 +1631,13 @@ impl WorkspaceHost {
         let Some(mut chat) = self.read(|doc| doc.chat(chat_id))? else {
             return Ok(false);
         };
+        if self.is_provider_run(&chat) {
+            // Its host changes only by a claim (docs/design/provider-run-chats.md
+            // §4): the device that takes it over claims it on use.
+            return Err(EngineError::Other(
+                "A Claude Code cloud chat moves to a device when it's used there; it can't be moved.".into(),
+            ));
+        }
         chat.device_id = device_id.to_string();
         self.mutate(|doc| doc.upsert_chat(&chat))?;
         Ok(true)
@@ -1624,6 +1813,14 @@ impl WorkspaceHostInner {
         match snapshot {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
+                {
+                    let mut provider_chats = lock(&self.provider_chats);
+                    for chat in state.chats.iter().filter(|c| c.provider_session.is_some()) {
+                        if !provider_chats.contains(&chat.id) {
+                            provider_chats.insert(chat.id.clone());
+                        }
+                    }
+                }
                 // Retain the latest value even with no subscribers, but don't
                 // wake every list for unrelated registry/presence changes.
                 publish_if_changed(&self.chats_tx, state.chats);
@@ -1864,7 +2061,10 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
-    let client = reqwest::Client::new();
+    let client = match weak.upgrade() {
+        Some(inner) => inner.relay_http.clone(),
+        None => return,
+    };
     loop {
         tick.tick().await;
         let Some(inner) = weak.upgrade() else { return };

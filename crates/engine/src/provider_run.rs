@@ -27,8 +27,8 @@ use std::collections::{HashMap, HashSet};
 
 use zeron_doc::{SessionCommandPayload, SessionDoc};
 use zeron_harness::provider_cloud::{
-    AccountLogin, CreateSession, ProviderChatState, ProviderCloudError, ProviderCloudStatus,
-    ProviderResume, RunBinding, SessionSource,
+    AccountLogin, CreateSession, HostCheck, ProviderChatState, ProviderCloudError,
+    ProviderCloudStatus, ProviderResume, RunBinding, SessionSource,
 };
 use zeron_proto::{Chat, ChatConfig, ChildKind, HarnessId, ProviderSession, RunRequest};
 
@@ -266,6 +266,15 @@ pub(crate) fn bind_run(
         .open(chat_id)
         .map(|handle| resume_point(handle.doc()))
         .map_err(|e| refused(format!("This chat's transcript couldn't be read: {e}")))?;
+    // Every request the run sends asks first whether this device still
+    // hosts the chat (ticket #12, design §4 "Demotion").
+    if let Some(workspace) = workspace.cloned() {
+        let chat = chat_id.to_owned();
+        cloud.check_host(
+            &session.session_id,
+            HostCheck::new(move || workspace.is_host(&chat)),
+        );
+    }
     cloud.bind_run(RunBinding {
         session,
         prompt_uuid: message_id.map(zeron_proto::provider_cloud::event_uuid),
@@ -401,9 +410,18 @@ pub(crate) fn resume_hosted_chats(sessions: &SessionsEngine, doc_host: &DocHost)
     };
     let (sessions, host) = (sessions.clone(), doc_host.clone());
     doc_host.spawn_worker(async move {
+        // Rows from before this boot may be stale (another device may have
+        // taken a chat over meanwhile): only once the room has answered.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !workspace.registry_synced() {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         let chats = workspace.read_chats().unwrap_or_default();
         for chat in chats {
-            if chat.device_id != host.device_id() || chat.provider_session.is_none() {
+            if chat.provider_session.is_none() || !workspace.is_host(&chat.id) {
                 continue;
             }
             let unfinished = host
@@ -489,14 +507,16 @@ fn record_states(
 ) {
     let mut hosted = HashSet::new();
     for chat in chats {
-        if chat.device_id != host.device_id() {
-            continue;
-        }
         let Some(session) = &chat.provider_session else {
             continue;
         };
+        if !host.workspace().is_some_and(|ws| ws.is_host(&chat.id)) {
+            continue;
+        }
         hosted.insert(chat.id.as_str());
-        let state = match status.accounts.get(&session.account_uuid) {
+        let login = status.accounts.get(&session.account_uuid).copied();
+        crate::provider_host::publish_host_unavailable(host, &chat.id, login);
+        let state = match login {
             Some(AccountLogin::Works) => None,
             Some(AccountLogin::SignInAgain) => Some(ProviderChatState::SignInAgain {
                 email: session.account_email.clone(),
