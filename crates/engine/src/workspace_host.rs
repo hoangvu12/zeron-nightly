@@ -76,8 +76,7 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// device acts as its host (`WorkspaceHost::settled_host`).
 pub(crate) const PROVIDER_HOST_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 /// See `WorkspaceHostInner::provider_hosts`.
-type ProviderHosts =
-    Mutex<std::collections::HashMap<String, (String, Option<std::time::Instant>)>>;
+type ProviderHosts = Mutex<std::collections::HashMap<String, (String, Option<std::time::Instant>)>>;
 
 /// Initial-join retry backoff (base, cap). A first registry-room join that
 /// fails must not strand the device offline until an app restart — retry until
@@ -234,6 +233,9 @@ struct WorkspaceHostInner {
     /// A registry room was attached (the edge, or the test seam): rows read
     /// before it synced may be stale.
     room_expected: std::sync::atomic::AtomicBool,
+    /// For asking device relays whether a host is connected (the probe
+    /// task and [WorkspaceHost::relay_host_connected]).
+    relay_http: reqwest::Client,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -393,6 +395,7 @@ impl WorkspaceHost {
                 provider_chats: Mutex::new(provider_chats),
                 provider_hosts: Mutex::default(),
                 room_expected: std::sync::atomic::AtomicBool::new(false),
+                relay_http: reqwest::Client::new(),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -892,13 +895,19 @@ impl WorkspaceHost {
     /// §4): its host is the `deviceId` the room last sent, so a claim counts
     /// only once echoed (until the room has sent the row at all, this
     /// device's own new row counts), and a missing row or a failed read
-    /// means "not host".
+    /// means "not host". Until the room has answered this run
+    /// ([`Self::registry_synced`]) the local rows may be stale (another
+    /// device may have taken the chat over while this one was off), so it
+    /// hosts none.
     pub fn is_host(&self, chat_id: &str) -> bool {
         let me = &self.inner.config.device_id;
         let (row, acked) = self.read(|doc| (doc.chat(chat_id), doc.chat_host_acked(chat_id)));
         match row {
-            Ok(Some(chat)) if chat.provider_session.is_some() || self.is_provider_chat(chat_id) => {
+            Ok(Some(chat)) if self.is_provider_run(&chat) => {
                 self.note_provider_chat(chat_id);
+                if !self.registry_synced() {
+                    return false;
+                }
                 let host = acked.as_deref().unwrap_or(chat.device_id.as_str());
                 self.settled_host(chat_id, host)
             }
@@ -946,6 +955,28 @@ impl WorkspaceHost {
         lock(&self.inner.provider_chats).contains(chat_id)
     }
 
+    /// Whether `chat` is a provider-run chat: its row names a provider
+    /// session, its config a provider-cloud harness (an older client's copy
+    /// that lost the session), or this engine knows it as one.
+    pub fn is_provider_run(&self, chat: &Chat) -> bool {
+        chat.provider_session.is_some()
+            || chat
+                .config
+                .as_ref()
+                .is_some_and(|c| c.harness.runs_in_provider_cloud())
+            || self.is_provider_chat(&chat.id)
+    }
+
+    /// [`Self::is_provider_run`] by id, whether or not its row is here.
+    pub fn is_provider_run_id(&self, chat_id: &str) -> bool {
+        self.is_provider_chat(chat_id)
+            || self
+                .chat(chat_id)
+                .ok()
+                .flatten()
+                .is_some_and(|chat| self.is_provider_run(&chat))
+    }
+
     /// Remember `chat_id` as a provider-run chat (its document says so, or
     /// it was just created here) for [`Self::is_host`].
     pub fn note_provider_chat(&self, chat_id: &str) {
@@ -990,7 +1021,9 @@ impl WorkspaceHost {
             edge.url.trim_end_matches('/'),
             device_id
         );
-        let response = reqwest::Client::new()
+        let response = self
+            .inner
+            .relay_http
             .get(&url)
             .bearer_auth(&bearer)
             .timeout(RELAY_PROBE_TIMEOUT)
@@ -999,7 +1032,8 @@ impl WorkspaceHost {
             .ok()
             .filter(|r| r.status().is_success())?;
         let body = response.json::<serde_json::Value>().await.ok()?;
-        body.get("hostConnected").and_then(serde_json::Value::as_bool)
+        body.get("hostConnected")
+            .and_then(serde_json::Value::as_bool)
     }
 
     /// Claim-on-first-command: create the chat row under OUR device id when a run
@@ -1581,7 +1615,7 @@ impl WorkspaceHost {
         let Some(mut chat) = self.read(|doc| doc.chat(chat_id))? else {
             return Ok(false);
         };
-        if chat.provider_session.is_some() || self.is_provider_chat(chat_id) {
+        if self.is_provider_run(&chat) {
             // Never a whole-row write (it would carry `deviceId`).
             let at = |ms: Option<i64>| ms.and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
             return Ok(self.mutate(|doc| {
@@ -1607,9 +1641,12 @@ impl WorkspaceHost {
         let Some(mut chat) = self.read(|doc| doc.chat(chat_id))? else {
             return Ok(false);
         };
-        if chat.provider_session.is_some() || self.is_provider_chat(chat_id) {
-            // A provider-run chat's row is never rewritten whole.
-            return Ok(self.mutate(|doc| doc.set_chat_device(chat_id, device_id))?);
+        if self.is_provider_run(&chat) {
+            // Its host changes only by a claim (docs/design/provider-run-chats.md
+            // §4): the device that takes it over claims it on use.
+            return Err(EngineError::Other(
+                "A Claude Code cloud chat moves to a device when it's used there; it can't be moved.".into(),
+            ));
         }
         chat.device_id = device_id.to_string();
         self.mutate(|doc| doc.upsert_chat(&chat))?;
@@ -2034,7 +2071,10 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
-    let client = reqwest::Client::new();
+    let client = match weak.upgrade() {
+        Some(inner) => inner.relay_http.clone(),
+        None => return,
+    };
     loop {
         tick.tick().await;
         let Some(inner) = weak.upgrade() else { return };

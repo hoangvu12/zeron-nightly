@@ -21,7 +21,7 @@ use zeron_doc::{
 use zeron_engine::{DocHost, EngineCore, HarnessRegistry, HostPresence, WorkspaceHost};
 use zeron_harness::claude_cloud::credentials::ClaudeConfigDir;
 use zeron_harness::claude_cloud::{ClaudeCloudConfig, ClaudeCloudHarness};
-use zeron_proto::provider_cloud::ProviderChatState;
+use zeron_proto::provider_cloud::{HostUnavailableReason, ProviderChatState};
 use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 use zeron_provider_fake::{
     ClaudeLogin, FakeAccount, FakeSessionServer, SeedSession, StubClaude, Turn,
@@ -64,18 +64,23 @@ impl HostPresence for FakeRelay {
 
 /// Exchanges every provider-run chat's document updates between devices
 /// that are both connected, like the chat rooms do.
+type Bridged = Vec<(String, DocHost, WorkspaceHost)>;
+
 struct DocBridge {
     cut: Arc<Mutex<HashSet<String>>>,
+    devices: Arc<Mutex<Bridged>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl DocBridge {
-    fn start(devices: Vec<(String, DocHost, WorkspaceHost)>) -> Self {
+    fn start(devices: Bridged) -> Self {
         let cut: Arc<Mutex<HashSet<String>>> = Arc::default();
-        let off = cut.clone();
+        let devices = Arc::new(Mutex::new(devices));
+        let (off, all) = (cut.clone(), devices.clone());
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                let devices = all.lock().unwrap().clone();
                 let mut chats: HashSet<String> = HashSet::new();
                 for (_, _, workspace) in &devices {
                     for chat in workspace.read_chats().unwrap_or_default() {
@@ -100,7 +105,16 @@ impl DocBridge {
                 }
             }
         });
-        Self { cut, task }
+        Self { cut, devices, task }
+    }
+
+    /// `device` restarted: bridge its new engine instead.
+    fn replace(&self, device: &str, doc_host: DocHost, workspace: WorkspaceHost) {
+        for entry in self.devices.lock().unwrap().iter_mut() {
+            if entry.0 == device {
+                *entry = (device.to_owned(), doc_host.clone(), workspace.clone());
+            }
+        }
     }
 
     fn set_connected(&self, device: &str, connected: bool) {
@@ -135,11 +149,40 @@ fn exchange(a: &loro::LoroDoc, b: &loro::LoroDoc) {
 
 struct Device {
     id: String,
+    kind: Kind,
+    data: std::path::PathBuf,
     login: ClaudeLogin,
     core: EngineCore,
     client: zeron_rpc::RpcClient,
-    _stub: StubClaude,
+    stub: StubClaude,
     _tmp: tempfile::TempDir,
+}
+
+/// A device's engine on its data folder, with its harnesses and the fake
+/// relay.
+fn engine(
+    fake: &FakeSessionServer,
+    relay: &Arc<FakeRelay>,
+    data: &std::path::Path,
+    login: &ClaudeLogin,
+    stub: &StubClaude,
+    kind: Kind,
+) -> EngineCore {
+    let registry = HarnessRegistry::new();
+    if let Kind::Cloud(_) = kind {
+        registry.register(Arc::new(
+            ClaudeCloudHarness::new(ClaudeCloudConfig {
+                base_url: fake.base_url().to_owned(),
+                login: ClaudeConfigDir::at(login.dir()),
+                claude_executable: Some(stub.path().to_owned()),
+            })
+            .expect("harness builds"),
+        ));
+    }
+    let core = EngineCore::assemble(data, Arc::new(registry), HarnessId::ClaudeCodeCloud, None)
+        .expect("engine core assembles");
+    core.provider_hosting.set_presence(relay.clone());
+    core
 }
 
 /// What a device can do with provider-run chats.
@@ -173,17 +216,6 @@ async fn fleet(devices: &[(&str, &str, Kind)]) -> Fleet {
         };
         let login = ClaudeLogin::create(tmp.path().join("claude-login"), &account, &token(id));
         let stub = StubClaude::install(tmp.path().join("bin"), &account);
-        let registry = HarnessRegistry::new();
-        if let Kind::Cloud(_) = kind {
-            registry.register(Arc::new(
-                ClaudeCloudHarness::new(ClaudeCloudConfig {
-                    base_url: fake.base_url().to_owned(),
-                    login: ClaudeConfigDir::at(login.dir()),
-                    claude_executable: Some(stub.path().to_owned()),
-                })
-                .expect("harness builds"),
-            ));
-        }
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(data.join("device-id"), id).unwrap();
@@ -197,10 +229,7 @@ async fn fleet(devices: &[(&str, &str, Kind)]) -> Fleet {
                 })
                 .expect("setting saves");
         }
-        let core =
-            EngineCore::assemble(&data, Arc::new(registry), HarnessId::ClaudeCodeCloud, None)
-                .expect("engine core assembles");
-        core.provider_hosting.set_presence(relay.clone());
+        let core = engine(&fake, &relay, &data, &login, &stub, *kind);
         core.workspace.connect_registry_url(&room.url());
         let client = zeron_rpc::memory_client(core.rpc_service());
         client
@@ -212,10 +241,12 @@ async fn fleet(devices: &[(&str, &str, Kind)]) -> Fleet {
             .expect("rename device");
         out.push(Device {
             id: (*id).to_owned(),
+            kind: *kind,
+            data,
             login,
             core,
             client,
-            _stub: stub,
+            stub,
             _tmp: tmp,
         });
     }
@@ -300,6 +331,39 @@ impl Fleet {
             .core
             .workspace
             .connect_registry_url(&self.room.url());
+    }
+
+    /// Quit `id`'s engine and start it again on the same data, joining the
+    /// registry room at `registry_url` (its chat rooms stay as they were).
+    async fn restart(&mut self, id: &str, registry_url: &str) {
+        let at = self.devices.iter().position(|d| d.id == id).unwrap();
+        let Device {
+            id,
+            kind,
+            data,
+            login,
+            core,
+            client,
+            stub,
+            _tmp,
+        } = self.devices.swap_remove(at);
+        core.shutdown().await;
+        drop((core, client));
+        let core = engine(&self.fake, &self.relay, &data, &login, &stub, kind);
+        core.workspace.connect_registry_url(registry_url);
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        self.bridge
+            .replace(&id, core.doc_host.clone(), core.workspace.clone());
+        self.devices.push(Device {
+            id,
+            kind,
+            data,
+            login,
+            core,
+            client,
+            stub,
+            _tmp,
+        });
     }
 
     /// Every event payload sent to the session with `device`'s token.
@@ -436,6 +500,17 @@ impl Device {
             .expect("queue message");
     }
 
+    /// How many uses of provider-run chats this device has decided about.
+    fn decisions(&self) -> u64 {
+        *self.core.provider_hosting.watch_decisions().borrow()
+    }
+
+    /// Wait until this device has decided about `n` more uses than `from`.
+    async fn decided(&self, from: u64, n: u64) {
+        let rx = self.core.provider_hosting.watch_decisions();
+        wait_for("the use decided", || *rx.borrow() >= from + n).await;
+    }
+
     /// The person opens the chat on this device.
     async fn open(&self, chat: &str) {
         self.client
@@ -543,9 +618,22 @@ async fn an_eligible_host_online_keeps_the_chat_and_nothing_moves_it_in_the_back
     assert_eq!(laptop.host_of(&chat).as_deref(), Some(PC));
     assert!(laptop.notes(&chat).is_empty());
 
-    // The PC goes away, but nobody uses the chat: it stays where it is.
+    // The PC goes away, but nobody uses the chat: it stays where it is. (A
+    // rename from the laptop makes every device's registry move on once, so
+    // the hosts were looked at again.)
     fleet.go_offline(PC);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    laptop
+        .core
+        .workspace
+        .rename_chat(&chat, "Renamed while the PC is away")
+        .unwrap();
+    wait_for("the rename in the room", || {
+        fleet
+            .room
+            .row("chats", &chat)
+            .is_some_and(|r| r.fields["title"] == "Renamed while the PC is away")
+    })
+    .await;
     assert_eq!(laptop.host_of(&chat).as_deref(), Some(PC));
     assert_eq!(
         fleet.room.row("chats", &chat).unwrap().fields["deviceId"],
@@ -630,8 +718,8 @@ async fn two_devices_claiming_at_once_converge_and_the_session_hears_each_messag
         !other.core.sessions.has_run(&chat)
     })
     .await;
+    // The claimant that lost never started: one note, the winner's.
     wait_for("the note", || !host.notes(&chat).is_empty()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(host.notes(&chat).len(), 1, "{:?}", host.notes(&chat));
     fleet.shutdown().await;
 }
@@ -665,17 +753,19 @@ async fn a_demoted_host_that_reconnects_stops_at_once_and_keeps_away() {
     // Used on the PC now: the laptop is online and eligible, so it keeps
     // the chat, and the PC sends nothing.
     fleet.fake.queue_turn(Turn::text_zulu());
+    let decided = pc.decisions();
     pc.open(&chat).await;
     pc.send(&chat, &cwd, THIRD, "Again: the single word ZULU.");
     wait_for("the reply on the laptop", || {
         laptop.replies(&chat) >= 3 && laptop.settled(&chat)
     })
     .await;
+    // Both uses on the PC were decided: neither moved the chat.
+    pc.decided(decided, 2).await;
     assert_eq!(fleet.stored_messages(&session, THIRD), 1);
     assert!(fleet.posted_by(LAPTOP).iter().any(|p| p["uuid"] == THIRD));
     assert_eq!(fleet.posted_by(PC).len(), pc_posts);
     assert!(!pc.core.sessions.has_run(&chat));
-    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         fleet.room.row("chats", &chat).unwrap().fields["deviceId"],
         LAPTOP
@@ -690,11 +780,14 @@ async fn a_host_without_the_capability_is_taken_over_on_use() {
     let (chat, cwd, session) = chat_on(&fleet, LAPTOP).await;
     let (old, laptop) = (fleet.device(PC), fleet.device(LAPTOP));
 
-    // An older build ends up host (a tool moved it there).
-    old.core
-        .workspace
-        .set_chat_host(&chat, PC)
-        .expect("move the chat");
+    // An older build ends up host (written straight to the row, as an old
+    // tool or an old claim-on-first-command could).
+    assert!(
+        old.core
+            .workspace
+            .claim_chat_host(&chat, chrono::Utc::now())
+            .expect("move the chat")
+    );
     wait_for("the old PC hosting", || {
         laptop.host_of(&chat).as_deref() == Some(PC) && !laptop.core.sessions.has_run(&chat)
     })
@@ -706,7 +799,7 @@ async fn a_host_without_the_capability_is_taken_over_on_use() {
     wait_for("the note", || !laptop.notes(&chat).is_empty()).await;
     assert_eq!(
         laptop.notes(&chat),
-        vec!["Continued here, Old PC can't run Claude cloud chats."]
+        vec!["Continued here, Old PC can't run Claude Code cloud chats."]
     );
     fleet.fake.queue_turn(Turn::text_zulu());
     laptop.send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
@@ -734,7 +827,7 @@ async fn a_host_signed_into_another_account_says_so_and_hands_the_chat_over() {
             .core
             .workspace
             .chat_host_unavailable(&chat)
-            .is_some_and(|u| u.device_id == PC && u.reason == "account")
+            .is_some_and(|u| u.device_id == PC && u.reason == HostUnavailableReason::Account)
     })
     .await;
     assert_eq!(fleet.stored_messages(&session, SECOND), 0);
@@ -775,12 +868,34 @@ async fn with_no_device_able_to_host_the_chat_shows_sign_in_as() {
     ])
     .await;
     let (chat, cwd, session) = chat_on(&fleet, PC).await;
-    let laptop = fleet.device(LAPTOP);
+    let (pc, laptop) = (fleet.device(PC), fleet.device(LAPTOP));
 
     // The only device with the chat's login is off; the laptop has another
-    // account's.
+    // account's. The PC could still run it: the chat waits for it, and says
+    // nothing about signing in.
     fleet.go_offline(PC);
-    laptop.send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
+    let decided = laptop.decisions();
+    laptop.open(&chat).await;
+    laptop.decided(decided, 1).await;
+    assert_eq!(laptop.state(&chat), None);
+    assert_eq!(laptop.host_of(&chat).as_deref(), Some(PC));
+
+    // Back, but signed into another account: it says it can't host the
+    // chat. Now no device can.
+    fleet.come_back(PC);
+    pc.login.set_account(&FakeAccount::b());
+    pc.send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
+    wait_for("hostUnavailable on the laptop", || {
+        laptop
+            .core
+            .workspace
+            .chat_host_unavailable(&chat)
+            .is_some_and(|u| u.device_id == PC)
+    })
+    .await;
+    let decided = laptop.decisions();
+    laptop.open(&chat).await;
+    laptop.decided(decided, 1).await;
     wait_for("Sign in as", || {
         laptop.state(&chat)
             == Some(ProviderChatState::SignInAs {
@@ -788,10 +903,52 @@ async fn with_no_device_able_to_host_the_chat_shows_sign_in_as() {
             })
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(laptop.host_of(&chat).as_deref(), Some(PC));
     assert_eq!(fleet.requests_by(LAPTOP), 0);
     assert_eq!(fleet.stored_messages(&session, SECOND), 0);
+    fleet.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_demoted_host_restarting_with_commands_waiting_sends_nothing() {
+    let mut fleet = fleet(&[(PC, "PC", cloud_a()), (LAPTOP, "Laptop", cloud_a())]).await;
+    let (chat, cwd, session) = chat_on(&fleet, PC).await;
+
+    // The PC goes away and the laptop takes the chat over.
+    fleet.go_offline(PC);
+    fleet.fake.queue_turn(Turn::text_zulu());
+    fleet
+        .device(LAPTOP)
+        .send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
+    wait_for("the laptop hosting and replying", || {
+        let laptop = fleet.device(LAPTOP);
+        laptop.hosts(&chat) && laptop.replies(&chat) == 2 && laptop.settled(&chat)
+    })
+    .await;
+    let pc_posts = fleet.posted_by(PC).len();
+
+    // The PC restarts, its rows still naming it host, and its registry room
+    // not answering yet. A message typed there waits.
+    fleet.restart(PC, "ws://127.0.0.1:9").await;
+    fleet.fake.queue_turn(Turn::text_zulu());
+    let pc = fleet.device(PC);
+    assert_eq!(pc.host_of(&chat).as_deref(), Some(PC), "stale rows");
+    let decided = pc.decisions();
+    pc.send(&chat, &cwd, THIRD, "Again: the single word ZULU.");
+    pc.decided(decided, 1).await;
+    assert!(!pc.core.sessions.has_run(&chat));
+
+    // The room answers: the laptop hosts it, and runs the waiting message.
+    fleet.come_back(PC);
+    let (pc, laptop) = (fleet.device(PC), fleet.device(LAPTOP));
+    wait_for("the PC's message answered on the laptop", || {
+        fleet.stored_messages(&session, THIRD) == 1 && laptop.settled(&chat)
+    })
+    .await;
+    assert!(fleet.posted_by(LAPTOP).iter().any(|p| p["uuid"] == THIRD));
+    assert_eq!(fleet.posted_by(PC).len(), pc_posts, "the PC sent nothing");
+    assert!(!pc.core.sessions.has_run(&chat));
+    assert_eq!(pc.host_of(&chat).as_deref(), Some(LAPTOP));
     fleet.shutdown().await;
 }
 
@@ -822,6 +979,29 @@ async fn the_host_refuses_forks_and_side_chats_of_a_provider_run_chat() {
     for id in ["fork-1", "side-1"] {
         assert!(pc.core.workspace.chat(id).unwrap().is_none(), "{id}");
     }
+    fleet.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_run_chat_moves_only_by_a_claim() {
+    let fleet = fleet(&[(PC, "PC", cloud_a()), (LAPTOP, "Laptop", cloud_a())]).await;
+    let (chat, _cwd, _session) = chat_on(&fleet, PC).await;
+    let pc = fleet.device(PC);
+
+    // The SetChatHost tool (any client) can't move it.
+    let moved = pc
+        .client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({"op": "setChatHost", "chatId": chat, "deviceId": LAPTOP}),
+        )
+        .await;
+    assert!(moved.is_err(), "{moved:?}");
+    assert_eq!(pc.host_of(&chat).as_deref(), Some(PC));
+    assert_eq!(
+        fleet.room.row("chats", &chat).unwrap().fields["deviceId"],
+        PC
+    );
     fleet.shutdown().await;
 }
 

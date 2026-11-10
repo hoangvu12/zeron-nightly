@@ -1,26 +1,33 @@
 //! Hosting provider-run chats across devices (docs/design/provider-run-chats.md
 //! §4, ticket #12): takeover on use, the claim, and demotion.
 //!
-//! - **Eligible.** This engine advertises `provider-run-v1` while the
-//!   `claude-code-cloud` harness is on, and can host a chat when it also has
-//!   a login for the chat's account ([`ProviderCloud::has_login`]).
-//! - **Takeover on use** ([`ProviderHosting::used`]): when the person opens
-//!   or sends to a provider-run chat here, and its host is offline (the
+//! - **Eligible.** This engine can host provider-run chats while the
+//!   `claude-code-cloud` harness is on (the device row then advertises
+//!   `provider-run-v1`, `crate::claude_cloud_sessions`), and a given chat when
+//!   it also has a login for the chat's account (`ProviderCloud::has_login`).
+//!   A device that isn't eligible never acts on a chat.
+//! - **Takeover on use** ([`ProviderHosting::on_chat_used`]): when the person
+//!   opens or sends to a provider-run chat here, and its host is offline (the
 //!   relay's own view, [`HostPresence`]), lacks the capability, or said it
 //!   can't host it (`hostUnavailable`), an eligible device claims it. Nothing
 //!   moves a chat in the background, and an eligible host online keeps it.
-//!   When this device can't host the chat either, the chat shows "Sign in as
-//!   <email> to continue".
+//!   - When this device has no login for the chat's account either, and the
+//!     host lacks the capability or said it can't host it, no device can:
+//!     the chat shows "Sign in as <email> to continue". A host that is only
+//!     offline keeps the chat waiting for it.
 //! - **The claim** writes `deviceId` alone, clocked past the field's current
 //!   clock ([`WorkspaceHost::claim_chat_host`]). Work starts only once the
-//!   room echoes the merged row with this device as host
-//!   ([`WorkspaceHost::is_host`] reads the echoed row): queued commands
-//!   drain, the run resumes from the transcript's watermark, and the
-//!   transcript says "Continued here, <device> was offline".
+//!   room echoes the merged row with this device as host and the settle wait
+//!   ([`PROVIDER_HOST_SETTLE`]) has passed with it still host
+//!   ([`WorkspaceHost::is_host`]): every takeover costs that wait, so two
+//!   devices claiming at once never both start. Then queued commands drain,
+//!   the run resumes from the transcript's watermark, and the transcript
+//!   says "Continued here, <device> was offline".
 //! - **Demotion.** The moment the echoed host is another device, this
 //!   device's run ends (closing the stream never interrupts the session),
 //!   the drain stops (it asks `is_host`), and every request a run would
-//!   still send asks first ([`ProviderCloud::check_host`]).
+//!   still send asks first (`ProviderCloud::check_host`). After a restart,
+//!   nothing is hosted until the room has answered.
 //! - **hostUnavailable.** A host whose login can't act for a chat's account
 //!   says so on the row ([`publish_host_unavailable`]), and clears it once
 //!   its login works again; a new host clears it on taking over.
@@ -32,12 +39,12 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use zeron_harness::provider_cloud::{AccountLogin, ProviderChatState};
-use zeron_proto::provider_cloud::{HOST_UNAVAILABLE_ACCOUNT, HostUnavailable};
+use zeron_proto::provider_cloud::{HostUnavailable, HostUnavailableReason};
 use zeron_proto::{HarnessId, ProviderSession};
 
 use crate::doc_host::DocHost;
 use crate::sessions::SessionsEngine;
-use crate::workspace_host::WorkspaceHost;
+use crate::workspace_host::{PROVIDER_HOST_SETTLE, WorkspaceHost};
 
 /// The capability an engine that can host provider-run chats advertises.
 pub use zeron_proto::capabilities::PROVIDER_RUN_V1;
@@ -48,9 +55,6 @@ const CLAIM_TTL: Duration = Duration::from_secs(60);
 /// A claim's clock is at least this far ahead of now
 /// (docs/design/provider-run-chats.md §4).
 const CLAIM_LEAD: chrono::Duration = chrono::Duration::seconds(5);
-/// How long a device whose claim was echoed waits for a competing claim to
-/// land before it starts work (see `became_host`).
-const CLAIM_SETTLE: Duration = Duration::from_secs(5);
 
 /// Whether a device is online, as the relay sees it: its `host_offline`
 /// signal (no ping for 75 s). Tests stand in a fake relay.
@@ -84,7 +88,7 @@ impl HostPresence for RelayPresence {
 /// Why the current host isn't hosting the chat, as the device taking it over
 /// tells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Why {
+enum TakeoverReason {
     Offline,
     /// It lacks `provider-run-v1` (an older build, or the feature is off).
     Ineligible,
@@ -95,7 +99,7 @@ enum Why {
 #[derive(Debug, Clone)]
 struct Claim {
     from: String,
-    why: Why,
+    reason: TakeoverReason,
     at: tokio::time::Instant,
 }
 
@@ -112,6 +116,9 @@ struct Inner {
     presence: RwLock<Arc<dyn HostPresence>>,
     /// Takeovers claimed here and not yet echoed, by chat.
     claims: Mutex<HashMap<String, Claim>>,
+    /// Counts the uses of provider-run chats decided here
+    /// ([`ProviderHosting::watch_decisions`]).
+    decisions: tokio::sync::watch::Sender<u64>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -134,6 +141,7 @@ impl ProviderHosting {
                 workspace,
                 presence: RwLock::new(presence),
                 claims: Mutex::default(),
+                decisions: tokio::sync::watch::channel(0).0,
             }),
         }
     }
@@ -155,9 +163,7 @@ impl ProviderHosting {
             .clone()
     }
 
-    /// Follow the chats' hosts for as long as the engine runs. (The device
-    /// row's `provider-run-v1` follows the "Claude cloud sessions" setting,
-    /// `crate::claude_cloud_sessions`.)
+    /// Follow the chats' hosts for as long as the engine runs.
     pub(crate) fn start(&self) {
         let hosting = self.clone();
         self.inner
@@ -165,28 +171,41 @@ impl ProviderHosting {
             .spawn_worker(async move { hosting.follow_hosts().await });
     }
 
+    /// How many uses of provider-run chats this engine has finished deciding
+    /// about ([`Self::on_chat_used`]), as it changes.
+    pub fn watch_decisions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.decisions.subscribe()
+    }
+
     /// The person opened or sent to `chat_id` on this device: take it over
     /// when its host can't host it (see module docs). Returns at once.
-    pub fn used(&self, chat_id: &str) {
-        let workspace = &self.inner.workspace;
-        let provider = workspace.is_provider_chat(chat_id)
-            || workspace
-                .chat(chat_id)
-                .ok()
-                .flatten()
-                .is_some_and(|chat| chat.provider_session.is_some());
-        if !provider {
+    pub fn on_chat_used(&self, chat_id: &str) {
+        if !self.inner.workspace.is_provider_run_id(chat_id) {
             return;
         }
         let hosting = self.clone();
         let chat = chat_id.to_owned();
         self.inner.doc_host.spawn_worker(async move {
             hosting.consider(&chat).await;
+            hosting.inner.decisions.send_modify(|n| *n += 1);
         });
     }
 
-    /// Decide whether to take `chat_id` over (see [`Self::used`]).
+    /// Whether this engine can host provider-run chats at all: the
+    /// `claude-code-cloud` harness is on.
+    fn eligible_engine(&self) -> bool {
+        self.inner
+            .sessions
+            .registry()
+            .resolve(HarnessId::ClaudeCodeCloud)
+            .is_ok_and(|harness| harness.provider_cloud().is_some())
+    }
+
+    /// Decide whether to take `chat_id` over (see [`Self::on_chat_used`]).
     async fn consider(&self, chat_id: &str) {
+        if !self.eligible_engine() {
+            return; // an older build, or the feature off here: hands off
+        }
         let workspace = &self.inner.workspace;
         let me = workspace.device_id().to_owned();
         let Some(row) = workspace.chat(chat_id).ok().flatten() else {
@@ -214,22 +233,25 @@ impl ProviderHosting {
         {
             return; // waiting for the room's echo
         }
-        let Some(why) = self.why_not_hosting(chat_id, &host).await else {
+        let Some(reason) = self.why_not_hosting(chat_id, &host).await else {
             return; // an eligible host is online: it keeps the chat
         };
         if !self.can_host_here(&session).await {
-            // Neither the host nor this device can run it.
-            self.show_sign_in_as(chat_id, &session);
+            // A host that is only offline keeps the chat waiting for it. One
+            // that can't run it, with no login for it here either: nobody can.
+            if reason != TakeoverReason::Offline {
+                self.show_sign_in_as(chat_id, &session);
+            }
             return;
         }
         match workspace.claim_chat_host(chat_id, chrono::Utc::now() + CLAIM_LEAD) {
             Ok(true) => {
-                tracing::info!(chat = %chat_id, from = %host, ?why, "claiming the provider-run chat");
+                tracing::info!(chat = %chat_id, from = %host, ?reason, "claiming the provider-run chat");
                 lock(&self.inner.claims).insert(
                     chat_id.to_owned(),
                     Claim {
                         from: host,
-                        why,
+                        reason,
                         at: tokio::time::Instant::now(),
                     },
                 );
@@ -241,13 +263,13 @@ impl ProviderHosting {
 
     /// Why `host` isn't hosting `chat_id` right now; `None` when it is an
     /// eligible device that is online.
-    async fn why_not_hosting(&self, chat_id: &str, host: &str) -> Option<Why> {
+    async fn why_not_hosting(&self, chat_id: &str, host: &str) -> Option<TakeoverReason> {
         let workspace = &self.inner.workspace;
         if workspace
             .chat_host_unavailable(chat_id)
             .is_some_and(|unavailable| unavailable.device_id == host)
         {
-            return Some(Why::CantHost);
+            return Some(TakeoverReason::CantHost);
         }
         let capable = workspace
             .read_devices()
@@ -255,10 +277,10 @@ impl ProviderHosting {
             .iter()
             .any(|d| d.id == host && d.capabilities.iter().any(|c| c == PROVIDER_RUN_V1));
         if !capable {
-            return Some(Why::Ineligible);
+            return Some(TakeoverReason::Ineligible);
         }
         if !self.presence().online(host).await {
-            return Some(Why::Offline);
+            return Some(TakeoverReason::Offline);
         }
         None
     }
@@ -279,8 +301,7 @@ impl ProviderHosting {
         cloud.has_login(&session.account_uuid).await
     }
 
-    /// "Sign in as <email> to continue": no device that could host the chat
-    /// is hosting it, and this one has no login for its account.
+    /// "Sign in as <email> to continue" (see module docs).
     fn show_sign_in_as(&self, chat_id: &str, session: &ProviderSession) {
         let state = ProviderChatState::SignInAs {
             email: session.account_email.clone(),
@@ -305,16 +326,23 @@ impl ProviderHosting {
         let mut hosts: HashMap<String, Option<String>> = HashMap::new();
         let mut first = true;
         loop {
+            // Until the room has answered this run, no host is known (and
+            // `is_host` hosts nothing).
+            let synced = workspace.registry_synced();
             let chats = workspace.read_chats().unwrap_or_default();
             let mut seen: HashMap<String, Option<String>> = HashMap::new();
             for chat in &chats {
-                if chat.provider_session.is_none() && !workspace.is_provider_chat(&chat.id) {
+                if !workspace.is_provider_run(chat) {
                     continue;
                 }
-                let host = workspace
-                    .is_host(&chat.id)
-                    .then(|| me.clone())
-                    .or_else(|| workspace.provider_chat_host(&chat.id));
+                let host = if synced {
+                    workspace
+                        .is_host(&chat.id)
+                        .then(|| me.clone())
+                        .or_else(|| workspace.provider_chat_host(&chat.id))
+                } else {
+                    None
+                };
                 seen.insert(chat.id.clone(), host);
             }
             // Chats whose row went away while hosted here: not host now.
@@ -329,11 +357,13 @@ impl ProviderHosting {
                 let hosts_now = host.as_deref() == Some(me.as_str());
                 if hosts_now && !hosted_before {
                     // A claim echoed (or the room moved the chat here). A
-                    // chat first seen hosted here (created here, or at boot)
-                    // starts as it always did.
+                    // chat first seen hosted here (created here, or the room
+                    // answering after a restart) runs what waited for that.
                     let claimed = lock(&self.inner.claims).remove(chat);
                     if !first && (before.is_some() || claimed.is_some()) {
                         self.became_host(chat, before, claimed);
+                    } else if !first {
+                        self.drain(chat);
                     }
                 } else if hosted_before && !hosts_now {
                     self.demoted(chat, host.clone());
@@ -368,22 +398,13 @@ impl ProviderHosting {
         self.inner.doc_host.spawn_worker(async move {
             let inner = &hosting.inner;
             let workspace = &inner.workspace;
-            // Devices that claimed at the same moment converge within the
-            // room's round trip: this device acts as host (drains, sends)
-            // only once that has passed with it still host
-            // (`WorkspaceHost::is_host`), so the losing claimant never
-            // starts work it then may not finish.
-            let deadline = tokio::time::Instant::now() + CLAIM_SETTLE;
-            loop {
-                if workspace.is_host(&chat) {
-                    break;
-                }
-                let still_ours =
-                    workspace.provider_chat_host(&chat).as_deref() == Some(workspace.device_id());
-                if !still_ours || tokio::time::Instant::now() >= deadline {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            // The settle wait every takeover costs: devices that claimed at
+            // the same moment converge within it, and `is_host` says yes only
+            // once it has passed with this device still host, so the losing
+            // claimant never starts work it then may not finish.
+            tokio::time::sleep(PROVIDER_HOST_SETTLE + Duration::from_millis(50)).await;
+            if !workspace.is_host(&chat) {
+                return;
             }
             if workspace.chat_host_unavailable(&chat).is_some()
                 && let Err(error) = workspace.set_chat_host_unavailable(&chat, None)
@@ -432,7 +453,7 @@ impl ProviderHosting {
             .map(|d| d.name)
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "the other device".to_owned());
-        let text = takeover_note(&name, claim.why);
+        let text = takeover_note(&name, claim.reason);
         let now = chrono::Utc::now().timestamp_millis();
         let id = format!("takeover:{}:{now}", self.inner.workspace.device_id());
         let entry = SessionMessageEntry {
@@ -450,6 +471,17 @@ impl ProviderHosting {
         }
     }
 
+    /// Run `chat_id`'s waiting commands (this device hosts it).
+    fn drain(&self, chat_id: &str) {
+        let doc_host = self.inner.doc_host.clone();
+        let chat = chat_id.to_owned();
+        self.inner.doc_host.spawn_worker(async move {
+            if let Ok(handle) = doc_host.open(&chat) {
+                doc_host.drain_commands(&handle).await;
+            }
+        });
+    }
+
     /// Another device hosts `chat_id` now (or nobody can tell): stop
     /// mirroring and sending. Closing the run never interrupts the session.
     fn demoted(&self, chat_id: &str, to: Option<String>) {
@@ -465,11 +497,13 @@ impl ProviderHosting {
 }
 
 /// The quiet note a takeover leaves in the transcript.
-fn takeover_note(device: &str, why: Why) -> String {
-    match why {
-        Why::Offline => format!("Continued here, {device} was offline."),
-        Why::Ineligible => format!("Continued here, {device} can't run Claude cloud chats."),
-        Why::CantHost => format!("Continued here, {device} couldn't host this chat."),
+fn takeover_note(device: &str, reason: TakeoverReason) -> String {
+    match reason {
+        TakeoverReason::Offline => format!("Continued here, {device} was offline."),
+        TakeoverReason::Ineligible => {
+            format!("Continued here, {device} can't run Claude Code cloud chats.")
+        }
+        TakeoverReason::CantHost => format!("Continued here, {device} couldn't host this chat."),
     }
 }
 
@@ -490,7 +524,7 @@ pub(crate) fn publish_host_unavailable(
     let write = match login {
         Some(AccountLogin::CantHost) if !names_me => Some(Some(HostUnavailable {
             device_id: me.to_owned(),
-            reason: HOST_UNAVAILABLE_ACCOUNT.to_owned(),
+            reason: HostUnavailableReason::Account,
         })),
         Some(AccountLogin::Works) if names_me => Some(None),
         _ => None,
@@ -509,9 +543,13 @@ mod tests {
     #[test]
     fn the_note_names_the_device_and_why() {
         assert_eq!(
-            takeover_note("PC", Why::Offline),
+            takeover_note("PC", TakeoverReason::Offline),
             "Continued here, PC was offline."
         );
-        assert!(takeover_note("PC", Why::CantHost).starts_with("Continued here, PC "));
+        assert_eq!(
+            takeover_note("PC", TakeoverReason::Ineligible),
+            "Continued here, PC can't run Claude Code cloud chats."
+        );
+        assert!(takeover_note("PC", TakeoverReason::CantHost).starts_with("Continued here, PC "));
     }
 }
