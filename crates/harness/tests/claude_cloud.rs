@@ -834,11 +834,13 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     assert_eq!(sent[0]["type"], "user");
 
     // The plan command executed again by a device that knows nothing of the
-    // session (another host, or this one after a restart) doesn't know the
-    // person changed anything, so it sends no setting: only the message,
-    // under the same uuid, which the provider ignores.
+    // session (another host, or this one after a restart): its delivery is
+    // uncertain, so the history is read first, and it has the message, so
+    // nothing goes (no message, and no setting the person never changed
+    // there).
     let stored = rig.fake.stored_events(&sid).len();
     let posts = event_posts(&rig).len();
+    let reads = history_reads(&rig);
     let other = ClaudeCloudHarness::new(ClaudeCloudConfig {
         base_url: rig.fake.base_url().to_owned(),
         login: ClaudeConfigDir::at(rig.login.dir()),
@@ -852,11 +854,9 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     });
     let (controls, _steer, _interrupt) = crate::controls();
     let again = other.run(plan, controls).await.unwrap();
-    wait("the repeat sent", || event_posts(&rig).len() > posts).await;
-    let sent = payloads_of(event_posts(&rig).last().unwrap());
-    let uuids: Vec<&str> = sent.iter().map(|p| p["uuid"].as_str().unwrap()).collect();
-    assert_eq!(uuids, vec![SECOND]);
+    wait("the history read", || history_reads(&rig) > reads).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(event_posts(&rig).len(), posts, "nothing sent again");
     assert_eq!(rig.fake.stored_events(&sid).len(), stored);
     assert_eq!(
         rig.fake.permission_mode(&sid).as_deref(),
@@ -864,6 +864,15 @@ async fn model_permission_and_plan_changes_go_as_control_requests_ahead_of_their
     );
     assert!(!rig.fake.turn_playing(&sid));
     drop(again);
+}
+
+/// History reads (`GET …/events`, not the stream) the server got.
+fn history_reads(rig: &Rig) -> usize {
+    rig.fake
+        .requests()
+        .iter()
+        .filter(|r| r.method == "GET" && r.path.ends_with("/events"))
+        .count()
 }
 
 #[tokio::test]

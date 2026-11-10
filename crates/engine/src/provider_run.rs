@@ -230,6 +230,13 @@ pub(crate) fn bind_run(
 /// over again. The run then mirrors whatever the session does, and the
 /// chat's next message goes to it.
 ///
+/// Messages whose delivery is uncertain ([`uncertain_sends`]: sent from
+/// Zeron, by this device before a crash or by a host that went away, and
+/// never echoed by the session) go again instead, under their own ids (so
+/// their original uuids): the oldest opens the run, whose harness reads the
+/// session's history for it first and sends it only if it isn't there; the
+/// others follow it as steers (ticket #13).
+///
 /// `Ok(false)`: a run is already live for the chat (nothing to do).
 /// Refused for a chat with no provider session, or when provider-run chats
 /// are off here. Whether this device should host the chat is the caller's
@@ -250,6 +257,38 @@ pub(crate) async fn resume_as_host(
         .doc()
         .sweep_provider_duplicates()
         .map_err(|e| refused(format!("This chat's transcript couldn't be cleaned up: {e}")))?;
+    let uncertain = uncertain_sends(handle.doc());
+    if let Some((first, rest)) = uncertain.split_first() {
+        let config = chat_config(workspace, chat_id);
+        let request = run_request(
+            &config,
+            zeron_proto::provider_cloud::claude_cwd(&session.session_id),
+            first.text.clone(),
+        );
+        tracing::info!(chat = %chat_id, messages = uncertain.len(), "sending again what may not have arrived");
+        doc_host
+            .dispatch_with_source_context(
+                sessions,
+                chat_id,
+                HarnessId::ClaudeCodeCloud,
+                request,
+                Some(first.message_id.clone()),
+            )
+            .await?;
+        for message in rest {
+            let now = chrono::Utc::now().timestamp_millis();
+            sessions
+                .steer_now(
+                    chat_id,
+                    &message.text,
+                    Vec::new(),
+                    Some(message.message_id.clone()),
+                    now,
+                )
+                .await?;
+        }
+        return Ok(true);
+    }
     bind_run(
         sessions.registry(),
         workspace,
@@ -258,7 +297,20 @@ pub(crate) async fn resume_as_host(
         chat_id,
         None,
     )?;
-    let config = workspace
+    let config = chat_config(workspace, chat_id);
+    let request = run_request(
+        &config,
+        zeron_proto::provider_cloud::claude_cwd(&session.session_id),
+        String::new(),
+    );
+    sessions.start_provider_resume(chat_id, request).await?;
+    Ok(true)
+}
+
+/// The chat's configuration, from its row (a default one when the row has
+/// none).
+fn chat_config(workspace: Option<&WorkspaceHost>, chat_id: &str) -> ChatConfig {
+    workspace
         .and_then(|ws| ws.chat(chat_id).ok().flatten())
         .and_then(|chat| chat.config)
         .unwrap_or_else(|| ChatConfig {
@@ -269,14 +321,63 @@ pub(crate) async fn resume_as_host(
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             access: Default::default(),
             plan: false,
-        });
-    let request = run_request(
-        &config,
-        zeron_proto::provider_cloud::claude_cwd(&session.session_id),
-        String::new(),
-    );
-    sessions.start_provider_resume(chat_id, request).await?;
-    Ok(true)
+        })
+}
+
+/// A message sent to a provider-run chat from Zeron whose delivery is
+/// uncertain ([`uncertain_sends`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UncertainSend {
+    pub message_id: String,
+    pub text: String,
+}
+
+/// The messages this chat sent from Zeron (a Run or Steer command that went
+/// through) that the session never echoed, after the last entry it did echo
+/// or write: the device sending them may have died before, or right after,
+/// the session got them. Oldest first. A message the transcript shows
+/// answered is past (its echo or reply is stamped), and so is a failed send
+/// (its command didn't go through; the person retries it).
+pub(crate) fn uncertain_sends(doc: &SessionDoc) -> Vec<UncertainSend> {
+    let stamped: HashSet<String> = doc
+        .provider_entries()
+        .into_iter()
+        .filter(|entry| entry.provider_uuid.is_some())
+        .map(|entry| entry.id)
+        .collect();
+    let sent: HashMap<String, String> = doc
+        .read_commands()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|command| command.status == zeron_doc::SessionCommandStatus::Applied)
+        .filter_map(|command| match command.payload {
+            SessionCommandPayload::Run {
+                message_id,
+                request,
+            } => Some((message_id, request.prompt)),
+            SessionCommandPayload::Steer {
+                message_id: Some(message_id),
+                prompt,
+            } => Some((message_id, prompt)),
+            _ => None,
+        })
+        .collect();
+    let entries = doc.read_entries().unwrap_or_default();
+    let after = entries
+        .iter()
+        .rposition(|entry| stamped.contains(&entry.id))
+        .map_or(0, |at| at + 1);
+    entries[after..]
+        .iter()
+        .filter(|entry| entry.role == zeron_doc::MessageRole::User)
+        .filter_map(|entry| {
+            let text = sent.get(&entry.id)?;
+            Some(UncertainSend {
+                message_id: entry.id.clone(),
+                text: text.clone(),
+            })
+        })
+        .collect()
 }
 
 /// A provider-run chat's run in configuration `config`.
@@ -361,9 +462,10 @@ pub(crate) fn resume_hosted_chats(sessions: &SessionsEngine, doc_host: &DocHost)
             if chat.provider_session.is_none() || !workspace.is_host(&chat.id) {
                 continue;
             }
-            let unfinished = host
-                .open(&chat.id)
-                .is_ok_and(|handle| mirror_unfinished(handle.doc()));
+            // Cut off mid-turn, or with a send that may not have arrived.
+            let unfinished = host.open(&chat.id).is_ok_and(|handle| {
+                mirror_unfinished(handle.doc()) || !uncertain_sends(handle.doc()).is_empty()
+            });
             if !unfinished {
                 continue;
             }

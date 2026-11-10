@@ -864,3 +864,57 @@ async fn two_messages_drained_together_after_a_takeover_are_answered() {
     .await;
     fleet.shutdown().await;
 }
+
+/// The host dies while its send is on the way (ticket #13), before the
+/// session stored it or after: the device taking the chat over finds the
+/// message's delivery uncertain, reads the session's history for it, and
+/// sends it under its uuid only if it isn't there. The session has it once,
+/// and the reply shows on the new host.
+async fn host_dies_mid_send(stored_first: bool) {
+    let fleet = fleet(&[(PC, "PC", cloud_a()), (LAPTOP, "Laptop", cloud_a())]).await;
+    let (chat, cwd, session) = chat_on(&fleet, PC).await;
+    let (pc, laptop) = (fleet.device(PC), fleet.device(LAPTOP));
+    let uuid = zeron_proto::provider_cloud::event_uuid(SECOND);
+
+    fleet.fake.queue_turn(Turn::text_zulu());
+    let _held = if stored_first {
+        fleet.fake.hold_next_ack()
+    } else {
+        fleet.fake.hold_next_post()
+    };
+    pc.send(&chat, &cwd, SECOND, "Reply with the single word ZULU.");
+    wait_for("the send on its way, and its entry everywhere", || {
+        fleet.posted_by(PC).iter().any(|p| p["uuid"] == uuid)
+            && laptop.entries(&chat).iter().any(|e| e.id == SECOND)
+    })
+    .await;
+    fleet.go_offline(PC);
+    pc.core.shutdown().await;
+
+    laptop.open(&chat).await;
+    wait_for("the reply on the laptop", || {
+        laptop.hosts(&chat)
+            && laptop.settled(&chat)
+            && laptop
+                .entries(&chat)
+                .iter()
+                .rev()
+                .find(|e| e.role != MessageRole::System)
+                .is_some_and(|e| e.role == MessageRole::Assistant && text_of(e).contains("ZULU"))
+    })
+    .await;
+    assert_eq!(fleet.stored_messages(&session, &uuid), 1);
+    let entries = laptop.entries(&chat);
+    assert_eq!(entries.iter().filter(|e| e.id == SECOND).count(), 1);
+    fleet.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_dying_before_its_send_was_stored_is_covered_by_the_new_host() {
+    host_dies_mid_send(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_dying_before_its_send_was_acknowledged_is_covered_by_the_new_host() {
+    host_dies_mid_send(true).await;
+}

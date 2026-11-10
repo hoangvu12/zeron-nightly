@@ -46,9 +46,9 @@ use zeron_proto::{AgentEvent, HarnessId, ProviderPrompt};
 
 use super::api::StreamItem;
 use super::{PermissionMode, Settings};
-use crate::provider_cloud::ProviderResume;
 use crate::claude::normalize::Normalizer;
 use crate::claude::wire::{ControlRequestBody, ControlRequestFrame, parse_frame};
+use crate::provider_cloud::ProviderResume;
 
 /// What the session's control traffic means for the run.
 #[derive(Debug)]
@@ -147,6 +147,12 @@ impl Mirror {
 
     pub fn last_seq(&self) -> u64 {
         self.last_seq
+    }
+
+    /// Stored events up to here were in the transcript before the run
+    /// started: the run shows nothing of them again.
+    pub fn mirrored_through(&self) -> u64 {
+        self.mirrored_through
     }
 
     /// The run interrupted the turn: it ends `Interrupted`, whatever its

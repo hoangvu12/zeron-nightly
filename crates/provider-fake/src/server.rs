@@ -230,6 +230,10 @@ struct Inner {
     rejected_tokens: std::collections::HashSet<String>,
     /// Gates the next event posts wait on before they are accepted.
     post_holds: VecDeque<Gate>,
+    /// Gates the next event posts' answers wait on, once stored.
+    ack_holds: VecDeque<Gate>,
+    /// Statuses the next event posts are answered with, once stored.
+    lost_acks: VecDeque<u16>,
 }
 
 impl Inner {
@@ -333,6 +337,22 @@ impl FakeSessionServer {
         let gate = Gate::default();
         lock(&self.state).post_holds.push_back(gate.clone());
         gate
+    }
+
+    /// The next `POST …/events` is accepted and stored as usual, but its
+    /// answer waits until the returned gate is released: a sender that dies
+    /// meanwhile never learns its events arrived.
+    pub fn hold_next_ack(&self) -> Gate {
+        let gate = Gate::default();
+        lock(&self.state).ack_holds.push_back(gate.clone());
+        gate
+    }
+
+    /// The next `POST …/events` is accepted and stored as usual, but
+    /// answered with `status` (a gateway timing out after the session got
+    /// the events, say).
+    pub fn lose_next_ack(&self, status: u16) {
+        lock(&self.state).lost_acks.push_back(status);
     }
 
     pub fn inject(&self, fault: Fault) {
@@ -542,7 +562,24 @@ async fn handle(state: State, req: Request<Incoming>) -> Result<Response<Body>, 
             Some(session) => json_response(StatusCode::OK, session.info.clone()),
             None => not_found(),
         },
-        ("POST", ["v1", "code", "sessions", id, "events"]) => post_events(&state, id, body),
+        ("POST", ["v1", "code", "sessions", id, "events"]) => {
+            let response = post_events(&state, id, body);
+            let (hold, lost) = {
+                let mut inner = lock(&state);
+                (inner.ack_holds.pop_front(), inner.lost_acks.pop_front())
+            };
+            if let Some(gate) = hold {
+                gate.pass().await;
+            }
+            match lost {
+                Some(status) => error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    "api_error",
+                    "the answer was lost",
+                ),
+                None => response,
+            }
+        }
         ("GET", ["v1", "code", "sessions", id, "events"]) => history(&state, id, &recorded),
         ("GET", ["v1", "code", "sessions", id, "events", "stream"]) => {
             stream(&state, id, &recorded)

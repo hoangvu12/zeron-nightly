@@ -352,6 +352,82 @@ async fn answered_in_history(
     Ok(false)
 }
 
+/// The first stored event after `after` that `wanted` picks, by its sequence
+/// number; `None` when the history (as far as [`HISTORY_PAGES`] reach) has
+/// none.
+async fn find_in_history(
+    client: &CloudClient,
+    session: &ProviderSession,
+    after: u64,
+    wanted: impl Fn(&Value) -> bool,
+) -> Result<Option<u64>, ApiError> {
+    let account = account_of(session);
+    let mut cursor = after.to_string();
+    for _ in 0..HISTORY_PAGES {
+        let page =
+            with_retries(|| client.history(&account, &session.session_id, Some(&cursor))).await?;
+        if let Some(found) = page.data.iter().find(|event| {
+            event.sequence_num.is_some_and(|seq| seq > after) && wanted(&event.payload)
+        }) {
+            return Ok(found.sequence_num);
+        }
+        match page.resume_cursor {
+            Some(next) if !page.data.is_empty() && next != cursor => cursor = next,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// Where the history has the event sent under `uuid`, looking after `after`.
+async fn stored_at(
+    client: &CloudClient,
+    session: &ProviderSession,
+    uuid: &str,
+    after: u64,
+) -> Result<Option<u64>, ApiError> {
+    find_in_history(client, session, after, |payload| {
+        payload.get("uuid").and_then(Value::as_str) == Some(uuid)
+    })
+    .await
+}
+
+/// The end of the turn that ran for a message stored at `seq`: the first
+/// `result` after it that no queued turn continues.
+async fn turn_end_after(
+    client: &CloudClient,
+    session: &ProviderSession,
+    seq: u64,
+) -> Result<Option<u64>, ApiError> {
+    find_in_history(client, session, seq, |payload| {
+        payload.get("type").and_then(Value::as_str) == Some("result")
+            && payload
+                .get("queued_turn_count")
+                .and_then(Value::as_u64)
+                .is_none_or(|n| n == 0)
+    })
+    .await
+}
+
+/// The session already had a message (stored at `seq`), so it started no
+/// turn for it now. `true` when the turn it did run for it is over, its end
+/// at or before `shown` (what the run has shown, or skipped as already in
+/// the transcript): nothing more is coming for it.
+async fn answered_already(
+    client: &CloudClient,
+    session: &ProviderSession,
+    seq: u64,
+    shown: u64,
+) -> bool {
+    match turn_end_after(client, session, seq).await {
+        Ok(end) => end.is_some_and(|end| end <= shown),
+        Err(error) => {
+            tracing::warn!(target: "zeron_harness::claude_cloud", %error, "turn state unknown");
+            false
+        }
+    }
+}
+
 /// End the run quietly: another device hosts the chat now, and the session
 /// works on there.
 async fn demoted(events: &Events) {
@@ -381,18 +457,17 @@ fn close_all(open: &mut HashMap<String, OpenPrompt>) {
 impl RunSession {
     /// Send `payloads`, while this device still hosts the chat (asked
     /// before every request; design §4).
-    async fn post(&mut self, payloads: Vec<Value>) -> Result<(), ApiError> {
+    async fn post(&mut self, payloads: Vec<Value>) -> Result<Vec<EventAck>, ApiError> {
         if !payloads.is_empty() && !self.bindings.hosts(&self.session.session_id) {
             return Err(ApiError::NotHost);
         }
-        post(&self.client, &self.bindings, &self.session, payloads)
-            .await
-            .map(drop)
+        post(&self.client, &self.bindings, &self.session, payloads).await
     }
 
     /// Send `message` now (with the settings it changed ahead of it),
-    /// starting a new assistant message after it.
-    async fn deliver(&mut self, message: SteerMessage) -> Result<(), String> {
+    /// starting a new assistant message after it. `Ok(false)`: the session
+    /// had it already and its turn is over, so no turn runs for it.
+    async fn deliver(&mut self, message: SteerMessage) -> Result<bool, String> {
         let (prev, next) = self.mirror.rotate_for_steer();
         if !send(
             &self.events,
@@ -427,20 +502,31 @@ impl RunSession {
             &self.session.session_id,
             &message.prompt,
         ));
-        if let Err(error) = self.post(payloads).await {
-            if matches!(error, ApiError::NotHost) {
+        let acks = match self.post(payloads).await {
+            Ok(acks) => acks,
+            Err(ApiError::NotHost) => {
                 demoted(&self.events).await;
                 return Err(String::new());
             }
-            return Err(error.to_string());
-        }
+            Err(error) => return Err(error.to_string()),
+        };
         let session_id = &self.session.session_id;
         if let Some(after) = after {
             self.bindings.note_actual(session_id, after);
         }
         self.bindings
             .note_ran_with(session_id, settings_of(&self.config));
-        Ok(())
+        // A repeat (a retry of a send that did arrive) starts no turn.
+        let repeat = acks
+            .last()
+            .filter(|ack| ack.duplicate)
+            .and_then(|ack| ack.sequence_num);
+        Ok(match repeat {
+            Some(seq) => {
+                !answered_already(&self.client, &self.session, seq, self.mirror.last_seq()).await
+            }
+            None => true,
+        })
     }
 
     /// Decide prompt `request_id` the way the local Claude Code harness
@@ -475,8 +561,24 @@ impl RunSession {
         let session_id = self.session.session_id.clone();
         let (mut opening, opening_actual) = std::mem::take(&mut self.opening_changes);
         let prompted = self.opening.is_some();
+        // Whether the session has the opening prompt already (its delivery
+        // was uncertain: a crash, a lost answer, another device's send) is
+        // read from its history first; a prompt found there (with the
+        // settings that rode it) isn't sent again.
+        let mut found = None;
         if let Some((uuid, prompt)) = self.opening.take() {
-            opening.push(user_payload(&uuid, &session_id, &prompt));
+            match stored_at(&self.client, &self.session, &uuid, self.mirror.last_seq()).await {
+                Ok(Some(seq)) => {
+                    found = Some(seq);
+                    opening.clear();
+                }
+                Ok(None) => opening.push(user_payload(&uuid, &session_id, &prompt)),
+                Err(error) => {
+                    // The uuid is the server's dedupe key: sending is safe.
+                    tracing::warn!(target: "zeron_harness::claude_cloud", %error, "history check failed");
+                    opening.push(user_payload(&uuid, &session_id, &prompt));
+                }
+            }
         }
         // A turn whose end is stored before this run's opening prompt is an
         // earlier one (a replay catching the transcript up, or turns run
@@ -486,9 +588,19 @@ impl RunSession {
             demoted(&self.events).await;
             return;
         }
-        let floor = match post(&self.client, &self.bindings, &self.session, opening).await {
-            Ok(acks) if prompted => acks.last().and_then(|ack| ack.sequence_num).unwrap_or(0),
-            Ok(_) => 0,
+        // `repeat`: the session had the prompt already, so it started no
+        // turn for this run.
+        let (floor, repeat) = match post(&self.client, &self.bindings, &self.session, opening).await
+        {
+            Ok(_) if let Some(seq) = found => (seq, true),
+            Ok(acks) if prompted => {
+                let last = acks.last();
+                (
+                    last.and_then(|ack| ack.sequence_num).unwrap_or(0),
+                    last.is_some_and(|ack| ack.duplicate),
+                )
+            }
+            Ok(_) => (0, false),
             Err(error) => {
                 fail(&self.events, error.to_string(), true).await;
                 return;
@@ -506,6 +618,22 @@ impl RunSession {
         // Request ids with a `control_response` in the mirrored history.
         let mut responded: HashSet<String> = HashSet::new();
         let mut turn_active = !self.idle;
+        // The turn the session ran for a repeated prompt is over and was in
+        // the transcript already: this run's turn ends at once, empty.
+        if repeat
+            && answered_already(
+                &self.client,
+                &self.session,
+                floor,
+                self.mirror.mirrored_through(),
+            )
+            .await
+        {
+            if !send(&self.events, done(DoneStatus::Completed, None)).await {
+                return;
+            }
+            turn_active = false;
+        }
         let mut steering_open = true;
         let mut stop_deadline: Option<Instant> = None;
         // Reconnects spent, when the stream last came up, and when the next
@@ -561,7 +689,7 @@ impl RunSession {
                         continue 'main;
                     }
                     match self.post(vec![answer_payload(&request_id, response)]).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             open.remove(&request_id);
                             responded.insert(request_id);
                         }
@@ -726,15 +854,23 @@ impl RunSession {
                     }
                 },
                 steer = self.controls.steering.recv(), if steering_open && stop_deadline.is_none() => match steer {
-                    Some(message) => {
-                        if let Err(error) = self.deliver(message).await {
+                    Some(message) => match self.deliver(message).await {
+                        Ok(true) => turn_active = true,
+                        // Nothing runs for it: a parked chat parks again.
+                        Ok(false) => {
+                            if !turn_active
+                                && !send(&self.events, done(DoneStatus::Completed, None)).await
+                            {
+                                break 'main;
+                            }
+                        }
+                        Err(error) => {
                             if !error.is_empty() {
                                 fail(&self.events, error, true).await;
                             }
                             break 'main;
                         }
-                        turn_active = true;
-                    }
+                    },
                     None => {
                         steering_open = false;
                         if !turn_active {
