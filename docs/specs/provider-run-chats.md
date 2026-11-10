@@ -152,7 +152,7 @@ Observed semantics the design relies on:
 **Commands.**
 - **Messages, interrupts and settings changes** use the Zeron command id as the event `uuid`. An uncertain delivery is always retried with its original uuid, after checking the history for it.
 - **Prompt answers** use a UUIDv5 of the `request_id`, and are only sent while that request has no response in the mirrored history.
-- **Create** is synchronous on the user's device and never queued or retried automatically. It carries a tag `zeron:<chatId>`. If the response is lost, Zeron pages the list for the tag, and failing that shows "Creation uncertain" with a user-only "Create again".
+- **Create** is synchronous on the user's device and never queued or retried automatically. It carries a tag `zeron:<first prompt uuid>` (the chat id is a UUIDv5 of the session id, so it doesn't exist before the create succeeds; the first prompt's uuid is chosen first and is also the first event's uuid). If the response is lost, Zeron pages the list for the tag and adopts the session it finds, and failing that shows "Creation uncertain" with a link to claude.ai and a user-only "Create again", which makes a new create under a new first-prompt uuid.
 
 **Transcript mirroring.**
 - Each mirrored entry carries its provider `uuid` and `sequence_num`.
