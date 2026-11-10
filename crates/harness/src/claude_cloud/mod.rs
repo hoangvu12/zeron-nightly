@@ -57,6 +57,12 @@ pub fn enabled() -> bool {
 const ENVIRONMENT_PAGES: usize = 10;
 const ENVIRONMENT_PAGE_SIZE: usize = 50;
 
+/// Whether the provider keeps the custom tag a create sends
+/// (`zeron:<first prompt uuid>`), so a create whose answer was lost can be
+/// found by it. Without it, such a create goes straight to "Creation
+/// uncertain". Checked against the real API once (ticket #11).
+const TAGS_KEPT: bool = true;
+
 /// The session list's page size, and the most pages one read follows.
 const LIST_PAGE_SIZE: usize = 20;
 const LIST_PAGES: usize = 25;
@@ -381,6 +387,37 @@ fn provider_error(error: ApiError) -> ProviderCloudError {
     }
 }
 
+/// A create's failure: [`ProviderCloudError::Uncertain`] when the session
+/// may exist (the request went out and no answer said what happened: a
+/// dropped connection or timeout, a server failure, or an answer that
+/// couldn't be read); otherwise what [`provider_error`] says, nothing having
+/// been created (a refusal, a login problem, or no connection at all).
+fn create_error(error: ApiError) -> ProviderCloudError {
+    let uncertain = match &error {
+        ApiError::Transport(_) | ApiError::Decode(_) => true,
+        ApiError::Status { status, .. } => *status == 408 || (500..600).contains(status),
+        _ => false,
+    };
+    if uncertain {
+        ProviderCloudError::Uncertain(format!(
+            "Zeron couldn't tell whether Claude created the session ({error})."
+        ))
+    } else {
+        provider_error(error)
+    }
+}
+
+/// Session `id` of `account`.
+fn session_of(id: String, account: &credentials::ClaudeAccount) -> ProviderSession {
+    ProviderSession {
+        provider: zeron_proto::provider_cloud::CLAUDE.to_owned(),
+        session_id: id,
+        account_uuid: account.account_uuid.clone(),
+        account_email: account.email.clone(),
+        org_id: account.org_id.clone(),
+    }
+}
+
 #[async_trait]
 impl ProviderCloud for ClaudeCloudHarness {
     async fn create_session(
@@ -423,27 +460,90 @@ impl ProviderCloud for ClaudeCloudHarness {
         if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
             config["model"] = json!(model);
         }
-        let body = json!({
+        let mut body = json!({
             "title": request.title.clone().unwrap_or_else(|| zeron_proto::provider_cloud::title_from_prompt(&request.prompt)),
             "environment_id": environment,
             "events": [{ "payload": session::user_payload(&request.prompt_uuid, "", &request.prompt) }],
             "config": config,
         });
+        if TAGS_KEPT {
+            body["tags"] = json!([zeron_proto::provider_cloud::create_tag(&request.prompt_uuid)]);
+        }
         let created = self
             .client
             .create_session(&account, &body)
             .await
-            .map_err(provider_error)?;
-        let session = ProviderSession {
-            provider: zeron_proto::provider_cloud::CLAUDE.to_owned(),
-            session_id: created.id,
-            account_uuid: account.account_uuid,
-            account_email: account.email,
-            org_id: account.org_id,
-        };
+            .map_err(create_error)?;
+        let session = session_of(created.id, &account);
         self.bindings
             .created(session.clone(), request.prompt_uuid, request.model);
         Ok(session)
+    }
+
+    async fn find_created(
+        &self,
+        prompt_uuid: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ProviderSession>, ProviderCloudError> {
+        if !TAGS_KEPT {
+            return Ok(None);
+        }
+        let account = self
+            .client
+            .credentials()
+            .account()
+            .await
+            .map_err(|e| provider_error(ApiError::Credentials(e)))?;
+        let tag = zeron_proto::provider_cloud::create_tag(prompt_uuid);
+        let mut cursor: Option<String> = None;
+        for _ in 0..LIST_PAGES {
+            let page = self
+                .client
+                .list_sessions(&account, LIST_PAGE_SIZE, cursor.as_deref())
+                .await
+                .map_err(provider_error)?;
+            let mut reached_older = page.data.is_empty();
+            for info in page.data {
+                if info.tags.iter().any(|t| *t == tag) && !info.id.is_empty() {
+                    let session = session_of(info.id, &account);
+                    // Every session starts on the model it was created with;
+                    // which one is unknown here, so no model change is assumed.
+                    self.bindings
+                        .created(session.clone(), prompt_uuid.to_owned(), None);
+                    return Ok(Some(session));
+                }
+                let last = parse_time(info.last_event_at.as_deref())
+                    .or_else(|| parse_time(info.created_at.as_deref()));
+                if last.is_some_and(|at| at < since) {
+                    // Newest activity first: the create's session (whose first
+                    // event is no older than the attempt) can't come later.
+                    reached_older = true;
+                }
+            }
+            cursor = page.next_cursor.filter(|c| !c.is_empty());
+            if reached_older || cursor.is_none() {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    async fn archive_session(&self, session: &ProviderSession) -> Result<(), ProviderCloudError> {
+        self.client
+            .archive(&session::account_of(session), &session.session_id)
+            .await
+            .map_err(provider_error)
+    }
+
+    async fn session_archived(
+        &self,
+        session: &ProviderSession,
+    ) -> Result<bool, ProviderCloudError> {
+        self.client
+            .session(&session::account_of(session), &session.session_id)
+            .await
+            .map(|info| info.archived())
+            .map_err(provider_error)
     }
 
     async fn list_sessions(

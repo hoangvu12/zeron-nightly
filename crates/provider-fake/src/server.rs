@@ -228,6 +228,10 @@ struct Inner {
     faults: Vec<Fault>,
     /// Bearer tokens the server refuses with 401 (revoked or expired).
     rejected_tokens: std::collections::HashSet<String>,
+    /// Creates still to make whose answer is then lost.
+    lost_creates: usize,
+    /// Whether a create keeps the custom tags it was sent (on by default).
+    keep_tags: bool,
 }
 
 impl Inner {
@@ -269,7 +273,10 @@ impl FakeSessionServer {
             .await
             .expect("fake session server binds");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let state: State = Arc::default();
+        let state: State = Arc::new(Mutex::new(Inner {
+            keep_tags: true,
+            ..Inner::default()
+        }));
         let accepting = state.clone();
         let accept = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
@@ -364,6 +371,46 @@ impl FakeSessionServer {
         if let Some(session) = lock(&self.state).session(session_id) {
             session.info["status"] = json!("archived");
         }
+    }
+
+    /// Resume an archived session on claude.ai: it is active again, and
+    /// `prompt` is its next message (which plays the next queued turn).
+    pub fn resume_elsewhere(&self, session_id: &str, prompt: &str) {
+        let mut inner = lock(&self.state);
+        let Some(session) = inner.session(session_id) else {
+            return;
+        };
+        session.info["status"] = json!("active");
+        let payload = json!({
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "session_id": session_id,
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": prompt},
+        });
+        let _ = accept_events(&self.state, &mut inner, session_id, vec![payload]);
+    }
+
+    /// The next `times` creates make their session, but their answer is
+    /// lost on the way back (the client sees a 502).
+    pub fn lose_create_answers(&self, times: usize) {
+        lock(&self.state).lost_creates = times;
+    }
+
+    /// Whether creates keep the custom tags they're sent (they do unless
+    /// told otherwise).
+    pub fn keep_tags(&self, keep: bool) {
+        lock(&self.state).keep_tags = keep;
+    }
+
+    /// The archive requests served so far (`POST …/archive`), by session id.
+    pub fn archive_requests(&self) -> Vec<String> {
+        lock(&self.state)
+            .requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/archive"))
+            .filter_map(|r| r.path.trim_matches('/').split('/').nth(3).map(str::to_owned))
+            .collect()
     }
 
     /// Rename a session, as claude.ai's rename does.
@@ -666,6 +713,19 @@ fn create(state: &State, body: Value) -> Response<Body> {
         .as_str()
         .unwrap_or_default()
         .to_owned();
+    // The provider's own tag, then the create's (the real API keeps custom
+    // tags: checked live for ticket #11).
+    let mut tags = vec![json!("config:no-git-repo")];
+    if inner.keep_tags {
+        tags.extend(
+            body["tags"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t.is_string())
+                .cloned(),
+        );
+    }
     let info = json!({
         "id": id,
         "environment_id": environment_id,
@@ -675,7 +735,7 @@ fn create(state: &State, body: Value) -> Response<Body> {
         "created_at": created_at,
         "updated_at": created_at,
         "last_event_at": created_at,
-        "tags": ["config:no-git-repo"],
+        "tags": tags,
         "config": body["config"].clone(),
         "session_url": format!("https://claude.ai/code/{id}"),
     });
@@ -693,6 +753,16 @@ fn create(state: &State, body: Value) -> Response<Body> {
         .session(&id)
         .map(|s| s.info.clone())
         .unwrap_or_default();
+    if inner.lost_creates > 0 {
+        // Created, but the answer never reaches the client (a gateway that
+        // timed out on the way back).
+        inner.lost_creates -= 1;
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "upstream connect error or disconnect/reset before headers",
+        );
+    }
     json_response(
         StatusCode::OK,
         json!({ "deduplicated": false, "session": info }),

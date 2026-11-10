@@ -35,6 +35,10 @@ pub const REJECTED_AFTER_RENEWAL: &str = "Claude cloud sessions turned off on th
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 
+/// How long a create may take before its outcome counts as unknown (the
+/// session may exist: the caller looks for it by its tag, never retries).
+const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Zeron's identity on every request.
 pub fn user_agent() -> String {
     format!("zeron/{}", env!("CARGO_PKG_VERSION"))
@@ -52,8 +56,12 @@ pub enum ApiError {
         /// How long the server asked to wait (`Retry-After`), if it did.
         retry_after: Option<std::time::Duration>,
     },
+    /// The request went out (or may have), but no answer came back.
     #[error("Claude cloud could not be reached: {0}")]
     Transport(String),
+    /// No connection was made: the request never left this device.
+    #[error("Claude cloud could not be reached: {0}")]
+    NotSent(String),
     #[error("Claude cloud sent a response Zeron can't read: {0}")]
     Decode(String),
     /// The feature turned itself off on this device (why).
@@ -66,7 +74,7 @@ impl ApiError {
     /// was busy (429) or failed (5xx). Never a refusal or a login problem.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::NotSent(_) => true,
             Self::Status { status, .. } => *status == 429 || (500..600).contains(status),
             _ => false,
         }
@@ -122,6 +130,21 @@ pub struct SessionInfo {
     pub created_at: Option<String>,
     #[serde(default)]
     pub last_event_at: Option<String>,
+    /// The session's tags: the provider's own (`config:no-git-repo`) and
+    /// the one Zeron's create sends (`zeron:<first prompt uuid>`).
+    #[serde(default, deserialize_with = "de_tags")]
+    pub tags: Vec<String>,
+}
+
+/// Tags as strings; anything else in the list is skipped.
+fn de_tags<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::Array(tags)) => tags
+            .into_iter()
+            .filter_map(|t| t.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 impl SessionInfo {
@@ -295,10 +318,13 @@ impl CloudClient {
                     .header("anthropic-version", API_VERSION),
             );
             drop(token);
-            let response = request
-                .send()
-                .await
-                .map_err(|e| ApiError::Transport(without_url(&e)))?;
+            let response = request.send().await.map_err(|e| {
+                if e.is_connect() || e.is_builder() {
+                    ApiError::NotSent(without_url(&e))
+                } else {
+                    ApiError::Transport(without_url(&e))
+                }
+            })?;
             if response.status() != reqwest::StatusCode::UNAUTHORIZED {
                 if response.status().is_success() {
                     self.note(account, AccountLogin::Works);
@@ -367,7 +393,7 @@ impl CloudClient {
         }
         let response = self
             .execute(reqwest::Method::POST, "/v1/code/sessions", account, |r| {
-                r.json(body)
+                r.json(body).timeout(CREATE_TIMEOUT)
             })
             .await?;
         let created: Created = self.send_json(response).await?;
@@ -382,6 +408,38 @@ impl CloudClient {
             }),
             _ => Err(ApiError::Decode("the created session has no id".into())),
         }
+    }
+
+    /// `GET /v1/code/sessions/{id}`: one session as the list describes it.
+    pub async fn session(
+        &self,
+        account: &ClaudeAccount,
+        session_id: &str,
+    ) -> Result<SessionInfo, ApiError> {
+        let response = self
+            .execute(
+                reqwest::Method::GET,
+                &format!("/v1/code/sessions/{}", path_segment(session_id)),
+                account,
+                |r| r,
+            )
+            .await?;
+        self.send_json(response).await
+    }
+
+    /// `POST /v1/code/sessions/{id}/archive`. Archiving an archived session
+    /// changes nothing.
+    pub async fn archive(&self, account: &ClaudeAccount, session_id: &str) -> Result<(), ApiError> {
+        let response = self
+            .execute(
+                reqwest::Method::POST,
+                &format!("/v1/code/sessions/{}/archive", path_segment(session_id)),
+                account,
+                |r| r.json(&json!({})),
+            )
+            .await?;
+        let _: Value = self.send_json(response).await?;
+        Ok(())
     }
 
     /// `POST /v1/code/sessions/{id}/events` with `{events: [{payload}]}`.
@@ -550,6 +608,14 @@ fn is_loopback(base: &str) -> bool {
 /// but kept out on principle: error text reaches transcripts).
 fn without_url(error: &reqwest::Error) -> String {
     let mut text = error.to_string();
+    // What actually broke is in the causes ("error sending request" alone
+    // says nothing): a refused connection, a TLS failure, a timeout.
+    let mut cause = std::error::Error::source(error);
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
     if let Some(url) = error.url() {
         text = text.replace(url.as_str(), "the session API");
     }

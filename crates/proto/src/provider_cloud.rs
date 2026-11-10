@@ -85,10 +85,31 @@ pub fn answer_uuid(request_id: &str) -> String {
     uuid::Uuid::new_v5(&NAMESPACE, format!("answer:{request_id}").as_bytes()).to_string()
 }
 
-/// What a provider-run chat shows when its host can't act for the chat's
-/// account (docs/design/provider-run-chats.md §3). The host records it in
-/// the chat document's metadata (`providerState`) and clears it once a
-/// request for that account works again.
+/// The tag a session Zeron creates carries: `zeron:<first prompt uuid>`.
+/// The first prompt's uuid is chosen before the create (the chat id, a
+/// UUIDv5 of the session id, can't be), so a create whose answer was lost
+/// can be found in the session list by it.
+pub fn create_tag(prompt_uuid: &str) -> String {
+    format!("zeron:{prompt_uuid}")
+}
+
+/// Where the person sees a session on claude.ai.
+pub fn claude_session_url(session_id: &str) -> String {
+    format!("https://claude.ai/code/{session_id}")
+}
+
+/// Where the person sees their Claude cloud sessions on claude.ai.
+pub const CLAUDE_SESSIONS_URL: &str = "https://claude.ai/code";
+
+/// What a provider-run chat shows about its session beyond its transcript
+/// (docs/design/provider-run-chats.md §3, §6), recorded in the chat
+/// document's metadata (`providerState`):
+///
+/// - sign-in states, which the host records when it can't act for the
+///   chat's account and clears once a request for that account works again;
+/// - "Archived on claude.ai", recorded when the session is archived at the
+///   provider while the chat is kept (archived in Zeron, or unarchived after
+///   the session was archived), and cleared once the session is active again.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ProviderChatState {
@@ -102,6 +123,10 @@ pub enum ProviderChatState {
     /// the feature off.
     #[serde(rename_all = "camelCase")]
     SignInAs { email: String },
+    /// The session is archived at the provider (claude.ai, the phone): it
+    /// takes no messages. `url` opens it on claude.ai.
+    #[serde(rename_all = "camelCase")]
+    ArchivedOnProvider { url: String },
 }
 
 impl ProviderChatState {
@@ -110,6 +135,21 @@ impl ProviderChatState {
         match self {
             Self::SignInAgain { .. } => "Sign in again".to_owned(),
             Self::SignInAs { email } => format!("Sign in as {email} to continue"),
+            Self::ArchivedOnProvider { .. } => "Archived on claude.ai".to_owned(),
+        }
+    }
+
+    /// A sign-in state (which the host's login decides), as opposed to a
+    /// fact about the session.
+    pub fn is_sign_in(&self) -> bool {
+        matches!(self, Self::SignInAgain { .. } | Self::SignInAs { .. })
+    }
+
+    /// The page on claude.ai the chat links to, if it shows one.
+    pub fn link(&self) -> Option<&str> {
+        match self {
+            Self::ArchivedOnProvider { url } => Some(url),
+            _ => None,
         }
     }
 }
@@ -159,6 +199,24 @@ mod tests {
         let elsewhere: ProviderChatState =
             serde_json::from_str(r#"{"kind":"signInAs","email":"a@example.test"}"#).unwrap();
         assert_eq!(elsewhere.label(), "Sign in as a@example.test to continue");
+    }
+
+    #[test]
+    fn archived_on_claude_reads_with_its_link() {
+        let state = ProviderChatState::ArchivedOnProvider {
+            url: claude_session_url("cse_01ABC"),
+        };
+        assert_eq!(state.label(), "Archived on claude.ai");
+        assert_eq!(state.link(), Some("https://claude.ai/code/cse_01ABC"));
+        assert!(!state.is_sign_in());
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::json!({"kind": "archivedOnProvider", "url": "https://claude.ai/code/cse_01ABC"})
+        );
+        assert_eq!(
+            create_tag("6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70"),
+            "zeron:6f1f8a3e-3c3b-4f7e-9d1a-2b8c4d5e6f70"
+        );
     }
 
     #[test]

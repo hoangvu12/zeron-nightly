@@ -36,6 +36,12 @@ pub enum ProviderCloudError {
     /// The feature turned itself off on this device (the reason).
     #[error("{0}")]
     Disabled(String),
+    /// A create whose outcome is unknown: it went out, but no answer that
+    /// says what happened came back (the connection dropped, it timed out,
+    /// the server failed, or its answer couldn't be read). The session may
+    /// exist; look for it ([`ProviderCloud::find_created`]), never retry.
+    #[error("{0}")]
+    Uncertain(String),
     /// Anything else (network, a response this build can't read).
     #[error("{0}")]
     Other(String),
@@ -166,11 +172,33 @@ pub trait ProviderCloud: Send + Sync {
 
     /// Create one provider cloud session in this device's own login, with
     /// `request.prompt` as its first message. NOT idempotent: two calls make
-    /// two sessions, so callers never retry it on their own.
+    /// two sessions, so callers never retry it on their own. The session is
+    /// tagged `zeron:<prompt uuid>`
+    /// ([`zeron_proto::provider_cloud::create_tag`]) so a create whose
+    /// answer was lost ([`ProviderCloudError::Uncertain`]) can be found.
     async fn create_session(
         &self,
         request: CreateSession,
     ) -> Result<ProviderSession, ProviderCloudError>;
+
+    /// The session a create with first prompt `prompt_uuid` made, if the
+    /// device's own login's session list has it: the list is read newest
+    /// activity first until sessions older than `since` (the attempt's
+    /// start). `Ok(None)`: no such session. A session found is known to the
+    /// harness as [`Self::create_session`]'s would be.
+    async fn find_created(
+        &self,
+        prompt_uuid: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<ProviderSession>, ProviderCloudError>;
+
+    /// Archive the session at the provider (deleting its chat in Zeron).
+    /// Archiving an archived session changes nothing.
+    async fn archive_session(&self, session: &ProviderSession) -> Result<(), ProviderCloudError>;
+
+    /// Whether the session is archived at the provider now.
+    async fn session_archived(&self, session: &ProviderSession)
+    -> Result<bool, ProviderCloudError>;
 
     /// Tie the chat's next fresh run to its session. Called by the engine
     /// before every fresh dispatch; replaces any earlier binding for the

@@ -791,6 +791,11 @@ pub mod capability_errors {
     pub const TOOL_OUTPUT_UNAVAILABLE: &str = "tool_output.unavailable";
     /// `ReadToolOutput`: the command has no result yet.
     pub const TOOL_OUTPUT_NOT_FINISHED: &str = "tool_output.not_finished";
+    /// `Mutate createChat` of a provider-run chat: whether the provider
+    /// created the session is unknown, and the session list has none with
+    /// the create's tag. Nothing is retried; the person decides ("Creation
+    /// uncertain", with a link to claude.ai and "Create again").
+    pub const PROVIDER_CREATION_UNCERTAIN: &str = "provider_run.creation_uncertain";
 }
 
 #[derive(Debug, thiserror::Error)]
