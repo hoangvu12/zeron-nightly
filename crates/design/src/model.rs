@@ -6,18 +6,25 @@
 //! property groups shared by the types that have them ([`Size`], [`Fill`]),
 //! and joins [`Kind`] with one line in its `kinds!` list.
 
+mod corners;
+mod effects;
 mod frame;
 mod paint;
 mod rectangle;
+mod stroke;
+pub mod warn;
 
+pub use corners::Corners;
+pub use effects::{Effect, EffectKind, Effects, Shadow};
 pub use frame::Frame;
-pub use paint::{Color, Fill, Paint};
+pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
 pub use rectangle::Rectangle;
+pub use stroke::{Align, Cap, Join, Sides, Stroke, StrokeStyle};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::render::Painter;
+use crate::render::{Look, Painter};
 
 /// The format version new Designs are written with.
 pub const VERSION: &str = "1.0";
@@ -123,12 +130,39 @@ pub struct Node {
     pub x: f32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub y: f32,
+    /// Degrees counter-clockwise, about its top-left corner; it turns its
+    /// children with it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation: f32,
+    /// Mirrored left to right (and top to bottom) within its box, with its
+    /// children.
+    #[serde(default, rename = "flipX", skip_serializing_if = "std::ops::Not::not")]
+    pub flip_x: bool,
+    #[serde(default, rename = "flipY", skip_serializing_if = "std::ops::Not::not")]
+    pub flip_y: bool,
+    /// 0 to 1, for the node and its children as one.
+    #[serde(default = "opaque", skip_serializing_if = "is_opaque", deserialize_with = "opacity")]
+    pub opacity: f32,
     #[serde(flatten)]
     pub kind: Kind,
 }
 
 fn is_zero(value: &f32) -> bool {
     *value == 0.
+}
+
+fn opaque() -> f32 {
+    1.
+}
+
+fn is_opaque(value: &f32) -> bool {
+    *value == 1.
+}
+
+fn opacity<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let mut props = Map::new();
+    props.insert("opacity".into(), Value::deserialize(deserializer)?);
+    paint::opacity(&props).map_err(serde::de::Error::custom)
 }
 
 /// What each node type answers, so walking, editing and drawing a Design
@@ -151,9 +185,15 @@ pub trait NodeKind {
         false
     }
 
-    /// Draws the node itself, not its children, with its top-left at the
-    /// painter's origin.
-    fn paint(&self, painter: &mut dyn Painter);
+    /// Its outline and the fills, stroke and effects drawn on it, for the
+    /// types drawn that way.
+    fn look(&self) -> Option<Look<'_>> {
+        None
+    }
+
+    /// Draws what the node draws itself beyond its [`look`](Self::look),
+    /// not its children, with its top-left at the painter's origin.
+    fn paint(&self, _painter: &mut dyn Painter) {}
 }
 
 macro_rules! kinds {

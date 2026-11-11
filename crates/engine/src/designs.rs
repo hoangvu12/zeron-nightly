@@ -99,7 +99,8 @@ impl Designs {
 
     /// Runs one `design_execute` call to its end (blocking: run it off the
     /// async runtime). Returns the Design's name and path, the name-to-id
-    /// map of the nodes the call made, and its screenshots as base64 PNG.
+    /// map of the nodes the call made, its screenshots as base64 PNG and any
+    /// warnings about its changes.
     pub fn execute(&self, params: ExecuteParams) -> Result<Value, DesignError> {
         if params.snippet.trim().is_empty() {
             return Err(DesignError::Refused("the snippet is empty".into()));
@@ -118,11 +119,15 @@ impl Designs {
         let draft = snippet::run(Draft::new(live.design.clone()), code, self.inner.limits)?;
         let edited = draft.finish();
         let screenshots = live.commit(&edited)?;
-        Ok(json!({
+        let mut result = json!({
             "design": { "name": design_name(&live.path), "path": live.path },
             "ids": edited.names,
             "screenshots": screenshots,
-        }))
+        });
+        if !edited.warnings.is_empty() {
+            result["warnings"] = json!(edited.warnings);
+        }
+        Ok(result)
     }
 
     /// The Design a call is for: the file it names, or a new managed

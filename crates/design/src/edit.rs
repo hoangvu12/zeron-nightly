@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::model::{Design, Kind, Node};
+use crate::model::{Design, Kind, Node, warn};
 
 /// Characters a generated node id is made of.
 const ID_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -38,6 +38,9 @@ pub struct Draft {
     changed: BTreeSet<String>,
     /// Nodes whose screenshots the call asked for, in order.
     screenshots: Vec<String>,
+    /// What the call should know about its changes, such as values the
+    /// Design doesn't support and left out.
+    warnings: Vec<String>,
 }
 
 /// What a call's draft ends as, once it succeeded.
@@ -48,6 +51,7 @@ pub struct Edited {
     pub names: Map<String, Value>,
     pub changed: BTreeSet<String>,
     pub screenshots: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 impl Draft {
@@ -62,6 +66,7 @@ impl Draft {
             created: Vec::new(),
             changed: BTreeSet::new(),
             screenshots: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -84,8 +89,12 @@ impl Draft {
         }
         let mut made = Vec::new();
         self.prepare(&mut node, &mut made)?;
-        let node: Node = serde_json::from_value(node)
-            .map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
+        let (node, warnings) = warn::collect(|| serde_json::from_value::<Node>(node));
+        let node = node.map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
+        let warnings = warnings
+            .into_iter()
+            .map(|warning| format!("Insert \"{}\": {warning}", node.name))
+            .collect::<Vec<_>>();
         let siblings = match parent {
             None => &mut self.design.children,
             Some(parent) => {
@@ -101,6 +110,7 @@ impl Draft {
         };
         let id = node.id.clone();
         siblings.push(node);
+        self.warnings.extend(warnings);
         for (name, id) in made {
             self.changed.insert(id.clone());
             self.created.push((name, id));
@@ -135,6 +145,7 @@ impl Draft {
             names,
             changed: self.changed,
             screenshots: self.screenshots,
+            warnings: self.warnings,
         }
     }
 
