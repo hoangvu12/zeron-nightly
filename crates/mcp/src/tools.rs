@@ -628,7 +628,7 @@ async fn read_image(path: &str) -> anyhow::Result<Vec<u8>> {
 /// A design call's result, the guides the engine sent in it moved to
 /// [`TEXT_CONTENT`].
 fn guide_texts(mut result: Value) -> Value {
-    if let Some(texts) = result.as_object_mut().and_then(|result| result.remove("guideTexts")) {
+    if let Some(texts) = result.as_object_mut().and_then(|result| result.remove(zeron_rpc::methods::GUIDE_TEXTS)) {
         result[TEXT_CONTENT] = texts;
     }
     result

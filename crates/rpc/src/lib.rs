@@ -370,6 +370,10 @@ pub mod methods {
     /// result carries `guideTexts` with the core guide the first time a
     /// chat calls. Local only, like `DesignExecute`.
     pub const DESIGN_GUIDE: &str = "DesignGuide";
+    /// Where a design call's result carries guides to read beside it (the
+    /// core guide with a chat's first design call, a topic from
+    /// `DesignGuide`): Zeron's MCP server gives each as a text of its own.
+    pub const GUIDE_TEXTS: &str = "guideTexts";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
     /// changes, path, unsaved, recovered, stale}`: the Design whole as it is, then
     /// after each change, with each change since the item before as

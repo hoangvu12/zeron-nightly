@@ -63,6 +63,7 @@ use sha2::Digest as _;
 use zeron_design::icons::Icons;
 use zeron_design::model::{ImageFill, Kind};
 use zeron_design::snippet::{self, Globals, Limits, SnippetError};
+use zeron_rpc::methods::GUIDE_TEXTS;
 
 pub use retry::{Edit, Failure};
 use retry::{Failed, Kept, Retarget};
@@ -94,11 +95,6 @@ const SAVE_AS_DESCRIPTION: &str = "Save as, renaming images";
 
 /// What `design_state` reminds an agent of.
 pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide came with your first design call in this chat. If it's no longer in your context (after compaction, say), call design_guide for it again, and design_guide with a topic for components, design systems, landing pages, mobile apps, web apps, slides, tables, code or Tailwind.";
-
-/// Where a result carries guides to read beside it (the core guide with a
-/// chat's first design call, a topic from `design_guide`): Zeron's MCP
-/// server gives each as a text of its own.
-pub const GUIDE_TEXTS: &str = "guideTexts";
 
 /// What a call is told when its Design changed since that chat's last call
 /// (a chat's first call on a Design has nothing to compare, so isn't).
@@ -830,29 +826,25 @@ impl Designs {
     /// The core guide comes after a topic when the chat hasn't had it yet.
     pub fn guide(&self, chat_id: Option<&str>, topic: Option<&str>) -> Result<Value, DesignError> {
         let topics = guide::topics();
+        let text = match topic {
+            None => guide::CORE,
+            Some(name) => guide::topic(name).ok_or_else(|| {
+                DesignError::Refused(format!(
+                    "there's no design guide on \"{name}\": the topics are {}, or none for the core guide",
+                    topics.join(", ")
+                ))
+            })?,
+        };
         let mut result = json!({ "topic": topic.unwrap_or("core"), "topics": topics });
-        match topic {
-            None | Some("core") => {
-                lock(&self.inner.guided).insert(chat_id.unwrap_or_default().to_owned());
-                result[GUIDE_TEXTS] = json!([guide::CORE]);
-            }
-            Some(name) => {
-                let text = guide::topic(name).ok_or_else(|| {
-                    DesignError::Refused(format!(
-                        "there's no design guide on \"{name}\": the topics are {}, or none for the core guide",
-                        topics.join(", ")
-                    ))
-                })?;
-                self.guide_once(chat_id, &mut result, vec![text]);
-            }
-        }
+        self.guide_once(chat_id, &mut result, vec![text]);
         Ok(result)
     }
 
     /// Puts `texts` in `result` as [`GUIDE_TEXTS`], and the core guide
-    /// after them when `chat_id` hasn't had it, which it now has.
+    /// after them when `chat_id` hasn't had it (unless they hold it), which
+    /// it now has.
     fn guide_once(&self, chat_id: Option<&str>, result: &mut Value, mut texts: Vec<&'static str>) {
-        if lock(&self.inner.guided).insert(chat_id.unwrap_or_default().to_owned()) {
+        if lock(&self.inner.guided).insert(chat_id.unwrap_or_default().to_owned()) && !texts.contains(&guide::CORE) {
             texts.push(guide::CORE);
         }
         if !texts.is_empty() {

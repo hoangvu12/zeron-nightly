@@ -9,6 +9,7 @@ use crate::seam::{CHAT, OTHER, Seam};
 /// The design tools, as Zeron's MCP server lists them.
 const DESIGN_TOOLS: [&str; 3] = ["design_execute", "design_state", "design_guide"];
 
+/// A call that makes one Screen.
 const SCREEN: &str = r##"Insert({ type: "frame", name: "Screen", width: 100, height: 100, fill: "#FFFFFF" });"##;
 
 /// The guide's topics, as design_guide lists them.

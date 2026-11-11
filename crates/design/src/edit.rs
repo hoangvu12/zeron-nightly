@@ -199,8 +199,8 @@ impl Draft {
                 self.warn(&problem.node, None, problem.message);
             }
         }
-        // However it came to be: inserted so, or its fill taken away (a
-        // fill naming a Token is one).
+        // However it came to be: inserted so, or its fill taken away. A
+        // fill naming a Token counts as a fill.
         for id in &self.changed {
             if let Some(node) = self.design.find(id)
                 && let Kind::Text(text) = &node.kind

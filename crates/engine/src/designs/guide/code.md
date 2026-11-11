@@ -52,7 +52,7 @@ Print(GetTokens({ css: true }));
 
 ## 3. Each component
 
-Read the Component whole with Tokens resolved, so you see the values you'll write; read it again without resolving to see which Tokens each property uses (the variable names you'll write).
+Read the Component whole with Tokens resolved, so you see the values you'll write; read it again without resolving to see which Tokens each property uses (the custom property names you'll write).
 
 ```js
 Print(JSON.stringify(Get(button, { depth: Infinity, resolveTokens: true })));

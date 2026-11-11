@@ -1,6 +1,6 @@
 # Designing in Zeron: the core guide
 
-You design by writing small JavaScript snippets that `design_execute` runs against a **Design**: one `.zdesign` file holding an infinite **Canvas** of **Screens** (top-level Frames, each a page, app screen or slide), **Components**, and the **Tokens** and **Themes** they draw from. The person may be watching the Design in a Design tab beside the chat as you work, and may select nodes or edit them by hand. Your result returns the ids of what you made, lines you printed, warnings, and screenshots you asked for.
+You design by writing small JavaScript snippets that `design_execute` runs against a **Design**: one `.zdesign` file holding an infinite **Canvas** of **Screens** (top-level Frames, each one web view, app screen or slide), **Components**, and the **Tokens** and **Themes** they draw from. The person may be watching the Design in a Design tab beside the chat as you work, and may select nodes or edit them by hand. Your result returns the ids of what you made, lines you printed, warnings, and screenshots you asked for.
 
 This guide is the rules, the API and the format, how to check your work, and how to design well. Topic guides go deeper: call `design_guide` with `components`, `design-systems`, `landing-pages`, `mobile-apps`, `web-apps`, `slides`, `tables`, `code` (implementing a Design) or `tailwind`. Load the ones your task touches before you start.
 
@@ -157,8 +157,8 @@ See *Tokens and Themes*. `GetTokens({css: true})` returns the Tokens as CSS cust
 
 Writes files for whoever implements the Design; it's for delivery, not for checking your work. A relative `path` is from the Design's folder.
 
-- `Export([ids], {format: "png", path: folder, scale})`: each node as a PNG in `folder`, at `scale` (2 by default).
-- `Export([screens], {format: "html", path: "file.html", css: "tailwind" | "css", scaffold, layerNames})`: Screens (every Screen with no ids) as one HTML page. Auto layout becomes flexbox; it's a starting point to adapt, not production code.
+- `Export([ids], {format: "png", path: folder, scale})`: each node as a PNG in `folder`, named after the node, at `scale` (2 by default, at most 8).
+- `Export([screens], {format: "html", path: "file.html", css, scaffold, layerNames})`: Screens (every Screen with no ids) as one HTML file. `css` is `"css"` (plain, the default) or `"tailwind"`; `scaffold: false` writes just the Screens and their styles instead of a whole page; `layerNames: true` puts each node's name on its element as `data-name`. Auto layout becomes flexbox; it's a starting point to adapt, not production code.
 
 ```js
 Export([header], { format: "png", path: "exports", scale: 2 });
@@ -179,7 +179,7 @@ A node is `{type, name, ...properties}`. Unknown properties are kept but do noth
 - `polygon`: a regular polygon with `polygonCount` sides (3 to 64), one corner at the top, stretched to its box.
 - `path`: SVG path data in `geometry`, with `viewBox: [x, y, width, height]` stretched onto its box (without one, the geometry's own bounds are), and `fillRule` (`nonzero` or `evenodd`).
 - `text`: see *Text*.
-- `icon`: `icon: "set:name"` from any Iconify set (`lucide:search`, `ph:house-fill`, `material-symbols:settings-outline`), drawn in its first solid `fill` colour at `width` × `height`; `weight` (100 to 900) for Lucide's and Phosphor's icons. An icon that doesn't exist fails the call. Use icons rather than drawing pictograms with paths.
+- `icon`: `icon: "set:name"` from any Iconify set (`lucide:search`, `ph:house-fill`, `material-symbols:settings-outline`), drawn in its first solid `fill` colour at `width` × `height`; `weight` (100 to 900, 400 the set's regular) thins or thickens icons drawn with strokes (Lucide, Tabler) and picks Phosphor's weights, and warns on other sets. An icon named directly that doesn't exist fails the call; one named through a Token warns and draws nothing. Use icons rather than drawing pictograms with paths.
 - `instance`: made by copying a Component, `{ref, descendants, ...overrides}`.
 
 `cornerRadius` is one number or four `[topLeft, topRight, bottomRight, bottomLeft]`.
