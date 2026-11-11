@@ -68,3 +68,8 @@ note = "Subagents and side chats report back to the chat that made them when the
 name = "child-reports-follow-ups"
 file = "patches/0009-child-reports-follow-ups.patch"
 note = "What real use of child-chats-report-back found: a turn a child starts on its own (its tests done, a timer) reports as a follow-up; a reply repeating what the child sent isn't said twice; a child's answer to a thanks doesn't wake its parent; the still-working note is short and right across devices; a report after the person's Stop still wakes the parent; after a handoff the new orchestrator gets the children, and nobody writes to an archived chat; a restart or another chat's Stop isn't the person's; a turn that ended on an error reports failed; Pi's info toasts stay out of replies, and Pi without a Zeron account still counts as connected. Applies on top of child-chats-report-back."
+
+[[patch]]
+name = "child-reports-held-stop"
+file = "patches/0010-child-reports-held-stop.patch"
+note = "The person's Stop on a child is held for two minutes: what they write to it meanwhile corrects the parent's task, so the parent hears nothing until the child's normal finished report, and the child stays on its wait. A Stop left standing reports once the hold is out; an agent's Stop or a Zeron restart still reports at once. Once the person writes to a child otherwise, it is theirs and its ends no longer report. Applies on top of child-reports-follow-ups."

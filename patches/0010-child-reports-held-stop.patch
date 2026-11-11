@@ -1,0 +1,428 @@
+From d6e85b5d5187ab17a26a04186fea78cfc486a944 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 11 Nov 2026 11:02:36 +0700
+Subject: [PATCH] engine: the person's Stop on a child is held, and what they
+ write next corrects the task
+
+When the person stopped a child chat to steer it, the parent heard "the
+person stopped it" at once, woke, and reacted mid-correction; the child
+dropped off its wait as soon as they wrote to it, though it still worked on
+the parent's task.
+
+Now the person's Stop is held for two minutes (ZERON_STOP_HOLD_MS for
+tests). A message they write to the child meanwhile corrects the parent's
+task: the child stays on the parent's wait and its still-working note, no
+stop is reported, and its end reports as usual. A Stop left standing
+reports once the hold is out. An agent's Stop and Zeron cutting a run off
+still report at once.
+
+A turn the held Stop cut that settles again otherwise (its runtime killed
+after it, a failure) reports as that stop, once, not as its own failure.
+Once the person writes to the child other than to correct the task, it is
+theirs: the end of what it does for them no longer reports to the parent.
+---
+ crates/engine/src/session_reports.rs | 142 ++++++++++++++++++++++----
+ crates/engine/src/sessions.rs        | 144 ++++++++++++++++++++++++++-
+ 2 files changed, 264 insertions(+), 22 deletions(-)
+
+diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
+index c69f47695d34ab46d1f04fa62ca52a869aeb7a9a..a47926857e537a66fa49d0deffa89454d95a33f9 100644
+--- a/crates/engine/src/session_reports.rs
++++ b/crates/engine/src/session_reports.rs
+@@ -104,6 +104,20 @@ const QUIET_CHARS: usize = 300;
+ /// one that ended it.
+ const STOP_SETTLE_MS: i64 = 60 * 1000;
+ 
++/// How long the person's Stop on a child is held before the parent hears of
++/// it: what they write to it meanwhile corrects the parent's task (the child
++/// goes on with it, and its end reports as usual), and only a Stop left
++/// standing is news. An agent's Stop, or Zeron's, isn't held.
++/// `ZERON_STOP_HOLD_MS` sets it for tests.
++const STOP_HOLD_MS: i64 = 2 * 60 * 1000;
++
++fn stop_hold_ms() -> i64 {
++    std::env::var("ZERON_STOP_HOLD_MS")
++        .ok()
++        .and_then(|ms| ms.parse().ok())
++        .unwrap_or(STOP_HOLD_MS)
++}
++
+ #[cfg(test)]
+ thread_local! {
+     /// How many of the next reports fail to queue, as a parent's doc that
+@@ -152,7 +166,22 @@ pub(super) async fn report_turn_end(
+             entries = handle.doc().read_entries().unwrap_or_default();
+         }
+     }
+-    let commands = handle.doc().read_commands().unwrap_or_default();
++    let mut commands = handle.doc().read_commands().unwrap_or_default();
++    // A turn the person's Stop cut, settling otherwise (its runtime killed
++    // after it, a failure), ended on that Stop: reported as one, once. A
++    // turn on a message sent since is another turn.
++    let status = if status != ReportStatus::Stopped
++        && status != ReportStatus::NeedsInput
++        && commands
++            .iter()
++            .filter(|c| persons_stop(c) && c.issued_at <= settled_at && settled_at - c.issued_at <= STOP_SETTLE_MS)
++            .max_by_key(|c| c.issued_at)
++            .is_some_and(|c| !entries.iter().any(|e| e.role == MessageRole::User && e.created_at >= c.issued_at))
++    {
++        ReportStatus::Stopped
++    } else {
++        status
++    };
+     // The Stop that ended a stopped turn, when one did (not a "send now").
+     let stop = (status == ReportStatus::Stopped)
+         .then(|| {
+@@ -161,8 +190,23 @@ pub(super) async fn report_turn_end(
+                 .filter(|c| matches!(c.payload, SessionCommandPayload::Interrupt { .. }))
+                 .filter(|c| c.issued_at <= settled_at && settled_at - c.issued_at <= STOP_SETTLE_MS)
+                 .max_by_key(|c| c.issued_at)
++                .cloned()
+         })
+         .flatten();
++    // The person's Stop is held: what they write to it meanwhile corrects
++    // the task, whose end reports instead.
++    if let Some(c) = stop.as_ref().filter(|c| persons_stop(c)) {
++        let left = c.issued_at + stop_hold_ms() - Utc::now().timestamp_millis();
++        if left > 0 {
++            tokio::time::sleep(std::time::Duration::from_millis(left as u64)).await;
++            commands = handle.doc().read_commands().unwrap_or_default();
++        }
++        if commands.iter().any(|t| typed_command(t) && corrects(c, t.issued_at)) {
++            tracing::info!(chat = %child, %parent, "the person wrote to it after their Stop: no stop report");
++            return;
++        }
++    }
++    let stop = stop.as_ref();
+     // A stopped turn answered what was sent before its Stop (strictly: one
+     // sent in the same millisecond came with it, not before): the parent's
+     // next message, sent after it, may be in already, its turn not begun.
+@@ -219,6 +263,13 @@ pub(super) async fn report_turn_end(
+         tracing::info!(chat = %child, %parent, "its parent stopped it: no report");
+         return;
+     }
++    // The person took it over (wrote to it other than to correct the task
++    // right after their Stop): what it does now is theirs. Only how the
++    // parent's turn ended, a stop, is still news.
++    if status != ReportStatus::Stopped && follow_up.is_none() && took_over(&entries, &commands, at) {
++        tracing::info!(chat = %child, %parent, "the person took it over: no report");
++        return;
++    }
+     // The parent has it already (this engine, or another before a restart,
+     // sent it): its ledger keeps every report by its key.
+     if delivered(&host, &parent, &child, &entries[at], &stage) {
+@@ -287,14 +338,7 @@ pub(super) async fn report_turn_end(
+             });
+             // The person wrote to it themselves since the parent's message:
+             // they stepped in, and it works for them now.
+-            let person_wrote = commands.iter().any(|c| {
+-                c.issued_at >= entries[at].created_at
+-                    && match &c.payload {
+-                        SessionCommandPayload::Run { request, .. } => typed(&request.prompt),
+-                        SessionCommandPayload::Steer { prompt, .. } => typed(prompt),
+-                        _ => false,
+-                    }
+-            });
++            let person_wrote = took_over(&entries, &commands, at);
+             let what = match by {
+                 Some(None) if person_wrote => {
+                     "The person stepped in: they stopped it and wrote to it themselves, so it works for them now."
+@@ -496,13 +540,19 @@ pub(super) fn children_on(host: &DocHost, parent: &str, local: &[Session]) -> Ve
+             };
+             let doc = handle.doc();
+             let entries = doc.read_entries().unwrap_or_default();
++            let commands = doc.read_commands().unwrap_or_default();
+             let last_row = session.or_else(|| last_row_of(child, &remote));
+-            if on_its_way(host, &doc.read_commands().unwrap_or_default(), &entries, parent, &child.id, last_row) {
++            if on_its_way(host, &commands, &entries, parent, &child.id, last_row) {
+                 return true;
+             }
+-            working
+-                && parents_turn(&entries, parent)
+-                    .is_some_and(|at| !reported_done(host, parent, &child.id, &entries[at], session))
++            let Some(at) = parents_turn(&entries, &commands, parent) else {
++                return false;
++            };
++            // Stopped by the person, who may yet correct it: still at work
++            // on it until their Stop is reported.
++            let held = held_stop(&commands, entries[at].created_at, now.timestamp_millis()).is_some()
++                && !delivered(host, parent, &child.id, &entries[at], "stopped");
++            (working || held) && !reported_done(host, parent, &child.id, &entries[at], session)
+         })
+         .map(|child| WaitingOn {
+             id: child.id.clone(),
+@@ -633,7 +683,7 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+                 });
+             }
+             // A chat the person has taken over works for them, not here.
+-            let at = parents_turn(&entries, parent)?;
++            let at = parents_turn(&entries, &commands, parent)?;
+             if stopped_by_parent(&commands, parent, entries[at].created_at) {
+                 return None;
+             }
+@@ -649,6 +699,16 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+                     since(oldest)
+                 ));
+             }
++            // Stopped by the person, who may yet correct it.
++            if let Some(stop) = held_stop(&commands, entries[at].created_at, now.timestamp_millis())
++                && session.is_none_or(|s| s.status != SessionStatus::Working)
++                && !delivered(host, parent, &child.id, &entries[at], "stopped")
++            {
++                return line(format!(
++                    "the person stopped it {} ago; if they write to it, it goes on with your task, else you hear of the stop",
++                    since(stop.issued_at)
++                ));
++            }
+             let mut facts = vec![format!("asked {} ago", since(entries[at].created_at))];
+             match session {
+                 Some(s) if s.status == SessionStatus::AwaitingInput => facts.insert(0, "waiting on an answer".into()),
+@@ -712,13 +772,11 @@ fn last_row_of<'a>(child: &Chat, remote: &'a [Session]) -> Option<&'a Session> {
+ 
+ /// Where the parent's latest message sits in `entries` (see
+ /// [`request_message`]), while the child's latest turn is still the
+-/// parent's: none once the person wrote to it since, taking it over.
+-fn parents_turn(entries: &[SessionMessageEntry], parent: &str) -> Option<usize> {
++/// parent's: none once the person wrote to it since, taking it over (a
++/// correction right after their Stop doesn't: see [`took_over`]).
++fn parents_turn(entries: &[SessionMessageEntry], commands: &[zeron_doc::SessionCommandEntry], parent: &str) -> Option<usize> {
+     let at = request_message(entries, parent)?;
+-    let person_since = entries[at + 1..]
+-        .iter()
+-        .any(|e| e.role == MessageRole::User && typed(&text_of(&e.parts)));
+-    (!person_since).then_some(at)
++    (!took_over(entries, commands, at)).then_some(at)
+ }
+ 
+ /// A span of milliseconds as a person says it.
+@@ -922,6 +980,50 @@ fn typed(text: &str) -> bool {
+     agent_messages::agent_message_sender(text).is_none()
+ }
+ 
++/// `c` is a message the person typed to the chat.
++fn typed_command(c: &zeron_doc::SessionCommandEntry) -> bool {
++    match &c.payload {
++        SessionCommandPayload::Run { request, .. } => typed(&request.prompt),
++        SessionCommandPayload::Steer { prompt, .. } => typed(prompt),
++        _ => false,
++    }
++}
++
++/// `c` is a Stop the person sent (no agent's).
++fn persons_stop(c: &zeron_doc::SessionCommandEntry) -> bool {
++    matches!(c.payload, SessionCommandPayload::Interrupt { stopped_by: None })
++}
++
++/// A message the person sent at `at` corrects the task their Stop `stop`
++/// cut: it came while that Stop was held.
++fn corrects(stop: &zeron_doc::SessionCommandEntry, at: i64) -> bool {
++    at >= stop.issued_at && at - stop.issued_at <= stop_hold_ms()
++}
++
++/// The person wrote to the child since the parent's message at `at` (in its
++/// transcript, or sent and not run yet), other than to correct the task
++/// right after a Stop of theirs: it's theirs now.
++fn took_over(entries: &[SessionMessageEntry], commands: &[zeron_doc::SessionCommandEntry], at: usize) -> bool {
++    let since = entries[at].created_at;
++    let stops: Vec<_> = commands.iter().filter(|c| c.issued_at >= since && persons_stop(c)).collect();
++    entries[at + 1..]
++        .iter()
++        .filter(|e| e.role == MessageRole::User && typed(&text_of(&e.parts)))
++        .map(|e| e.created_at)
++        .chain(commands.iter().filter(|c| c.issued_at >= since && typed_command(c)).map(|c| c.issued_at))
++        .any(|written| !stops.iter().any(|stop| corrects(stop, written)))
++}
++
++/// The person's latest Stop on the child since the parent's message at
++/// `since`, while it's still held (they may yet correct the task).
++fn held_stop(commands: &[zeron_doc::SessionCommandEntry], since: i64, now: i64) -> Option<&zeron_doc::SessionCommandEntry> {
++    commands
++        .iter()
++        .filter(|c| c.issued_at >= since && persons_stop(c))
++        .max_by_key(|c| c.issued_at)
++        .filter(|stop| now - stop.issued_at <= stop_hold_ms())
++}
++
+ /// `reply` says what `sent` said already: the same words, give or take
+ /// spacing, or most of them, one inside the other.
+ fn repeats(reply: &str, sent: &str) -> bool {
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index e02dd7d7537ae9c3b9c2b10605c37c5158dc1991..e7dc9b8e7753445a407be1931ca9f04e4edb74db 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -7573,6 +7573,7 @@ mod tests {
+         unsafe { std::env::set_var("ZERON_WAKE_GRACE_MS", "300") };
+         unsafe { std::env::set_var("ZERON_REPORT_WINDOW_MS", "1000") };
+         unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
++        unsafe { std::env::set_var("ZERON_STOP_HOLD_MS", "5000") };
+         let harness = Arc::new(ChatsHarness::default());
+         let registry = HarnessRegistry::new();
+         registry.register(harness.clone());
+@@ -7660,7 +7661,7 @@ mod tests {
+ 
+         /// Until `check` holds (a few seconds at most).
+         async fn until(&self, what: &str, check: impl Fn(&Self) -> bool) {
+-            for _ in 0..200 {
++            for _ in 0..400 {
+                 if check(self) {
+                     return;
+                 }
+@@ -8202,7 +8203,8 @@ mod tests {
+         rig.quiet().await;
+         assert!(rig.reports("lead").is_empty());
+         assert!(rig.queued("lead").is_empty());
+-        // The person stops Docs: the lead hears so, at once, as stopped.
++        // The person stops Docs and leaves it stopped: the lead hears so,
++        // once the Stop's hold is out, as stopped.
+         rpc.handle(zeron_rpc::methods::QUEUE_COMMAND, stop("kid-b")).await.unwrap();
+         rig.until("the lead hears Docs stopped", |r| !r.reports("lead").is_empty()).await;
+         assert_eq!(statuses(&rig.reports("lead")[0]), [("kid-b".to_owned(), ReportStatus::Stopped)]);
+@@ -8622,6 +8624,144 @@ mod tests {
+         rig.core.sessions.shutdown().await;
+     }
+ 
++    impl FamilyRig {
++        /// The person stops `chat` (no agent's Stop).
++        fn person_stops(&self, chat: &str) {
++            self.core
++                .doc_host
++                .queue_command(chat, zeron_doc::SessionCommandPayload::Interrupt { stopped_by: None })
++                .unwrap();
++        }
++
++        /// The person writes `chat` themselves.
++        fn person_writes(&self, chat: &str, text: &str, id: &str) {
++            let mut request = request();
++            request.prompt = text.into();
++            self.core
++                .doc_host
++                .queue_command(chat, zeron_doc::SessionCommandPayload::Run { request, message_id: id.into() })
++                .unwrap();
++        }
++
++        /// The children the lead's wait lists now.
++        fn on(&self) -> Vec<String> {
++            reports::children_on(&self.core.doc_host, "lead", &self.core.sessions.local_sessions())
++                .into_iter()
++                .map(|w| w.id)
++                .collect()
++        }
++
++        /// `chat`'s next run, a fresh runtime after `was` stopped, started.
++        async fn next_run(&self, chat: &str, was: &ChatRun) -> ChatRun {
++            self.until("its next run", |r| !lock(&r.harness.runs).get(chat).unwrap().feed.same_channel(&was.feed))
++                .await;
++            let run = lock(&self.harness.runs).get(chat).cloned().unwrap();
++            run.feed.send(started()).unwrap();
++            run
++        }
++    }
++
++    /// The person stops Tests, which runs the wrong suite, and tells it what
++    /// to run instead: a correction to the lead's task. The lead hears
++    /// nothing of the stop; Tests stays on its wait; its end is the report.
++    #[tokio::test]
++    async fn a_correction_after_the_persons_stop_keeps_the_task_the_parents() {
++        let rig = family_rig().await;
++        let (a, b) = rig.both_at_work().await;
++        a.feed.send(text("Running the whole suite.")).unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
++        let stopped = std::time::Instant::now();
++        rig.person_stops("kid-a");
++        rig.until("Tests stops", |r| r.status("kid-a").status != SessionStatus::Working).await;
++        // Held: still the lead's, and said so once the Stop is applied.
++        assert_eq!(rig.on(), ["kid-a", "kid-b"]);
++        rig.until("the Stop is applied", |r| {
++            let handle = r.core.doc_host.open("kid-a").unwrap();
++            !handle.doc().read_commands().unwrap().iter().any(|c| {
++                c.status == zeron_doc::SessionCommandStatus::Pending
++                    && matches!(c.payload, zeron_doc::SessionCommandPayload::Interrupt { .. })
++            })
++        })
++        .await;
++        let roster = rig.roster();
++        assert!(roster.contains("Tests (the person stopped it "), "{roster}");
++
++        rig.person_writes("kid-a", "Run the unit tests only.", "p1");
++        let next = rig.next_run("kid-a", &a).await;
++        rig.until("Tests works on it", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        // Past the hold: no stop report, and Tests still works for the lead.
++        tokio::time::sleep(std::time::Duration::from_millis(5500).saturating_sub(stopped.elapsed())).await;
++        assert!(rig.heard().is_empty(), "{:?}", rig.heard());
++        assert_eq!(rig.on(), ["kid-a", "kid-b"]);
++
++        next.feed.send(text("312 unit tests pass.")).unwrap();
++        next.feed.send(done(DoneStatus::Completed)).unwrap();
++        let once: Vec<(String, ReportStatus, String)> =
++            vec![("kid-a".into(), ReportStatus::Finished, "312 unit tests pass.".into())];
++        rig.until("the lead hears the result", |r| r.heard() == once).await;
++        rig.quiet().await;
++        assert_eq!(rig.heard(), once);
++        drop(b);
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// The person stops Tests and leaves it: the lead hears so once the hold
++    /// is out. Written to later, Tests is the person's: its end isn't news.
++    #[tokio::test]
++    async fn a_persons_stop_left_standing_reports_after_its_hold() {
++        let rig = family_rig().await;
++        let (a, b) = rig.both_at_work().await;
++        a.feed.send(text("Halfway through.")).unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
++        let stopped = std::time::Instant::now();
++        rig.person_stops("kid-a");
++        rig.until("Tests stops", |r| r.status("kid-a").status != SessionStatus::Working).await;
++        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++        assert!(rig.heard().is_empty(), "held: {:?}", rig.heard());
++        assert_eq!(rig.on(), ["kid-a", "kid-b"]);
++
++        rig.until("the stop reaches the lead", |r| !r.heard().is_empty()).await;
++        assert!(stopped.elapsed() >= std::time::Duration::from_millis(4900), "{:?}", stopped.elapsed());
++        let stop: Vec<(String, ReportStatus, String)> = vec![(
++            "kid-a".into(),
++            ReportStatus::Stopped,
++            "The person stopped it. What it wrote before that, possibly unfinished:\n\nRunning them.Halfway through.".into(),
++        )];
++        assert_eq!(rig.heard(), stop);
++        assert_eq!(rig.on(), ["kid-b"]);
++
++        rig.person_writes("kid-a", "Just run the linter.", "p1");
++        let next = rig.next_run("kid-a", &a).await;
++        rig.until("Tests works for the person", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        assert_eq!(rig.on(), ["kid-b"]);
++        next.feed.send(text("Lint clean.")).unwrap();
++        next.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("Tests is done", |r| r.status("kid-a").status != SessionStatus::Working).await;
++        rig.quiet().await;
++        assert_eq!(rig.heard(), stop);
++        drop(b);
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// Another chat's agent stops Tests: not held, the lead hears at once.
++    #[tokio::test]
++    async fn an_agents_stop_on_a_child_reports_at_once() {
++        let rig = family_rig().await;
++        let (_a, b) = rig.both_at_work().await;
++        let stopped = std::time::Instant::now();
++        rig.core
++            .doc_host
++            .queue_command("kid-a", zeron_doc::SessionCommandPayload::Interrupt { stopped_by: Some("kid-b".into()) })
++            .unwrap();
++        rig.until("the lead hears", |r| !r.heard().is_empty()).await;
++        assert!(stopped.elapsed() < std::time::Duration::from_millis(4500), "{:?}", stopped.elapsed());
++        let (from, status, body) = rig.heard().remove(0);
++        assert_eq!((from.as_str(), status), ("kid-a", ReportStatus::Stopped));
++        assert!(body.starts_with("Chat "), "{body}");
++        drop(b);
++        rig.core.sessions.shutdown().await;
++    }
++
+     impl FamilyRig {
+         /// `chat`'s run as it stands now, started if it's a new one since
+         /// `was`; a parked run reads the next message from its mailbox.
+-- 
+2.55.0.windows.2
+
