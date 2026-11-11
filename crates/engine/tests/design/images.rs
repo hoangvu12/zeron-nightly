@@ -238,15 +238,18 @@ async fn a_design_tab_is_told_each_images_file_and_never_downloads() {
     );
     assert!(!seam.execute(&path, &snippet).await.is_error);
 
-    // The window watches it: each image it has, by url, with its file on
-    // this computer; the one it hasn't isn't named, and draws as a
-    // placeholder.
+    // The window watches it: each image it has is an asset, named by its
+    // url, with its file on this computer; the one it hasn't isn't named,
+    // and draws as a placeholder.
     let window = zeron_rpc::memory_client(seam.core.rpc_service());
     let mut seen = window.subscribe("WatchDesign", json!({ "path": path })).await.unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv()).await.unwrap().unwrap();
-    let images = first["images"].as_object().expect("images");
+    let images: Vec<&Value> = first["assets"].as_array().expect("assets").iter().filter(|a| a["kind"] == "image").collect();
     assert_eq!(images.len(), 2, "{first}");
-    let file = |url: &str| std::path::PathBuf::from(images[url].as_str().unwrap());
+    let file = |url: &str| {
+        let image = images.iter().find(|a| a["name"] == url).unwrap_or_else(|| panic!("no {url} in {first}"));
+        std::path::PathBuf::from(image["path"].as_str().unwrap())
+    };
     assert_eq!(std::fs::read(file("images/stripes.png")).unwrap(), stripes());
     assert_eq!(std::fs::read(file(&url)).unwrap(), stripes());
     assert!(file(&url).is_absolute() && !file(&url).starts_with(path.parent().unwrap()));
@@ -308,5 +311,23 @@ Insert({{ type: "rectangle", name: "Remote", width: 100, height: 100, fill: ["#0
     let reread: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(reread["children"][1], file["children"][1]);
     assert_eq!(reread["children"][2], file["children"][2]);
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_image_on_a_stroke_is_kept_and_warned_of() {
+    let seam = Seam::new().await;
+    let path = design(&seam, "Stroked").await;
+    let called = seam
+        .execute(
+            &path,
+            r##"Insert({ type: "rectangle", name: "Framed", width: 10, height: 10,
+  stroke: { fill: { type: "image", url: "images/stripes.png" }, thickness: 2 } });"##,
+        )
+        .await;
+    let warned = warnings(&called);
+    assert!(warned.iter().any(|w| w.contains("\"Framed\"") && w.contains("only as fills")), "{warned:?}");
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(file["children"][1]["stroke"]["fill"], json!({ "type": "image", "url": "images/stripes.png" }));
     seam.shutdown().await;
 }

@@ -1,10 +1,11 @@
-//! Assets: what a Design draws with beyond its own file, as icons are (and
-//! fonts and images will be). The engine resolves them, fetching, caching
+//! Assets: what a Design draws with beyond its own file, as icons and
+//! images are (and fonts will be). The engine resolves them, fetching, caching
 //! and checking each ([`Cache`]); it tells the window which a Design uses
 //! and the file holding each ([`Resolved`]), and the window reads only
 //! those files, never the network ([`Files`]). A painter asks either for an
 //! asset's bytes through [`Assets`], so a Design tab draws what an agent's
-//! screenshot does.
+//! screenshot does. An image in the Design's folder is found through the
+//! Design's own view of the cache ([`Beside`]).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::icons::{IconSource, Icons};
-use crate::model::Design;
+use crate::images::{self, ImageSource, Images};
+use crate::model::{Design, ImageFill};
 
 /// The kinds of asset; a kind is added with a variant here and its arms in
 /// [`Cache`].
@@ -22,6 +24,9 @@ use crate::model::Design;
 pub enum AssetKind {
     /// An Iconify icon's SVG, named `set:name` (its weight's variant).
     Icon,
+    /// An image fill's file, named by its url as written: a path relative
+    /// to the Design's folder, or an http(s) URL.
+    Image,
 }
 
 /// One asset, by kind and name.
@@ -34,6 +39,15 @@ pub struct AssetKey {
 impl AssetKey {
     pub fn icon(name: impl Into<String>) -> Self {
         Self { kind: AssetKind::Icon, name: name.into() }
+    }
+
+    pub fn image(url: impl Into<String>) -> Self {
+        Self { kind: AssetKind::Image, name: url.into() }
+    }
+
+    /// An image in the Design's folder, which only [`Beside`] finds.
+    fn is_beside(&self) -> bool {
+        self.kind == AssetKind::Image && !ImageFill::is_remote(&self.name)
     }
 }
 
@@ -74,16 +88,34 @@ pub fn used(design: &Design) -> BTreeSet<AssetKey> {
 /// in a folder per kind.
 pub struct Cache {
     icons: Icons,
+    images: Images,
 }
 
 impl Cache {
-    /// Assets cached in `dir`, icons fetched from `icons`.
+    /// Assets cached in `dir`, icons fetched from `icons`; images aren't
+    /// downloaded until [`with_images`](Self::with_images).
     pub fn new(dir: &Path, icons: Arc<dyn IconSource>) -> Self {
-        Self { icons: Icons::new(dir.join("icons"), icons) }
+        Self { icons: Icons::new(dir.join("icons"), icons), images: Images::new(dir.join("images")) }
+    }
+
+    /// Images downloaded from `images`.
+    pub fn with_images(self, images: Arc<dyn ImageSource>) -> Self {
+        self.images.set_source(images);
+        self
     }
 
     pub fn icons(&self) -> &Icons {
         &self.icons
+    }
+
+    pub fn images(&self) -> &Images {
+        &self.images
+    }
+
+    /// The assets of a Design in `folder`: this cache's, and the images
+    /// beside it.
+    pub fn beside(self: &Arc<Self>, folder: impl Into<PathBuf>) -> Beside {
+        Beside { cache: self.clone(), folder: folder.into() }
     }
 
     /// Fetches what `design` uses that isn't cached (a Design read from a
@@ -95,6 +127,10 @@ impl Cache {
                 AssetKind::Icon => {
                     let _ = self.icons.load(&key.name);
                 }
+                AssetKind::Image if !key.is_beside() => {
+                    let _ = self.images.load(&key.name);
+                }
+                AssetKind::Image => {}
             }
         }
     }
@@ -107,6 +143,8 @@ impl Cache {
             .filter_map(|key| {
                 let path = match key.kind {
                     AssetKind::Icon => self.icons.file_of(&key.name).ok()?,
+                    AssetKind::Image if !key.is_beside() => self.images.file_of(&key.name),
+                    AssetKind::Image => return None,
                 };
                 path.is_file().then_some(Resolved { key, path })
             })
@@ -119,7 +157,59 @@ impl Assets for Cache {
     fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
         match key.kind {
             AssetKind::Icon => self.icons.cached(&key.name).map(Arc::from),
+            AssetKind::Image if !key.is_beside() => std::fs::read(self.images.file_of(&key.name)).ok().map(Arc::from),
+            AssetKind::Image => None,
         }
+    }
+}
+
+/// One Design's assets: the [`Cache`]'s, and the images in its folder.
+pub struct Beside {
+    cache: Arc<Cache>,
+    folder: PathBuf,
+}
+
+impl Beside {
+    pub fn cache(&self) -> &Arc<Cache> {
+        &self.cache
+    }
+
+    /// Fetches what `design` uses that isn't cached ([`Cache::fetch`]).
+    pub fn fetch(&self, design: &Design) {
+        self.cache.fetch(design);
+    }
+
+    /// Each asset `design` uses that's here, and its file
+    /// ([`Cache::resolved`]), with the images in its folder. Never fetches.
+    pub fn resolved(&self, design: &Design) -> Vec<Resolved> {
+        let mut resolved = self.cache.resolved(design);
+        for key in used(design).into_iter().filter(AssetKey::is_beside) {
+            let path = self.folder.join(key.name.replace('\\', "/"));
+            if path.is_file() {
+                resolved.push(Resolved { key, path });
+            }
+        }
+        resolved
+    }
+
+    /// The file of the image at `url`, downloaded now if it's a URL not
+    /// cached yet, or why it can't be drawn.
+    pub fn image(&self, url: &str) -> Result<PathBuf, String> {
+        if ImageFill::is_remote(url) {
+            self.cache.images.load(url)
+        } else {
+            images::beside(&self.folder, url)
+        }
+    }
+}
+
+/// What's here only: drawing never fetches.
+impl Assets for Beside {
+    fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
+        if !key.is_beside() {
+            return self.cache.get(key);
+        }
+        std::fs::read(self.folder.join(key.name.replace('\\', "/"))).ok().map(Arc::from)
     }
 }
 
@@ -136,6 +226,11 @@ impl Files {
             paths: resolved.into_iter().map(|resolved| (resolved.key, resolved.path)).collect(),
             read: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Each asset's file.
+    pub fn paths(&self) -> &HashMap<AssetKey, PathBuf> {
+        &self.paths
     }
 }
 
