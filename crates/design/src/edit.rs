@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde_json::{Map, Value};
 
 use crate::model::{Design, Kind, Node};
+use crate::printed::Printed;
 
 /// Characters a generated node id is made of.
 const ID_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -38,6 +39,8 @@ pub struct Draft {
     changed: BTreeSet<String>,
     /// Nodes whose screenshots the call asked for, in order.
     screenshots: Vec<String>,
+    /// What the snippet printed, for the call's result.
+    printed: Printed,
     /// What the agent should know about its edits that didn't fail them.
     warnings: Vec<String>,
 }
@@ -50,6 +53,8 @@ pub struct Edited {
     pub names: Map<String, Value>,
     pub changed: BTreeSet<String>,
     pub screenshots: Vec<String>,
+    /// The lines the call printed.
+    pub printed: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -69,8 +74,19 @@ impl Draft {
             created: Vec::new(),
             changed: BTreeSet::new(),
             screenshots: Vec::new(),
+            printed: Printed::default(),
             warnings: Vec::new(),
         }
+    }
+
+    /// The Design as this call has it so far.
+    pub fn design(&self) -> &Design {
+        &self.design
+    }
+
+    /// Adds a line to the call's result.
+    pub fn print(&mut self, line: String) {
+        self.printed.push(line);
     }
 
     /// Adds `node` (a node's properties, with any `children` inline) as the
@@ -147,6 +163,7 @@ impl Draft {
             names,
             changed: self.changed,
             screenshots: self.screenshots,
+            printed: self.printed.into_lines(),
             warnings: self.warnings,
         }
     }

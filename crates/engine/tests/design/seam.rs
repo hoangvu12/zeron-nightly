@@ -22,8 +22,6 @@ pub const OTHER: &str = "implementer";
 pub struct Seam {
     pub core: EngineCore,
     tools: Tools,
-    /// [`OTHER`]'s agent.
-    other: Tools,
     dir: tempfile::TempDir,
 }
 
@@ -54,6 +52,14 @@ impl Called {
     pub fn path(&self) -> PathBuf {
         PathBuf::from(self.json()["design"]["path"].as_str().expect("a path"))
     }
+
+    /// The lines the snippet printed.
+    pub fn printed(&self) -> Vec<String> {
+        match self.json().get("printed") {
+            Some(printed) => serde_json::from_value(printed.clone()).expect("printed lines"),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// An image content block, decoded.
@@ -80,24 +86,10 @@ impl Seam {
             None,
         )
         .unwrap();
-        let agent = |chat: &str| {
-            core.workspace
-                .create_chat(chat, None, Some(&core.device_id), None, None)
-                .unwrap();
-            Tools::new(Arc::new(Zeron::with_client(
-                zeron_rpc::agent_memory_client(core.rpc_service(), Some(chat.into())),
-                Origin {
-                    chat_id: Some(chat.into()),
-                    device_id: Some(core.device_id.clone()),
-                    ..Default::default()
-                },
-            )))
-        };
-        let (tools, other) = (agent(CHAT), agent(OTHER));
+        let tools = agent_tools(&core, CHAT);
         Self {
             core,
             tools,
-            other,
             dir,
         }
     }
@@ -117,9 +109,9 @@ impl Seam {
         call(&self.tools, tool, arguments).await
     }
 
-    /// A tool call from [`OTHER`]'s agent.
-    pub async fn call_other(&self, tool: &str, arguments: Value) -> Called {
-        call(&self.other, tool, arguments).await
+    /// A call from another chat's agent, made on first use.
+    pub async fn call_from(&self, chat: &str, tool: &str, arguments: Value) -> Called {
+        call(&agent_tools(&self.core, chat), tool, arguments).await
     }
 
     /// `design_execute` on a new Design named `name`.
@@ -142,6 +134,23 @@ impl Seam {
     pub async fn shutdown(self) {
         self.core.shutdown().await;
     }
+}
+
+/// Zeron's MCP server for `chat`'s agent, making the chat if it's new.
+fn agent_tools(core: &EngineCore, chat: &str) -> Tools {
+    if core.workspace.chat(chat).unwrap().is_none() {
+        core.workspace
+            .create_chat(chat, None, Some(&core.device_id), None, None)
+            .unwrap();
+    }
+    Tools::new(Arc::new(Zeron::with_client(
+        zeron_rpc::agent_memory_client(core.rpc_service(), Some(chat.into())),
+        Origin {
+            chat_id: Some(chat.into()),
+            device_id: Some(core.device_id.clone()),
+            ..Default::default()
+        },
+    )))
 }
 
 async fn call(tools: &Tools, tool: &str, arguments: Value) -> Called {

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
-use zeron_design::snippet::{self, Limits};
+use zeron_design::snippet::{self, Globals, Limits};
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -101,6 +101,8 @@ struct Inner {
     limits: Limits,
     /// Designs held live, by file: one owner each, so calls apply in order.
     live: Mutex<HashMap<PathBuf, Arc<Mutex<Live>>>>,
+    /// Each chat's snippet globals, carried to its next call.
+    globals: Mutex<HashMap<String, Globals>>,
     /// The Designs each chat's Design tabs show, front first.
     tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The Designs touched most recently, newest first, as kept in
@@ -138,6 +140,7 @@ impl Designs {
                 root,
                 limits: Limits::default(),
                 live: Mutex::new(HashMap::new()),
+                globals: Mutex::new(HashMap::new()),
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
@@ -152,8 +155,8 @@ impl Designs {
 
     /// Runs one `design_execute` call to its end (blocking: run it off the
     /// async runtime). Returns the Design's name and path, the name-to-id
-    /// map of the nodes the call made, its screenshots as base64 PNG, and
-    /// any warnings about its edits.
+    /// map of the nodes the call made, its screenshots as base64 PNG, the
+    /// lines it printed and any warnings about its edits.
     pub fn execute(&self, params: ExecuteParams) -> Result<Value, DesignError> {
         if params.snippet.trim().is_empty() {
             return Err(DesignError::Refused("the snippet is empty".into()));
@@ -167,16 +170,25 @@ impl Designs {
         ran
     }
 
+    /// Runs the call's snippet with its chat's globals, keeping the globals
+    /// it leaves when it succeeds. Read once the Design is held, so calls
+    /// queued on one Design see each other's; calls on two Designs at once
+    /// each start from what was there, and the later to end wins.
     fn run(&self, live: &Mutex<Live>, params: &ExecuteParams) -> Result<Value, DesignError> {
         let mut live = lock(live);
-        let draft = snippet::run(Draft::new(live.design.clone()), &params.snippet, self.inner.limits)?;
-        let edited = draft.finish();
         let chat = params.chat_id.as_deref();
+        let globals = chat
+            .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
+            .unwrap_or_default();
+        let (draft, globals) =
+            snippet::run(Draft::new(live.design.clone()), globals, &params.snippet, self.inner.limits)?;
+        let edited = draft.finish();
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
         let screenshots = live.commit(&edited)?;
         if let Some(chat) = chat {
+            lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
             live.seen.insert(chat.to_owned(), version);
         }
@@ -185,6 +197,9 @@ impl Designs {
             "ids": edited.names,
             "screenshots": screenshots,
         });
+        if !edited.printed.is_empty() {
+            result["printed"] = json!(edited.printed);
+        }
         if !edited.warnings.is_empty() {
             result["warnings"] = json!(edited.warnings);
         }

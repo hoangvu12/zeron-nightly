@@ -191,7 +191,7 @@ async fn design_state_lists_the_chats_open_designs_and_the_guide_reminder() {
     let recent: Vec<_> = state["recent"].as_array().unwrap().iter().map(|r| r["name"].clone()).collect();
     assert_eq!(recent, [json!("Gamma"), json!("Beta"), json!("Alpha")]);
 
-    let theirs = seam.call_other("design_state", json!({})).await.json();
+    let theirs = seam.call_from(OTHER, "design_state", json!({})).await.json();
     assert_eq!(theirs["designs"], json!([{ "name": "Gamma", "path": gamma, "front": true }]));
     seam.shutdown().await;
 }
@@ -207,16 +207,22 @@ async fn two_chats_changing_one_design_share_one_live_copy() {
         let path = path.clone();
         async move {
             shared
-                .call_other("design_execute", json!({ "path": path, "snippet": snippet }))
+                .call_from(OTHER, "design_execute", json!({ "path": path, "snippet": snippet }))
                 .await
         }
     };
 
-    // The other chat sees this chat's Screen at once, and this chat is told
-    // its Design changed since its last call.
+    // Each chat sees the other's nodes at once, and this chat is told its
+    // Design changed since its last call.
     let theirs = from_other(card("Theirs")).await;
     assert!(theirs.json().get("notice").is_none(), "{}", theirs.text);
-    let mine = seam.execute(&path, &card("Mine")).await;
+    let mine = seam
+        .execute(
+            &path,
+            &format!(r#"{} Print(Get("{}", {{ depth: 0 }}).name);"#, card("Mine"), theirs.id("Theirs")),
+        )
+        .await;
+    assert_eq!(mine.printed(), ["Theirs"]);
     let notice = mine.json()["notice"].as_str().unwrap_or_default().to_owned();
     assert!(notice.contains("changed since your last call"), "{}", mine.text);
     // Not when no one else changed it.
