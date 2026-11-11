@@ -353,17 +353,21 @@ pub mod methods {
     /// turn as an image part (`show_image`). Local only, like `PublishVisual`.
     pub const PUBLISH_IMAGE: &str = "PublishImage";
     /// Run an agent's snippet against a Design (`design_execute`): `{chatId?,
-    /// snippet, description?, path? | name?}` → `{design: {name, path}, ids,
-    /// screenshots: [{id, width, height, mimeType, data}]}`. Local only:
-    /// Designs live on the engine of their computer.
+    /// snippet, description?, path? | name?}`, or a failed call's retry
+    /// `{chatId?, editId, edits: [{find, replace}]}` → `{design: {name,
+    /// path}, ids, screenshots: [{id, width, height, mimeType, data}],
+    /// printed?, warnings?}`, or `{failed: {error, line?, code?, editId,
+    /// retry}}` when the snippet ran and failed. Local only: Designs live on
+    /// the engine of their computer.
     pub const DESIGN_EXECUTE: &str = "DesignExecute";
     /// The Designs a chat has open (`design_state`): `{chatId?}` →
     /// `{designs: [{name, path, front}], recent: [{name, path, touchedAt}],
     /// guide}`. Local only, like `DesignExecute`.
     pub const DESIGN_STATE: &str = "DesignState";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
-    /// changed}`: the Design whole as it is, then after each change, with
-    /// the ids the change made or changed. Local only.
+    /// changes}`: the Design whole as it is, then after each change, with
+    /// each change since the item before as `{version, changed, by}` (the
+    /// ids it made or changed; `by` "agent"). Local only.
     pub const WATCH_DESIGN: &str = "WatchDesign";
     /// `{chatId, paths}` → `{}`: the Designs a chat's Design tabs show, the
     /// front one first (none: it has none), as the app's tabs open, close

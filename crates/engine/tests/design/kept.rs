@@ -78,8 +78,11 @@ async fn insert_warns_about_properties_it_doesnt_know() {
         .await;
     let warnings = made.json()["warnings"].clone();
     assert_eq!(warnings.as_array().map(Vec::len), Some(1), "{warnings}");
-    let warning = warnings[0].as_str().unwrap();
-    assert!(warning.contains("\"fills\"") && warning.contains("Card"), "{warning}");
+    // About that node and property, and saying so.
+    let warning = &warnings[0];
+    assert_eq!((&warning["node"], &warning["property"]), (&json!(made.id("Card")), &json!("fills")));
+    let message = warning["message"].as_str().unwrap();
+    assert!(message.contains("\"fills\"") && message.contains("Card"), "{message}");
 
     // Kept as written, though it does nothing.
     let file: Value = serde_json::from_str(&std::fs::read_to_string(made.path()).unwrap()).unwrap();
@@ -87,6 +90,7 @@ async fn insert_warns_about_properties_it_doesnt_know() {
 
     // Not an unknown type, though: Insert refuses that.
     let unknown = seam.execute(&made.path(), r#"Insert({ type: "blob" });"#).await;
-    assert!(unknown.is_error && unknown.text.contains("\"blob\""), "{}", unknown.text);
+    let error = unknown.failure()["error"].as_str().unwrap().to_owned();
+    assert!(error.contains("\"blob\""), "{error}");
     seam.shutdown().await;
 }

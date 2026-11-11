@@ -103,6 +103,19 @@ impl Design {
         depth_in(&self.children, id, 1)
     }
 
+    /// Where the node is: its parent's id (none on the Canvas) and its
+    /// index among its siblings.
+    pub fn position_of(&self, id: &str) -> Option<(Option<String>, usize)> {
+        fn position_in(nodes: &[Node], parent: Option<&str>, id: &str) -> Option<(Option<String>, usize)> {
+            nodes.iter().enumerate().find_map(|(index, node)| {
+                (node.id == id)
+                    .then(|| (parent.map(str::to_owned), index))
+                    .or_else(|| position_in(node.kind.get().children(), Some(&node.id), id))
+            })
+        }
+        position_in(&self.children, None, id)
+    }
+
     pub fn find_mut(&mut self, id: &str) -> Option<&mut Node> {
         find_in_mut(&mut self.children, id)
     }
@@ -160,6 +173,9 @@ pub struct Node {
     /// Placed at its x and y even in a parent that lays its children out,
     /// and left out of that layout.
     pub absolute: bool,
+    /// An agent is still building it (a Screen's mark while it works): the
+    /// Design tab shows it as in progress.
+    pub in_progress: bool,
     pub kind: Kind,
     /// Properties the model doesn't know (all but its id, for an
     /// [`Opaque`] node), written back as they were read.

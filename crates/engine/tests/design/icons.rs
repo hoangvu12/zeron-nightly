@@ -100,7 +100,7 @@ async fn an_unknown_icon_fails_the_call_and_says_why() {
         .await;
     let before = std::fs::read_to_string(made.path()).unwrap();
     for (icon, says) in [
-        ("lucide:no-such-icon", "no icon \"lucide:no-such-icon\""),
+        ("lucide:no-such-icon", "Iconify has no icon"),
         ("house", "set and name"),
         ("../mdi:square", "set and name"),
         ("", "set and name"),
@@ -156,8 +156,10 @@ async fn weight_thickens_icons_where_the_set_has_weights() {
             r#"Insert({ type: "icon", name: "Box", icon: "mdi:square", width: 24, height: 24, weight: 700 });"#,
         )
         .await;
-    let warnings = unweighted.json()["warnings"].to_string();
-    assert!(warnings.contains("Box") && warnings.contains("no weights"), "{}", unweighted.text);
+    let warning = &unweighted.json()["warnings"][0];
+    assert_eq!(warning["node"].as_str(), Some(unweighted.id("Box").as_str()), "{}", unweighted.text);
+    assert_eq!(warning["property"], "weight", "{}", unweighted.text);
+    assert!(warning["message"].as_str().unwrap().contains("no weights"), "{}", unweighted.text);
     seam.shutdown().await;
 }
 
@@ -215,5 +217,39 @@ async fn waiting_on_the_network_for_icons_does_not_count_against_the_snippet() {
     *seam.iconify.delay.lock().unwrap() = std::time::Duration::ZERO;
     let spun = seam.create("Spun", "while (true) {}").await;
     assert!(spun.is_error && spun.text.contains("limit"), "{}", spun.text);
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn updating_or_copying_to_an_unknown_icon_fails_and_changes_nothing() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Edited",
+            r#"const card = Insert({ type: "frame", name: "Card", width: 100, height: 100 });
+Insert(card, { type: "icon", name: "Mark", icon: "mdi:square", width: 24, height: 24 });"#,
+        )
+        .await;
+    let (card, mark) = (made.id("Card"), made.id("Mark"));
+    let before = std::fs::read_to_string(made.path()).unwrap();
+    for snippet in [
+        format!(r#"Update("{mark}", {{ icon: "lucide:no-such-icon" }});"#),
+        format!(r#"Copy("{card}", null, {{ descendants: {{ "{mark}": {{ icon: "lucide:no-such-icon" }} }} }});"#),
+        format!(r#"Replace("{mark}", {{ type: "icon", icon: "lucide:no-such-icon", width: 24, height: 24 }});"#),
+    ] {
+        let failed = seam.execute(&made.path(), &snippet).await;
+        assert!(failed.is_error && failed.text.contains("Iconify has no icon") && failed.text.contains("lucide:no-such-icon"), "{snippet}: {}", failed.text);
+    }
+    assert_eq!(std::fs::read_to_string(made.path()).unwrap(), before);
+
+    // Caught in the snippet, the Update leaves the node as it was.
+    let caught = seam
+        .execute(
+            &made.path(),
+            &format!(r#"try {{ Update("{mark}", {{ icon: "lucide:no-such-icon", width: 48 }}); }} catch (e) {{}}
+Print(Get("{mark}").icon, Get("{mark}").width);"#),
+        )
+        .await;
+    assert_eq!(caught.printed(), ["mdi:square 24"], "{}", caught.text);
     seam.shutdown().await;
 }

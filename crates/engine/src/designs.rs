@@ -5,7 +5,13 @@
 //! runs its snippet against a draft of it in the QuickJS sandbox, and on
 //! success keeps the draft ([`Live::commit`]): the file is saved, then the
 //! call's screenshots drawn (one that can't be drawn says why in its
-//! place). A failed call changes nothing, on disk or in memory. New Designs are made in the managed folder, `designs/` in the
+//! place). Each kept call is one step of the Design's undo stack.
+//!
+//! A failed call changes nothing, on disk or in memory, nor the chat's
+//! globals: it returns a [`Failure`] with an edit id, and its snippet is
+//! kept for the chat to retry with find-and-replace edits ([`retry`]).
+//!
+//! New Designs are made in the managed folder, `designs/` in the
 //! engine's data dir, one folder each with an `images/` folder beside the
 //! `.zdesign` file. Assets (icons) are fetched as a call places them and
 //! cached in `design-cache/` beside it ([`zeron_design::assets::Cache`]);
@@ -20,6 +26,7 @@
 //! change.
 
 mod iconify;
+mod retry;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,10 +37,14 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
-use zeron_design::edit::{Draft, Edited};
 use zeron_design::assets::{Cache, Resolved};
+use zeron_design::edit::{Draft, Edited};
+use zeron_design::history::History;
 use zeron_design::icons::Icons;
-use zeron_design::snippet::{self, Globals, Limits};
+use zeron_design::snippet::{self, Globals, Limits, SnippetError};
+
+pub use retry::{Edit, Failure};
+use retry::{Failed, Kept, Retarget};
 
 use self::iconify::Iconify;
 
@@ -60,7 +71,9 @@ pub struct ExecuteParams {
     /// The calling chat (the agent's, set by the engine for an agent).
     #[serde(default)]
     pub chat_id: Option<String>,
-    pub snippet: String,
+    /// Left out when retrying a failed call.
+    #[serde(default)]
+    pub snippet: Option<String>,
     /// What the call does, in a few words.
     #[serde(default)]
     pub description: Option<String>,
@@ -70,6 +83,11 @@ pub struct ExecuteParams {
     /// The name of a new managed Design to make.
     #[serde(default)]
     pub name: Option<String>,
+    /// The failed call to retry, with `edits` to its snippet.
+    #[serde(default)]
+    pub edit_id: Option<String>,
+    #[serde(default)]
+    pub edits: Vec<Edit>,
 }
 
 /// `WatchDesign`'s params.
@@ -112,8 +130,10 @@ pub enum DesignError {
     /// The request can't be met as asked; the agent can fix it and retry.
     #[error("{0}")]
     Refused(String),
-    #[error(transparent)]
-    Snippet(#[from] snippet::SnippetError),
+    /// The call ran and failed, changing nothing; the agent can retry it
+    /// with edits.
+    #[error("{}", .0.error)]
+    Failed(Box<Failure>),
     #[error("{0}")]
     Io(String),
 }
@@ -131,6 +151,8 @@ struct Inner {
     live: Mutex<HashMap<PathBuf, Arc<Mutex<Live>>>>,
     /// Each chat's snippet globals, carried to its next call.
     globals: Mutex<HashMap<String, Globals>>,
+    /// Failed calls, kept to retry.
+    failed: Mutex<Failed>,
     /// The Designs each chat's Design tabs show, front first.
     tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The Designs touched most recently, newest first, as kept in
@@ -143,23 +165,50 @@ struct Inner {
 struct Live {
     path: PathBuf,
     design: Design,
+    history: History,
     /// Counts the changes kept, whoever made them.
     version: u64,
     /// The version each chat's last successful call left.
     seen: HashMap<String, u64>,
     /// What the Design tabs following it hear: it after each change.
     followers: tokio::sync::watch::Sender<Told>,
+    /// Where its tabs are told the files of its assets.
+    assets: Arc<Cache>,
 }
 
-/// A Design as the tabs following it hear it: its version, what the
-/// change that made it made or changed, and the files of the assets it
-/// uses (`None` until resolved for a tab).
+/// A Design as the tabs following it hear it: its version, the changes
+/// that made the latest versions (a tab that falls behind hears each
+/// change it missed, up to [`MAX_TOLD_CHANGES`]), and the files of the
+/// assets it uses (`None` until resolved for a tab).
 #[derive(Clone)]
 struct Told {
     version: u64,
     design: Arc<Design>,
-    changed: Vec<String>,
+    changes: Vec<Change>,
     assets: Option<Vec<Resolved>>,
+}
+
+/// One change to a Design, as its tabs hear of it.
+#[derive(Clone, Serialize)]
+struct Change {
+    version: u64,
+    /// The nodes it made or changed.
+    changed: Vec<String>,
+    by: Changer,
+}
+
+/// How many of the latest changes a Design's tabs are told of.
+const MAX_TOLD_CHANGES: usize = 32;
+
+/// Who changed a Design: its tabs flash an agent's changes. (The person's
+/// own edits in a Design tab come with #33.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Changer {
+    /// An agent's `design_execute` call.
+    Agent,
+    /// An undo or redo of an earlier change.
+    Undo,
 }
 
 impl Designs {
@@ -171,7 +220,6 @@ impl Designs {
         let root = std::fs::create_dir_all(&root)
             .and_then(|()| canonical(&root))
             .unwrap_or(root);
-        let assets = Cache::new(&data_dir.join("design-cache"), Arc::new(Iconify));
         let recent_file = data_dir.join("recent-designs.json");
         let recent = std::fs::read_to_string(&recent_file)
             .ok()
@@ -181,9 +229,10 @@ impl Designs {
             inner: Arc::new(Inner {
                 root,
                 limits: Limits::default(),
-                assets: Arc::new(assets),
+                assets: Arc::new(Cache::new(&data_dir.join("design-cache"), Arc::new(Iconify))),
                 live: Mutex::new(HashMap::new()),
                 globals: Mutex::new(HashMap::new()),
+                failed: Mutex::new(Failed::default()),
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
@@ -205,25 +254,103 @@ impl Designs {
     /// Runs one `design_execute` call to its end (blocking: run it off the
     /// async runtime). Returns the Design's name and path, the name-to-id
     /// map of the nodes the call made, its screenshots as base64 PNG, the
-    /// lines it printed and any warnings about its edits.
+    /// lines it printed and any warnings about its edits. A call that
+    /// fails once it runs is a [`DesignError::Failed`], kept to retry.
     pub fn execute(&self, params: ExecuteParams) -> Result<Value, DesignError> {
-        if params.snippet.trim().is_empty() {
+        let (params, edit_id) = match params.edit_id.clone() {
+            Some(edit_id) => (self.retried(params, &edit_id)?, Some(edit_id)),
+            None => (params, None),
+        };
+        let code = params.snippet.as_deref().unwrap_or_default();
+        if code.trim().is_empty() {
             return Err(DesignError::Refused("the snippet is empty".into()));
         }
         let target = self.target(&params)?;
-        let ran = self.run(&target.live, &params);
+        let ran = self.run(&target.live, code, &params);
         if ran.is_err() && target.new {
             // Nothing was made: the name is free again.
             lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
         }
-        ran
+        let (error, line) = match ran {
+            Ok(result) => {
+                if let Some(edit_id) = &edit_id {
+                    lock(&self.inner.failed).remove(edit_id);
+                }
+                return Ok(result);
+            }
+            Err(Ran::Snippet(SnippetError::Failed { message, line })) => (message, line),
+            Err(Ran::Snippet(e)) => (e.to_string(), None),
+            Err(Ran::Design(e)) => (e.to_string(), None),
+        };
+        let retarget = match (&params.name, target.new) {
+            (Some(name), true) => Retarget::Name(name.clone()),
+            _ => Retarget::Path(lock(&target.live).path.clone()),
+        };
+        let kept = Kept {
+            chat: params.chat_id.clone(),
+            snippet: code.to_owned(),
+            description: params.description.clone(),
+            target: retarget,
+        };
+        let edit_id = lock(&self.inner.failed).keep(edit_id, kept);
+        Err(DesignError::Failed(Box::new(Failure::new(error, line, code, edit_id))))
+    }
+
+    /// A retry's call: the failed call `edit_id`'s, its snippet patched
+    /// with the retry's edits and kept so, should this try fail too.
+    fn retried(&self, retry: ExecuteParams, edit_id: &str) -> Result<ExecuteParams, DesignError> {
+        if retry.snippet.is_some() {
+            return Err(DesignError::Refused(
+                "a retry sends edits to the failed call's snippet, not a snippet: leave out snippet".into(),
+            ));
+        }
+        if retry.path.is_some() || retry.name.is_some() {
+            return Err(DesignError::Refused(
+                "a retry runs on the failed call's Design: leave out path and name".into(),
+            ));
+        }
+        let mut failed = lock(&self.inner.failed);
+        let kept = failed.get(edit_id, retry.chat_id.as_deref()).cloned().ok_or_else(|| {
+            DesignError::Refused(format!(
+                "no failed call of this chat has the edit id \"{edit_id}\" (a retry that succeeds is done with it)"
+            ))
+        })?;
+        let snippet = retry::patched(&kept.snippet, &retry.edits).map_err(|error| {
+            DesignError::Failed(Box::new(Failure::new(error, None, &kept.snippet, edit_id.to_owned())))
+        })?;
+        failed.keep(Some(edit_id.to_owned()), Kept { snippet: snippet.clone(), ..kept.clone() });
+        let (path, name) = match kept.target {
+            Retarget::Path(path) => (Some(path.to_string_lossy().into_owned()), None),
+            Retarget::Name(name) => (None, Some(name)),
+        };
+        Ok(ExecuteParams {
+            chat_id: retry.chat_id,
+            snippet: Some(snippet),
+            description: retry.description.or(kept.description),
+            path,
+            name,
+            edit_id: None,
+            edits: Vec::new(),
+        })
+    }
+
+    /// Undoes the latest change to the Design at `path`, whoever made it,
+    /// and saves it. False with nothing to undo.
+    pub fn undo(&self, path: &Path) -> Result<bool, DesignError> {
+        lock(&*self.open(path)?).step(History::undo, History::redo)
+    }
+
+    /// Does the latest undone change to the Design at `path` again.
+    pub fn redo(&self, path: &Path) -> Result<bool, DesignError> {
+        lock(&*self.open(path)?).step(History::redo, History::undo)
     }
 
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
-    /// design, changed, assets}`, `assets` the file of each asset it uses
-    /// (`{kind, name, path}`), for the tab to draw from without fetching.
-    /// A tab that falls behind hears the latest only.
+    /// design, changes: [{version, changed, by}], assets}`: the changes
+    /// since the item before (none in the first), `by` "agent", and the
+    /// file of each asset it uses (`{kind, name, path}`), for the tab to
+    /// draw from without fetching. A tab that falls behind hears the latest only.
     /// Blocking (it may read the file): run it off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
@@ -236,46 +363,52 @@ impl Designs {
                     *told = Told {
                         version: live.version,
                         design: Arc::new(live.design.clone()),
-                        changed: Vec::new(),
-                        assets: Some(self.inner.assets.resolved(&live.design)),
+                        changes: Vec::new(),
+                        assets: Some(live.assets.resolved(&live.design)),
                     };
                 }
                 stale
             });
             live.followers.subscribe()
         };
-        Ok(futures::stream::unfold((told, true), |(mut told, first)| async move {
-            if !first && told.changed().await.is_err() {
+        // (The version it last told, so each item tells the changes since.)
+        Ok(futures::stream::unfold((told, None::<u64>), |(mut told, last)| async move {
+            if last.is_some() && told.changed().await.is_err() {
                 return None;
             }
             let now = told.borrow_and_update().clone();
+            let since: Vec<&Change> = match last {
+                Some(last) => now.changes.iter().filter(|change| change.version > last).collect(),
+                None => Vec::new(),
+            };
             let item = json!({
                 "version": now.version,
                 "design": &*now.design,
-                "changed": now.changed,
-                "assets": now.assets.unwrap_or_default(),
+                "changes": since,
+                "assets": now.assets.as_deref().unwrap_or_default(),
             });
-            Some((item, (told, false)))
+            Some((item, (told, Some(now.version))))
         }))
     }
 
-    /// Runs the call's snippet with its chat's globals, keeping the globals
-    /// it leaves when it succeeds. Read once the Design is held, so calls
+    /// Runs `code` with the calling chat's globals, keeping the globals it
+    /// leaves when it succeeds. Read once the Design is held, so calls
     /// queued on one Design see each other's; calls on two Designs at once
     /// each start from what was there, and the later to end wins.
-    fn run(&self, live: &Mutex<Live>, params: &ExecuteParams) -> Result<Value, DesignError> {
+    fn run(&self, live: &Mutex<Live>, code: &str, params: &ExecuteParams) -> Result<Value, Ran> {
         let mut live = lock(live);
         let chat = params.chat_id.as_deref();
         let globals = chat
             .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
             .unwrap_or_default();
-        let draft = Draft::new(live.design.clone()).with_assets(self.inner.assets.clone());
-        let (draft, globals) = snippet::run(draft, globals, &params.snippet, self.inner.limits)?;
+        let (draft, globals) = snippet::run(Draft::new(live.design.clone()).with_assets(self.inner.assets.clone()), globals, code, self.inner.limits)
+            .map_err(Ran::Snippet)?;
         let edited = draft.finish();
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
-        let screenshots = live.commit(&edited, &self.inner.assets)?;
+        let description = params.description.as_deref().unwrap_or(DEFAULT_DESCRIPTION);
+        let screenshots = live.commit(&edited, description, Changer::Agent).map_err(Ran::Design)?;
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -465,7 +598,7 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        let design = Arc::new(Mutex::new(Live::new(path.clone(), design)));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), design, self.inner.assets.clone())));
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -491,11 +624,20 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default())));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default(), self.inner.assets.clone())));
         live.insert(path, design.clone());
         Ok(design)
     }
 }
+
+/// How a call that ran failed.
+enum Ran {
+    Snippet(SnippetError),
+    Design(DesignError),
+}
+
+/// A call's undo step's description when the agent gave none.
+const DEFAULT_DESCRIPTION: &str = "An agent's change";
 
 /// The Design a call is for, and whether the call is making it.
 struct Target {
@@ -504,43 +646,82 @@ struct Target {
 }
 
 impl Live {
-    fn new(path: PathBuf, design: Design) -> Self {
+    fn new(path: PathBuf, design: Design, assets: Arc<Cache>) -> Self {
         let told = Told {
             version: 0,
             design: Arc::new(design.clone()),
-            changed: Vec::new(),
+            changes: Vec::new(),
             assets: None,
         };
         Self {
             path,
             design,
+            history: History::default(),
             version: 0,
             seen: HashMap::new(),
             followers: tokio::sync::watch::channel(told).0,
+            assets,
         }
     }
 
-    /// Tells the Design's tabs what a change made of it (copied for them
-    /// only while some follow it).
-    fn tell(&self, edited: &Edited, assets: &Cache) {
+    /// Makes `design` the Design, as every change does: saves it, then
+    /// tells other chats' next calls and the Design's tabs, with the nodes
+    /// `changed`. Returns the Design as it was.
+    fn keep(&mut self, design: Design, changed: Vec<String>, by: Changer) -> Result<Design, DesignError> {
+        save(&self.path, &design)?;
+        let before = std::mem::replace(&mut self.design, design);
+        self.version += 1;
+        self.tell(changed, by);
+        Ok(before)
+    }
+
+    /// Takes one step through the Design's history with `step` (undo or
+    /// redo), or back with `back` when the Design can't be saved. False
+    /// with no step to take.
+    fn step(
+        &mut self,
+        step: fn(&mut History, &Design) -> Option<(Design, String)>,
+        back: fn(&mut History, &Design) -> Option<(Design, String)>,
+    ) -> Result<bool, DesignError> {
+        let Some((design, _)) = step(&mut self.history, &self.design) else {
+            return Ok(false);
+        };
+        if let Err(e) = self.keep(design.clone(), Vec::new(), Changer::Undo) {
+            back(&mut self.history, &design);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Tells the Design's tabs what a change (`by` whom) made of it, and
+    /// the nodes it `changed` (copied for them only while some follow it).
+    fn tell(&self, changed: Vec<String>, by: Changer) {
         if self.followers.receiver_count() == 0 {
             return;
         }
-        self.followers.send_replace(Told {
+        let change = Change {
             version: self.version,
-            design: Arc::new(self.design.clone()),
-            changed: edited.changed.iter().cloned().collect(),
-            assets: Some(assets.resolved(&self.design)),
+            changed,
+            by,
+        };
+        let design = Arc::new(self.design.clone());
+        let assets = self.assets.resolved(&self.design);
+        self.followers.send_modify(|told| {
+            told.version = change.version;
+            told.design = design;
+            told.assets = Some(assets);
+            told.changes.push(change);
+            let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
+            told.changes.drain(..over);
         });
     }
 
-    /// Keeps a successful call's draft: saves the file, then draws the
-    /// screenshots the call asked for.
-    fn commit(&mut self, edited: &Edited, assets: &Cache) -> Result<Vec<Value>, DesignError> {
-        save(&self.path, &edited.design)?;
-        self.design = edited.design.clone();
-        self.version += 1;
-        self.tell(edited, assets);
+    /// Keeps a successful change's draft (`by` whom) as one undo step,
+    /// described as `description`: saves the file, then draws the
+    /// screenshots it asked for.
+    fn commit(&mut self, edited: &Edited, description: &str, by: Changer) -> Result<Vec<Value>, DesignError> {
+        let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect(), by)?;
+        self.history.record(description, &before, &self.design);
         Ok(edited
             .screenshots
             .iter()
@@ -549,7 +730,7 @@ impl Live {
                     &self.design,
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
-                    assets,
+                    &*self.assets,
                 );
                 match shot {
                     Ok(shot) => json!({
@@ -582,20 +763,24 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(folder)?;
     std::io::Write::write_all(&mut file, bytes)?;
-    // Windows refuses to replace a file someone has open (a reader, a
-    // virus scan) until they let go: try again for a moment.
-    for attempt in 1.. {
+    // Windows refuses to replace a file another process (a virus scanner,
+    // the indexer) has open for a moment after it was written: try again.
+    let mut tries = 0;
+    loop {
         match file.persist(path) {
-            Ok(_) => break,
-            Err(e) if e.error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 5 => {
+            Ok(_) => return Ok(()),
+            Err(e) if e.error.kind() == std::io::ErrorKind::PermissionDenied && tries < PERSIST_TRIES => {
+                tries += 1;
                 file = e.file;
-                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+                std::thread::sleep(std::time::Duration::from_millis(10 * tries));
             }
             Err(e) => return Err(e.error),
         }
     }
-    Ok(())
 }
+
+/// How many times a save tries again to replace its file.
+const PERSIST_TRIES: u64 = 8;
 
 /// A Design's name: its file's, without the extension.
 fn design_name(path: &Path) -> String {

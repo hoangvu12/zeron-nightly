@@ -231,3 +231,28 @@ async fn a_path_that_isnt_path_data_is_refused() {
     assert!(!seam.designs_folder().join("Squiggle").exists());
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn copying_or_updating_a_shape_to_bad_values_fails_and_changes_nothing() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Badges",
+            r##"const badge = Insert({ type: "frame", name: "Badge", width: 100, height: 100 });
+Insert(badge, { type: "path", name: "Tick", width: 20, height: 20, geometry: "M0 0 L10 10", fill: "#000" });
+Insert(badge, { type: "polygon", name: "Gem", width: 20, height: 20, polygonCount: 6 });"##,
+        )
+        .await;
+    let (badge, tick, gem) = (made.id("Badge"), made.id("Tick"), made.id("Gem"));
+    let before = std::fs::read_to_string(made.path()).unwrap();
+    for (snippet, says) in [
+        (format!(r#"Copy("{badge}", null, {{ descendants: {{ "{tick}": {{ geometry: "a squiggle" }} }} }});"#), "a squiggle"),
+        (format!(r#"Update("{tick}", {{ viewBox: [0, 0, 0, 0] }});"#), "viewBox"),
+        (format!(r#"Update("{gem}", {{ polygonCount: 2 }});"#), "polygonCount"),
+    ] {
+        let failed = seam.execute(&made.path(), &snippet).await;
+        assert!(failed.is_error && failed.text.contains(says), "{snippet}: {}", failed.text);
+    }
+    assert_eq!(std::fs::read_to_string(made.path()).unwrap(), before);
+    seam.shutdown().await;
+}
