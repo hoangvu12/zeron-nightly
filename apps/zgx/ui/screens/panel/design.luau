@@ -69,6 +69,16 @@ local function shown(id: string): State<any>
 	return ui.shared(`design.tab.{id}`, nil :: any)
 end
 
+-- Its layers list (the host's, set as the Design changes).
+local function shown_tree(id: string): State<any>
+	return ui.shared(`design.tree.{id}`, nil :: any)
+end
+
+-- The chat a panel's tabs are (`chat:<id>`), if they're a chat's.
+local function chat_of(key: string): string?
+	return string.match(key, "^chat:(.+)$")
+end
+
 -- Its Design's name: its file's, as the host follows it (the tab's own
 -- record may be from before it had one, or before Save as).
 function M.title(tab: Tab): string?
@@ -195,7 +205,7 @@ end
 -- to last first (what its agent's calls naming no Design go by). The host
 -- says it only when it changed, and again to a new engine.
 function M.say_tabs(key: string)
-	local chat = string.match(key, "^chat:(.+)$")
+	local chat = chat_of(key)
 	if not chat then
 		return
 	end
@@ -230,11 +240,13 @@ function M.Empty(props: { title: any, body: any, action: any? }): Node
 	}
 end
 
--- What tab `id` (of `key`) has selected: `ids` (none: nothing). `add`
--- adds one, or takes it away if it's selected (Shift's).
+-- Sets what tab `id` has selected: `ids` (none: nothing).
 local function select(id: string, ids: { string })
 	selections:set_key(id, ids)
 end
+
+-- A click on `node` in tab `id` (nothing: off any node): it alone
+-- selected, or with `add` (Shift) added, or taken away if it was.
 local function pick(id: string, node: string?, add: boolean)
 	local now = selections:peek()[id] or {}
 	if not add then
@@ -244,19 +256,20 @@ local function pick(id: string, node: string?, add: boolean)
 	if not node then
 		return
 	end
-	local next = table.clone(now)
-	local at = table.find(next, node)
+	local picked = table.clone(now)
+	local at = table.find(picked, node)
 	if at then
-		table.remove(next, at)
+		table.remove(picked, at)
 	else
-		table.insert(next, node)
+		table.insert(picked, node)
 	end
-	select(id, next)
+	select(id, picked)
 end
 
 -- The layers list: the Design's tree, a row a node, indented by its
 -- depth; a click selects (Shift adds), as on the Canvas.
-local function layers(id: string, told: () -> any): Node
+local function layers(id: string): Node
+	local tree = shown_tree(id)
 	local function row(n: any): Node
 		return ListRow {
 			id = `design-layer-{id}-{n.id}`,
@@ -266,8 +279,8 @@ local function layers(id: string, told: () -> any): Node
 			selected = function(): boolean
 				return table.find(selections:get()[id] or {}, n.id) ~= nil
 			end,
-			on_click = function(keys: any)
-				pick(id, n.id, type(keys) == "table" and keys.shift == true)
+			on_click = function()
+				pick(id, n.id, ui.modifiers.shift:peek())
 			end,
 			ui.row {
 				w_full = true,
@@ -297,8 +310,8 @@ local function layers(id: string, told: () -> any): Node
 			min_h = 0,
 			py = "$space.1",
 			ui.each(ui.computed(function(): { any }
-				local b = told()
-				return if b and b.tree then b.tree else {}
+				local t = tree:get()
+				return if type(t) == "table" then t else {}
 			end), row, {
 				key = function(n: any): string
 					return n.id
@@ -728,12 +741,36 @@ M.Design = ui.component(function(props: Props): Node
 			api.invoke("design.open", { tab = id, path = p })
 		end
 	end)
+	-- What's no longer in the Design (deleted, or another Design opened in
+	-- the tab) leaves the selection. (A node inside an Instance isn't a row
+	-- of the list: kept while its Instance is.)
+	local tree = shown_tree(id)
+	ui.effect(function()
+		local t = tree:get()
+		local ids = selections:peek()[id]
+		if type(t) ~= "table" or not ids or #ids == 0 then
+			return
+		end
+		local here: { [string]: boolean } = {}
+		for _, n in t do
+			here[n.id] = true
+		end
+		local kept: { string } = {}
+		for _, node in ids do
+			if here[string.match(node, "^([^/]+)") or node] then
+				table.insert(kept, node)
+			end
+		end
+		if #kept ~= #ids then
+			select(id, kept)
+		end
+	end)
 	-- Its selection told to the host as it changes (the host passes it on
 	-- only when it changed), for the chat's agent.
 	ui.effect(function()
 		local ids = selections:get()[id] or {}
 		if path() then
-			api.invoke("design.select", { tab = id, chat = string.match(key, "^chat:(.+)$") or "", ids = ids })
+			api.invoke("design.select", { tab = id, chat = chat_of(key) or "", ids = ids })
 		end
 	end)
 	-- Saved as another file: the tab's from then on.
@@ -862,9 +899,7 @@ M.Design = ui.component(function(props: Props): Node
 				w_full = true,
 				grow = 1,
 				min_h = 0,
-				layers(id, function(): any
-					return host:get()
-				end),
+				layers(id),
 				canvas(id),
 			}
 		end, { w_full = true, grow = 1, min_h = 0 }),

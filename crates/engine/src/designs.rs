@@ -974,8 +974,14 @@ impl Designs {
             return Vec::new();
         };
         let live = lock(&live);
+        // (A node inside an Instance, `instance/node`, is in the Design as
+        // drawn: worked out only when one is selected.)
+        let drawn = ids
+            .iter()
+            .any(|id| id.contains('/'))
+            .then(|| zeron_design::resolve::drawn(&live.design));
         ids.iter()
-            .filter_map(|id| live.design.find(id))
+            .filter_map(|id| live.design.find(id).or_else(|| drawn.as_ref()?.find(id)))
             .map(|node| json!({ "id": node.id, "name": node.name, "type": node.kind.name() }))
             .collect()
     }

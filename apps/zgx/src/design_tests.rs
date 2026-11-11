@@ -1224,10 +1224,46 @@ fn a_click_on_the_canvas_selects_and_the_layers_list_agrees_and_both_reach_the_e
     assert_eq!(tab.said_selected(), ["hero"]);
     assert_eq!(tab.selected_in_list(), ["hero"]);
     assert!(tab.app.find(&format!("#design-selected-{TAB}-hero")).is_some(), "{}", tab.app.tree());
+    // Shift in the list adds, as on the Canvas.
+    zgx::input::set_held_modifiers(&tab.app.ui.runtime, shift);
+    tab.app.click(&format!("#design-layer-{TAB}-badge"));
+    zgx::input::set_held_modifiers(&tab.app.ui.runtime, none);
+    tab.app.frames(2);
+    assert_eq!(tab.said_selected(), ["hero", "badge"]);
+    // A node deleted since leaves the selection.
+    let mut gone = landing("#EF4444", false);
+    let zeron_design::model::Kind::Frame(screen) = &mut gone.children[0].kind else { panic!("a frame") };
+    screen.children.retain(|n| n.id != "badge");
+    tab.engine.say(PATH, gone);
+    tab.app.frames(4);
+    assert_eq!(tab.said_selected(), ["hero"]);
     // (A drag pans, and selects nothing.)
     let said = tab.engine.selected_said.borrow().len();
     let (sx, sy) = tab.on_screen(780., 530.);
     zgx_script::driver::drag_between(&mut tab.app.ui, (sx as f32, sy as f32), (sx as f32 + 80., sy as f32 + 40.));
     tab.app.frames(2);
     assert_eq!(tab.engine.selected_said.borrow().len(), said);
+}
+
+#[test]
+fn a_click_hits_a_turned_node_where_it_is_drawn_and_a_lone_node_on_the_canvas_whole() {
+    // A square turned 45° in a Screen, and a group-like rectangle alone on
+    // the Canvas, holding nothing.
+    let design = design(serde_json::json!({ "version": "1.0", "children": [
+        { "id": "screen", "type": "frame", "width": 600, "height": 400, "fill": "#FFFFFF", "children": [
+            { "id": "turned", "type": "rectangle", "x": 300, "y": 100, "width": 100, "height": 100, "fill": "#4F46E5", "rotation": 45 },
+        ] },
+        { "id": "lone", "type": "rectangle", "x": 700, "width": 100, "height": 100, "fill": "#EF4444" },
+    ] }));
+    let mut tab = mount(design);
+    let none = zgx::input::Modifiers::default();
+    // Turned about its top-left corner (300, 100), it's drawn up and to the
+    // right of it, where its upright box never reaches.
+    tab.click_canvas(370., 60., none);
+    assert_eq!(tab.said_selected(), ["turned"]);
+    // Inside its upright box but off the turned square: the Screen.
+    tab.click_canvas(310., 190., none);
+    assert_eq!(tab.said_selected(), ["screen"]);
+    tab.click_canvas(750., 50., none);
+    assert_eq!(tab.said_selected(), ["lone"]);
 }

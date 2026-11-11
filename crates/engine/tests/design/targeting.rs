@@ -184,8 +184,9 @@ async fn design_state_lists_the_chats_open_designs_and_the_guide_reminder() {
     assert_eq!(
         state["designs"],
         json!([
-            { "name": "Beta", "path": beta, "front": true },
-            { "name": "Alpha", "path": alpha, "front": false },
+            // (Nothing selected in them yet: #32.)
+            { "name": "Beta", "path": beta, "front": true, "selection": [] },
+            { "name": "Alpha", "path": alpha, "front": false, "selection": [] },
         ])
     );
     assert!(state["guide"].as_str().unwrap().contains("design_guide"), "{state}");
@@ -194,7 +195,7 @@ async fn design_state_lists_the_chats_open_designs_and_the_guide_reminder() {
     assert_eq!(recent, [json!("Gamma"), json!("Beta"), json!("Alpha")]);
 
     let theirs = seam.call_from(OTHER, "design_state", json!({})).await.json();
-    assert_eq!(theirs["designs"], json!([{ "name": "Gamma", "path": gamma, "front": true }]));
+    assert_eq!(theirs["designs"], json!([{ "name": "Gamma", "path": gamma, "front": true, "selection": [] }]));
     seam.shutdown().await;
 }
 

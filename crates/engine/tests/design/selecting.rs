@@ -61,6 +61,28 @@ async fn design_state_reports_the_persons_selection_in_each_open_design() {
 }
 
 #[tokio::test]
+async fn a_node_inside_an_instance_is_reported_by_its_path() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Kit",
+            r##"const card = Insert({ type: "frame", name: "Card", reusable: true, width: 100, height: 60, fill: "#FFFFFF",
+  children: [{ type: "text", name: "Label", content: "Hi" }] });
+const screen = Insert({ type: "frame", name: "Screen", x: 200, width: 400, height: 300 });
+Copy(card, screen, { x: 20, y: 20 });"##,
+        )
+        .await;
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(made.path()).unwrap()).unwrap();
+    let instance = file["children"][1]["children"][0]["id"].as_str().unwrap().to_owned();
+    let label = format!("{instance}/{}", made.id("Label"));
+    seam.window("SetDesignTabs", json!({ "chatId": CHAT, "paths": [made.path()] })).await.unwrap();
+    seam.window("SetDesignSelection", json!({ "chatId": CHAT, "path": made.path(), "ids": [label] })).await.unwrap();
+    let state = seam.call("design_state", json!({})).await.json();
+    assert_eq!(selection(&state, "Kit"), json!([{ "id": label, "name": "Label", "type": "text" }]), "{state}");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn another_chats_selection_isnt_this_ones() {
     let seam = Seam::new().await;
     let one = seam.create("One", SCREEN).await;

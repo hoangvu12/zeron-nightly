@@ -11,8 +11,8 @@
 //!                             flashes = { { id, version, x, y, w, h }… },  what an agent just changed
 //!                             working = { { id, name, x, y, w, h }… },  Screens in progress
 //!                             path, unsaved, recovered, stale,   its file, and whether it's current
-//!                             selected = { { id, x, y, w, h }… },  the selection
-//!                             tree = { { id, name, type, depth }… } }   its layers list
+//!                             selected = { { id, x, y, w, h }… } }  the selection
+//! shared  design.tree.<tab>   { { id, name, type, depth }… }   its layers list, as the Design changes
 //!                             layers = { Layer… } }   the previous zoom's first
 //!         Layer             { level, tiles = { { id, src, x, y, size }… } }
 //! invoke  design.open       { tab, path }           follow the Design at `path`
@@ -163,15 +163,30 @@ pub trait Source {
 pub type Asked = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json, String>>>>;
 
 /// The engine of this computer (ADR-0003), over its local connection.
-struct EngineSource;
+#[derive(Default)]
+struct EngineSource {
+    /// Selections to tell it, in order (each waits for the one before, so
+    /// the engine keeps the last).
+    selections: Rc<RefCell<std::collections::VecDeque<Json>>>,
+    telling: Rc<Cell<bool>>,
+}
 
 impl Source for EngineSource {
     fn select(&self, chat: &str, path: &str, ids: &[String]) {
-        let params = json!({ "chatId": chat, "path": path, "ids": ids });
+        self.selections.borrow_mut().push_back(json!({ "chatId": chat, "path": path, "ids": ids }));
+        if self.telling.replace(true) {
+            return;
+        }
+        let (queue, telling) = (self.selections.clone(), self.telling.clone());
         engine::get().spawn(async move {
-            if let Err(e) = engine::get().call("SetDesignSelection", params).await {
-                eprintln!("zeron-zgx: design: the engine didn't take the selection: {e}");
+            loop {
+                let next = queue.borrow_mut().pop_front();
+                let Some(params) = next else { break };
+                if let Err(e) = engine::get().call("SetDesignSelection", params).await {
+                    eprintln!("zeron-zgx: design: the engine didn't take the selection: {e}");
+                }
             }
+            telling.set(false);
         });
     }
 
@@ -293,30 +308,41 @@ fn layers_of(design: &Design) -> Vec<Value> {
 }
 
 /// The node a click at Canvas point (`x`, `y`) selects in `scene`: within
-/// a Screen, its child there (the Screen itself between its children), as
-/// design tools pick; `deep`, the innermost node there. The topmost of
-/// overlapping ones; none on the bare Canvas.
+/// a Screen (a top-level Frame), its child there (the Screen itself
+/// between its children), as design tools pick; `deep`, the innermost node
+/// there. The topmost of overlapping ones, each as it's turned; none on the
+/// bare Canvas. (Inside an Instance, what's drawn has the Instance's id
+/// first, slash-separated: a plain click picks the Instance.)
 fn hit(scene: &Scene, x: f32, y: f32, deep: bool) -> Option<String> {
-    fn contains(scene: &Scene, id: &str, x: f32, y: f32) -> bool {
-        scene.laid_out.get(id).is_some_and(|p| {
-            let b = p.bounds;
-            x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height
-        })
+    use zeron_design::model::Node;
+    // The point in `node`'s own (unturned) space: turned back about its
+    // top-left corner, as `render::paint_node` turns it.
+    fn unturned(node: &Node, at: Rect, (x, y): (f32, f32)) -> (f32, f32) {
+        if node.rotation == 0. {
+            return (x, y);
+        }
+        let (sin, cos) = node.rotation.to_radians().sin_cos();
+        let (dx, dy) = (x - at.x, y - at.y);
+        (at.x + dx * cos - dy * sin, at.y + dx * sin + dy * cos)
     }
-    // The path of nodes under the point, outermost first: drawn last is on
-    // top, so children are tried last to first.
-    fn path<'a>(scene: &Scene, nodes: &'a [zeron_design::model::Node], x: f32, y: f32, out: &mut Vec<&'a str>) {
-        if let Some(node) = nodes.iter().rev().find(|n| contains(scene, &n.id, x, y)) {
-            out.push(&node.id);
-            path(scene, node.kind.get().children(), x, y, out);
+    // The nodes under the point, outermost first: drawn last is on top, so
+    // children are tried last to first.
+    fn path<'a>(scene: &Scene, nodes: &'a [Node], point: (f32, f32), out: &mut Vec<&'a Node>) {
+        for node in nodes.iter().rev() {
+            let Some(at) = scene.laid_out.get(&node.id).map(|p| p.bounds) else { continue };
+            let (x, y) = unturned(node, at, point);
+            if x >= at.x && x <= at.x + at.width && y >= at.y && y <= at.y + at.height {
+                out.push(node);
+                path(scene, node.kind.get().children(), (x, y), out);
+                return;
+            }
         }
     }
     let mut under = Vec::new();
-    path(scene, &scene.design.children, x, y, &mut under);
-    let at = if deep { under.last() } else { under.get(1).or(under.first()) };
-    // (Inside an Instance, what's drawn has the Instance's id first,
-    // slash-separated: a plain click picks the Instance.)
-    at.map(|id| if deep { id.to_string() } else { id.split('/').next().unwrap_or(id).to_string() })
+    path(scene, &scene.design.children, (x, y), &mut under);
+    let screen = under.first().is_some_and(|top| top.kind.name() == "frame");
+    let at = if deep { under.last() } else if screen { under.get(1).or(under.first()) } else { under.first() };
+    at.map(|node| if deep { node.id.clone() } else { node.id.split('/').next().unwrap_or(&node.id).to_string() })
 }
 
 /// How finely tiles are drawn: device pixels a Canvas unit, in
@@ -550,8 +576,13 @@ struct TabCanvas {
     tiles: HashMap<TileKey, Tile>,
     /// What flashes now, a flash for each version agents changed.
     flashes: Vec<Flash>,
-    /// The person's selection, in the order selected.
+    /// The person's selection, in the order selected, and the chat it's
+    /// told for (again if the file changes: Save as).
     selection: Vec<String>,
+    selection_chat: String,
+    /// The layers list (`design.tree.<tab>`), set as the Design changes,
+    /// not with every view.
+    tree: Shared,
     saving: FileState,
 }
 
@@ -653,12 +684,10 @@ impl TabCanvas {
                 .collect();
             fields.push(("flashes", Value::List(flashes.into())));
             fields.push(("working", Value::List(working.into())));
-            // The selection (#32), where each node is; and the layers list:
-            // the Design's tree as written (an Instance one row, not what
-            // it expands to), parents before their children.
+            // The selection (#32), where each node is.
             let selected: Vec<Value> = self.selection.iter().filter_map(|id| placed(id, Vec::new())).collect();
             fields.push(("selected", Value::List(selected.into())));
-            fields.push(("tree", Value::List(layers_of(&scene.written).into())));
+
         }
         if let Some(why) = &self.failed {
             fields.push(("error", Value::from(why.as_str())));
@@ -696,7 +725,7 @@ pub struct DesignTabs {
 
 /// The Design tabs of `cx`'s window, following this computer's engine.
 pub fn install(cx: &mut zgx_desktop::WindowContext, host: &ScriptHost) {
-    let (tabs, pump) = register(host, Box::new(EngineSource));
+    let (tabs, pump) = register(host, Box::new(EngineSource::default()));
     cx.tasks.spawn(pump);
     let weak = Rc::downgrade(&tabs);
     engine::get().on_connect(move |_| {
@@ -818,10 +847,11 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         let path = {
             let mut all = tabs.tabs.borrow_mut();
             let Some(canvas) = all.get_mut(&tab) else { return };
-            if canvas.selection == ids {
+            if canvas.selection == ids && canvas.selection_chat == chat {
                 return;
             }
             canvas.selection.clone_from(&ids);
+            canvas.selection_chat.clone_from(&chat);
             canvas.path.clone()
         };
         if !chat.is_empty() {
@@ -891,6 +921,8 @@ impl DesignTabs {
             tiles: HashMap::new(),
             flashes: Vec::new(),
             selection: Vec::new(),
+            selection_chat: String::new(),
+            tree: self.host.shared(&format!("design.tree.{tab}"), Value::Nil),
             saving: FileState::default(),
         };
         self.tabs.borrow_mut().insert(tab.to_owned(), canvas);
@@ -949,10 +981,14 @@ impl DesignTabs {
             self.host.image(&key.image_name(tab), None);
         }
         canvas.shared.set(Value::Nil);
+        canvas.tree.set(Value::Nil);
     }
 
     /// The Design of `tab` as it is now (or why it can't be followed).
     fn heard(&self, tab: &str, heard: Result<Heard, String>) {
+        // The layers list, set once the tabs aren't borrowed (what follows
+        // it may call back: a selection pruned to what's still there).
+        let mut tree = None;
         {
             let mut tabs = self.tabs.borrow_mut();
             let Some(canvas) = tabs.get_mut(tab) else { return };
@@ -960,10 +996,17 @@ impl DesignTabs {
                 Err(why) => canvas.failed = Some(why),
                 Ok(Heard { design, flash, fonts, assets, saving }) => {
                     canvas.failed = None;
-                    // (Saved as another file: still this tab's, followed on.)
-                    if let Some(path) = &saving.path {
+                    // (Saved as another file: still this tab's, followed on,
+                    // its selection told for that file.)
+                    if let Some(path) = saving.path.as_ref().filter(|p| **p != canvas.path) {
                         canvas.path.clone_from(path);
+                        if !canvas.selection.is_empty() && !canvas.selection_chat.is_empty() {
+                            self.source.select(&canvas.selection_chat, path, &canvas.selection);
+                        }
                     }
+                    // The layers list: the Design's tree as written (an
+                    // Instance one row, not what it expands to).
+                    tree = Some((canvas.tree.clone(), Value::List(layers_of(&design).into())));
                     canvas.saving = saving;
                     self.versions.set(self.versions.get() + 1);
                     let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, assets));
@@ -995,6 +1038,9 @@ impl DesignTabs {
                     canvas.scene = Some(scene);
                 }
             }
+        }
+        if let Some((shared, list)) = tree {
+            shared.set(list);
         }
         self.update(tab);
     }
@@ -1140,8 +1186,10 @@ impl DesignTabs {
     }
 
     fn publish(&self, tab: &str) {
-        if let Some(canvas) = self.tabs.borrow().get(tab) {
-            canvas.shared.set(canvas.value(tab, self.dpr.get()));
+        // (Set once the tabs aren't borrowed: what reads it may call back.)
+        let made = self.tabs.borrow().get(tab).map(|canvas| (canvas.shared.clone(), canvas.value(tab, self.dpr.get())));
+        if let Some((shared, value)) = made {
+            shared.set(value);
         }
     }
 
