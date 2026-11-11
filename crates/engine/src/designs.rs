@@ -36,15 +36,14 @@
 //! fonts beside it, and the Design is that file from then on.
 //!
 //! Text is set in Google Fonts, fetched on first use as assets, or in font
-//! files beside its Design ([`zeron_design::fonts`]). Image paints draw
-//! files from the Design's folder, and downloads cached for every Design ([`images`]);
-//! tabs are told the image files too.
+//! files beside its Design ([`zeron_design::fonts`]). An image fill's file
+//! is in the Design's folder, or downloaded ([`images`]) as an asset.
 
 mod iconify;
 mod images;
 mod retry;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -67,7 +66,7 @@ pub use retry::{Edit, Failure};
 use retry::{Failed, Kept, Retarget};
 
 use self::iconify::Iconify;
-use self::images::{DesignImages, ImageCache};
+use self::images::Download;
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -209,8 +208,6 @@ struct Inner {
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
     recent_file: PathBuf,
-    /// Images downloaded, for every Design.
-    images: Arc<ImageCache>,
     /// Where Designs that aren't managed keep their unsaved changes.
     backups: PathBuf,
     /// How long after a change managed Designs save themselves.
@@ -230,8 +227,6 @@ struct Live {
     seen: HashMap<String, u64>,
     /// What the Design tabs following it hear: it after each change.
     followers: tokio::sync::watch::Sender<Told>,
-    /// The images its paints refer to.
-    images: DesignImages,
     /// Where its tabs are told the files of its assets.
     assets: Arc<Cache>,
     /// How its changes reach its file.
@@ -273,9 +268,6 @@ struct Told {
     version: u64,
     design: Arc<Design>,
     changes: Vec<Change>,
-    /// The file each image it draws is in, for the tabs to read (they
-    /// never download): those it has, by url.
-    images: BTreeMap<String, PathBuf>,
     assets: Option<Vec<Resolved>>,
     /// Its file, unsaved, recovered and stale: as [`Designs::saving`]
     /// says.
@@ -332,6 +324,7 @@ impl Designs {
                 assets: {
                     let assets = Cache::new(&data_dir.join("design-cache"), Arc::new(Iconify));
                     assets.set_font_source(Box::new(GoogleFonts::default()));
+                    assets.set_image_source(Arc::new(Download));
                     Arc::new(assets)
                 },
                 live: Mutex::new(HashMap::new()),
@@ -340,7 +333,6 @@ impl Designs {
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
-                images: Arc::new(ImageCache::new(data_dir.join("image-cache"))),
                 backups: data_dir.join("design-backups"),
                 autosave: Mutex::new(AUTOSAVE_AFTER),
             }),
@@ -454,7 +446,6 @@ impl Designs {
         if let Saving::Backup(backup) = &live.saving {
             remove_backup(backup);
         }
-        live.images = DesignImages::new(&to, self.inner.images.clone());
         live.fonts = self.fonts_for(&to);
         live.on_file(digest(json.as_bytes()));
         if renamed {
@@ -507,8 +498,8 @@ impl Designs {
         let fonts = self.fonts_for(&path);
         let saving = self.saving_for(&path);
         Arc::new_cyclic(|me| {
-            let (images, assets) = (self.inner.images.clone(), self.inner.assets.clone());
-            let mut live = Live::new(path, design, fonts, images, assets, saving, me.clone());
+            let assets = self.inner.assets.clone();
+            let mut live = Live::new(path, design, fonts, assets, saving, me.clone());
             live.unsaved = opened.recovered;
             live.recovered = opened.recovered;
             live.stale = opened.stale;
@@ -629,14 +620,14 @@ impl Designs {
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
         let told = loop {
-            let (version, design, images) = {
+            let (version, design) = {
                 let live = lock(&live);
                 let told = live.followers.borrow();
                 if told.version == live.version && told.assets.is_some() {
                     drop(told);
                     break live.followers.subscribe();
                 }
-                (live.version, live.design.clone(), live.images.files(&live.design))
+                (live.version, live.design.clone())
             };
             let live = lock(&live);
             // (Changes with nobody following weren't copied for them; one
@@ -648,7 +639,6 @@ impl Designs {
                     version,
                     design: Arc::new(design),
                     changes: Vec::new(),
-                    images,
                     assets: Some(assets),
                     path: live.path.clone(),
                     unsaved: live.unsaved,
@@ -672,7 +662,6 @@ impl Designs {
                 "version": now.version,
                 "design": &*now.design,
                 "changes": since,
-                "images": now.images,
                 "assets": now.assets.as_deref().unwrap_or_default(),
                 "path": now.path,
                 "unsaved": now.unsaved,
@@ -734,7 +723,8 @@ impl Designs {
         // Images the call placed or looked at that can't be had (those it
         // can, downloaded now, for its screenshots and the tabs).
         let looked_at = edited.changed.iter().chain(&edited.screenshots);
-        let missing = images::warnings(looked_at.filter_map(|id| drawn.find(id)), &live.images);
+        let assets = live.assets.beside(&live.folder());
+        let missing = images::warnings(looked_at.filter_map(|id| drawn.find(id)), &assets);
         edited.warnings.extend(missing);
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
@@ -1027,7 +1017,6 @@ impl Live {
         path: PathBuf,
         design: Design,
         fonts: Fonts,
-        cache: Arc<ImageCache>,
         assets: Arc<Cache>,
         saving: Saving,
         me: Weak<Mutex<Live>>,
@@ -1036,14 +1025,12 @@ impl Live {
             version: 0,
             design: Arc::new(design.clone()),
             changes: Vec::new(),
-            images: BTreeMap::new(),
             assets: None,
             path: path.clone(),
             unsaved: false,
             recovered: false,
             stale: false,
         };
-        let images = DesignImages::new(&path, cache);
         Self {
             path,
             design,
@@ -1052,7 +1039,6 @@ impl Live {
             version: 0,
             seen: HashMap::new(),
             followers: tokio::sync::watch::channel(told).0,
-            images,
             assets,
             saving,
             unsaved: false,
@@ -1061,6 +1047,11 @@ impl Live {
             base: None,
             me,
         }
+    }
+
+    /// The folder its file is in.
+    fn folder(&self) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).to_owned()
     }
 
     /// Makes `design` the Design, as every change does: puts it on disk as
@@ -1239,14 +1230,11 @@ impl Live {
             by,
         };
         let design = Arc::new(self.design.clone());
-        // (Downloaded already, by the call that placed them.)
-        let images = self.images.files(&self.design);
         // (Only what's cached: no fetch under its lock.)
         let assets = self.assets.resolved(&self.design, self.path.parent());
         self.followers.send_modify(|told| {
             told.version = change.version;
             told.design = design;
-            told.images = images;
             told.assets = Some(assets);
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
@@ -1256,10 +1244,11 @@ impl Live {
 
     /// Keeps a successful change's draft (`by` whom) as one undo step,
     /// described as `description`: saves the file, then draws the
-    /// screenshots it asked for.
+    /// screenshots it asked for with its assets.
     fn commit(&mut self, edited: &Edited, description: &str, by: Changer) -> Result<Vec<Value>, DesignError> {
         let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect(), by)?;
         self.history.record(description, &before, &self.design);
+        let assets = self.assets.beside(&self.folder());
         Ok(edited
             .screenshots
             .iter()
@@ -1269,8 +1258,7 @@ impl Live {
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
                     &self.fonts,
-                    &self.images,
-                    &*self.assets,
+                    &assets,
                 );
                 match shot {
                     Ok(shot) => json!({
