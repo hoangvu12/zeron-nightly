@@ -21,9 +21,14 @@ impl Draft {
             return self.update_inside(id, props);
         }
         let node = self.design.find_mut(id).ok_or_else(|| EditError::NotFound(id.into()))?;
+        let before = node.clone();
         let unsupported = set(node, &props, "Update")?;
         let node = self.design.find(id).expect("the node was just updated");
         let mut warnings = unsupported_warnings(node, "Update", unsupported);
+        if let Err(e) = self.check_one(node, &mut warnings) {
+            *self.design.find_mut(id).expect("the node was just updated") = before;
+            return Err(EditError::Invalid(format!("Update: {e}")));
+        }
         warnings.extend(set_warnings(node, &props));
         for key in props.keys() {
             self.unwarn(id, key);

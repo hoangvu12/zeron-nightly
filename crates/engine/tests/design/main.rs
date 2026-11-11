@@ -3,12 +3,14 @@
 
 mod editing;
 mod failing;
+mod icons;
 mod images;
 mod kept;
 mod layout;
 mod looks;
 mod reading;
 mod seam;
+mod shapes;
 mod system;
 mod targeting;
 mod text;

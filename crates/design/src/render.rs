@@ -1,17 +1,21 @@
 //! Drawing a Design, behind an interface (ADR-0002): node types draw
-//! through a [`Painter`], and [`screenshot`] (an agent's) and [`region`]
-//! (the Design tab's tiles) are the only places that pick the backend
-//! (Skia's raster, [`crate::skia`]), so a tiny-skia renderer would replace
-//! those and a painter of its own. Both draw a node with [`paint_node`],
-//! so the tab shows what the agent's screenshot does.
+//! through a [`Painter`], and [`screenshot`] (an agent's), [`region`] (the
+//! Design tab's tiles) and [`is_path_data`] are the only places that pick
+//! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
+//! would replace those and a painter of its own. Both draw a node with
+//! [`paint_node`], its assets from an [`Assets`], so the tab shows what
+//! the agent's screenshot does.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::assets::Assets;
 use crate::fonts::Fonts;
 use crate::layout::LaidOut;
-use crate::model::{Design, EffectKind, Effects, ImageFill, Node, Paint, PaintKind, Shadow, StrokeStyle, Text};
+use crate::model::{
+    Color, Design, EffectKind, Effects, FillRule, ImageFill, Node, Paint, PaintKind, Shadow, StrokeStyle, Text,
+};
 use crate::skia::Typesetter;
 
 /// The longest side of an agent's screenshot, in pixels.
@@ -52,29 +56,77 @@ impl Rect {
 
 /// The shape a node's fills, stroke and effects follow.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Outline {
+pub enum Outline<'a> {
     /// A rectangle with a radius per corner: top left, top right, bottom
     /// right, bottom left.
     Rounded { rect: Rect, radii: [f32; 4] },
+    /// The ellipse filling `rect`, or the part of it from `start` through
+    /// `sweep` degrees (0 at 3 o'clock, clockwise), less a hole of `inner`
+    /// times its radii.
+    Ellipse { rect: Rect, start: f32, sweep: f32, inner: f32 },
+    /// The regular polygon of `sides` filling `rect` ([`polygon`]).
+    Polygon { rect: Rect, sides: u32 },
+    /// SVG path data whose `view_box` (or, without one, its own bounds) is
+    /// stretched onto `rect`.
+    Path {
+        rect: Rect,
+        geometry: &'a str,
+        view_box: Option<Rect>,
+        fill_rule: FillRule,
+    },
 }
 
-impl Outline {
+impl Outline<'_> {
     pub fn rounded(rect: Rect, radii: [f32; 4]) -> Self {
         Outline::Rounded { rect, radii }
     }
 
     pub fn bounds(&self) -> Rect {
         match *self {
-            Outline::Rounded { rect, .. } => rect,
+            Outline::Rounded { rect, .. }
+            | Outline::Ellipse { rect, .. }
+            | Outline::Polygon { rect, .. }
+            | Outline::Path { rect, .. } => rect,
         }
     }
+}
+
+/// The corners of a regular polygon of `sides` (3 to 64), one at the top,
+/// clockwise, stretched to fill `rect`.
+pub fn polygon(rect: Rect, sides: u32) -> Vec<(f32, f32)> {
+    let sides = sides.clamp(3, 64);
+    let unit: Vec<(f32, f32)> = (0..sides)
+        .map(|i| {
+            let angle = i as f32 * std::f32::consts::TAU / sides as f32 - std::f32::consts::FRAC_PI_2;
+            (angle.cos(), angle.sin())
+        })
+        .collect();
+    // The corners' own bounds, mapped onto the rectangle.
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in &unit {
+        (left, top, right, bottom) = (left.min(x), top.min(y), right.max(x), bottom.max(y));
+    }
+    unit.into_iter()
+        .map(|(x, y)| {
+            (
+                rect.x + (x - left) / (right - left) * rect.width,
+                rect.y + (y - top) / (bottom - top) * rect.height,
+            )
+        })
+        .collect()
+}
+
+/// Whether `geometry` is SVG path data that draws something, as the
+/// backend reads it.
+pub fn is_path_data(geometry: &str) -> bool {
+    crate::skia::svg_path(geometry).is_some_and(|path| !path.is_empty())
 }
 
 /// How a node type is drawn from its properties ([`NodeKind::look`]).
 ///
 /// [`NodeKind::look`]: crate::model::NodeKind::look
 pub struct Look<'a> {
-    pub outline: Outline,
+    pub outline: Outline<'a>,
     pub fill: &'a [Paint],
     pub stroke: Option<&'a StrokeStyle>,
     pub effects: &'a Effects,
@@ -190,6 +242,9 @@ pub trait Painter {
     fn shadow(&mut self, outline: &Outline, shadow: &Shadow);
     /// Blurs what's already drawn within `outline` by `radius`.
     fn background_blur(&mut self, outline: &Outline, radius: f32);
+    /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
+    /// the painter's assets haven't that one.
+    fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
     /// Draws `text` in a box of `size` at the origin, in each of its fill's
     /// paints in turn.
     fn text(&mut self, text: &Text, size: (f32, f32));
@@ -377,8 +432,8 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// puts them, their text set by `typesetter` (as it was laid out). It's
 /// drawn `margin` (Canvas units, [`blur_reach`]) wider all round and cut
 /// to `area`, so blurs at its edges read what they would with the whole
-/// Canvas drawn. Image paints draw what `images` has. `None` for an
-/// empty or oversized image.
+/// Canvas drawn. Image paints draw what `images` has, icons and other
+/// assets what `assets` has. `None` for an empty or oversized image.
 #[allow(clippy::too_many_arguments)]
 pub fn region(
     design: &Design,
@@ -390,13 +445,14 @@ pub fn region(
     margin: f32,
     (width, height): (u32, u32),
     images: &dyn Images,
+    assets: &dyn Assets,
 ) -> Option<Vec<u8>> {
     // (At most a tile's worth each side: past that a blur is faint.)
     let pad = (margin * scale).ceil().clamp(0., 512.) as u32;
     let (wide, high) = (width + 2 * pad, height + 2 * pad);
     let mut drawn = vec![0; wide as usize * high as usize * 4];
     crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
-        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_images(images);
+        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_images(images).with_assets(assets);
         painter.translate(pad as f32, pad as f32);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
@@ -443,13 +499,15 @@ pub enum RenderError {
 
 /// Draws one node of `design` on a transparent background at 1x, or
 /// smaller when its longest side is over `max_side`, with the images
-/// `images` has, and encodes it.
+/// `images` has and the icons and other assets `assets` has, and encodes
+/// it. Its text is set in `fonts`.
 pub fn screenshot(
     design: &Design,
     id: &str,
     max_side: f32,
     fonts: &Fonts,
     images: &dyn Images,
+    assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
     let design = &crate::resolve::drawn(design);
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
@@ -469,7 +527,7 @@ pub fn screenshot(
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_images(images);
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_images(images).with_assets(assets);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }

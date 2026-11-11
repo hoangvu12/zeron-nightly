@@ -9,9 +9,11 @@
 //! may catch its error and carry on.
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+use crate::assets::Cache;
 use crate::fonts::Fonts;
 use crate::model::{Design, Kind, Node, warn};
 use crate::printed::Printed;
@@ -59,6 +61,8 @@ pub struct Draft {
     printed: Printed,
     /// What the agent should know about its edits that didn't fail them.
     warnings: Vec<Warning>,
+    /// Where the assets nodes draw with are checked; without, any is taken.
+    assets: Option<Arc<Cache>>,
 }
 
 /// What a call's draft ends as, once it succeeded.
@@ -93,7 +97,15 @@ impl Draft {
             screenshots: Vec::new(),
             printed: Printed::default(),
             warnings: Vec::new(),
+            assets: None,
         }
+    }
+
+    /// Checks the assets the call's nodes draw with (their icons) against
+    /// `assets`, fetching each.
+    pub fn with_assets(mut self, assets: Arc<Cache>) -> Self {
+        self.assets = Some(assets);
+        self
     }
 
     /// The draft with its text set in `fonts` (else in the bundled font
@@ -156,7 +168,11 @@ impl Draft {
     pub fn finish(mut self) -> Edited {
         // What can't be drawn as asked, about the nodes this call changed,
         // the Instances they're in, or Instances of Components it changed.
-        let (_, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
+        let (drawn, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
+        // What it draws with that no edit fetched: icons a Token names.
+        if let Some(assets) = &self.assets {
+            assets.fetch(&drawn);
+        }
         for problem in problems {
             let top = problem.node.split('/').next().unwrap_or_default();
             let follows_changed = match self.design.find(top).map(|node| &node.kind) {
@@ -252,8 +268,48 @@ impl Draft {
         let (node, unsupported) = warn::collect(|| serde_json::from_value::<Node>(node));
         let node = node.map_err(|e| EditError::Invalid(format!("{verb}: {e}")))?;
         let mut warnings = unsupported_warnings(&node, verb, unsupported);
+        self.check(&node, &mut warnings)
+            .map_err(|e| EditError::Invalid(format!("{verb}: {e}")))?;
         warn_unknown(&node, &mut warnings);
         Ok(Built { node, made, warnings })
+    }
+
+    /// Refuses what `node` or its descendants can't be drawn with, as
+    /// [`Draft::check_one`]: for a node an edit made.
+    fn check(&self, node: &Node, warnings: &mut Vec<Warning>) -> Result<(), String> {
+        self.check_one(node, warnings)?;
+        node.kind
+            .get()
+            .children()
+            .iter()
+            .try_for_each(|child| self.check(child, warnings))
+    }
+
+    /// Refuses what `node` itself can't be drawn with: an icon Iconify
+    /// doesn't have (fetching it now, so it's cached to draw), a path that
+    /// isn't path data, a polygon's side count; and warns of a weight on an
+    /// icon without weights. Every edit that makes a node or sets its
+    /// properties checks it here (Update and Copy only the nodes they set).
+    fn check_one(&self, node: &Node, warnings: &mut Vec<Warning>) -> Result<(), String> {
+        match &node.kind {
+            // One a Token names is fetched once it's resolved, to draw.
+            Kind::Icon(icon) if !node.refs.contains_key("icon") => {
+                if let Some(assets) = &self.assets {
+                    let svg = assets.icons().svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
+                    if icon.weight.is_some() && !crate::icons::takes_weight(&icon.icon, &svg) {
+                        warnings.push(Warning {
+                            node: Some(node.id.clone()),
+                            property: Some("weight".into()),
+                            message: format!("\"{}\" ({}) has no weights; its weight does nothing", node.name, icon.icon),
+                        });
+                    }
+                }
+            }
+            Kind::Path(path) => path.problem().map_or(Ok(()), Err)?,
+            Kind::Polygon(polygon) => polygon.problem().map_or(Ok(()), Err)?,
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Puts a built node among `parent`'s children (already checked to

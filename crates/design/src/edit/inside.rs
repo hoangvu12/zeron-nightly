@@ -29,10 +29,12 @@ impl Draft {
         // Checked as an Update of the node as it's drawn, then kept as the
         // Instance's override.
         let unsupported = set(&mut node, &props, "Update")?;
+        let mut warnings = unsupported_warnings(&node, "Update", unsupported);
+        self.check_one(&node, &mut warnings)
+            .map_err(|e| EditError::Invalid(format!("Update: {e}")))?;
         let (instance, key) = path.split_once('/').expect("a path has a slash");
         let descendants = self.overrides(instance)?;
         resolve::merge_override(descendants, key, &Value::Object(settable(&props)));
-        let mut warnings = unsupported_warnings(&node, "Update", unsupported);
         warnings.extend(set_warnings(&node, &props));
         for key in props.keys() {
             self.unwarn(path, key);

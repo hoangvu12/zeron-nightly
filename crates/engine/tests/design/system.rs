@@ -224,6 +224,32 @@ Print(Get(named, { resolveTokens: true }).content, Get(price, { resolveTokens: t
 }
 
 #[tokio::test]
+async fn icons_inside_instances_and_named_by_tokens_draw_and_are_checked() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Glyphs",
+            r##"SetTokens({ glyph: { type: "string", value: "mdi:square" } });
+badge = Insert({ type: "frame", name: "Badge", reusable: true, x: 0, y: 200, width: 48, height: 48,
+  children: [{ type: "icon", name: "Glyph", icon: "$glyph", width: 48, height: 48, fill: "#EF4444" }] });
+glyph = Get(badge).children[0].id;
+screen = Insert({ type: "frame", name: "Screen", width: 48, height: 48, fill: "#FFFFFF" });
+inst = Copy(badge, screen, { x: 0, y: 0 });
+TakeScreenshot([screen]);"##,
+        )
+        .await;
+    // The Token's icon, fetched though only an Instance draws it.
+    assert_eq!(made.images[0].rgba(24, 24), RED, "{}", made.text);
+
+    // An icon set inside an Instance is checked as any Update's is.
+    let before = std::fs::read_to_string(made.path()).unwrap();
+    let bad = seam.execute(&made.path(), r#"Update(`${inst}/${glyph}`, { icon: "mdi:no-such-icon" });"#).await;
+    assert!(bad.is_error, "{}", bad.text);
+    assert_eq!(std::fs::read_to_string(made.path()).unwrap(), before);
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_components_theme_reaches_inside_its_instances() {
     let seam = Seam::new().await;
     let made = seam
