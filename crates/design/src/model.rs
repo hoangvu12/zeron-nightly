@@ -18,8 +18,8 @@ mod layout;
 mod paint;
 mod rectangle;
 mod stroke;
-pub mod warn;
 mod text;
+pub mod warn;
 
 pub use corners::Corners;
 pub use effects::{Effect, EffectKind, Effects, Shadow};
@@ -27,8 +27,8 @@ pub use frame::Frame;
 pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
 pub use rectangle::Rectangle;
-pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign};
 pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
+pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

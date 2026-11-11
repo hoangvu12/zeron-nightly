@@ -89,6 +89,8 @@ impl Source for EngineSource {
         let rpc = engine::get().current()?;
         let listener = Rc::new(RefCell::new(listener));
         let ended = listener.clone();
+        // The fonts last heard, read again only when the files change.
+        let fonts: RefCell<Fonts> = RefCell::default();
         // (`WatchDesign` also names what each call made or changed, for the
         // tab's flashes: not read yet.)
         let watch = rpc.watch_ending(
@@ -98,8 +100,12 @@ impl Source for EngineSource {
                 let design = serde_json::from_value(item["design"].clone()).map_err(|e| format!("not a Design: {e}"));
                 // (Font files that can't be read draw as the engine said
                 // the families it can't get do: in the bundled one.)
-                let fonts: Vec<FontFile> = serde_json::from_value(item["fonts"].clone()).unwrap_or_default();
-                (listener.borrow_mut())(design.map(|design| (design, Fonts::of_files(&fonts))))
+                let files: Vec<FontFile> = serde_json::from_value(item["fonts"].clone()).unwrap_or_default();
+                if !fonts.borrow().is_of(&files) {
+                    *fonts.borrow_mut() = Fonts::of_files(&files);
+                }
+                let fonts = fonts.borrow().clone();
+                (listener.borrow_mut())(design.map(|design| (design, fonts)))
             },
             move |why| {
                 // (A connection that ended is followed again on the next.)

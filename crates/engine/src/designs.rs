@@ -229,23 +229,30 @@ impl Designs {
     /// fetch fonts): run it off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
-        let told = {
-            let live = lock(&live);
-            let fonts = self.fonts_for(&live.path);
-            // (Changes with nobody following weren't copied for them.)
-            live.followers.send_if_modified(|told| {
-                let stale = told.version != live.version || told.fonts.is_none();
-                if stale {
-                    *told = Told {
-                        version: live.version,
-                        design: Arc::new(live.design.clone()),
-                        changed: Vec::new(),
-                        fonts: Some(Arc::new(fonts.files(&live.design))),
-                    };
+        let told = loop {
+            let (version, design, fonts) = {
+                let live = lock(&live);
+                let told = live.followers.borrow();
+                if told.version == live.version && told.fonts.is_some() {
+                    drop(told);
+                    break live.followers.subscribe();
                 }
-                stale
-            });
-            live.followers.subscribe()
+                (live.version, live.design.clone(), self.fonts_for(&live.path))
+            };
+            // Its fonts found (fetched, maybe) without holding the Design up.
+            let files = Arc::new(fonts.files(&design));
+            let live = lock(&live);
+            // (Changes with nobody following weren't copied for them; one
+            // made meanwhile is looked at again.)
+            if live.version == version {
+                live.followers.send_replace(Told {
+                    version,
+                    design: Arc::new(design),
+                    changed: Vec::new(),
+                    fonts: Some(files),
+                });
+                break live.followers.subscribe();
+            }
         };
         Ok(futures::stream::unfold((told, true), |(mut told, first)| async move {
             if !first && told.changed().await.is_err() {

@@ -131,7 +131,8 @@ impl Draft {
             .into_iter()
             .map(|warning| format!("Insert \"{}\": {warning}", node.name))
             .collect();
-        warn_about(&node, &mut warnings);
+        warn_unknown(&node, &mut warnings);
+        warn_invisible(&node, &mut warnings);
         let siblings = match parent {
             None => &mut self.design.children,
             Some(parent) => {
@@ -234,9 +235,8 @@ impl Draft {
 }
 
 /// A warning for each property `node` and its children have that the model
-/// doesn't know (kept, but doing nothing): most often a typo; and for each
-/// text without a fill, which can't be seen.
-fn warn_about(node: &Node, warnings: &mut Vec<String>) {
+/// doesn't know (kept, but doing nothing): most often a typo.
+fn warn_unknown(node: &Node, warnings: &mut Vec<String>) {
     for property in node.unknown_properties() {
         warnings.push(format!(
             "\"{}\" ({}) has a property \"{property}\" Zeron doesn't know; it's kept, but does nothing",
@@ -244,6 +244,14 @@ fn warn_about(node: &Node, warnings: &mut Vec<String>) {
             node.kind.name()
         ));
     }
+    for child in node.kind.get().children() {
+        warn_unknown(child, warnings);
+    }
+}
+
+/// A warning for each text among `node` and its children without a fill,
+/// which can't be seen.
+fn warn_invisible(node: &Node, warnings: &mut Vec<String>) {
     if let Kind::Text(text) = &node.kind
         && text.fill.fill.is_empty()
     {
@@ -253,7 +261,7 @@ fn warn_about(node: &Node, warnings: &mut Vec<String>) {
         ));
     }
     for child in node.kind.get().children() {
-        warn_about(child, warnings);
+        warn_invisible(child, warnings);
     }
 }
 

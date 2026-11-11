@@ -7,8 +7,8 @@
 
 use crate::fonts::Fonts;
 use crate::layout::LaidOut;
-use crate::skia::Typesetter;
 use crate::model::{Design, EffectKind, Effects, Node, Paint, Shadow, StrokeStyle, Text};
+use crate::skia::Typesetter;
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -290,9 +290,10 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// transparent `width` × `height` image (RGBA, premultiplied): the
 /// Canvas's top-level nodes at `nodes` (indices into its children, the
 /// ones meeting `area` grown by `margin`, in order) drawn where `laid_out`
-/// puts them, their text set by `typesetter` (as it was laid out). It's drawn `margin` (Canvas units, [`blur_reach`]) wider all
-/// round and cut to `area`, so blurs at its edges read what they would
-/// with the whole Canvas drawn. `None` for an empty or oversized image.
+/// puts them, their text set by `typesetter` (as it was laid out). It's
+/// drawn `margin` (Canvas units, [`blur_reach`]) wider all round and cut
+/// to `area`, so blurs at its edges read what they would with the whole
+/// Canvas drawn. `None` for an empty or oversized image.
 pub fn region(
     design: &Design,
     laid_out: &LaidOut,

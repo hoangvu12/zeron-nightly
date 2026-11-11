@@ -274,6 +274,49 @@ Insert({{ type: "text", name: "Geist", content: "Hamburgefonstiv", fontSize: 40,
 }
 
 #[tokio::test]
+async fn letters_geist_has_need_no_other_font() {
+    let seam = Seam::new().await;
+    let fetched = counted(&seam, &seam.data_dir().join("fonts under test"));
+    let made = seam
+        .create(
+            "Accents",
+            r##"Insert({ type: "text", name: "Price", content: "Café — 50% off, naïve “quotes”", fill: "#000000" });"##,
+        )
+        .await;
+    assert_eq!(warnings(&made), Vec::<String>::new());
+    assert!(fetched.lock().unwrap().is_empty(), "{:?}", fetched.lock().unwrap());
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn design_tabs_hear_the_font_files_a_design_uses() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Watched",
+            r##"Insert({ type: "text", name: "Serif", content: "Hello", fontFamily: "Instrument Serif", fill: "#000000" });"##,
+        )
+        .await;
+    let window = zeron_rpc::memory_client(seam.core.rpc_service());
+    let mut seen = window
+        .subscribe("WatchDesign", serde_json::json!({ "path": made.path() }))
+        .await
+        .expect("the window may watch a Design");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv())
+        .await
+        .expect("the watch said nothing")
+        .expect("the watch ended");
+    // Instrument Serif from the cache, where the engine fetched it; the
+    // bundled Geist needs no file.
+    let fonts = first["fonts"].as_array().unwrap_or_else(|| panic!("{first}"));
+    assert_eq!(fonts.len(), 1, "{first}");
+    assert_eq!(fonts[0]["family"], "Instrument Serif");
+    let path = PathBuf::from(fonts[0]["path"].as_str().unwrap());
+    assert!(path.is_file() && path.ends_with("Instrument Serif/400.ttf"), "{path:?}");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn font_files_beside_a_design_are_used() {
     let seam = Seam::new().await;
     // Nothing to fetch from: only the file beside the Design has it.

@@ -60,6 +60,13 @@ pub struct FontFile {
 /// A typeface, and the file it was read from (none for the bundled one).
 type Face = (Typeface, Option<PathBuf>);
 
+/// A font file read, and the family it's for.
+struct Read {
+    family: String,
+    typeface: Typeface,
+    path: PathBuf,
+}
+
 /// Where fonts not yet cached come from.
 pub trait FontSource: Send + Sync {
     /// A font file of `family` at the weight nearest `weight`, or `None`
@@ -82,8 +89,11 @@ struct Library {
     cache: Option<PathBuf>,
     source: Option<Box<dyn FontSource>>,
     /// Font files given by family, looked in first ([`Fonts::of_files`]).
-    given: Vec<(String, Typeface, PathBuf)>,
+    given: Vec<Read>,
     state: Mutex<State>,
+    /// Held while fetching, so a family is fetched once however many
+    /// Designs want it at once.
+    fetching: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -95,14 +105,14 @@ struct State {
     /// Fetches that failed: when, and why.
     failed: HashMap<(String, u16), (Instant, String)>,
     /// Font files beside Designs, by folder.
-    beside: HashMap<PathBuf, Beside>,
+    beside: HashMap<PathBuf, Folder>,
 }
 
 /// One folder's font files: the listing they were read from, so a change
-/// to it reads them again, and their typefaces by family.
-struct Beside {
+/// to it reads them again, and what was read of them.
+struct Folder {
     listing: Vec<(PathBuf, SystemTime)>,
-    families: Vec<(String, Typeface, PathBuf)>,
+    read: Vec<Read>,
 }
 
 /// Why a family couldn't be had.
@@ -117,13 +127,16 @@ impl Fonts {
     /// Fonts cached in `cache` (none without one), fetched from `source`
     /// (none without one).
     pub fn new(cache: Option<PathBuf>, source: Option<Box<dyn FontSource>>) -> Self {
+        Self::of(Library {
+            cache,
+            source,
+            ..Library::default()
+        })
+    }
+
+    fn of(library: Library) -> Self {
         Self {
-            library: Arc::new(Library {
-                cache,
-                source,
-                given: Vec::new(),
-                state: Mutex::default(),
-            }),
+            library: Arc::new(library),
             beside: None,
         }
     }
@@ -135,19 +148,24 @@ impl Fonts {
         let given = files
             .iter()
             .filter_map(|file| {
-                let typeface = decode(&std::fs::read(&file.path).ok()?)?;
-                Some((file.family.clone(), typeface, file.path.clone()))
+                Some(Read {
+                    family: file.family.clone(),
+                    typeface: read(&file.path)?,
+                    path: file.path.clone(),
+                })
             })
             .collect();
-        Self {
-            library: Arc::new(Library {
-                cache: None,
-                source: None,
-                given,
-                state: Mutex::default(),
-            }),
-            beside: None,
-        }
+        Self::of(Library {
+            given,
+            ..Library::default()
+        })
+    }
+
+    /// Whether these fonts were made of exactly `files`.
+    pub fn is_of(&self, files: &[FontFile]) -> bool {
+        let given = &self.library.given;
+        given.len() == files.len()
+            && given.iter().zip(files).all(|(read, file)| read.family == file.family && read.path == file.path)
     }
 
     /// These fonts, and those in font files beside the Design in `folder`.
@@ -206,15 +224,15 @@ impl Fonts {
         });
     }
 
-    /// What an agent should hear of the fonts `texts` use: families that
-    /// couldn't be had, once each.
+    /// What an agent should hear of the fonts `texts` use: families (or
+    /// weights of them) that couldn't be had, once each.
     pub fn warnings<'a>(&self, texts: impl IntoIterator<Item = &'a Text>) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut warnings = Vec::new();
         for text in texts {
             let weight = snapped(text.weight().0);
             for (i, family) in families(text).into_iter().enumerate() {
-                if !seen.insert(family.clone()) {
+                if !seen.insert((family.clone(), weight)) {
                     continue;
                 }
                 let drawn = if i == 0 {
@@ -240,13 +258,7 @@ impl Fonts {
     /// beside the Design, else the bundled one, else one from the cache or
     /// the source.
     fn load(&self, family: &str, weight: u16) -> Result<Vec<Face>, Missing> {
-        let given: Vec<Face> = self
-            .library
-            .given
-            .iter()
-            .filter(|(name, ..)| name == family)
-            .map(|(_, typeface, path)| (typeface.clone(), Some(path.clone())))
-            .collect();
+        let given = faces(&self.library.given, family);
         if !given.is_empty() {
             return Ok(given);
         }
@@ -260,23 +272,12 @@ impl Fonts {
             return Ok(bundled().iter().map(|typeface| (typeface.clone(), None)).collect());
         }
         let key = (family.to_owned(), weight);
-        {
-            let state = lock(&self.library.state);
-            if let Some(face) = state.loaded.get(&key) {
-                return Ok(vec![face.clone()]);
-            }
-            if state.unknown.contains(family) {
-                return Err(Missing::Unknown);
-            }
-            if let Some((when, why)) = state.failed.get(&key)
-                && when.elapsed() < RETRY_AFTER
-            {
-                return Err(Missing::Failed(why.clone()));
-            }
+        if let Some(known) = self.known(&key) {
+            return known;
         }
         let cached = self.library.cache.as_ref().map(|cache| cached_file(cache, family, weight));
         if let Some(file) = &cached
-            && let Some(typeface) = std::fs::read(file).ok().and_then(|bytes| decode(&bytes))
+            && let Some(typeface) = read(file)
         {
             let face = (typeface, Some(file.clone()));
             lock(&self.library.state).loaded.insert(key, face.clone());
@@ -285,7 +286,12 @@ impl Fonts {
         let Some(source) = &self.library.source else {
             return Err(Missing::Unknown);
         };
-        // Fetched without holding the fonts up for other Designs' text.
+        // Fetched without holding the fonts up for other Designs' text, but
+        // one fetch at a time: one waiting may find its font fetched.
+        let _fetching = lock(&self.library.fetching);
+        if let Some(known) = self.known(&key) {
+            return known;
+        }
         let fetched = source.fetch(family, weight);
         let mut state = lock(&self.library.state);
         match fetched {
@@ -322,39 +328,59 @@ impl Fonts {
         }
     }
 
+    /// What's known of `key` without reading or fetching: loaded, not on
+    /// the source, or failed lately.
+    fn known(&self, key: &(String, u16)) -> Option<Result<Vec<Face>, Missing>> {
+        let state = lock(&self.library.state);
+        if let Some(face) = state.loaded.get(key) {
+            return Some(Ok(vec![face.clone()]));
+        }
+        if state.unknown.contains(&key.0) {
+            return Some(Err(Missing::Unknown));
+        }
+        match state.failed.get(key) {
+            Some((when, why)) if when.elapsed() < RETRY_AFTER => Some(Err(Missing::Failed(why.clone()))),
+            _ => None,
+        }
+    }
+
     /// The typefaces of `family` in font files in `folder` and its
     /// `fonts/`, read again when the files there change.
     fn beside_design(&self, folder: &Path, family: &str) -> Vec<Face> {
         let listing = font_files(&[folder.to_owned(), folder.join("fonts")]);
         let mut state = lock(&self.library.state);
-        let read = state.beside.get(folder).is_some_and(|beside| beside.listing == listing);
-        if !read {
-            let families = listing
+        let fresh = state.beside.get(folder).is_some_and(|folder| folder.listing == listing);
+        if !fresh {
+            let read = listing
                 .iter()
                 .filter_map(|(path, _)| {
-                    let typeface = decode(&std::fs::read(path).ok()?)?;
-                    Some((typeface.family_name(), typeface, path.clone()))
+                    let typeface = read(path)?;
+                    Some(Read { family: typeface.family_name(), typeface, path: path.clone() })
                 })
                 .collect();
-            state.beside.insert(folder.to_owned(), Beside { listing, families });
+            state.beside.insert(folder.to_owned(), Folder { listing, read });
         }
-        state.beside[folder]
-            .families
-            .iter()
-            .filter(|(name, ..)| name.eq_ignore_ascii_case(family))
-            .map(|(_, typeface, path)| (typeface.clone(), Some(path.clone())))
-            .collect()
+        faces(&state.beside[folder].read, family)
     }
 }
 
+/// The faces of `family` among `read`.
+fn faces(read: &[Read], family: &str) -> Vec<Face> {
+    read.iter()
+        .filter(|read| read.family.eq_ignore_ascii_case(family))
+        .map(|read| (read.typeface.clone(), Some(read.path.clone())))
+        .collect()
+}
+
 /// The families a text draws with, in order: its own, then Geist, then a
-/// Noto family for each script among its characters that Geist lacks.
+/// Noto family for each script among its characters that Geist lacks
+/// (whether its own family has them or not, so it's the same everywhere).
 /// Each character draws in the first that has it, so a text draws the same
 /// whatever else its Design holds.
 pub fn families(text: &Text) -> Vec<String> {
     let mut families = vec![text.family().to_owned()];
     let mut scripts = [false; FALLBACKS.len()];
-    for c in text.content.chars() {
+    for c in text.content.chars().filter(|&c| !bundled_has(c)) {
         if let Some(i) = fallback(c) {
             scripts[i] = true;
         }
@@ -371,7 +397,7 @@ pub fn families(text: &Text) -> Vec<String> {
 /// Google Fonts' families for characters Geist lacks, by the code points
 /// they're for, in the order they're tried. Japanese's comes before
 /// Chinese's, so Han characters in Japanese text take Japanese forms; the
-/// last takes every other character past ASCII.
+/// last takes every other one.
 const FALLBACKS: &[(&str, &[(u32, u32)])] = &[
     (
         "Noto Color Emoji",
@@ -398,12 +424,9 @@ const FALLBACKS: &[(&str, &[(u32, u32)])] = &[
     ("Noto Sans", &[(0x0080, 0x10FFFF)]),
 ];
 
-/// Which of [`FALLBACKS`] `c` may need, if any.
+/// Which of [`FALLBACKS`] `c`, a character Geist lacks, needs, if any.
 fn fallback(c: char) -> Option<usize> {
     let c = c as u32;
-    if c < 0x80 {
-        return None;
-    }
     FALLBACKS
         .iter()
         .position(|(_, ranges)| ranges.iter().any(|&(from, to)| (from..=to).contains(&c)))
@@ -516,6 +539,15 @@ fn bundled() -> &'static [Typeface] {
     BUNDLED_TYPEFACES.get_or_init(|| BUNDLED.iter().filter_map(|file| decode(file)).collect())
 }
 
+/// Whether the bundled Geist draws `c` (a control character needs no font).
+fn bundled_has(c: char) -> bool {
+    c.is_control() || bundled().first().is_some_and(|geist| geist.unichar_to_glyph(c as i32) != 0)
+}
+
+fn read(path: &Path) -> Option<Typeface> {
+    decode(&std::fs::read(path).ok()?)
+}
+
 fn decode(bytes: &[u8]) -> Option<Typeface> {
     FontMgr::new().new_from_data(skia_safe::Data::new_copy(bytes), None)
 }
@@ -532,6 +564,13 @@ fn cached_file(cache: &Path, family: &str, weight: u16) -> PathBuf {
         .chars()
         .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
         .collect();
+    // Not a name Windows keeps for a device.
+    let stem = folder.trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    let folder = if device || folder.is_empty() { format!("{folder}_") } else { folder };
     cache.join(folder).join(format!("{weight}.ttf"))
 }
 
@@ -560,7 +599,7 @@ fn font_files(folders: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
 fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let folder = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(folder)?;
-    let temp = folder.join(format!(".{}.{}", uuid::Uuid::new_v4(), "part"));
+    let temp = folder.join(format!(".{}.part", uuid::Uuid::new_v4()));
     std::fs::write(&temp, bytes)?;
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);

@@ -537,6 +537,10 @@ fn text_draws_in_tiles_as_it_does_whole_in_the_fonts_the_engine_names() {
         zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600)).expect("drawn")
     };
     let one = whole(&Fonts::of_files(&[serif]));
+    // As the engine draws it, fetching the font itself (from the same
+    // files, standing in for Google Fonts).
+    let fixture = zeron_design::fonts::FontFolder::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts"));
+    assert!(whole(&Fonts::new(None, Some(Box::new(fixture)))) == one, "the window draws text as the engine does");
     let mut off = Vec::new();
     for y in 0..600 {
         for x in 0..860 {
