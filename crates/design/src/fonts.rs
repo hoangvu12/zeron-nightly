@@ -498,8 +498,14 @@ pub struct GoogleFonts {
 #[cfg(feature = "google-fonts")]
 impl Default for GoogleFonts {
     fn default() -> Self {
+        // The platform's own roots, as native TLS trusts by default: ureq's
+        // default (Mozilla's roots alone) fails on Windows, whose SChannel
+        // ends the chain at a root of its own store ("unable to find any
+        // user-specified roots in the final cert chain"), and trusts no
+        // root the system adds (a company's or a TLS-inspecting VPN's).
         let tls = ureq::tls::TlsConfig::builder()
             .provider(ureq::tls::TlsProvider::NativeTls)
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
             .build();
         let config = ureq::Agent::config_builder()
             .tls_config(tls)
