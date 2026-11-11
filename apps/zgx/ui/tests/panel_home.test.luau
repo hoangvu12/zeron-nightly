@@ -582,10 +582,7 @@ end
 
 test("the home stands a little over the panel's middle as its parts open, close and grow", function()
 	local app = home()
-	-- (The lift: the composer's, here with no strip over the page; read
-	-- with the subagents folded, short enough for the whole lift.)
-	app:click("#panel-home-subagents-head")
-	app:frames(30)
+	-- (The lift: the composer's, here with no strip over the page.)
 	local py, ph = span_of(app, "#panel-empty")
 	local by, bh = span_of(app, "#panel-home-block")
 	local lift = (py + ph - by - bh) - (by - py)
@@ -593,6 +590,7 @@ test("the home stands a little over the panel's middle as its parts open, close 
 	app:click("#panel-home-subagents-head")
 	app:frames(30)
 	expect(centred(app, lift)).to_be(true)
+	app:click("#panel-home-subagents-head")
 	app:command("many")
 	app:frames(30)
 	expect(centred(app, lift)).to_be(true)

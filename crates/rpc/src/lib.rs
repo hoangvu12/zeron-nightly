@@ -357,10 +357,19 @@ pub mod methods {
     /// screenshots: [{id, width, height, mimeType, data}]}`. Local only:
     /// Designs live on the engine of their computer.
     pub const DESIGN_EXECUTE: &str = "DesignExecute";
+    /// The Designs a chat has open (`design_state`): `{chatId?}` →
+    /// `{designs: [{name, path, front}], recent: [{name, path, touchedAt}],
+    /// guide}`. Local only, like `DesignExecute`.
+    pub const DESIGN_STATE: &str = "DesignState";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
-    /// changed}`: the Design whole as it is, then after each call that
-    /// changes it, with the ids that call made or changed. Local only.
+    /// changed}`: the Design whole as it is, then after each change, with
+    /// the ids the change made or changed. Local only.
     pub const WATCH_DESIGN: &str = "WatchDesign";
+    /// `{chatId, paths}` → `{}`: the Designs a chat's Design tabs show, the
+    /// front one first (none: it has none), as the app's tabs open, close
+    /// and come to the front; what `design_state` and a call naming no
+    /// Design go by. Local only.
+    pub const SET_DESIGN_TABS: &str = "SetDesignTabs";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -723,7 +732,9 @@ pub fn local_only(method: &str) -> bool {
             | methods::DESCRIBE_ELEMENTS
             // Designs: this computer's own (ADR-0003).
             | methods::DESIGN_EXECUTE
+            | methods::DESIGN_STATE
             | methods::WATCH_DESIGN
+            | methods::SET_DESIGN_TABS
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME
@@ -804,8 +815,9 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::PUBLISH_IMAGE
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
-            // Designs: running snippets against them.
+            // Designs: running snippets against them, and which are open.
             | methods::DESIGN_EXECUTE
+            | methods::DESIGN_STATE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, exporting (to Zeron's plugin-exports
             // folder only: the engine refuses an agent's `to`), and their

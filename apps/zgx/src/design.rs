@@ -13,6 +13,7 @@
 //! invoke  design.open       { tab, path }           follow the Design at `path`
 //! invoke  design.view       { tab, x, y, zoom, w, h, settled }
 //! invoke  design.close      tab                      its watch and tiles let go
+//! invoke  design.tabs       { chat, paths }          a chat's Design tabs, front first
 //! ```
 //!
 //! A layer's tiles are placed in points at `level` points a Canvas unit, so
@@ -34,6 +35,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use serde_json::{Value as Json, json};
 use zeron_design::Design;
+use zeron_design::layout::LaidOut;
 use zeron_design::render::{self, Rect};
 use zgx::image::ImageData;
 use zgx_script::{ScriptHost, Shared, Value};
@@ -60,12 +62,25 @@ pub trait Source {
     /// each change, until the handle it gives drops. `None` while it can't
     /// yet (no engine): [`DesignTabs::follow_again`] asks again.
     fn follow(&self, path: &str, listener: Listener) -> Option<Box<dyn Any>>;
+
+    /// Says which Designs `chat`'s Design tabs show, the front one first
+    /// (what its agent's calls naming no Design go by).
+    fn set_tabs(&self, chat: &str, paths: &[String]);
 }
 
 /// The engine of this computer (ADR-0003), over its local connection.
 struct EngineSource;
 
 impl Source for EngineSource {
+    fn set_tabs(&self, chat: &str, paths: &[String]) {
+        let params = json!({ "chatId": chat, "paths": paths });
+        engine::get().spawn(async move {
+            if let Err(e) = engine::get().call("SetDesignTabs", params).await {
+                eprintln!("zeron-zgx: design: the engine didn't take the Design tabs: {e}");
+            }
+        });
+    }
+
     fn follow(&self, path: &str, listener: Listener) -> Option<Box<dyn Any>> {
         let rpc = engine::get().current()?;
         let listener = Rc::new(RefCell::new(listener));
@@ -91,18 +106,20 @@ impl Source for EngineSource {
 }
 
 /// A Design as tiles draw it: its version in this window (one more each
-/// time it's heard), the Design and where each of its top-level nodes
-/// draws.
+/// time it's heard), the Design laid out, and where each of its top-level
+/// nodes draws.
 struct Scene {
     version: u64,
     design: Design,
+    laid_out: LaidOut,
     tops: Vec<Rect>,
 }
 
 impl Scene {
     fn new(version: u64, design: Design) -> Self {
-        let tops = design.children.iter().map(render::bounds).collect();
-        Self { version, design, tops }
+        let laid_out = LaidOut::of(&design);
+        let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
+        Self { version, design, laid_out, tops }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -218,7 +235,7 @@ fn draw(scene: &Scene, key: TileKey) -> Option<Arc<ImageData>> {
     if nodes.is_empty() {
         return None;
     }
-    let pixels = render::region(&scene.design, &nodes, area, key.level.scale(), TILE, TILE)?;
+    let pixels = render::region(&scene.design, &scene.laid_out, &nodes, area, key.level.scale(), TILE, TILE)?;
     ImageData::new_premultiplied(TILE, TILE, pixels).ok().map(Arc::new)
 }
 
@@ -428,6 +445,8 @@ pub struct DesignTabs {
     host: ScriptHost,
     source: Box<dyn Source>,
     tabs: RefCell<HashMap<String, TabCanvas>>,
+    /// Each chat's Design tabs as last said (said again to a new engine).
+    chats: RefCell<HashMap<String, Vec<String>>>,
     pool: Pool,
     /// The display's scale.
     dpr: Cell<f32>,
@@ -466,6 +485,7 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         host: host.clone(),
         source,
         tabs: RefCell::default(),
+        chats: RefCell::default(),
         pool: Pool { queue: Arc::default(), done: RefCell::default(), wake },
         dpr: Cell::new(1.),
         clock: Cell::new(0),
@@ -501,6 +521,20 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         if let Some(tabs) = me.upgrade() {
             tabs.close(&crate::auth::text(&arg));
         }
+    });
+    let me = Rc::downgrade(&tabs);
+    host.action("design.tabs", move |arg| {
+        let Some(tabs) = me.upgrade() else { return };
+        let chat = text(&arg, "chat");
+        let paths: Vec<String> = match arg.field("paths") {
+            Some(Value::List(paths)) => paths.iter().map(crate::auth::text).collect(),
+            _ => Vec::new(),
+        };
+        if chat.is_empty() || tabs.chats.borrow().get(&chat) == Some(&paths) {
+            return;
+        }
+        tabs.source.set_tabs(&chat, &paths);
+        tabs.chats.borrow_mut().insert(chat, paths);
     });
     let me = Rc::downgrade(&tabs);
     let pump = async move {
@@ -557,8 +591,12 @@ impl DesignTabs {
         }
     }
 
-    /// Every tab's Design followed again (a new connection to the engine).
+    /// Every tab's Design followed again, and every chat's Design tabs said
+    /// again (a new connection to the engine, which may be a new engine).
     pub fn follow_again(self: &Rc<Self>) {
+        for (chat, paths) in self.chats.borrow().iter() {
+            self.source.set_tabs(chat, paths);
+        }
         let tabs: Vec<String> = self.tabs.borrow().keys().cloned().collect();
         for tab in tabs {
             // (Let go once the tabs aren't borrowed: an ending may say so.)

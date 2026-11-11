@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, NodeKind, Size};
+use super::{Fill, NodeKind, Size, Sizing};
 use crate::render::{Painter, Rect};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -12,11 +12,11 @@ pub struct Rectangle {
 }
 
 impl NodeKind for Rectangle {
-    fn size(&self) -> (f32, f32) {
-        (self.size.width, self.size.height)
+    fn size(&self) -> (Sizing, Sizing) {
+        self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, painter: &mut dyn Painter) {
-        painter.fill_rect(Rect::sized(self.size()), &self.fill.fill);
+    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
+        painter.fill_rect(Rect::sized(size), &self.fill.fill);
     }
 }

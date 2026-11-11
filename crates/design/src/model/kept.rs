@@ -24,6 +24,8 @@ struct Common {
     x: f32,
     #[serde(default)]
     y: f32,
+    #[serde(default)]
+    absolute: bool,
 }
 
 #[derive(Serialize)]
@@ -35,6 +37,8 @@ struct Written<'a> {
     x: Option<f32>,
     #[serde(skip_serializing_if = "is_none_or_zero")]
     y: Option<f32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    absolute: bool,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     kind: Option<&'a Kind>,
     #[serde(flatten)]
@@ -55,6 +59,7 @@ impl Node {
             name: if known { &self.name } else { "" },
             x: known.then_some(self.x),
             y: known.then_some(self.y),
+            absolute: known && self.absolute,
             kind: known.then_some(&self.kind),
             extra: &self.extra,
         }
@@ -82,6 +87,7 @@ impl Node {
                 name,
                 x,
                 y,
+                absolute: false,
                 kind: Kind::Opaque(Opaque { type_name }),
                 extra,
             });
@@ -98,6 +104,7 @@ impl Node {
             name: common.name,
             x: common.x,
             y: common.y,
+            absolute: common.absolute,
             kind,
             extra: Map::new(),
         };

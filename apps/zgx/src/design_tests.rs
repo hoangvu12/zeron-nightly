@@ -38,6 +38,14 @@ fn landing(badge: &str, second: bool) -> Design {
         "children": [
             { "id": "hero", "type": "rectangle", "x": 40, "y": 40, "width": 200, "height": 100, "fill": "#4F46E5" },
             { "id": "badge", "type": "rectangle", "x": 600, "y": 400, "width": 160, "height": 160, "fill": badge },
+            // Laid out (#20): three 60 px chips in a row from (40, 300),
+            // 10 apart inside 20 of padding, whatever their x and y.
+            { "id": "chips", "type": "frame", "x": 40, "y": 300, "width": 260, "height": 100, "fill": "#F3F4F6",
+              "layout": "horizontal", "gap": 10, "padding": 20, "children": [
+                { "id": "chip1", "type": "rectangle", "x": 500, "y": 500, "width": 60, "height": 60, "fill": "#4F46E5" },
+                { "id": "chip2", "type": "rectangle", "width": 60, "height": 60, "fill": "#EF4444" },
+                { "id": "chip3", "type": "rectangle", "width": 60, "height": 60, "fill": "#4F46E5" },
+            ] },
         ],
     })];
     if second {
@@ -74,6 +82,8 @@ fn many_screens() -> Design {
 struct StandIn {
     designs: RefCell<HashMap<String, Design>>,
     following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
+    /// What each chat's Design tabs were said to be, in order.
+    tabs_said: RefCell<Vec<(String, Vec<String>)>>,
 }
 
 impl StandIn {
@@ -96,6 +106,10 @@ impl Source for Engine {
         let now = self.0.designs.borrow().get(path).cloned();
         (listener.borrow_mut())(now.ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
+    }
+
+    fn set_tabs(&self, chat: &str, paths: &[String]) {
+        self.0.tabs_said.borrow_mut().push((chat.into(), paths.to_vec()));
     }
 }
 
@@ -236,6 +250,9 @@ fn the_tab_draws_its_design_as_the_engines_screenshot_does() {
     assert_eq!(shown.rgba(tab.on_screen(150., 100.)), INDIGO);
     assert_eq!(shown.rgba(tab.on_screen(780., 530.)), RED);
     assert_eq!(shown.rgba(tab.on_screen(500., 300.)), WHITE);
+    // The row's second chip, where the layout puts it (the Screen at
+    // (100, 50), the row at (40, 300) in it, 20 in, past a chip and a gap).
+    assert_eq!(shown.rgba(tab.on_screen(100. + 40. + 20. + 70. + 30., 50. + 300. + 20. + 30.)), RED);
     assert_eq!(shown.rgba(tab.on_screen(50., 300.)), [0; 4], "the Canvas shows through");
 }
 
@@ -355,4 +372,26 @@ fn a_design_that_cannot_be_followed_says_so() {
     app.frames(4);
     assert!(app.find("~\"The Design didn't open\"").is_some(), "{}", app.tree());
     assert!(app.find("~\"can't open fixture.zdesign\"").is_some(), "{}", app.tree());
+}
+
+#[test]
+fn the_engine_hears_which_designs_a_chats_tabs_show() {
+    let tab = mount(landing("#EF4444", false));
+    let said = || tab_feed(&tab);
+    assert_eq!(said(), [("design-fixture".to_string(), vec![PATH.to_string()])]);
+
+    // A second Design tab with no Design yet, in front: the same Designs,
+    // not said again.
+    assert!(tab.app.host.run_command("design_empty"));
+    tab.app.frames(4);
+    assert_eq!(said().len(), 1, "{:?}", said());
+
+    // A new engine (the connection made again) hears them again.
+    tab.canvas.follow_again();
+    assert_eq!(said().len(), 2);
+    assert_eq!(said()[1], said()[0]);
+}
+
+fn tab_feed(tab: &Tab) -> Vec<(String, Vec<String>)> {
+    tab.engine.tabs_said.borrow().clone()
 }

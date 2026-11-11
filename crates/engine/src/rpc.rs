@@ -962,6 +962,12 @@ impl EngineRpc {
         self
     }
 
+    fn designs(&self) -> Result<&crate::designs::Designs, RpcError> {
+        self.designs
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))
+    }
+
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
         self
@@ -5800,10 +5806,7 @@ impl RpcService for EngineRpc {
                 }))
             }
             methods::DESIGN_EXECUTE => {
-                let designs = self
-                    .designs
-                    .clone()
-                    .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))?;
+                let designs = self.designs()?.clone();
                 let p: crate::designs::ExecuteParams = parse_params(params)?;
                 let executed = tokio::task::spawn_blocking(move || designs.execute(p))
                     .await
@@ -5818,20 +5821,31 @@ impl RpcService for EngineRpc {
                     })?;
                 RpcReply::value(&executed)
             }
+            methods::DESIGN_STATE => {
+                let designs = self.designs()?;
+                let p: crate::designs::StateParams = parse_params(params)?;
+                RpcReply::value(&designs.state(p.chat_id.as_deref()))
+            }
             methods::WATCH_DESIGN => {
-                let designs = self
-                    .designs
-                    .clone()
-                    .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))?;
+                let designs = self.designs()?.clone();
                 let p: crate::designs::WatchParams = parse_params(params)?;
-                let seen = tokio::task::spawn_blocking(move || designs.watch(&p.path))
+                let told = tokio::task::spawn_blocking(move || designs.watch(&p.path))
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| match e {
                         crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
                         e => RpcError::Failed(e.to_string()),
                     })?;
-                Ok(RpcReply::Stream(seen.boxed()))
+                Ok(RpcReply::Stream(told.boxed()))
+            }
+            methods::SET_DESIGN_TABS => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::TabsParams = parse_params(params)?;
+                // (It keeps the recent list on disk.)
+                tokio::task::spawn_blocking(move || designs.set_tabs(&p.chat_id, p.paths))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;

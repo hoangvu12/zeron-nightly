@@ -14,6 +14,7 @@
 --   Design.close(tab)     its tiles let go
 --   Design.fit(id)        the tab's view on all of its Design again
 --   Design.Empty { title, body, action? }   what shows in place of a Canvas
+--   Design.say_tabs(key)  the engine told which Designs the chat's tabs show
 
 local ds = require("@ds")
 local state = require("@app/screens/panel/state")
@@ -52,6 +53,33 @@ end
 
 function M.fit(id: string)
 	views:set_key(id, nil)
+end
+
+-- Tells the engine which Designs a chat's Design tabs show, the one turned
+-- to last first (what its agent's calls naming no Design go by). The host
+-- says it only when it changed, and again to a new engine.
+function M.say_tabs(key: string)
+	local chat = string.match(key, "^chat:(.+)$")
+	if not chat then
+		return
+	end
+	local s = state.of(key)
+	local paths: { string } = {}
+	local function add(t: Tab)
+		if t.kind == "design" and t.path and not table.find(paths, t.path) then
+			table.insert(paths, t.path)
+		end
+	end
+	for _, seen in s.visited do
+		local t = state.find(key, seen)
+		if t then
+			add(t)
+		end
+	end
+	for _, t in s.tabs do
+		add(t)
+	end
+	ui.invoke("design.tabs", { chat = chat, paths = paths })
 end
 
 -- What a Design tab shows instead of a Canvas: its kind's empty state.
@@ -244,6 +272,16 @@ M.Design = ui.component(function(props: Props): Node
 	end
 	-- Its Design followed as it's named (and again after a reload: the host
 	-- keeps one Canvas a tab).
+	-- Its chat's Design tabs said as they change, and once more as it goes
+	-- (closed, or another tab in front).
+	ui.effect(function()
+		M.say_tabs(key)
+	end)
+	ui.on_cleanup(function()
+		ui.after(0, function()
+			M.say_tabs(key)
+		end)
+	end)
 	ui.effect(function()
 		local p = path()
 		if p then

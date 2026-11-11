@@ -5,6 +5,7 @@
 //! those and a painter of its own. Both draw a node with [`paint_node`],
 //! so the tab shows what the agent's screenshot does.
 
+use crate::layout::LaidOut;
 use crate::model::{Design, Node, Paint};
 
 /// The longest side of an agent's screenshot, in pixels.
@@ -55,59 +56,80 @@ pub trait Painter {
     fn fill_rect(&mut self, rect: Rect, paints: &[Paint]);
 }
 
-/// Draws `node` and its descendants with its top-left at the painter's
-/// origin, wherever it sits in its parent.
-pub fn paint_node(node: &Node, painter: &mut dyn Painter) {
+/// Draws `node` and its descendants where `laid_out` puts them, with its
+/// top-left at the painter's origin wherever it sits in its parent.
+pub fn paint_node(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter) {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return;
+    };
+    let bounds = placed.bounds;
+    let size = (bounds.width, bounds.height);
     let kind = node.kind.get();
-    kind.paint(painter);
+    kind.paint(size, painter);
     if kind.children().is_empty() {
         return;
     }
     painter.save();
     if kind.clips() {
-        painter.clip_rect(Rect::sized(kind.size()));
+        painter.clip_rect(Rect::sized(size));
     }
     for child in kind.children() {
+        let Some(at) = laid_out.get(&child.id) else {
+            continue;
+        };
         painter.save();
-        painter.translate(child.x, child.y);
-        paint_node(child, painter);
+        painter.translate(at.bounds.x - bounds.x, at.bounds.y - bounds.y);
+        paint_node(child, laid_out, painter);
         painter.restore();
     }
     painter.restore();
 }
 
-/// Where `node` draws, in its parent's space: its own box, and its
-/// descendants' unless it clips them.
-pub fn bounds(node: &Node) -> Rect {
+/// Where `node` draws on the Canvas, as `laid_out` puts it: its own box,
+/// and its descendants' unless it clips them.
+pub fn bounds(node: &Node, laid_out: &LaidOut) -> Rect {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return Rect::sized((0., 0.));
+    };
     let kind = node.kind.get();
-    let mut drawn = Rect::sized(kind.size());
+    let mut drawn = placed.bounds;
     if !kind.clips() {
         for child in kind.children() {
-            drawn = drawn.union(&bounds(child));
+            let child = bounds(child, laid_out);
+            if child.width > 0. || child.height > 0. {
+                drawn = drawn.union(&child);
+            }
         }
     }
-    Rect {
-        x: drawn.x + node.x,
-        y: drawn.y + node.y,
-        ..drawn
-    }
+    drawn
 }
 
 /// The part `area` of the Canvas at `scale` pixels a unit, as a
 /// transparent `width` × `height` image (RGBA, premultiplied): the
 /// Canvas's top-level nodes at `nodes` (indices into its children, the
-/// ones meeting `area`, in order) drawn where they sit. `None` for an
-/// empty or oversized image.
-pub fn region(design: &Design, nodes: &[usize], area: Rect, scale: f32, width: u32, height: u32) -> Option<Vec<u8>> {
+/// ones meeting `area`, in order) drawn where `laid_out` puts them. `None`
+/// for an empty or oversized image.
+pub fn region(
+    design: &Design,
+    laid_out: &LaidOut,
+    nodes: &[usize],
+    area: Rect,
+    scale: f32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
     let mut pixels = vec![0; width as usize * height as usize * 4];
     crate::skia::draw_into(&mut pixels, width, height, |canvas| {
         let mut painter = crate::skia::SkiaPainter::new(canvas);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
         for node in nodes.iter().filter_map(|&i| design.children.get(i)) {
+            let Some(at) = laid_out.get(&node.id) else {
+                continue;
+            };
             painter.save();
-            painter.translate(node.x, node.y);
-            paint_node(node, &mut painter);
+            painter.translate(at.bounds.x, at.bounds.y);
+            paint_node(node, laid_out, &mut painter);
             painter.restore();
         }
     })?;
@@ -137,7 +159,9 @@ pub enum RenderError {
 /// smaller when its longest side is over `max_side`, and encodes it.
 pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
-    let (width, height) = node.kind.get().size();
+    let laid_out = LaidOut::of(design);
+    let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
+    let (width, height) = (bounds.width, bounds.height);
     if !(width > 0. && height > 0.) {
         return Err(RenderError::Empty(id.into()));
     }
@@ -152,7 +176,7 @@ pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot
     {
         let mut painter = crate::skia::SkiaPainter::new(surface.canvas());
         painter.scale(scale);
-        paint_node(node, &mut painter);
+        paint_node(node, &laid_out, &mut painter);
     }
     let png = crate::skia::png(&mut surface).ok_or_else(failed)?;
     Ok(Screenshot {
