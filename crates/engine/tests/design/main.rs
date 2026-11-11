@@ -7,6 +7,7 @@ mod icons;
 mod images;
 mod kept;
 mod layout;
+mod opening;
 mod looks;
 mod reading;
 mod saving;

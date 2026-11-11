@@ -389,6 +389,14 @@ pub mod methods {
     /// `{path}` → as `DesignSaving`: puts a Design back as its file holds
     /// it, its unsaved changes gone (one undo step). Local only.
     pub const DISCARD_DESIGN: &str = "DiscardDesign";
+    /// `{name?}` → `{name, path}`: a new, empty Design in Zeron's designs
+    /// folder (the Design tab's New design; "Untitled design" when unnamed),
+    /// on disk at once. Local only.
+    pub const NEW_DESIGN: &str = "NewDesign";
+    /// `{}` → `{recent: [{name, path, touchedAt}]}`: the Designs touched
+    /// most recently on this computer, by anyone (the Design tab's Recent
+    /// designs). Local only.
+    pub const RECENT_DESIGNS: &str = "RecentDesigns";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -758,6 +766,8 @@ pub fn local_only(method: &str) -> bool {
             | methods::SAVE_DESIGN
             | methods::SAVE_DESIGN_AS
             | methods::DISCARD_DESIGN
+            | methods::NEW_DESIGN
+            | methods::RECENT_DESIGNS
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME

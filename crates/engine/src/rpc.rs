@@ -5883,6 +5883,17 @@ impl RpcService for EngineRpc {
                 let p: crate::designs::PathParams = parse_params(params)?;
                 self.design_saving(move |designs| designs.discard(&p.path)).await
             }
+            methods::NEW_DESIGN => {
+                let p: crate::designs::NewParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.new_design(p.name.as_deref())).await
+            }
+            methods::RECENT_DESIGNS => {
+                let designs = self.designs()?.clone();
+                let recent = tokio::task::spawn_blocking(move || designs.recent())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "recent": recent }))
+            }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self

@@ -71,6 +71,9 @@ use self::images::{DesignImages, ImageCache};
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
 
+/// What New design names a Design it isn't given a name for.
+const UNTITLED: &str = "Untitled design";
+
 /// Longest name a managed Design's folder takes from its Design's name.
 const MAX_NAME_CHARS: usize = 64;
 
@@ -144,6 +147,13 @@ pub struct TabsParams {
 pub struct PathParams {
     /// The `.zdesign` file.
     pub path: PathBuf,
+}
+
+/// `NewDesign`'s params.
+#[derive(Debug, Deserialize)]
+pub struct NewParams {
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// `SaveDesignAs`'s params.
@@ -364,6 +374,27 @@ impl Designs {
         let mut live = lock(&live);
         live.save_file()?;
         Ok(live.saving())
+    }
+
+    /// A new, empty managed Design named `name` ("Untitled design" without
+    /// one), on disk at once and the most recent (`NewDesign`, the Design
+    /// tab's New design): `{name, path}`.
+    pub fn new_design(&self, name: Option<&str>) -> Result<Value, DesignError> {
+        let name = name.map(str::trim).filter(|name| !name.is_empty()).unwrap_or(UNTITLED);
+        let live = self.create(name)?;
+        let path = {
+            let mut held = lock(&live);
+            let made = held.save_file();
+            if let Err(e) = made {
+                drop(held);
+                // Nothing was made: the name is free again.
+                lock(&self.inner.live).retain(|_, other| !Arc::ptr_eq(other, &live));
+                return Err(e);
+            }
+            held.path.clone()
+        };
+        self.touch(&path);
+        Ok(json!({ "name": design_name(&path), "path": path }))
     }
 
     /// Puts the Design at `path` back as its file holds it, its unsaved
