@@ -367,6 +367,12 @@ impl Designs {
                 path.display()
             )));
         }
+        // A Design already held, named as it was given back, without opening
+        // its file: on Windows, a handle open on it (as canonicalizing holds
+        // one) fails another call's save, which replaces the file.
+        if let Some(design) = lock(&self.inner.live).get(path) {
+            return Ok(design.clone());
+        }
         let path = canonical(path).map_err(|e| {
             DesignError::Refused(match e.kind() {
                 std::io::ErrorKind::NotFound => format!(
@@ -480,7 +486,18 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(folder)?;
     std::io::Write::write_all(&mut file, bytes)?;
-    file.persist(path).map_err(|e| e.error)?;
+    // Windows refuses to replace a file someone has open (a reader, a
+    // virus scan) until they let go: try again for a moment.
+    for attempt in 1.. {
+        match file.persist(path) {
+            Ok(_) => break,
+            Err(e) if e.error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 5 => {
+                file = e.file;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            Err(e) => return Err(e.error),
+        }
+    }
     Ok(())
 }
 
