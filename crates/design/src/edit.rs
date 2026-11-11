@@ -199,11 +199,13 @@ impl Draft {
                 self.warn(&problem.node, None, problem.message);
             }
         }
-        // However it came to be: inserted so, or its fill taken away.
+        // However it came to be: inserted so, or its fill taken away (a
+        // fill naming a Token is one).
         for id in &self.changed {
             if let Some(node) = self.design.find(id)
                 && let Kind::Text(text) = &node.kind
                 && text.fill.fill.is_empty()
+                && !node.refs.contains_key("fill")
             {
                 self.warnings.push(Warning::invisible(node));
             }

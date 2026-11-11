@@ -372,3 +372,22 @@ Insert({ type: "icon", name: "Glyph", icon: "$glyph", width: 24, height: 24 });"
     assert!(token.json()["warnings"].to_string().contains("mdi:also-missing"), "{}", token.text);
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn text_filled_by_a_token_is_seen_and_not_warned_about() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Ink",
+            r##"SetTokens({ ink: { type: "color", value: "#4F46E5" } });
+screen = Insert({ type: "frame", name: "Screen", width: 200, height: 100, fill: "#FFFFFF",
+  children: [{ type: "text", name: "Word", content: "IIII", fontSize: 60, fontWeight: 700, fill: "$ink" }] });
+TakeScreenshot(screen);"##,
+        )
+        .await;
+    assert!(made.json().get("warnings").is_none(), "{}", made.text);
+    let shot = &made.images[0];
+    let inked = (0..shot.width).any(|x| (0..shot.height).any(|y| shot.rgba(x, y) == INDIGO));
+    assert!(inked, "the text draws in its Token's colour");
+    seam.shutdown().await;
+}

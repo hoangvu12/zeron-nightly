@@ -60,8 +60,11 @@ impl IconSource for FixtureIcons {
 /// One tool call's result, as the agent's client gets it.
 pub struct Called {
     pub is_error: bool,
-    /// The text content: the result as JSON, or the error's message.
+    /// The first text content: the result as JSON, or the error's message.
     pub text: String,
+    /// The text contents after the first, as one: the design guide, which
+    /// the chat's first design call gets, or the one design_guide returns.
+    pub guide: Option<String>,
     pub images: Vec<Image>,
 }
 
@@ -165,6 +168,12 @@ impl Seam {
         reply["result"]["tools"].as_array().expect("a tool list").clone()
     }
 
+    /// What `initialize` tells the agent about Zeron's tools.
+    pub async fn instructions(&self) -> String {
+        let reply = zeron_mcp::handle_request(&self.tools, json!(1), "initialize", json!({})).await;
+        reply["result"]["instructions"].as_str().expect("instructions").to_owned()
+    }
+
     pub async fn call(&self, tool: &str, arguments: Value) -> Called {
         call(&self.tools, tool, arguments).await
     }
@@ -243,12 +252,12 @@ async fn call(tools: &Tools, tool: &str, arguments: Value) -> Called {
     .await;
     let result = &reply["result"];
     let content = result["content"].as_array().expect("content");
-    let text = content
+    let mut texts = content
         .iter()
         .filter(|c| c["type"] == "text")
-        .map(|c| c["text"].as_str().unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|c| c["text"].as_str().unwrap_or_default().to_owned());
+    let text = texts.next().unwrap_or_default();
+    let guide = texts.reduce(|guide, more| format!("{guide}\n\n{more}"));
     let images = content
         .iter()
         .filter(|c| c["type"] == "image")
@@ -268,6 +277,7 @@ async fn call(tools: &Tools, tool: &str, arguments: Value) -> Called {
     Called {
         is_error: result["isError"] == true,
         text,
+        guide,
         images,
     }
 }

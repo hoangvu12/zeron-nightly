@@ -39,12 +39,13 @@
 //! files beside its Design ([`zeron_design::fonts`]). An image fill's file
 //! is in the Design's folder, or downloaded ([`images`]) as an asset.
 
+pub mod guide;
 mod iconify;
 mod export;
 mod images;
 mod retry;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -92,7 +93,12 @@ const DISCARD_DESCRIPTION: &str = "Discard unsaved changes";
 const SAVE_AS_DESCRIPTION: &str = "Save as, renaming images";
 
 /// What `design_state` reminds an agent of.
-pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide comes with your first design call in a chat; call design_guide for it again (after your context was compacted, say) or for a topic guide.";
+pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide came with your first design call in this chat. If it's no longer in your context (after compaction, say), call design_guide for it again, and design_guide with a topic for components, design systems, landing pages, mobile apps, web apps, slides, tables, code or Tailwind.";
+
+/// Where a result carries guides to read beside it (the core guide with a
+/// chat's first design call, a topic from `design_guide`): Zeron's MCP
+/// server gives each as a text of its own.
+pub const GUIDE_TEXTS: &str = "guideTexts";
 
 /// What a call is told when its Design changed since that chat's last call
 /// (a chat's first call on a Design has nothing to compare, so isn't).
@@ -156,6 +162,18 @@ pub struct SaveAsParams {
     pub to: PathBuf,
 }
 
+/// `DesignGuide`'s params, as Zeron's `design_guide` tool sends them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideParams {
+    /// The calling chat (the agent's, set by the engine for an agent).
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    /// A topic guide's name; none for the core guide.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
 /// `DesignState`'s params, as Zeron's `design_state` tool sends them.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,6 +221,9 @@ struct Inner {
     globals: Mutex<HashMap<String, Globals>>,
     /// Failed calls, kept to retry.
     failed: Mutex<Failed>,
+    /// The chats given the core guide (with their first design call), and
+    /// "" for calls from no chat.
+    guided: Mutex<HashSet<String>>,
     /// The Designs each chat's Design tabs show, front first.
     tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The Designs touched most recently, newest first, as kept in
@@ -331,6 +352,7 @@ impl Designs {
                 live: Mutex::new(HashMap::new()),
                 globals: Mutex::new(HashMap::new()),
                 failed: Mutex::new(Failed::default()),
+                guided: Mutex::new(HashSet::new()),
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
@@ -536,10 +558,11 @@ impl Designs {
             lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
         }
         let (error, line) = match ran {
-            Ok(result) => {
+            Ok(mut result) => {
                 if let Some(edit_id) = &edit_id {
                     lock(&self.inner.failed).remove(edit_id);
                 }
+                self.guide_once(params.chat_id.as_deref(), &mut result, Vec::new());
                 return Ok(result);
             }
             Err(Ran::Snippet(SnippetError::Failed { message, line })) => (message, line),
@@ -797,7 +820,44 @@ impl Designs {
             .enumerate()
             .map(|(i, path)| json!({ "name": design_name(path), "path": path, "front": i == 0 }))
             .collect();
-        json!({ "designs": designs, "recent": self.recent(), "guide": GUIDE_REMINDER })
+        let mut state = json!({ "designs": designs, "recent": self.recent(), "guide": GUIDE_REMINDER });
+        self.guide_once(chat_id, &mut state, Vec::new());
+        state
+    }
+
+    /// `design_guide` for `chat_id`: the topic guide `topic`, or the core
+    /// guide without one, as [`GUIDE_TEXTS`], with the topics there are.
+    /// The core guide comes after a topic when the chat hasn't had it yet.
+    pub fn guide(&self, chat_id: Option<&str>, topic: Option<&str>) -> Result<Value, DesignError> {
+        let topics = guide::topics();
+        let mut result = json!({ "topic": topic.unwrap_or("core"), "topics": topics });
+        match topic {
+            None | Some("core") => {
+                lock(&self.inner.guided).insert(chat_id.unwrap_or_default().to_owned());
+                result[GUIDE_TEXTS] = json!([guide::CORE]);
+            }
+            Some(name) => {
+                let text = guide::topic(name).ok_or_else(|| {
+                    DesignError::Refused(format!(
+                        "there's no design guide on \"{name}\": the topics are {}, or none for the core guide",
+                        topics.join(", ")
+                    ))
+                })?;
+                self.guide_once(chat_id, &mut result, vec![text]);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Puts `texts` in `result` as [`GUIDE_TEXTS`], and the core guide
+    /// after them when `chat_id` hasn't had it, which it now has.
+    fn guide_once(&self, chat_id: Option<&str>, result: &mut Value, mut texts: Vec<&'static str>) {
+        if lock(&self.inner.guided).insert(chat_id.unwrap_or_default().to_owned()) {
+            texts.push(guide::CORE);
+        }
+        if !texts.is_empty() {
+            result[GUIDE_TEXTS] = json!(texts);
+        }
     }
 
     /// Sets the Designs `chat_id`'s Design tabs show, the one in front
