@@ -30,6 +30,11 @@ impl Warning {
         }
     }
 
+    /// Something about a call's exports.
+    pub fn export(message: String) -> Self {
+        Self { node: None, property: None, message }
+    }
+
     /// Something about the fonts a call's text uses.
     pub fn fonts(message: String) -> Self {
         Self { node: None, property: None, message }

@@ -5846,6 +5846,14 @@ impl RpcService for EngineRpc {
                 let p: crate::designs::StateParams = parse_params(params)?;
                 RpcReply::value(&designs.state(p.chat_id.as_deref()))
             }
+            methods::DESIGN_GUIDE => {
+                let designs = self.designs()?;
+                let p: crate::designs::GuideParams = parse_params(params)?;
+                let guide = designs
+                    .guide(p.chat_id.as_deref(), p.topic.as_deref())
+                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                RpcReply::value(&guide)
+            }
             methods::WATCH_DESIGN => {
                 let designs = self.designs()?.clone();
                 let p: crate::designs::WatchParams = parse_params(params)?;

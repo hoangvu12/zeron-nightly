@@ -39,11 +39,13 @@
 //! files beside its Design ([`zeron_design::fonts`]). An image fill's file
 //! is in the Design's folder, or downloaded ([`images`]) as an asset.
 
+pub mod guide;
 mod iconify;
+mod export;
 mod images;
 mod retry;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -61,6 +63,7 @@ use sha2::Digest as _;
 use zeron_design::icons::Icons;
 use zeron_design::model::{ImageFill, Kind};
 use zeron_design::snippet::{self, Globals, Limits, SnippetError};
+use zeron_rpc::methods::GUIDE_TEXTS;
 
 pub use retry::{Edit, Failure};
 use retry::{Failed, Kept, Retarget};
@@ -94,7 +97,7 @@ const DISCARD_DESCRIPTION: &str = "Discard unsaved changes";
 const SAVE_AS_DESCRIPTION: &str = "Save as, renaming images";
 
 /// What `design_state` reminds an agent of.
-pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide comes with your first design call in a chat; call design_guide for it again (after your context was compacted, say) or for a topic guide.";
+pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide came with your first design call in this chat. If it's no longer in your context (after compaction, say), call design_guide for it again, and design_guide with a topic for components, design systems, landing pages, mobile apps, web apps, slides, tables, code or Tailwind.";
 
 /// What a call is told when its Design changed since that chat's last call
 /// (a chat's first call on a Design has nothing to compare, so isn't).
@@ -165,6 +168,18 @@ pub struct SaveAsParams {
     pub to: PathBuf,
 }
 
+/// `DesignGuide`'s params, as Zeron's `design_guide` tool sends them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideParams {
+    /// The calling chat (the agent's, set by the engine for an agent).
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    /// A topic guide's name; none for the core guide.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
 /// `DesignState`'s params, as Zeron's `design_state` tool sends them.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +227,9 @@ struct Inner {
     globals: Mutex<HashMap<String, Globals>>,
     /// Failed calls, kept to retry.
     failed: Mutex<Failed>,
+    /// The chats given the core guide (with their first design call), and
+    /// "" for calls from no chat.
+    guided: Mutex<HashSet<String>>,
     /// The Designs each chat's Design tabs show, front first.
     tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The Designs touched most recently, newest first, as kept in
@@ -340,6 +358,7 @@ impl Designs {
                 live: Mutex::new(HashMap::new()),
                 globals: Mutex::new(HashMap::new()),
                 failed: Mutex::new(Failed::default()),
+                guided: Mutex::new(HashSet::new()),
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
@@ -570,10 +589,11 @@ impl Designs {
             lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
         }
         let (error, line) = match ran {
-            Ok(result) => {
+            Ok(mut result) => {
                 if let Some(edit_id) = &edit_id {
                     lock(&self.inner.failed).remove(edit_id);
                 }
+                self.guide_once(params.chat_id.as_deref(), &mut result, Vec::new());
                 return Ok(result);
             }
             Err(Ran::Snippet(SnippetError::Failed { message, line })) => (message, line),
@@ -734,9 +754,12 @@ impl Designs {
             .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
             .unwrap_or_default();
         live.fonts = self.fonts_for(&live.path);
-        let draft = Draft::new(live.design.clone())
+        let mut draft = Draft::new(live.design.clone())
             .with_fonts(live.fonts.clone())
             .with_assets(self.inner.assets.clone());
+        if let Some(folder) = live.path.parent() {
+            draft = draft.with_folder(folder.to_owned());
+        }
         let (draft, globals) = snippet::run(draft, globals, code, self.inner.limits).map_err(Ran::Snippet)?;
         let mut edited = draft.finish();
         // What it draws with that no edit's check fetched: icons and fonts
@@ -755,6 +778,23 @@ impl Designs {
             }
         });
         edited.warnings.extend(live.fonts.warnings(&texts).into_iter().map(Warning::fonts));
+        // Icons the call's nodes draw (named by a Token, say) that couldn't
+        // be fetched, which draw nothing: every icon's, when it changed the
+        // Tokens or a Component.
+        let icons = self.inner.assets.icons();
+        let everywhere = live.design.tokens != edited.design.tokens
+            || edited.changed.iter().any(|id| edited.design.find(id).is_some_and(|node| node.is_component()));
+        drawn.walk(&mut |node| {
+            let top = node.id.split('/').next().unwrap_or_default();
+            if let Kind::Icon(icon) = &node.kind
+                && (everywhere || edited.changed.contains(&node.id) || edited.changed.contains(top))
+                && let Ok(name) = zeron_design::icons::name(&icon.icon, icon.weight)
+                && icons.cached(&name).is_none()
+            {
+                let message = format!("\"{}\" draws the icon \"{}\", which can't be had; it draws nothing", node.name, icon.icon);
+                edited.warnings.push(Warning { node: Some(node.id.clone()), property: Some("icon".into()), message });
+            }
+        });
         // Images the call placed or looked at that can't be had (those it
         // can, downloaded now, for its screenshots and the tabs).
         let looked_at = edited.changed.iter().chain(&edited.screenshots);
@@ -766,6 +806,8 @@ impl Designs {
             .is_some_and(|&seen| seen != live.version);
         let description = params.description.as_deref().unwrap_or(DEFAULT_DESCRIPTION);
         let screenshots = live.commit(&edited, description, Changer::Agent).map_err(Ran::Design)?;
+        let (exported, unwritten) = live.export(&edited.exports);
+        edited.warnings.extend(unwritten);
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -778,6 +820,9 @@ impl Designs {
         });
         if !edited.printed.is_empty() {
             result["printed"] = json!(edited.printed);
+        }
+        if !exported.is_empty() {
+            result["exported"] = json!(exported);
         }
         if !edited.warnings.is_empty() {
             result["warnings"] = json!(edited.warnings);
@@ -806,7 +851,40 @@ impl Designs {
             .enumerate()
             .map(|(i, path)| json!({ "name": design_name(path), "path": path, "front": i == 0 }))
             .collect();
-        json!({ "designs": designs, "recent": self.recent(), "guide": GUIDE_REMINDER })
+        let mut state = json!({ "designs": designs, "recent": self.recent(), "guide": GUIDE_REMINDER });
+        self.guide_once(chat_id, &mut state, Vec::new());
+        state
+    }
+
+    /// `design_guide` for `chat_id`: the topic guide `topic`, or the core
+    /// guide without one, as [`GUIDE_TEXTS`], with the topics there are.
+    /// The core guide comes after a topic when the chat hasn't had it yet.
+    pub fn guide(&self, chat_id: Option<&str>, topic: Option<&str>) -> Result<Value, DesignError> {
+        let topics = guide::topics();
+        let text = match topic {
+            None => guide::CORE,
+            Some(name) => guide::topic(name).ok_or_else(|| {
+                DesignError::Refused(format!(
+                    "there's no design guide on \"{name}\": the topics are {}, or none for the core guide",
+                    topics.join(", ")
+                ))
+            })?,
+        };
+        let mut result = json!({ "topic": topic.unwrap_or("core"), "topics": topics });
+        self.guide_once(chat_id, &mut result, vec![text]);
+        Ok(result)
+    }
+
+    /// Puts `texts` in `result` as [`GUIDE_TEXTS`], and the core guide
+    /// after them when `chat_id` hasn't had it (unless they hold it), which
+    /// it now has.
+    fn guide_once(&self, chat_id: Option<&str>, result: &mut Value, mut texts: Vec<&'static str>) {
+        if lock(&self.inner.guided).insert(chat_id.unwrap_or_default().to_owned()) && !texts.contains(&guide::CORE) {
+            texts.push(guide::CORE);
+        }
+        if !texts.is_empty() {
+            result[GUIDE_TEXTS] = json!(texts);
+        }
     }
 
     /// Sets the Designs `chat_id`'s Design tabs show, the one in front
@@ -1221,18 +1299,21 @@ impl Live {
     /// Tells the Design's tabs its file, and whether it's unsaved,
     /// recovered or stale, when that changed.
     fn tell_saving(&self) {
-        let (path, unsaved, recovered, stale) = (&self.path, self.unsaved, self.recovered, self.stale);
-        self.followers.send_if_modified(|told| {
-            let changed = told.path != *path
-                || told.unsaved != unsaved
-                || told.recovered != recovered
-                || told.stale != stale;
-            told.path.clone_from(path);
-            told.unsaved = unsaved;
-            told.recovered = recovered;
-            told.stale = stale;
-            changed
-        });
+        self.followers.send_if_modified(|told| self.saving_into(told));
+    }
+
+    /// Sets what `told` says of its file, unsaved, recovered and stale to
+    /// how they are; true when that changed it.
+    fn saving_into(&self, told: &mut Told) -> bool {
+        let changed = told.path != self.path
+            || told.unsaved != self.unsaved
+            || told.recovered != self.recovered
+            || told.stale != self.stale;
+        told.path.clone_from(&self.path);
+        told.unsaved = self.unsaved;
+        told.recovered = self.recovered;
+        told.stale = self.stale;
+        changed
     }
 
     /// Takes one step through the Design's history with `step` (undo or
@@ -1253,8 +1334,9 @@ impl Live {
         Ok(true)
     }
 
-    /// Tells the Design's tabs what a change (`by` whom) made of it, and
-    /// the nodes it `changed` (copied for them only while some follow it).
+    /// Tells the Design's tabs what a change (`by` whom) made of it, the
+    /// nodes it `changed` (copied for them only while some follow it), and
+    /// its saving state as the change left it.
     fn tell(&self, changed: Vec<String>, by: Changer) {
         if self.followers.receiver_count() == 0 {
             return;
@@ -1271,6 +1353,9 @@ impl Live {
             told.version = change.version;
             told.design = design;
             told.assets = Some(assets);
+            // With the change, so no tab hears it saved before it's told
+            // otherwise.
+            self.saving_into(told);
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
             told.changes.drain(..over);

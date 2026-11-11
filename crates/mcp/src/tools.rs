@@ -278,18 +278,18 @@ fn catalog() -> Vec<ToolDef> {
     });
     tools.push(ToolDef {
         name: DESIGN_EXECUTE,
-        description: "Make or change a Design (Screens on a Canvas, saved as a .zdesign file) by running a JavaScript snippet against it; returns the new nodes' ids by name, and screenshots the snippet asks for.",
+        description: "Make or change a Design (Screens on a Canvas, saved as a .zdesign file) by running a JavaScript snippet against it; returns the new nodes' ids by name, what it printed, warnings, screenshots and exported files.",
         input_schema: json!({
             "type": "object",
             "properties": {
                 "snippet": {
                     "type": "string",
-                    "description": "JavaScript run in a sandbox. `Insert(parent, node)` adds a node as the last child of the node with id `parent` (or on the Canvas with `Insert(node)`) and returns its id; a node is {type: \"frame\" | \"rectangle\", name, x, y, width, height, fill: \"#RRGGBB\"}, and a frame takes `children` inline. `TakeScreenshot([ids])` attaches a PNG of each node once the call succeeds, at most 400 px on its longest side. `Copy(id, parent, {...props, descendants: {id: props}})` copies a node with new ids and returns the copy's; `Update(id, props)` sets properties (null unsets one); `Replace(id, node)` puts a new node in its place; `Move(id, parent, index?)`; `Delete(id | [ids])`; `FindEmptySpace({width, height, direction?, padding?, from?})` returns a free {x, y} on the Canvas. A snippet that fails changes nothing and returns an editId; a property Zeron doesn't know is kept, with a warning in the result."
+                    "description": "JavaScript calling Insert, Copy, Update, Replace, Move, Delete, Get, SetTokens, GetTokens, FindEmptySpace, TakeScreenshot, Export and Print, as the design guide documents."
                 },
-                "description": { "type": "string", "description": "What this call does, in a few words." },
+                "description": { "type": "string", "description": "What this call does, in a few words (it names the undo step)." },
                 "name": { "type": "string", "description": "A name for a new Design, made in Zeron's designs folder." },
-                "path": { "type": "string", "description": "The .zdesign file to change, anywhere on this computer (a previous call's `design.path`). With neither path nor name, the call changes the Design in your chat's front Design tab." },
-                "editId": { "type": "string", "description": "Retries the failed call with this edit id, its snippet changed by `edits`; send no snippet, path or name with it." },
+                "path": { "type": "string", "description": "The .zdesign file to change (a previous call's design.path). With neither path nor name, the Design in your chat's front Design tab." },
+                "editId": { "type": "string", "description": "Retries the failed call with this edit id, its snippet changed by edits; send no snippet, path or name with it." },
                 "edits": {
                     "type": "array",
                     "description": "With editId: find-and-replace edits to the failed snippet, made in order; each find must be in it once.",
@@ -306,6 +306,19 @@ fn catalog() -> Vec<ToolDef> {
         name: DESIGN_STATE,
         description: "Lists the Designs open in your chat's Design tabs (the front one first) and the ones touched recently on this computer, with a reminder to load the design guide.",
         input_schema: json!({ "type": "object", "properties": {} }),
+    });
+    tools.push(ToolDef {
+        name: DESIGN_GUIDE,
+        description: "Returns the design guide: the core guide without a topic, or a topic guide.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "components, design-systems, landing-pages, mobile-apps, web-apps, slides, tables, code or tailwind."
+                }
+            }
+        }),
     });
     tools.push(ToolDef {
         name: WAIT_ON_BACKGROUND,
@@ -345,6 +358,14 @@ const DESIGN_EXECUTE: &str = "design_execute";
 
 /// Says which Designs the calling chat has open.
 const DESIGN_STATE: &str = "design_state";
+
+/// Returns a design guide.
+const DESIGN_GUIDE: &str = "design_guide";
+
+/// Where a result carries texts to read beside its own (the design guides
+/// the engine sends as `guideTexts`): each goes to the client as a text
+/// content of its own, as Markdown rather than inside the result's JSON.
+pub(crate) const TEXT_CONTENT: &str = "textContent";
 
 /// Where a tool's result carries images for the client, as MCP image
 /// content (`{type: "image", data, mimeType}`); the transport moves them
@@ -604,6 +625,15 @@ async fn read_image(path: &str) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A design call's result, the guides the engine sent in it moved to
+/// [`TEXT_CONTENT`].
+fn guide_texts(mut result: Value) -> Value {
+    if let Some(texts) = result.as_object_mut().and_then(|result| result.remove(zeron_rpc::methods::GUIDE_TEXTS)) {
+        result[TEXT_CONTENT] = texts;
+    }
+    result
+}
+
 // ---- argument shapes ---------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -625,6 +655,12 @@ struct DesignExecuteArgs {
     edit_id: Option<String>,
     #[serde(default)]
     edits: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct DesignGuideArgs {
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -933,6 +969,7 @@ impl Tools {
             SHOW_IMAGE => self.show_image(parse(args)?).await,
             DESIGN_EXECUTE => self.design_execute(parse(args)?).await,
             DESIGN_STATE => self.design_state().await,
+            DESIGN_GUIDE => self.design_guide(parse(args)?).await,
             WAIT_ON_BACKGROUND => self.wait_on_background(parse(args)?).await,
             plugins::CREATE_PLUGIN => return self.create_plugin(args).await,
             plugins::LIST_PLUGINS => return self.list_plugins().await,
@@ -1717,16 +1754,29 @@ impl Tools {
             }
         }
         executed[IMAGE_CONTENT] = Value::Array(images);
-        Ok(executed)
+        Ok(guide_texts(executed))
     }
 
     async fn design_state(&self) -> anyhow::Result<Value> {
-        self.zeron
+        let state = self
+            .zeron
             .call(
                 zeron_rpc::methods::DESIGN_STATE,
                 json!({ "chatId": self.zeron.origin().chat_id }),
             )
-            .await
+            .await?;
+        Ok(guide_texts(state))
+    }
+
+    async fn design_guide(&self, args: DesignGuideArgs) -> anyhow::Result<Value> {
+        let guide = self
+            .zeron
+            .call(
+                zeron_rpc::methods::DESIGN_GUIDE,
+                json!({ "chatId": self.zeron.origin().chat_id, "topic": args.topic }),
+            )
+            .await?;
+        Ok(guide_texts(guide))
     }
 
     async fn wait_on_background(&self, args: WaitOnBackgroundArgs) -> anyhow::Result<Value> {

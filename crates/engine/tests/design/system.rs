@@ -350,3 +350,61 @@ async fn bad_token_names_and_bare_values_are_refused() {
     assert!(warnings.contains("$nope") && warnings.contains(&missing.id("Odd")), "{warnings}");
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn an_icon_a_token_names_that_cant_be_had_warns() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Missing glyph",
+            r##"SetTokens({ glyph: { type: "string", value: "mdi:no-such-icon" } });
+Insert({ type: "icon", name: "Glyph", icon: "$glyph", width: 24, height: 24 });"##,
+        )
+        .await;
+    let warnings = made.json()["warnings"].to_string();
+    assert!(warnings.contains("mdi:no-such-icon") && warnings.contains("can't be had"), "{warnings}");
+
+    // Pointing the Token at another icon that can't be had warns too,
+    // though no node changed.
+    let token = seam
+        .execute(&made.path(), r##"SetTokens({ glyph: { type: "string", value: "mdi:also-missing" } });"##)
+        .await;
+    assert!(token.json()["warnings"].to_string().contains("mdi:also-missing"), "{}", token.text);
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn text_filled_by_a_token_is_seen_and_not_warned_about() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Ink",
+            r##"SetTokens({ ink: { type: "color", value: "#4F46E5" } });
+screen = Insert({ type: "frame", name: "Screen", width: 200, height: 100, fill: "#FFFFFF",
+  children: [{ type: "text", name: "Word", content: "IIII", fontSize: 60, fontWeight: 700, fill: "$ink" }] });
+TakeScreenshot(screen);"##,
+        )
+        .await;
+    assert!(made.json().get("warnings").is_none(), "{}", made.text);
+    let shot = &made.images[0];
+    let inked = (0..shot.width).any(|x| (0..shot.height).any(|y| shot.rgba(x, y) == INDIGO));
+    assert!(inked, "the text draws in its Token's colour");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn text_that_only_looks_like_a_token_draws_as_written() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Prices",
+            r##"screen = Insert({ type: "frame", name: "Screen", width: 200, height: 100, fill: "#FFFFFF", layout: "vertical",
+  children: [{ type: "text", name: "Price", content: "$880", fontSize: 60, fontWeight: 700, fill: "#000000" }] });
+TakeScreenshot(screen);"##,
+        )
+        .await;
+    let shot = &made.images[0];
+    let inked = (0..shot.width).any(|x| (0..shot.height).any(|y| shot.rgba(x, y) == BLACK));
+    assert!(inked, "\"$880\" draws");
+    seam.shutdown().await;
+}

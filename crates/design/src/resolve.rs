@@ -231,6 +231,15 @@ impl Resolver {
                     let message = format!("has a property \"{key}\" Zeron doesn't know; it's kept, but does nothing");
                     self.problem(&node.id, message);
                 }
+                // Content that only looks like a reference ("$880") is set
+                // back among the refs when the node is read again: draw it
+                // as written.
+                if let Kind::Text(text) = &mut node.kind
+                    && let Some(Value::String(content)) = resolved.get("content")
+                    && token::reference(content).is_some()
+                {
+                    text.content.clone_from(content);
+                }
             }
             Err(e) => self.problem(&node.id, format!("with its Tokens' values, {e}")),
         }

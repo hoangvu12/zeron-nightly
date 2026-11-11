@@ -2,7 +2,9 @@
 //! agent calls them ([`seam`]), one module per part of the feature.
 
 mod editing;
+mod exports;
 mod failing;
+mod guide;
 mod icons;
 mod images;
 mod kept;

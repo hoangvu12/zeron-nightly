@@ -49,6 +49,12 @@ impl Draft {
         Ok(())
     }
 
+    /// The Design's Tokens as CSS custom properties, per Theme
+    /// ([`crate::export::tokens`]).
+    pub fn tokens_css(&self) -> String {
+        crate::export::tokens::css(&self.design)
+    }
+
     /// The Design's Tokens by name, and its Themes: each axis's values,
     /// the first the one nodes are shown in unless they set their own.
     pub fn tokens(&self) -> Value {

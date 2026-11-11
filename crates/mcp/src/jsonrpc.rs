@@ -71,7 +71,7 @@ The reader sees the visual above that reply, so don't announce or restate it. To
 reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
 draw images through `show_visual`.\n\
 \n\
-To make or change a visual design (Screens, Components, a design system), use `design_execute`; `design_state` says which Designs your chat has open.";
+To make or change a visual design (Screens, Components, a design system), call `design_state` first (your first design call brings the design guide), then `design_execute`; `design_guide` gives topic guides.";
 
 /// Appended to [`INSTRUCTIONS`] where the agent is offered
 /// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
@@ -321,7 +321,14 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                     let images = value
                         .as_object_mut()
                         .and_then(|value| value.remove(crate::tools::IMAGE_CONTENT));
+                    let texts = value
+                        .as_object_mut()
+                        .and_then(|value| value.remove(crate::tools::TEXT_CONTENT));
                     let mut content = vec![json!({ "type": "text", "text": pretty(&value) })];
+                    if let Some(Value::Array(texts)) = texts {
+                        let texts = texts.iter().filter_map(Value::as_str);
+                        content.extend(texts.map(|text| json!({ "type": "text", "text": text })));
+                    }
                     if let Some(Value::Array(images)) = images {
                         content.extend(images);
                     }

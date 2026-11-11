@@ -9,6 +9,7 @@
 //! may catch its error and carry on.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -20,6 +21,7 @@ use crate::printed::Printed;
 
 mod copy;
 mod delete;
+mod export;
 mod inside;
 mod moved;
 mod replace;
@@ -27,6 +29,7 @@ mod tokens;
 mod update;
 mod warning;
 
+pub use export::Export;
 pub use warning::Warning;
 
 /// Characters a generated node id is made of.
@@ -63,6 +66,10 @@ pub struct Draft {
     warnings: Vec<Warning>,
     /// Where the assets nodes draw with are checked; without, any is taken.
     assets: Option<Arc<Cache>>,
+    /// The Design's folder, which a relative export path is from.
+    folder: Option<PathBuf>,
+    /// The exports the call asked for, in order.
+    exports: Vec<Export>,
 }
 
 /// What a call's draft ends as, once it succeeded.
@@ -73,6 +80,7 @@ pub struct Edited {
     pub names: Map<String, Value>,
     pub changed: BTreeSet<String>,
     pub screenshots: Vec<String>,
+    pub exports: Vec<Export>,
     /// The lines the call printed.
     pub printed: Vec<String>,
     pub warnings: Vec<Warning>,
@@ -95,6 +103,8 @@ impl Draft {
             created: Vec::new(),
             changed: BTreeSet::new(),
             screenshots: Vec::new(),
+            folder: None,
+            exports: Vec::new(),
             printed: Printed::default(),
             warnings: Vec::new(),
             assets: None,
@@ -105,6 +115,13 @@ impl Draft {
     /// `assets`, fetching each.
     pub fn with_assets(mut self, assets: Arc<Cache>) -> Self {
         self.assets = Some(assets);
+        self
+    }
+
+    /// The draft of a Design in `folder`, which exports' relative paths
+    /// are from.
+    pub fn with_folder(mut self, folder: PathBuf) -> Self {
+        self.folder = Some(folder);
         self
     }
 
@@ -182,11 +199,13 @@ impl Draft {
                 self.warn(&problem.node, None, problem.message);
             }
         }
-        // However it came to be: inserted so, or its fill taken away.
+        // However it came to be: inserted so, or its fill taken away. A
+        // fill naming a Token counts as a fill.
         for id in &self.changed {
             if let Some(node) = self.design.find(id)
                 && let Kind::Text(text) = &node.kind
                 && text.fill.fill.is_empty()
+                && !node.refs.contains_key("fill")
             {
                 self.warnings.push(Warning::invisible(node));
             }
@@ -210,6 +229,7 @@ impl Draft {
             names,
             changed: self.changed,
             screenshots: self.screenshots,
+            exports: self.exports,
             printed: self.printed.into_lines(),
             warnings: warning::finished(self.warnings),
         }

@@ -10,6 +10,7 @@
 
 pub mod assets;
 pub mod edit;
+pub mod export;
 pub mod fonts;
 pub mod history;
 pub mod icons;

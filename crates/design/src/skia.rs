@@ -297,6 +297,17 @@ fn rrect(outline: &Outline) -> RRect {
     inset(outline, Sides::default())
 }
 
+/// `outline` as SVG path data, and whether it fills even-odd: for an
+/// export to draw a shape as the Canvas does.
+pub fn svg_outline(outline: &Outline) -> (String, bool) {
+    let path = match shape(outline) {
+        Shape::Rounded(rrect) => skia_safe::Path::rrect(rrect, None),
+        Shape::Path(path) => path,
+    };
+    let even_odd = path.fill_type() == PathFillType::EvenOdd;
+    (skia_safe::utils::parse_path::to_svg(&path), even_odd)
+}
+
 /// An outline as Skia draws it: a rounded rectangle as one, any other
 /// shape as a path.
 enum Shape {

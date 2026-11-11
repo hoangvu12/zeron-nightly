@@ -83,7 +83,7 @@ impl EngineRpc {
             return Ok(params);
         }
         // A design call is its own chat's (or no chat's), whatever it sends.
-        if matches!(method, methods::DESIGN_EXECUTE | methods::DESIGN_STATE) {
+        if matches!(method, methods::DESIGN_EXECUTE | methods::DESIGN_STATE | methods::DESIGN_GUIDE) {
             params["chatId"] = json!(chat);
             return Ok(params);
         }

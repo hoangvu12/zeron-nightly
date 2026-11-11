@@ -364,6 +364,16 @@ pub mod methods {
     /// `{designs: [{name, path, front}], recent: [{name, path, touchedAt}],
     /// guide}`. Local only, like `DesignExecute`.
     pub const DESIGN_STATE: &str = "DesignState";
+    /// A design guide (`design_guide`): `{chatId?, topic?}` → `{topic,
+    /// topics, guideTexts: [markdown]}`, the core guide without a topic (and
+    /// after the topic, when the chat hadn't had it). Every design call's
+    /// result carries `guideTexts` with the core guide the first time a
+    /// chat calls. Local only, like `DesignExecute`.
+    pub const DESIGN_GUIDE: &str = "DesignGuide";
+    /// Where a design call's result carries guides to read beside it (the
+    /// core guide with a chat's first design call, a topic from
+    /// `DesignGuide`): Zeron's MCP server gives each as a text of its own.
+    pub const GUIDE_TEXTS: &str = "guideTexts";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
     /// changes, path, unsaved, recovered, stale}`: the Design whole as it is, then
     /// after each change, with each change since the item before as
@@ -761,6 +771,7 @@ pub fn local_only(method: &str) -> bool {
             // Designs: this computer's own (ADR-0003).
             | methods::DESIGN_EXECUTE
             | methods::DESIGN_STATE
+            | methods::DESIGN_GUIDE
             | methods::WATCH_DESIGN
             | methods::SET_DESIGN_TABS
             | methods::DESIGN_SAVING
@@ -852,6 +863,7 @@ pub fn agent_allowed(method: &str) -> bool {
             // Designs: running snippets against them, and which are open.
             | methods::DESIGN_EXECUTE
             | methods::DESIGN_STATE
+            | methods::DESIGN_GUIDE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, exporting (to Zeron's plugin-exports
             // folder only: the engine refuses an agent's `to`), and their
