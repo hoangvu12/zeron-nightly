@@ -472,7 +472,9 @@ impl Painter for SkiaPainter<'_> {
                 VerticalAlign::Middle => (height - paragraph.height()) / 2.,
                 VerticalAlign::Bottom => height - paragraph.height(),
             };
-            paragraph.paint(self.canvas, (0., top));
+            // Skia puts half of each letter's spacing before it; CSS (and
+            // so an export) puts it all after.
+            paragraph.paint(self.canvas, (-text.letter_spacing / 2., top));
         }
     }
 }

@@ -412,6 +412,8 @@ TakeScreenshot(ids);"##,
     let (tight, spaced) = (ink(shots["Tight"]), ink(shots["Spaced"]));
     let pushed = i64::from(spaced[2]) - i64::from(tight[2]);
     assert!((58..=62).contains(&pushed), "pushed {pushed} px");
+    // The first starts where it would unspaced, as in CSS.
+    assert!(spaced[0].abs_diff(tight[0]) <= 1, "{spaced:?} {tight:?}");
 
     // Line height: two lines 60 px apart (20 px at 3).
     let bands = ink_bands(shots["Lines"]);
