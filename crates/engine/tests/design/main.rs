@@ -13,6 +13,7 @@ mod opening;
 mod looks;
 mod reading;
 mod saving;
+mod selecting;
 mod seam;
 mod shapes;
 mod system;

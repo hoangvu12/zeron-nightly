@@ -304,7 +304,7 @@ fn catalog() -> Vec<ToolDef> {
     });
     tools.push(ToolDef {
         name: DESIGN_STATE,
-        description: "Lists the Designs open in your chat's Design tabs (the front one first) and the ones touched recently on this computer, with a reminder to load the design guide.",
+        description: "Lists the Designs open in your chat's Design tabs (the front one first), each with what the person has selected in it, and the ones touched recently on this computer, with a reminder to load the design guide.",
         input_schema: json!({ "type": "object", "properties": {} }),
     });
     tools.push(ToolDef {

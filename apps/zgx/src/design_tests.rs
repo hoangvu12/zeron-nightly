@@ -14,14 +14,15 @@ use zeron_design::Design;
 use zeron_design::assets::Resolved;
 use zeron_design::fonts::Fonts;
 use zgx::input::InputEvent;
-use zgx_script::{ScriptHost, testing::TestApp};
+use zgx_script::{ScriptHost, Value, testing::TestApp};
 
 use crate::design::{FileState, CACHE_BYTES, DesignTabs, Heard, Listener, Source, heard_of};
 
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
 const PATH: &str = "fixture.zdesign";
-const SIZE: (f32, f32) = (960., 700.);
+/// The window: the layers list's 220 points, then a Canvas 960 by 700.
+const SIZE: (f32, f32) = (1180., 700.);
 
 const WHITE: [u8; 4] = [255, 255, 255, 255];
 const INDIGO: [u8; 4] = [79, 70, 229, 255];
@@ -89,6 +90,8 @@ struct StandIn {
     following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
     /// What each chat's Design tabs were said to be, in order.
     tabs_said: RefCell<Vec<(String, Vec<String>)>>,
+    /// What each Design tab's selection was said to be: chat, Design, ids.
+    selected_said: RefCell<Vec<(String, String, Vec<String>)>>,
     /// Each Design's file state (#28): `{unsaved, recovered, stale}`.
     saving: RefCell<HashMap<String, serde_json::Value>>,
     /// The Designs touched recently, newest first, as `RecentDesigns` says.
@@ -154,6 +157,10 @@ impl Source for Engine {
         Some(Box::new(listener))
     }
 
+    fn select(&self, chat: &str, path: &str, ids: &[String]) {
+        self.0.selected_said.borrow_mut().push((chat.into(), path.into(), ids.to_vec()));
+    }
+
     fn set_tabs(&self, chat: &str, paths: &[String]) {
         self.0.tabs_said.borrow_mut().push((chat.into(), paths.to_vec()));
     }
@@ -203,6 +210,8 @@ struct Tab {
     app: TestApp,
     canvas: Rc<DesignTabs>,
     engine: Rc<StandIn>,
+    /// Where the Canvas starts in the window (past the layers list).
+    origin: (f32, f32),
 }
 
 /// The fixture's Design tab on `design`, every tile in view drawn.
@@ -227,7 +236,9 @@ fn mount_with(design: Design, assets: Vec<Resolved>) -> Tab {
     app.ui.scene.borrow_mut().resize(SIZE.0, SIZE.1);
     app.frames(2);
     assert!(app.host.run_command("design_fit"));
-    let mut tab = Tab { app, canvas, engine };
+    let mut app = app;
+    let at = on_screen_of(&mut app, &format!("#design-canvas-{TAB}"));
+    let mut tab = Tab { app, canvas, engine, origin: (at.x, at.y) };
     tab.settle();
     assert_eq!(tab.app.error(), None, "the fixture failed");
     tab
@@ -281,7 +292,43 @@ impl Tab {
     /// Where Canvas point (`x`, `y`) shows in the tab.
     fn on_screen(&self, x: f32, y: f32) -> (usize, usize) {
         let (px, py, zoom) = self.canvas.view(TAB).expect("a view");
-        ((px + x * zoom).floor() as usize, (py + y * zoom).floor() as usize)
+        ((self.origin.0 + px + x * zoom).floor() as usize, (self.origin.1 + py + y * zoom).floor() as usize)
+    }
+
+    /// A click at Canvas point (`x`, `y`), with these keys held.
+    fn click_canvas(&mut self, x: f32, y: f32, held: zgx::input::Modifiers) {
+        let (sx, sy) = self.on_screen(x, y);
+        zgx::input::set_held_modifiers(&self.app.ui.runtime, held);
+        self.app.frames(1);
+        zgx_script::driver::click_at(&mut self.app.ui, zgx::scene::Rect { x: sx as f32, y: sy as f32, width: 1., height: 1. });
+        self.app.frames(2);
+        zgx::input::set_held_modifiers(&self.app.ui.runtime, zgx::input::Modifiers::default());
+        self.app.frames(2);
+    }
+
+    /// What the layers list shows selected (its rows' `selected` read this
+    /// tab's selection, `design_selections`).
+    fn selected_in_list(&self) -> Vec<String> {
+        let selections = self
+            .app
+            .host
+            .states()
+            .into_iter()
+            .find(|(n, _)| n.ends_with("::design_selections"))
+            .map(|(_, v)| v)
+            .expect("the tabs' selections");
+        match selections.field(TAB) {
+            Some(Value::List(ids)) => ids.iter().map(crate::auth::text).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The last selection said to the engine.
+    fn said_selected(&self) -> Vec<String> {
+        let said = self.engine.selected_said.borrow();
+        let (chat, path, ids) = said.last().cloned().expect("a selection said");
+        assert_eq!((chat.as_str(), path.as_str()), ("design-fixture", PATH));
+        ids
     }
 
     fn pinch(&mut self, delta: f32) {
@@ -1125,4 +1172,62 @@ fn closing_asks_only_for_a_design_of_your_own_and_discard_closes_too() {
     assert!(p.app.wait_until(|app| app.find(".design-canvas").is_none()), "{}", p.app.tree());
     assert_eq!(p.asked("DiscardDesign"), [serde_json::json!({ "path": "C:/work/mine.zdesign" })]);
     assert!(p.asked("SaveDesign").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Selection and layers (#32).
+
+#[test]
+fn a_click_on_the_canvas_selects_and_the_layers_list_agrees_and_both_reach_the_engine() {
+    let mut tab = mount(landing("#EF4444", false));
+    let none = zgx::input::Modifiers::default();
+    let shift = zgx::input::Modifiers { shift: true, ..Default::default() };
+    let deep = zgx::input::Modifiers { control: true, ..Default::default() };
+    // The layers list: the Design's tree, a row a node.
+    for id in ["screen", "hero", "badge", "chips", "chip2"] {
+        assert!(tab.app.find(&format!("#design-layer-{TAB}-{id}")).is_some(), "{id}:\n{}", tab.app.tree());
+    }
+
+    // A click on the badge: selected, outlined where it is, and the engine
+    // told (for the chat's agent).
+    tab.click_canvas(780., 530., none);
+    assert_eq!(tab.said_selected(), ["badge"]);
+    let outline = on_screen_of(&mut tab.app, &format!("#design-selected-{TAB}-badge"));
+    let (left, top) = tab.on_screen(700., 450.);
+    assert!(near(outline.x, left as f32) && near(outline.y, top as f32), "{outline:?}");
+    // (The layers list's rows show selected from the same selection.)
+    assert_eq!(tab.selected_in_list(), ["badge"]);
+
+    // Shift adds the hero; Shift again takes it away.
+    tab.click_canvas(150., 100., shift);
+    assert_eq!(tab.said_selected(), ["badge", "hero"]);
+    assert!(tab.app.find(&format!("#design-selected-{TAB}-hero")).is_some());
+    tab.click_canvas(150., 100., shift);
+    assert_eq!(tab.said_selected(), ["badge"]);
+
+    // Within a Screen a click picks its child; ⌘/Ctrl the innermost; the
+    // Screen between its children; nothing on the bare Canvas.
+    let chip2 = (100. + 40. + 20. + 70. + 30., 50. + 300. + 20. + 30.);
+    tab.click_canvas(chip2.0, chip2.1, none);
+    assert_eq!(tab.said_selected(), ["chips"]);
+    tab.click_canvas(chip2.0, chip2.1, deep);
+    assert_eq!(tab.said_selected(), ["chip2"]);
+    tab.click_canvas(500., 300., none);
+    assert_eq!(tab.said_selected(), ["screen"]);
+    tab.click_canvas(50., 300., none);
+    assert_eq!(tab.said_selected(), Vec::<String>::new());
+    assert!(tab.app.find(".design-selected").is_none());
+
+    // The layers list selects too, and the Canvas outlines it.
+    tab.app.click(&format!("#design-layer-{TAB}-hero"));
+    tab.app.frames(2);
+    assert_eq!(tab.said_selected(), ["hero"]);
+    assert_eq!(tab.selected_in_list(), ["hero"]);
+    assert!(tab.app.find(&format!("#design-selected-{TAB}-hero")).is_some(), "{}", tab.app.tree());
+    // (A drag pans, and selects nothing.)
+    let said = tab.engine.selected_said.borrow().len();
+    let (sx, sy) = tab.on_screen(780., 530.);
+    zgx_script::driver::drag_between(&mut tab.app.ui, (sx as f32, sy as f32), (sx as f32 + 80., sy as f32 + 40.));
+    tab.app.frames(2);
+    assert_eq!(tab.engine.selected_said.borrow().len(), said);
 }

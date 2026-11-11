@@ -152,6 +152,16 @@ pub struct PathParams {
     pub path: PathBuf,
 }
 
+/// `SetDesignSelection`'s params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionParams {
+    pub chat_id: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
 /// `NewDesign`'s params.
 #[derive(Debug, Deserialize)]
 pub struct NewParams {
@@ -253,6 +263,9 @@ struct Inner {
     guided: Mutex<HashSet<String>>,
     /// The Designs each chat's Design tabs show, front first.
     tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
+    /// The person's selection in each of a chat's Design tabs, by chat and
+    /// Design: the ids, in the order selected.
+    selection: Mutex<HashMap<(String, PathBuf), Vec<String>>>,
     /// The Designs touched most recently, newest first, as kept in
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
@@ -381,6 +394,7 @@ impl Designs {
                 failed: Mutex::new(Failed::default()),
                 guided: Mutex::new(HashSet::new()),
                 tabs: Mutex::new(HashMap::new()),
+                selection: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
                 backups: data_dir.join("design-backups"),
@@ -870,7 +884,10 @@ impl Designs {
         let designs: Vec<Value> = tabs
             .iter()
             .enumerate()
-            .map(|(i, path)| json!({ "name": design_name(path), "path": path, "front": i == 0 }))
+            .map(|(i, path)| {
+                let selection = chat_id.map(|chat| self.selection_in(chat, path)).unwrap_or_default();
+                json!({ "name": design_name(path), "path": path, "front": i == 0, "selection": selection })
+            })
             .collect();
         let mut state = json!({ "designs": designs, "recent": self.recent(), "guide": GUIDE_REMINDER });
         self.guide_once(chat_id, &mut state, Vec::new());
@@ -915,6 +932,8 @@ impl Designs {
     /// touched.
     pub fn set_tabs(&self, chat_id: &str, paths: Vec<PathBuf>) {
         let paths: Vec<PathBuf> = paths.into_iter().map(|p| canonical(&p).unwrap_or(p)).collect();
+        // A Design whose tab closed has no selection.
+        lock(&self.inner.selection).retain(|(chat, path), _| chat != chat_id || paths.contains(path));
         let mut tabs = lock(&self.inner.tabs);
         let before = tabs.get(chat_id).cloned().unwrap_or_default();
         let opened: Vec<PathBuf> = paths.iter().filter(|p| !before.contains(p)).cloned().collect();
@@ -928,6 +947,37 @@ impl Designs {
         for path in opened.iter().rev() {
             self.touch(path);
         }
+    }
+
+    /// Sets the person's selection in `chat_id`'s Design tab on the Design
+    /// at `path` (`SetDesignSelection`, the tab's): `ids`, in the order
+    /// selected; none clears it.
+    pub fn set_selection(&self, chat_id: &str, path: &Path, ids: Vec<String>) {
+        let path = canonical(path).unwrap_or_else(|_| path.to_owned());
+        let mut selection = lock(&self.inner.selection);
+        if ids.is_empty() {
+            selection.remove(&(chat_id.to_owned(), path));
+        } else {
+            selection.insert((chat_id.to_owned(), path), ids);
+        }
+    }
+
+    /// What `chat_id`'s Design tab has selected in the Design at `path`, as
+    /// `design_state` reports it: `[{id, name, type}]`, leaving out nodes
+    /// no longer in it.
+    fn selection_in(&self, chat_id: &str, path: &Path) -> Vec<Value> {
+        let Some(ids) = lock(&self.inner.selection).get(&(chat_id.to_owned(), path.to_owned())).cloned() else {
+            return Vec::new();
+        };
+        // (Held live while a tab shows it: never read from disk here.)
+        let Some(live) = lock(&self.inner.live).get(path).cloned() else {
+            return Vec::new();
+        };
+        let live = lock(&live);
+        ids.iter()
+            .filter_map(|id| live.design.find(id))
+            .map(|node| json!({ "id": node.id, "name": node.name, "type": node.kind.name() }))
+            .collect()
     }
 
     /// The Designs touched most recently on this computer, newest first,

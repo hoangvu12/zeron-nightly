@@ -361,8 +361,9 @@ pub mod methods {
     /// the engine of their computer.
     pub const DESIGN_EXECUTE: &str = "DesignExecute";
     /// The Designs a chat has open (`design_state`): `{chatId?}` →
-    /// `{designs: [{name, path, front}], recent: [{name, path, touchedAt}],
-    /// guide}`. Local only, like `DesignExecute`.
+    /// `{designs: [{name, path, front, selection: [{id, name, type}]}],
+    /// recent: [{name, path, touchedAt}], guide}`. Local only, like
+    /// `DesignExecute`.
     pub const DESIGN_STATE: &str = "DesignState";
     /// A design guide (`design_guide`): `{chatId?, topic?}` → `{topic,
     /// topics, guideTexts: [markdown]}`, the core guide without a topic (and
@@ -408,6 +409,10 @@ pub mod methods {
     /// most recently on this computer, by anyone (the Design tab's Recent
     /// designs). Local only.
     pub const RECENT_DESIGNS: &str = "RecentDesigns";
+    /// `{chatId, path, ids}` → `{}`: the person's selection in a chat's
+    /// Design tab on the Design at `path` (none: nothing selected), which
+    /// `design_state` reports to its agent. Local only.
+    pub const SET_DESIGN_SELECTION: &str = "SetDesignSelection";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -780,6 +785,7 @@ pub fn local_only(method: &str) -> bool {
             | methods::DISCARD_DESIGN
             | methods::NEW_DESIGN
             | methods::RECENT_DESIGNS
+            | methods::SET_DESIGN_SELECTION
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME

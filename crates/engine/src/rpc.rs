@@ -1052,6 +1052,14 @@ impl EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "recent": recent }))
             }
+            methods::SET_DESIGN_SELECTION => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::SelectionParams = parse_params(params)?;
+                crate::designs::on_design_thread(move || designs.set_selection(&p.chat_id, &p.path, p.ids))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
+            }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
@@ -5922,7 +5930,8 @@ impl RpcService for EngineRpc {
             | methods::SAVE_DESIGN_AS
             | methods::DISCARD_DESIGN
             | methods::NEW_DESIGN
-            | methods::RECENT_DESIGNS => Box::pin(self.design_rpc(method, params)).await,
+            | methods::RECENT_DESIGNS
+            | methods::SET_DESIGN_SELECTION => Box::pin(self.design_rpc(method, params)).await,
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self

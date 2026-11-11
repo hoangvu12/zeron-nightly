@@ -29,6 +29,7 @@
 local ds = require("@ds")
 local motion = require("@ds/motion")
 local PanelHome = require("@ds/panel_home")
+local ListRow = require("@ds/list_row").ListRow
 local toast = require("@ds/toast")
 local state = require("@app/screens/panel/state")
 local api = require("@app/screens/panel/design_api")
@@ -41,6 +42,8 @@ local ZOOM_MIN, ZOOM_MAX = 0.25, 5
 -- How long after the last wheel step a zoom is over, and its tiles drawn
 -- at its own level.
 local SETTLE_MS = 150
+-- How far a press may move and still be a click (selecting), not a drag.
+local CLICK_SLOP = 4
 -- How long what an agent just changed flashes (pen.dev's live touches).
 local FLASH_MS = 900
 
@@ -53,6 +56,10 @@ local kept = ui.state("design_kept", {} :: { [string]: boolean })
 -- The Recent designs each start page read, and the visit it read them in
 -- (a reload reads nothing again).
 local recent_read = ui.state("design_recent_read", {} :: { [string]: { any } })
+-- Each tab's selection (#32): the ids, in the order selected, kept across
+-- reloads and told to the host (which tells the engine, for the chat's
+-- agent).
+local selections = ui.state("design_selections", {} :: { [string]: { string } })
 -- The flashes already shown (`tab:version:node`), kept across reloads.
 local flashed = ui.state("design_flashed", {} :: { [string]: boolean })
 
@@ -223,6 +230,84 @@ function M.Empty(props: { title: any, body: any, action: any? }): Node
 	}
 end
 
+-- What tab `id` (of `key`) has selected: `ids` (none: nothing). `add`
+-- adds one, or takes it away if it's selected (Shift's).
+local function select(id: string, ids: { string })
+	selections:set_key(id, ids)
+end
+local function pick(id: string, node: string?, add: boolean)
+	local now = selections:peek()[id] or {}
+	if not add then
+		select(id, if node then { node } else {})
+		return
+	end
+	if not node then
+		return
+	end
+	local next = table.clone(now)
+	local at = table.find(next, node)
+	if at then
+		table.remove(next, at)
+	else
+		table.insert(next, node)
+	end
+	select(id, next)
+end
+
+-- The layers list: the Design's tree, a row a node, indented by its
+-- depth; a click selects (Shift adds), as on the Canvas.
+local function layers(id: string, told: () -> any): Node
+	local function row(n: any): Node
+		return ListRow {
+			id = `design-layer-{id}-{n.id}`,
+			class = "design-layer-row",
+			label = n.name,
+			h = ui.raw(26, "a layer row, as dense as a file tree's"),
+			selected = function(): boolean
+				return table.find(selections:get()[id] or {}, n.id) ~= nil
+			end,
+			on_click = function(keys: any)
+				pick(id, n.id, type(keys) == "table" and keys.shift == true)
+			end,
+			ui.row {
+				w_full = true,
+				h_full = true,
+				items = "center",
+				gap = "$space.1",
+				px = "$space.2",
+				pl = ui.raw(8 + 12 * n.depth, "a layer's depth, a step a level"),
+				ds.Icon { name = if n.type == "text" then "document" elseif n.type == "frame" or n.type == "instance" then "widget" else "pen", size = 12 },
+				ds.Text { n.name, style = "caption", truncate = true },
+			},
+		}
+	end
+	return ui.column {
+		id = `design-layers-{id}`,
+		role = "tree",
+		label = ui.t("panel.design.layers"),
+		w = ui.raw(220, "the layers list's width"),
+		h_full = true,
+		shrink = 0,
+		border = 1,
+		border_sides = { 0, 1, 0, 0 },
+		border_color = "$border.subtle",
+		ui.scroll {
+			w_full = true,
+			grow = 1,
+			min_h = 0,
+			py = "$space.1",
+			ui.each(ui.computed(function(): { any }
+				local b = told()
+				return if b and b.tree then b.tree else {}
+			end), row, {
+				key = function(n: any): string
+					return n.id
+				end,
+			}),
+		},
+	}
+end
+
 -- A tab's Design, once it has one, as the host draws it.
 local function canvas(id: string): Node
 	local host = shown(id)
@@ -389,6 +474,16 @@ local function canvas(id: string): Node
 		end), { duration = FLASH_MS, ease = "outQuad" })
 		return ui.div(box)
 	end
+	-- What the person selected: outlined.
+	local function selected(n: any): Node
+		local box = over(n)
+		box.id = `design-selected-{id}-{n.id}`
+		box.class = "design-selected"
+		box.aria_hidden = true
+		box.border = 2
+		box.border_color = "$accent"
+		return ui.div(box)
+	end
 	-- A Screen an agent marked in progress: outlined, veiled, and saying so
 	-- over its corner, until the agent clears the mark.
 	local function working(n: any): Node
@@ -443,18 +538,34 @@ local function canvas(id: string): Node
 			zoom_at(1 + e.scale, e.local_x, e.local_y)
 			return true
 		end,
+		-- A drag pans; a press that doesn't move selects what's under it:
+		-- Shift adds (or takes away), ⌘/Ctrl picks the innermost node.
 		on_press = function(e: any)
-			pointer = { x = e.local_x, y = e.local_y }
+			pointer = { x = e.local_x, y = e.local_y, from_x = e.local_x, from_y = e.local_y }
 		end,
 		on_pointer_move = function(e: any)
 			local p = pointer
 			if p then
 				pan(e.local_x - p.x, e.local_y - p.y)
-				pointer = { x = e.local_x, y = e.local_y }
+				p.x, p.y = e.local_x, e.local_y
 			end
 		end,
-		on_release = function(_e: any)
+		on_release = function(e: any)
+			local p = pointer
 			pointer = nil
+			local v = views:peek()[id]
+			if not p or not v or math.abs(e.local_x - p.from_x) + math.abs(e.local_y - p.from_y) > CLICK_SLOP then
+				return
+			end
+			local held = ui.modifiers
+			local deep = held.control:peek() or held.meta:peek()
+			local node = api.call_sync("design.hit", {
+				tab = id,
+				x = (e.local_x - v.x) / v.zoom,
+				y = (e.local_y - v.y) / v.zoom,
+				deep = deep,
+			})
+			pick(id, if type(node) == "string" then node else nil, held.shift:peek())
 		end,
 		ui.each(ui.computed(function(): { any }
 			local b = told()
@@ -462,6 +573,11 @@ local function canvas(id: string): Node
 		end), layer, {
 			key = function(l: any): string
 				return tostring(l.level)
+			end,
+		}),
+		ui.each(touches("selected"), selected, {
+			key = function(n: any): string
+				return n.id
 			end,
 		}),
 		ui.each(touches("working"), working, {
@@ -612,6 +728,14 @@ M.Design = ui.component(function(props: Props): Node
 			api.invoke("design.open", { tab = id, path = p })
 		end
 	end)
+	-- Its selection told to the host as it changes (the host passes it on
+	-- only when it changed), for the chat's agent.
+	ui.effect(function()
+		local ids = selections:get()[id] or {}
+		if path() then
+			api.invoke("design.select", { tab = id, chat = string.match(key, "^chat:(.+)$") or "", ids = ids })
+		end
+	end)
 	-- Saved as another file: the tab's from then on.
 	ui.effect(function()
 		local b, t = host:get(), tab()
@@ -734,7 +858,15 @@ M.Design = ui.component(function(props: Props): Node
 					end,
 				}
 			end
-			return canvas(id)
+			return ui.row {
+				w_full = true,
+				grow = 1,
+				min_h = 0,
+				layers(id, function(): any
+					return host:get()
+				end),
+				canvas(id),
+			}
 		end, { w_full = true, grow = 1, min_h = 0 }),
 	}
 end)

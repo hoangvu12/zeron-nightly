@@ -3129,6 +3129,7 @@
       "discard": "舍弃",
       "failed_save": "设计未能保存",
       "failed_new": "未能新建设计",
+      "layers": "图层",
       "save": "保存",
       "remote": "设计只能为这台电脑上的对话打开。",
       "command": {

@@ -3129,6 +3129,7 @@
       "discard": "Discard",
       "failed_save": "The Design wasn't saved",
       "failed_new": "No new Design was made",
+      "layers": "Layers",
       "save": "Save",
       "remote": "Designs open only for chats on this computer.",
       "command": {
