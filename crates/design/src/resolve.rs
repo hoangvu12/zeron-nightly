@@ -210,7 +210,11 @@ impl Resolver {
         let refs = std::mem::take(&mut node.refs);
         let resolved: Map<String, Value> = refs
             .iter()
-            .map(|(key, value)| (key.clone(), self.value(value, theme, &node.id)))
+            .map(|(key, value)| {
+                // Text that only looks like a reference ("$5") is text.
+                let literal = matches!(node.kind, Kind::Text(_)) && key == "content";
+                (key.clone(), self.value(value, theme, &node.id, literal))
+            })
             .collect();
         node.refs = refs;
         match node.set_props(&resolved) {
@@ -232,22 +236,32 @@ impl Resolver {
         }
     }
 
-    fn value(&mut self, value: &Value, theme: &Theme, node: &str) -> Value {
+    /// `value` with each reference given its Token's value in `theme`. One
+    /// to a Token the Design doesn't have stays as written, with a problem
+    /// unless it may be `literal` text.
+    fn value(&mut self, value: &Value, theme: &Theme, node: &str, literal: bool) -> Value {
         match value {
             Value::String(text) => match token::reference(text) {
                 Some(name) => match self.tokens.get(name) {
                     Some(token) => token.value_in(theme).clone(),
                     None => {
-                        self.problem(node, format!("\"{text}\" refers to a Token the Design doesn't have"));
+                        if !literal {
+                            self.problem(node, format!("\"{text}\" refers to a Token the Design doesn't have"));
+                        }
                         value.clone()
                     }
                 },
                 None => value.clone(),
             },
-            Value::Array(items) => Value::Array(items.iter().map(|item| self.value(item, theme, node)).collect()),
-            Value::Object(props) => {
-                Value::Object(props.iter().map(|(key, value)| (key.clone(), self.value(value, theme, node))).collect())
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| self.value(item, theme, node, literal)).collect())
             }
+            Value::Object(props) => Value::Object(
+                props
+                    .iter()
+                    .map(|(key, value)| (key.clone(), self.value(value, theme, node, literal)))
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }

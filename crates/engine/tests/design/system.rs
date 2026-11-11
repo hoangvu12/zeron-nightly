@@ -166,6 +166,64 @@ TakeScreenshot([screen]);"##
 }
 
 #[tokio::test]
+async fn overrides_by_unique_name_and_replacements_through_copy() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Named",
+            &format!(
+                r##"{BUTTONS}
+Insert(button, {{ type: "rectangle", name: "Dot", x: 90, y: 0, width: 5, height: 5, fill: "#FFFFFF" }});
+Insert(button, {{ type: "rectangle", name: "Dot", x: 95, y: 0, width: 5, height: 5, fill: "#FFFFFF" }});
+lone = Insert({{ type: "frame", name: "Lone", x: 0, y: 400, width: 300, height: 100, fill: "#000000" }});
+byName = Copy(button, lone, {{ x: 0, y: 0, descendants: {{ Label: {{ fill: "#0000FF" }} }} }});
+swapped = Copy(button, lone, {{ x: 150, y: 0, descendants: {{ [label]: {{ type: "rectangle", name: "Swap", x: 0, y: 0, width: 20, height: 20, fill: "#00FF00" }} }} }});
+Print(Get(`${{swapped}}/${{label}}`).name);
+TakeScreenshot([lone]);"##
+            ),
+        )
+        .await;
+    let shot = &made.images[0];
+    // The one node named Label, overridden by its name.
+    assert_eq!((shot.rgba(5, 5), shot.rgba(50, 20)), (INDIGO, BLUE));
+    // The Label replaced outright, the new node in its place by path.
+    assert_eq!((shot.rgba(160, 10), shot.rgba(200, 25)), (GREEN, INDIGO));
+    assert_eq!(made.printed(), ["Swap"]);
+
+    // A name two nodes have overrides neither, and says so.
+    let ambiguous = seam
+        .execute(&made.path(), r##"Copy(button, lone, { x: 0, y: 50, descendants: { Dot: { fill: "#FF0000" } } });"##)
+        .await;
+    let warnings = ambiguous.json()["warnings"].to_string();
+    assert!(warnings.contains("2 nodes") && warnings.contains("Dot"), "{warnings}");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn text_content_takes_string_tokens_and_keeps_text_that_only_looks_like_one() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Words",
+            r##"SetTokens({ title: { type: "string", value: "Hello" } });
+const named = Insert({ type: "text", name: "Named", content: "$title", fontSize: 16, fill: "#000000" });
+const price = Insert({ type: "text", name: "Price", content: "$5", fontSize: 16, fill: "#000000" });
+Print(Get(named, { resolveTokens: true }).content, Get(price, { resolveTokens: true }).content, Get(named).content);"##,
+        )
+        .await;
+    assert_eq!(made.printed(), ["Hello $5 $title"]);
+    // "$5" is text, not a missing Token.
+    let warnings = made.json().get("warnings").map(Value::to_string).unwrap_or_default();
+    assert!(!warnings.contains("$5"), "{warnings}");
+    // Anywhere else, a missing Token is still said.
+    let fill = seam
+        .execute(&made.path(), r##"Insert({ type: "text", name: "Odd", content: "x", fontSize: 16, fill: "$5" });"##)
+        .await;
+    assert!(fill.json()["warnings"].to_string().contains("$5"), "{}", fill.text);
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_components_theme_reaches_inside_its_instances() {
     let seam = Seam::new().await;
     let made = seam
