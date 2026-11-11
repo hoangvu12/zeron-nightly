@@ -1,7 +1,9 @@
 //! Drawing a Design, behind an interface (ADR-0002): node types draw
-//! through a [`Painter`], and [`screenshot`] is the one place that picks
-//! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
-//! would replace that and a painter of its own.
+//! through a [`Painter`], and [`screenshot`] (an agent's) and [`region`]
+//! (the Design tab's tiles) are the only places that pick the backend
+//! (Skia's raster, [`crate::skia`]), so a tiny-skia renderer would replace
+//! those and a painter of its own. Both draw a node with [`paint_node`],
+//! so the tab shows what the agent's screenshot does.
 
 use crate::model::{Design, Node, Paint};
 
@@ -20,6 +22,24 @@ impl Rect {
     /// A rectangle of this size at the origin.
     pub fn sized((width, height): (f32, f32)) -> Self {
         Self { x: 0., y: 0., width, height }
+    }
+
+    pub fn meets(&self, other: &Rect) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
+
+    /// The smallest rectangle holding both.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        Rect {
+            x,
+            y,
+            width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y,
+        }
     }
 }
 
@@ -54,6 +74,44 @@ pub fn paint_node(node: &Node, painter: &mut dyn Painter) {
         painter.restore();
     }
     painter.restore();
+}
+
+/// Where `node` draws, in its parent's space: its own box, and its
+/// descendants' unless it clips them.
+pub fn bounds(node: &Node) -> Rect {
+    let kind = node.kind.get();
+    let mut drawn = Rect::sized(kind.size());
+    if !kind.clips() {
+        for child in kind.children() {
+            drawn = drawn.union(&bounds(child));
+        }
+    }
+    Rect {
+        x: drawn.x + node.x,
+        y: drawn.y + node.y,
+        ..drawn
+    }
+}
+
+/// The part `area` of the Canvas at `scale` pixels a unit, as a
+/// transparent `width` × `height` image (RGBA, premultiplied): the
+/// Canvas's top-level nodes at `nodes` (indices into its children, the
+/// ones meeting `area`, in order) drawn where they sit. `None` for an
+/// empty or oversized image.
+pub fn region(design: &Design, nodes: &[usize], area: Rect, scale: f32, width: u32, height: u32) -> Option<Vec<u8>> {
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    crate::skia::draw_into(&mut pixels, width, height, |canvas| {
+        let mut painter = crate::skia::SkiaPainter::new(canvas);
+        painter.scale(scale);
+        painter.translate(-area.x, -area.y);
+        for node in nodes.iter().filter_map(|&i| design.children.get(i)) {
+            painter.save();
+            painter.translate(node.x, node.y);
+            paint_node(node, &mut painter);
+            painter.restore();
+        }
+    })?;
+    Some(pixels)
 }
 
 /// A node drawn on its own at 1x, scaled down to fit `max_side`, as PNG.

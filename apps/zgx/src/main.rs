@@ -38,6 +38,7 @@ mod cloud;
 mod dev;
 mod dictation;
 mod completion;
+mod design;
 mod desktop_blur;
 mod engine;
 mod engine_update;
@@ -132,6 +133,8 @@ mod i18n_tests;
 mod updates;
 #[cfg(test)]
 mod visuals_tests;
+#[cfg(test)]
+mod design_tests;
 
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
@@ -788,6 +791,8 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         appshots::install(cx, &host);
         // The panel's terminal tabs (src/terminal.rs).
         terminal::install(cx, &host);
+        // The panel's Design tabs: their Canvas's tiles (src/design.rs).
+        design::install(cx, &host);
         // The panel's home: run actions, the branch's totals (src/session_home.rs).
         session_home::install(&host);
         engine_update::install(cx, &host);

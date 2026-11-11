@@ -7,13 +7,15 @@
 //! call's screenshots drawn (one that can't be drawn says why in its
 //! place). A failed call changes nothing, on disk or in memory. New Designs are made in the managed folder, `designs/` in the
 //! engine's data dir, one folder each with an `images/` folder beside the
-//! `.zdesign` file.
+//! `.zdesign` file. Design tabs follow a Design ([`Designs::watch`]): it
+//! whole, then again after each call that changes it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use futures::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zeron_design::Design;
@@ -45,6 +47,13 @@ pub struct ExecuteParams {
     pub name: Option<String>,
 }
 
+/// `WatchDesign`'s params.
+#[derive(Debug, Deserialize)]
+pub struct WatchParams {
+    /// The `.zdesign` file to follow.
+    pub path: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DesignError {
     /// The request can't be met as asked; the agent can fix it and retry.
@@ -72,6 +81,17 @@ struct Inner {
 struct Live {
     path: PathBuf,
     design: Design,
+    /// What its Design tabs follow: it after each call.
+    seen: tokio::sync::watch::Sender<Seen>,
+}
+
+/// A Design as the tabs following it see it: its version (one more each
+/// call that changes it), and what that call made or changed.
+#[derive(Clone)]
+struct Seen {
+    version: u64,
+    design: Arc<Design>,
+    changed: Vec<String>,
 }
 
 impl Designs {
@@ -111,6 +131,28 @@ impl Designs {
             lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
         }
         ran
+    }
+
+    /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
+    /// tab's): it whole as it is now, then after each call that changes it,
+    /// as `{version, design, changed}`. A tab that falls behind hears the
+    /// latest only. Blocking (it may read the file): run it off the async
+    /// runtime.
+    pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
+        let live = self.open(Path::new(path))?;
+        let seen = lock(&live).seen.subscribe();
+        Ok(futures::stream::unfold((seen, true), |(mut seen, first)| async move {
+            if !first && seen.changed().await.is_err() {
+                return None;
+            }
+            let now = seen.borrow_and_update().clone();
+            let item = json!({
+                "version": now.version,
+                "design": &*now.design,
+                "changed": now.changed,
+            });
+            Some((item, (seen, false)))
+        }))
     }
 
     fn run(&self, live: &Mutex<Live>, code: &str) -> Result<Value, DesignError> {
@@ -165,10 +207,7 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        let design = Arc::new(Mutex::new(Live {
-            path: path.clone(),
-            design,
-        }));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), design)));
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -194,10 +233,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = Arc::new(Mutex::new(Live {
-            path: path.clone(),
-            design: Design::default(),
-        }));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default())));
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -210,11 +246,35 @@ struct Target {
 }
 
 impl Live {
+    fn new(path: PathBuf, design: Design) -> Self {
+        let seen = Seen {
+            version: 0,
+            design: Arc::new(design.clone()),
+            changed: Vec::new(),
+        };
+        Self {
+            path,
+            design,
+            seen: tokio::sync::watch::channel(seen).0,
+        }
+    }
+
+    /// Tells the Design's tabs what a call made of it.
+    fn tell(&self, edited: &Edited) {
+        let design = Arc::new(self.design.clone());
+        self.seen.send_modify(|seen| {
+            seen.version += 1;
+            seen.design = design;
+            seen.changed = edited.changed.iter().cloned().collect();
+        });
+    }
+
     /// Keeps a successful call's draft: saves the file, then draws the
     /// screenshots the call asked for.
     fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
+        self.tell(edited);
         Ok(edited
             .screenshots
             .iter()

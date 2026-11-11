@@ -357,6 +357,10 @@ pub mod methods {
     /// screenshots: [{id, width, height, mimeType, data}]}`. Local only:
     /// Designs live on the engine of their computer.
     pub const DESIGN_EXECUTE: &str = "DesignExecute";
+    /// `{path}` → stream (the app's Design tab) of `{version, design,
+    /// changed}`: the Design whole as it is, then after each call that
+    /// changes it, with the ids that call made or changed. Local only.
+    pub const WATCH_DESIGN: &str = "WatchDesign";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -719,6 +723,7 @@ pub fn local_only(method: &str) -> bool {
             | methods::DESCRIBE_ELEMENTS
             // Designs: this computer's own (ADR-0003).
             | methods::DESIGN_EXECUTE
+            | methods::WATCH_DESIGN
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME

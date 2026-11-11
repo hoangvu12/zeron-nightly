@@ -1,11 +1,12 @@
-//! The Skia renderer: a raster [`surface`], fonts from given files only
+//! The Skia renderer: a raster [`surface`] (or pixels of one's own,
+//! [`draw_into`]), fonts from given files only
 //! ([`fonts`]), [`png`] encoding and the [`SkiaPainter`] node types draw
 //! with, and the skia-safe they're made of.
 
 pub use skia_safe;
 
 use skia_safe::textlayout::{FontCollection, TypefaceFontProvider};
-use skia_safe::{Data, EncodedImageFormat, FontMgr, Surface, surfaces};
+use skia_safe::{AlphaType, ColorType, Data, EncodedImageFormat, FontMgr, ImageInfo, Surface, surfaces};
 
 use crate::model::{Color, Paint};
 use crate::render::{Painter, Rect};
@@ -14,6 +15,21 @@ use crate::render::{Painter, Rect};
 /// premultiplied), or `None` for an empty or oversized one.
 pub fn surface(width: i32, height: i32) -> Option<Surface> {
     surfaces::raster_n32_premul((width, height))
+}
+
+/// Draws with `draw` into `pixels`, `width` × `height` RGBA
+/// (premultiplied), as they are: `None` when they don't make such an image.
+pub fn draw_into(pixels: &mut [u8], width: u32, height: u32, draw: impl FnOnce(&skia_safe::Canvas)) -> Option<()> {
+    let info = ImageInfo::new(
+        (i32::try_from(width).ok()?, i32::try_from(height).ok()?),
+        ColorType::RGBA8888,
+        AlphaType::Premul,
+        None,
+    );
+    let row = width as usize * 4;
+    let mut surface = surfaces::wrap_pixels(&info, pixels, row, None)?;
+    draw(surface.canvas());
+    Some(())
 }
 
 /// A font collection holding these font files and nothing of the

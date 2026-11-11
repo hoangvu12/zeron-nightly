@@ -5818,6 +5818,18 @@ impl RpcService for EngineRpc {
                     })?;
                 RpcReply::value(&executed)
             }
+            methods::WATCH_DESIGN => {
+                let designs = self
+                    .designs
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))?;
+                let p: crate::designs::WatchParams = parse_params(params)?;
+                let seen = tokio::task::spawn_blocking(move || designs.watch(&p.path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                Ok(RpcReply::Stream(seen.boxed()))
+            }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self
