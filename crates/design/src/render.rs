@@ -1,9 +1,13 @@
 //! Drawing a Design, behind an interface (ADR-0002): node types draw
-//! through a [`Painter`], and [`screenshot`] is the one place that picks
-//! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
-//! would replace that and a painter of its own.
+//! through a [`Painter`], and [`screenshot`] (an agent's) and [`region`]
+//! (the Design tab's tiles) are the only places that pick the backend
+//! (Skia's raster, [`crate::skia`]), so a tiny-skia renderer would replace
+//! those and a painter of its own. Both draw a node with [`paint_node`],
+//! so the tab shows what the agent's screenshot does.
 
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::layout::LaidOut;
 use crate::model::{
@@ -25,6 +29,24 @@ impl Rect {
     /// A rectangle of this size at the origin.
     pub fn sized((width, height): (f32, f32)) -> Self {
         Self { x: 0., y: 0., width, height }
+    }
+
+    pub fn meets(&self, other: &Rect) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
+
+    /// The smallest rectangle holding both.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        Rect {
+            x,
+            y,
+            width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y,
+        }
     }
 }
 
@@ -73,6 +95,50 @@ impl Images for NoImages {
     fn get(&self, _url: &str) -> Result<Arc<[u8]>, String> {
         Err("no images are given to this drawing".into())
     }
+}
+
+/// Images from files already on this computer, by url: what a Design tab
+/// draws with, the engine having found each url's file (the Design's
+/// folder, or its download cache). Nothing is downloaded; a url without a
+/// file draws as a placeholder. Each file is read once.
+#[derive(Debug, Default)]
+pub struct ImageFiles {
+    paths: HashMap<String, PathBuf>,
+    read: Mutex<HashMap<String, Result<Arc<[u8]>, String>>>,
+}
+
+impl ImageFiles {
+    pub fn new(paths: HashMap<String, PathBuf>) -> Self {
+        Self { paths, read: Mutex::default() }
+    }
+
+    /// Each url's file.
+    pub fn paths(&self) -> &HashMap<String, PathBuf> {
+        &self.paths
+    }
+}
+
+impl Images for ImageFiles {
+    fn get(&self, url: &str) -> Result<Arc<[u8]>, String> {
+        let mut read = self.read.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        read.entry(url.to_owned())
+            .or_insert_with(|| {
+                let path = self.paths.get(url).ok_or("not had yet")?;
+                std::fs::read(path)
+                    .map(Arc::from)
+                    .map_err(|e| format!("can't read {}: {e}", path.display()))
+            })
+            .clone()
+    }
+}
+
+/// Every image url `design` draws.
+pub fn image_urls(design: &Design) -> BTreeSet<String> {
+    let mut found = Vec::new();
+    for node in &design.children {
+        images_in(node, &mut found);
+    }
+    found.into_iter().map(|(_, image)| image.url.clone()).collect()
 }
 
 /// The image paints `node` and its descendants draw (fills and strokes),
@@ -217,6 +283,137 @@ pub fn paint_upright(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter)
     if layered {
         painter.restore();
     }
+}
+
+/// How far past its outline a node's own drawing goes: an outer shadow
+/// (moved, grown and blurred), a layer blur and a stroke outside it. A
+/// blur reaches about three of its sigmas (`skia::sigma`).
+fn reach(look: &Look) -> f32 {
+    let blurred = |radius: f32| radius * 1.5;
+    let shadows = look.effects.enabled().filter_map(|effect| match effect {
+        EffectKind::Shadow(shadow) if !shadow.inner => {
+            Some(shadow.offset.0.abs().max(shadow.offset.1.abs()) + shadow.spread.max(0.) + blurred(shadow.blur))
+        }
+        _ => None,
+    });
+    let stroke = look.stroke.map_or(0., |stroke| {
+        let t = stroke.thickness;
+        t.top.max(t.right).max(t.bottom).max(t.left)
+    });
+    // (And a pixel for the edges' anti-aliasing.)
+    shadows.fold(blurred(look.effects.layer_blur()) + stroke, f32::max) + 1.
+}
+
+/// Where `node` draws on the Canvas, as `laid_out` puts it: its own box
+/// and what its effects and stroke reach past it, its descendants' unless
+/// it clips them, all turned as it is.
+pub fn bounds(node: &Node, laid_out: &LaidOut) -> Rect {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return Rect::sized((0., 0.));
+    };
+    let kind = node.kind.get();
+    let size = (placed.bounds.width, placed.bounds.height);
+    let out = kind.look(size).map_or(0., |look| reach(&look));
+    let mut drawn = Rect {
+        x: placed.bounds.x - out,
+        y: placed.bounds.y - out,
+        width: placed.bounds.width + 2. * out,
+        height: placed.bounds.height + 2. * out,
+    };
+    if !kind.clips() {
+        for child in kind.children() {
+            let child = bounds(child, laid_out);
+            if child.width > 0. || child.height > 0. {
+                drawn = drawn.union(&child);
+            }
+        }
+    }
+    if node.rotation == 0. {
+        return drawn;
+    }
+    // Turned about its top-left corner (`paint_node`), either way round:
+    // the box holding its corners.
+    let (ox, oy) = (placed.bounds.x, placed.bounds.y);
+    let (sin, cos) = node.rotation.to_radians().sin_cos();
+    let corners = [(drawn.x, drawn.y), (drawn.x + drawn.width, drawn.y), (drawn.x, drawn.y + drawn.height), (drawn.x + drawn.width, drawn.y + drawn.height)];
+    let mut turned: Option<Rect> = None;
+    for sign in [1., -1.] {
+        for (x, y) in corners {
+            let (dx, dy) = (x - ox, y - oy);
+            let at = Rect { x: ox + dx * cos - dy * sin * sign, y: oy + dx * sin * sign + dy * cos, width: 0., height: 0. };
+            turned = Some(turned.map_or(at, |t| t.union(&at)));
+        }
+    }
+    turned.unwrap_or(drawn)
+}
+
+/// How far around itself any node of `design` reads or spreads what's
+/// drawn: its widest background or layer blur. A part of the Canvas drawn
+/// on its own needs this much more drawn round it to come out as it does
+/// drawn whole ([`region`]'s `margin`).
+pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
+    let mut most: f32 = 0.;
+    design.walk(&mut |node| {
+        let Some(placed) = laid_out.get(&node.id) else { return };
+        if let Some(look) = node.kind.get().look((placed.bounds.width, placed.bounds.height)) {
+            for effect in look.effects.enabled() {
+                if let EffectKind::BackgroundBlur(radius) | EffectKind::LayerBlur(radius) = effect {
+                    most = most.max(radius * 1.5);
+                }
+            }
+        }
+    });
+    most
+}
+
+/// The part `area` of the Canvas at `scale` pixels a unit, as a
+/// transparent `width` × `height` image (RGBA, premultiplied): the
+/// Canvas's top-level nodes at `nodes` (indices into its children, the
+/// ones meeting `area` grown by `margin`, in order) drawn where `laid_out`
+/// puts them. It's drawn `margin` (Canvas units, [`blur_reach`]) wider all
+/// round and cut to `area`, so blurs at its edges read what they would
+/// with the whole Canvas drawn. Image paints draw what `images` has. `None`
+/// for an empty or oversized image.
+#[allow(clippy::too_many_arguments)]
+pub fn region(
+    design: &Design,
+    laid_out: &LaidOut,
+    nodes: &[usize],
+    area: Rect,
+    scale: f32,
+    margin: f32,
+    (width, height): (u32, u32),
+    images: &dyn Images,
+) -> Option<Vec<u8>> {
+    // (At most a tile's worth each side: past that a blur is faint.)
+    let pad = (margin * scale).ceil().clamp(0., 512.) as u32;
+    let (wide, high) = (width + 2 * pad, height + 2 * pad);
+    let mut drawn = vec![0; wide as usize * high as usize * 4];
+    crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
+        let mut painter = crate::skia::SkiaPainter::with_images(canvas, images);
+        painter.translate(pad as f32, pad as f32);
+        painter.scale(scale);
+        painter.translate(-area.x, -area.y);
+        for node in nodes.iter().filter_map(|&i| design.children.get(i)) {
+            let Some(at) = laid_out.get(&node.id) else {
+                continue;
+            };
+            painter.save();
+            painter.translate(at.bounds.x, at.bounds.y);
+            paint_node(node, laid_out, &mut painter);
+            painter.restore();
+        }
+    })?;
+    if pad == 0 {
+        return Some(drawn);
+    }
+    let (row, wide_row) = (width as usize * 4, wide as usize * 4);
+    let mut pixels = Vec::with_capacity(row * height as usize);
+    for y in pad as usize..(pad + height) as usize {
+        let from = y * wide_row + pad as usize * 4;
+        pixels.extend_from_slice(&drawn[from..from + row]);
+    }
+    Some(pixels)
 }
 
 /// A node drawn on its own at 1x, scaled down to fit `max_side`, as PNG.

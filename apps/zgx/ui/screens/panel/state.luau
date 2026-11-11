@@ -11,17 +11,19 @@
 --                                 active (else the first, else the empty page)
 --   state.activate(key, id?)      that tab (nil: the empty page)
 --   state.move(key, id, to)       to place `to` (from 1)
+--   state.set_path(key, id, path) a Design tab's Design
 --
 -- `key`: the session's ("chat:<id>"), a project's with none open, or a
 -- plugin's page's ("page:<plugin>/<id>": a page has a panel of its own).
 
 local M = {}
 
-export type Kind = "files" | "terminal" | "plugin" | "browser" | "side_chat" | "subagent"
+export type Kind = "files" | "terminal" | "plugin" | "browser" | "side_chat" | "subagent" | "design"
 export type Tab = {
 	id: string,
 	kind: Kind,
-	-- A file tab's first file (opened as the tab is made).
+	-- A file tab's first file (opened as the tab is made); a Design tab's
+	-- `.zdesign` file, once it has one.
 	path: string?,
 	-- A browser tab's address, as it was last navigated (its page lives in
 	-- the host by the tab's id, screens/panel/browser).
@@ -287,6 +289,19 @@ function M.set_terminal(key: string, id: string, terminal: string?, device: stri
 		end
 	end
 	write(key, s)
+end
+
+-- A Design tab's Design, as one is opened in it.
+function M.set_path(key: string, id: string, path: string)
+	local s = copy(peek(key))
+	for i, t in s.tabs do
+		if t.id == id and t.path ~= path then
+			local next_tab = table.clone(t)
+			next_tab.path = path
+			s.tabs[i] = next_tab
+			write(key, s)
+		end
+	end
 end
 
 -- A browser tab's address, as its page navigates (kept with the tab, so a

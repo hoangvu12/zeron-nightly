@@ -223,6 +223,37 @@ TakeScreenshot(screen);"##,
 }
 
 #[tokio::test]
+async fn a_design_tab_is_told_each_images_file_and_never_downloads() {
+    let server = Server::start(vec![("/stripes.png", stripes())]);
+    let seam = Seam::new().await;
+    let path = design(&seam, "Followed images").await;
+    let local = path.parent().unwrap().join("images").join("stripes.png");
+    std::fs::write(&local, stripes()).unwrap();
+    let url = server.url("/stripes.png");
+    let snippet = format!(
+        r#"Insert({{ type: "rectangle", width: 10, height: 10, fill: [{{ type: "image", url: "images/stripes.png" }},
+  {{ type: "image", url: {} }}, {{ type: "image", url: "images/gone.png" }}] }});"#,
+        json!(url)
+    );
+    assert!(!seam.execute(&path, &snippet).await.is_error);
+
+    // The window watches it: each image it has, by url, with its file on
+    // this computer; the one it hasn't isn't named, and draws as a
+    // placeholder.
+    let window = zeron_rpc::memory_client(seam.core.rpc_service());
+    let mut seen = window.subscribe("WatchDesign", json!({ "path": path })).await.unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv()).await.unwrap().unwrap();
+    let images = first["images"].as_object().expect("images");
+    assert_eq!(images.len(), 2, "{first}");
+    let file = |url: &str| std::path::PathBuf::from(images[url].as_str().unwrap());
+    assert_eq!(std::fs::read(file("images/stripes.png")).unwrap(), stripes());
+    assert_eq!(std::fs::read(file(&url)).unwrap(), stripes());
+    assert!(file(&url).is_absolute() && !file(&url).starts_with(path.parent().unwrap()));
+    assert_eq!(server.hits("/stripes.png"), 1);
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_image_must_be_a_relative_path_or_an_http_url() {
     let seam = Seam::new().await;
     let path = design(&seam, "Refused").await;

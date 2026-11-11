@@ -8,7 +8,7 @@
 -- runs one in a terminal tab of its own, its gear edits it, a zeron.json
 -- action not yet added imports, Add action adds one). Then what can open
 -- here, each with the one key that opens it: Browser B, File viewer F,
--- Terminal T, Side chat S, Fork chat K (plugins' rows after them,
+-- Terminal T, Design D, Side chat S, Fork chat K (plugins' rows after them,
 -- `hook:panel.empty`; C and H are the Git plugin's). Last, the session's
 -- side chats and forks, and its subagents: each a part that folds (folded
 -- or not kept per session), a list that builds only the rows in view, a
@@ -1225,6 +1225,9 @@ M.Page = ui.component(function(props: Props): Node
 		end },
 		{ id = "panel-open-terminal", icon = "terminal", label = "panel.empty.terminal", key = "T", run = function()
 			props.open_kind("terminal")
+		end },
+		{ id = "panel-open-design", icon = "palette", label = "panel.empty.design", key = "D", run = function()
+			props.open_kind("design")
 		end },
 	}
 	-- (A new chat with no project: no folder for a file viewer to show.)

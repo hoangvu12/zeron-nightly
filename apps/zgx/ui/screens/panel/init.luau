@@ -1,7 +1,8 @@
 -- The session page's right panel: tabs, as Zeron's right panel has them
 -- (crates/ui/src/shell.rs `render_right_tab_strip`, surface_chrome.rs),
--- each tab a file viewer (the tree and the file, screens/files) or a
--- terminal (screens/panel/terminal). Opening it shows its empty page,
+-- each tab a file viewer (the tree and the file, screens/files), a
+-- terminal (screens/panel/terminal), a browser, a lane or a Design
+-- (screens/panel/design). Opening it shows its empty page,
 -- which offers what can open here; "+" goes back to it.
 --
 --   Panel.Panel { project = route.project, session = route.session, left = fn?,
@@ -157,6 +158,24 @@ do
 		Browser = found
 	else
 		print(`zeron-zgx: the panel's browser didn't load: {found}`)
+	end
+end
+
+-- A Design tab's view (screens/panel/design), loaded the same way.
+type DesignModule = {
+	title: (tab: state.Tab) -> string?,
+	close: (tab: state.Tab) -> (),
+	Design: (props: { key: string, tab: string }) -> Node,
+}
+local Design: DesignModule? = nil
+do
+	local ok, found = pcall(function(): DesignModule
+		return (require :: any)("@app/screens/panel/design")
+	end)
+	if ok then
+		Design = found
+	else
+		print(`zeron-zgx: the panel's Design tabs didn't load: {found}`)
 	end
 end
 
@@ -652,6 +671,10 @@ local function title_of(tab: Tab): (string, boolean)
 		local path, dirty = Files.tab_file(tab.id)
 		return if path then base_name(path) else ui.t("panel.tab.files"):get(), dirty
 	end
+	if tab.kind == "design" then
+		local t = if Design then Design.title(tab) else nil
+		return if t and t ~= "" then t else ui.t("panel.tab.design"):get(), false
+	end
 	-- (A run action's: its name, as the shipping app titles it.)
 	if tab.title and tab.title ~= "" then
 		return tab.title, false
@@ -724,6 +747,8 @@ M.Panel = ui.component(function(props: Props): Node
 			Terminal.close(tab)
 		elseif tab.kind == "browser" and Browser then
 			Browser.close(tab)
+		elseif tab.kind == "design" and Design then
+			Design.close(tab)
 		elseif (tab.kind == "side_chat" or tab.kind == "subagent") and lanes_card then
 			-- Its chat let go (a reload never does this).
 			lanes_card.watch(tab.id, nil)
@@ -843,6 +868,7 @@ M.Panel = ui.component(function(props: Props): Node
 					return ui.image { src = path, w = 14, h = 14, fit = "contain", rounded = "$radius.sm" }
 				end)
 			elseif tab.kind == "plugin" then Icon { name = (tab.icon or "widget") :: any, size = 14 }
+			elseif tab.kind == "design" then Icon { name = "palette", size = 14 }
 			elseif (tab.kind == "side_chat" or tab.kind == "subagent") and Lanes then Icon { name = Lanes.icon(tab) :: any, size = 14 }
 			else ui.presence(function(): string
 				-- (A file tab's file by its name; none yet, "": by the file,
@@ -1409,6 +1435,18 @@ M.Panel = ui.component(function(props: Props): Node
 				fill = true,
 				title = ui.t("panel.broken.browser.title") :: any,
 				body = ui.t("panel.broken.browser.body") :: any,
+			}
+		end
+		if tab.kind == "design" then
+			if Design then
+				return Design.Design { key = k, tab = tab.id }
+			end
+			return ds.EmptyState {
+				icon = "palette",
+				size = "sm",
+				fill = true,
+				title = ui.t("panel.broken.design.title") :: any,
+				body = ui.t("panel.broken.design.body") :: any,
 			}
 		end
 		if tab.kind == "files" then

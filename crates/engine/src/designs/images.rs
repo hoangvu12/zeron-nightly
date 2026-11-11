@@ -2,15 +2,17 @@
 //! relative to the Design's folder, read when drawn, and http(s) URLs,
 //! downloaded once into `image-cache/` in the engine's data dir and read
 //! from there after. Nothing is copied beside the Design or into its file,
-//! so a Design saved elsewhere takes its `images/` folder along and fetches
-//! its URLs again from the cache.
+//! so a Design saved elsewhere takes its `images/` folder along and finds
+//! its URLs in the cache again. Design tabs are told each image's file
+//! ([`DesignImages::files`]) and read it there: only the engine downloads.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use zeron_design::Design;
 use zeron_design::model::{ImageFill, Node};
 use zeron_design::render::{self, Images};
 
@@ -43,12 +45,12 @@ impl ImageCache {
         }
     }
 
-    /// The image at `url`: from the cache folder, or downloaded now and
-    /// kept there.
-    fn remote(&self, url: &str) -> Result<Arc<[u8]>, String> {
+    /// The cache file holding the image at `url`, downloaded now if it
+    /// isn't yet.
+    fn file(&self, url: &str) -> Result<PathBuf, String> {
         let file = self.dir.join(format!("{:x}", Sha256::digest(url.as_bytes())));
-        if let Ok(bytes) = std::fs::read(&file) {
-            return Ok(bytes.into());
+        if file.is_file() {
+            return Ok(file);
         }
         if let Some((why, at)) = lock(&self.failed).get(url)
             && at.elapsed() < RETRY_AFTER
@@ -62,14 +64,15 @@ impl ImageCache {
                 Err(NOT_AN_IMAGE.to_owned())
             }
         });
-        match downloaded {
-            Ok(bytes) => {
-                // One that can't be kept is still drawn this time.
-                if let Err(e) = std::fs::create_dir_all(&self.dir).and_then(|()| write_whole(&file, &bytes)) {
-                    tracing::warn!("can't cache the image at {url}: {e}");
-                }
+        let kept = downloaded.and_then(|bytes| {
+            std::fs::create_dir_all(&self.dir)
+                .and_then(|()| write_whole(&file, &bytes))
+                .map_err(|e| format!("can't keep the download in {}: {e}", self.dir.display()))
+        });
+        match kept {
+            Ok(()) => {
                 lock(&self.failed).remove(url);
-                Ok(bytes.into())
+                Ok(file)
             }
             Err(why) => {
                 lock(&self.failed).insert(url.to_owned(), (why.clone(), Instant::now()));
@@ -82,20 +85,37 @@ impl ImageCache {
 /// The images one Design's paints refer to.
 pub struct DesignImages<'a> {
     /// The folder the Design's file is in.
-    pub folder: &'a Path,
+    pub folder: PathBuf,
     pub cache: &'a ImageCache,
+}
+
+impl DesignImages<'_> {
+    /// The file the image at `url` is in: in the Design's folder, or the
+    /// cache's, downloaded now if it's a URL not had yet.
+    fn file(&self, url: &str) -> Result<PathBuf, String> {
+        if ImageFill::is_remote(url) {
+            return self.cache.file(url);
+        }
+        let path = self.folder.join(url.replace('\\', "/"));
+        if !path.is_file() {
+            return Err(format!("there's no file at {}", path.display()));
+        }
+        Ok(path)
+    }
+
+    /// The file each image `design` draws is in, for those it has.
+    pub fn files(&self, design: &Design) -> BTreeMap<String, PathBuf> {
+        render::image_urls(design)
+            .into_iter()
+            .filter_map(|url| Some((url.clone(), self.file(&url).ok()?)))
+            .collect()
+    }
 }
 
 impl Images for DesignImages<'_> {
     fn get(&self, url: &str) -> Result<Arc<[u8]>, String> {
-        if ImageFill::is_remote(url) {
-            return self.cache.remote(url);
-        }
-        let path = self.folder.join(url.replace('\\', "/"));
-        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => format!("there's no file at {}", path.display()),
-            _ => format!("can't read {}: {e}", path.display()),
-        })?;
+        let path = self.file(url)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
         if !zeron_design::skia::is_image(&bytes) {
             return Err(NOT_AN_IMAGE.to_owned());
         }

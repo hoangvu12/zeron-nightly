@@ -13,23 +13,25 @@
 //! a call is told when someone else changed it since that chat's last. The
 //! engine also keeps which Designs each chat's Design tabs show
 //! ([`Designs::set_tabs`]), and the Designs touched most recently on this
-//! computer ([`Designs::recent`]), in `recent-designs.json`.
+//! computer ([`Designs::recent`]), in `recent-designs.json`. Design tabs
+//! follow a Design ([`Designs::watch`]): it whole, then again after each
+//! change.
 //!
 //! Image paints draw files from the Design's folder, and downloads cached
 //! for every Design ([`images`]).
 
 mod images;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
-use zeron_design::render::Images;
 use zeron_design::snippet::{self, Globals, Limits};
 
 use self::images::{DesignImages, ImageCache};
@@ -67,6 +69,22 @@ pub struct ExecuteParams {
     /// The name of a new managed Design to make.
     #[serde(default)]
     pub name: Option<String>,
+}
+
+/// `WatchDesign`'s params.
+#[derive(Debug, Deserialize)]
+pub struct WatchParams {
+    /// The `.zdesign` file to follow.
+    pub path: String,
+}
+
+/// `SetDesignTabs`'s params: a chat's Design tabs, the front one first.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabsParams {
+    pub chat_id: String,
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
 }
 
 /// `DesignState`'s params, as Zeron's `design_state` tool sends them.
@@ -128,6 +146,20 @@ struct Live {
     version: u64,
     /// The version each chat's last successful call left.
     seen: HashMap<String, u64>,
+    /// What the Design tabs following it hear: it after each change.
+    followers: tokio::sync::watch::Sender<Told>,
+}
+
+/// A Design as the tabs following it hear it: its version, and what the
+/// change that made it made or changed.
+#[derive(Clone)]
+struct Told {
+    version: u64,
+    design: Arc<Design>,
+    changed: Vec<String>,
+    /// The file each image it draws is in, for the tabs to read (they
+    /// never download): those it has, by url.
+    images: BTreeMap<String, PathBuf>,
 }
 
 impl Designs {
@@ -158,6 +190,14 @@ impl Designs {
         }
     }
 
+    /// The images of the Design at `path`.
+    fn images_of(&self, path: &Path) -> DesignImages<'_> {
+        DesignImages {
+            folder: path.parent().unwrap_or(Path::new(".")).to_owned(),
+            cache: &self.inner.images,
+        }
+    }
+
     /// The managed folder new Designs are made in.
     pub fn root(&self) -> &Path {
         &self.inner.root
@@ -180,6 +220,45 @@ impl Designs {
         ran
     }
 
+    /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
+    /// tab's): it whole as it is now, then after each change, as `{version,
+    /// design, changed}`. A tab that falls behind hears the latest only.
+    /// Blocking (it may read the file): run it off the async runtime.
+    pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
+        let live = self.open(Path::new(path))?;
+        let told = {
+            let live = lock(&live);
+            // (Changes with nobody following weren't copied for them.)
+            let images = self.images_of(&live.path);
+            live.followers.send_if_modified(|told| {
+                let stale = told.version != live.version;
+                if stale {
+                    *told = Told {
+                        version: live.version,
+                        design: Arc::new(live.design.clone()),
+                        changed: Vec::new(),
+                        images: images.files(&live.design),
+                    };
+                }
+                stale
+            });
+            live.followers.subscribe()
+        };
+        Ok(futures::stream::unfold((told, true), |(mut told, first)| async move {
+            if !first && told.changed().await.is_err() {
+                return None;
+            }
+            let now = told.borrow_and_update().clone();
+            let item = json!({
+                "version": now.version,
+                "design": &*now.design,
+                "changed": now.changed,
+                "images": now.images,
+            });
+            Some((item, (told, false)))
+        }))
+    }
+
     /// Runs the call's snippet with its chat's globals, keeping the globals
     /// it leaves when it succeeds. Read once the Design is held, so calls
     /// queued on one Design see each other's; calls on two Designs at once
@@ -196,8 +275,7 @@ impl Designs {
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
-        let folder = live.path.parent().unwrap_or(Path::new(".")).to_owned();
-        let images = DesignImages { folder: &folder, cache: &self.inner.images };
+        let images = self.images_of(&live.path);
         let screenshots = live.commit(&edited, &images)?;
         // And images the call placed or looked at that can't be drawn.
         let mut warnings = edited.warnings.clone();
@@ -244,10 +322,10 @@ impl Designs {
     }
 
     /// Sets the Designs `chat_id`'s Design tabs show, the one in front
-    /// first (none when it has no Design tab). For the Design tab (#30,
-    /// #31) to call as its tabs open, close and come to the front; until it
-    /// does, only seam 1 calls it. A call that names no Design changes the
-    /// front one. A Design newly open is touched.
+    /// first (none when it has no Design tab): the app's Design tabs say so
+    /// as they open, close and come to the front (`SetDesignTabs`). A call
+    /// that names no Design changes the front one. A Design newly open is
+    /// touched.
     pub fn set_tabs(&self, chat_id: &str, paths: Vec<PathBuf>) {
         let paths: Vec<PathBuf> = paths.into_iter().map(|p| canonical(&p).unwrap_or(p)).collect();
         let mut tabs = lock(&self.inner.tabs);
@@ -426,20 +504,44 @@ struct Target {
 
 impl Live {
     fn new(path: PathBuf, design: Design) -> Self {
+        // (Stale from the start: a tab's watch tells it again, images found.)
+        let told = Told {
+            version: u64::MAX,
+            design: Arc::new(design.clone()),
+            changed: Vec::new(),
+            images: BTreeMap::new(),
+        };
         Self {
             path,
             design,
             version: 0,
             seen: HashMap::new(),
+            followers: tokio::sync::watch::channel(told).0,
         }
     }
 
-    /// Keeps a successful call's draft: saves the file, then draws the
-    /// screenshots the call asked for with `images`.
-    fn commit(&mut self, edited: &Edited, images: &dyn Images) -> Result<Vec<Value>, DesignError> {
+    /// Tells the Design's tabs what a change made of it (copied for them
+    /// only while some follow it).
+    fn tell(&self, edited: &Edited, images: &DesignImages) {
+        if self.followers.receiver_count() == 0 {
+            return;
+        }
+        self.followers.send_replace(Told {
+            version: self.version,
+            design: Arc::new(self.design.clone()),
+            changed: edited.changed.iter().cloned().collect(),
+            images: images.files(&self.design),
+        });
+    }
+
+    /// Keeps a successful call's draft: saves the file, tells the tabs
+    /// following it, then draws the screenshots the call asked for, all
+    /// with `images`.
+    fn commit(&mut self, edited: &Edited, images: &DesignImages) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
         self.version += 1;
+        self.tell(edited, images);
         Ok(edited
             .screenshots
             .iter()
