@@ -15,7 +15,7 @@ use skia_safe::{
     Vector, dash_path_effect, gradient, image_filters, surfaces, svg,
 };
 
-use crate::icons::Icons;
+use crate::assets::{AssetKey, Assets};
 use crate::model::{
     BlendMode, Cap, Color, FillRule, Gradient, GradientShape, Join, Paint, PaintKind, Shadow,
     Sides, StrokeAlign, StrokeStyle,
@@ -75,17 +75,18 @@ pub fn svg_path(geometry: &str) -> Option<skia_safe::Path> {
 /// The [`Painter`] node types draw with, on a Skia canvas.
 pub struct SkiaPainter<'a> {
     canvas: &'a skia_safe::Canvas,
-    icons: Option<&'a Icons>,
+    assets: Option<&'a dyn Assets>,
 }
 
 impl<'a> SkiaPainter<'a> {
     pub fn new(canvas: &'a skia_safe::Canvas) -> Self {
-        Self { canvas, icons: None }
+        Self { canvas, assets: None }
     }
 
-    /// Draws icons from `icons` (without, icons draw nothing).
-    pub fn with_icons(mut self, icons: &'a Icons) -> Self {
-        self.icons = Some(icons);
+    /// Draws icons and other assets from `assets` (without, they draw
+    /// nothing).
+    pub fn with_assets(mut self, assets: &'a dyn Assets) -> Self {
+        self.assets = Some(assets);
         self
     }
 }
@@ -487,10 +488,16 @@ impl Painter for SkiaPainter<'_> {
     }
 
     fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, bounds: Rect) {
-        let Some(svg) = self.icons.and_then(|icons| icons.svg(icon, weight).ok()) else {
+        let Some(svg) = crate::icons::name(icon, weight)
+            .ok()
+            .and_then(|name| self.assets?.get(&AssetKey::icon(name)))
+        else {
             return;
         };
-        let svg = crate::icons::prepare(&svg, color, weight, bounds.width, bounds.height);
+        let Ok(svg) = std::str::from_utf8(&svg) else {
+            return;
+        };
+        let svg = crate::icons::prepare(svg, color, weight, bounds.width, bounds.height);
         let Ok(dom) = svg::Dom::from_str(svg, FontMgr::empty()) else {
             return;
         };

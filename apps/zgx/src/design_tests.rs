@@ -14,7 +14,7 @@ use zeron_design::Design;
 use zgx::input::InputEvent;
 use zgx_script::{ScriptHost, testing::TestApp};
 
-use crate::design::{CACHE_BYTES, DesignTabs, Listener, Source};
+use crate::design::{CACHE_BYTES, DesignTabs, Heard, Listener, Source};
 
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
@@ -80,7 +80,8 @@ fn many_screens() -> Design {
 /// The engine, stood in for: Designs by path, and who follows each.
 #[derive(Default)]
 struct StandIn {
-    designs: RefCell<HashMap<String, Design>>,
+    /// Each Design, with the files of the assets it uses.
+    designs: RefCell<HashMap<String, (Design, Vec<zeron_design::assets::Resolved>)>>,
     following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
     /// What each chat's Design tabs were said to be, in order.
     tabs_said: RefCell<Vec<(String, Vec<String>)>>,
@@ -89,10 +90,15 @@ struct StandIn {
 impl StandIn {
     /// A new version of the Design at `path`, said to whoever follows it.
     fn say(&self, path: &str, design: Design) {
-        self.designs.borrow_mut().insert(path.into(), design.clone());
+        self.say_with(path, design, Vec::new());
+    }
+
+    /// As [`StandIn::say`], naming the files of the assets it uses.
+    fn say_with(&self, path: &str, design: Design, assets: Vec<zeron_design::assets::Resolved>) {
+        self.designs.borrow_mut().insert(path.into(), (design.clone(), assets.clone()));
         let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
         for listener in listeners {
-            (listener.borrow_mut())(Ok(design.clone()));
+            (listener.borrow_mut())(Ok(Heard { design: design.clone(), assets: assets.clone() }));
         }
     }
 }
@@ -104,7 +110,8 @@ impl Source for Engine {
         let listener = Rc::new(RefCell::new(listener));
         self.0.following.borrow_mut().push((path.into(), Rc::downgrade(&listener)));
         let now = self.0.designs.borrow().get(path).cloned();
-        (listener.borrow_mut())(now.ok_or_else(|| format!("can't open {path}")));
+        let heard = now.map(|(design, assets)| Heard { design, assets });
+        (listener.borrow_mut())(heard.ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
     }
 
@@ -121,8 +128,13 @@ struct Tab {
 
 /// The fixture's Design tab on `design`, every tile in view drawn.
 fn mount(design: Design) -> Tab {
+    mount_with(design, Vec::new())
+}
+
+/// As [`mount`], the engine naming the files of the Design's assets.
+fn mount_with(design: Design, assets: Vec<zeron_design::assets::Resolved>) -> Tab {
     let engine = Rc::new(StandIn::default());
-    engine.say(PATH, design);
+    engine.say_with(PATH, design, assets);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/design_fixture.luau");
     let mut made = None;
     let app = TestApp::new(|runtime| {
@@ -228,7 +240,7 @@ fn the_tab_draws_its_design_as_the_engines_screenshot_does() {
     // The engine's screenshot of the Screen (crates/engine designs.rs),
     // against where the Screen shows in the tab.
     let design = landing("#EF4444", false);
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000.).expect("a screenshot");
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &zeron_design::assets::NoAssets).expect("a screenshot");
     let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
     let mut reader = decoder.read_info().expect("a PNG");
     let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
@@ -422,14 +434,10 @@ fn effects_across_tiles() -> Design {
     ] }))
 }
 
-#[test]
-fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
-    let design = effects_across_tiles();
-    let tab = mount(design.clone());
-    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
-
-    // At 1x a tile is 512 Canvas pixels: each Canvas pixel read from the
-    // tile holding it ("design-tile-<tab>-<level>_<x>_<y>").
+/// What the tab shows at 1x, by Canvas pixel: a tile is 512 Canvas pixels,
+/// and each pixel is read from the tile holding it
+/// ("design-tile-<tab>-<level>_<x>_<y>").
+fn tiled_at_1x(tab: &Tab) -> impl Fn(i32, i32) -> [u8; 4] + use<> {
     let tiles: HashMap<(i32, i32), std::sync::Arc<zgx::image::ImageData>> = tab
         .canvas
         .shown(TAB)
@@ -440,16 +448,26 @@ fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
             ((at[0], at[1]), image)
         })
         .collect();
-    let tiled = |x: i32, y: i32| -> [u8; 4] {
+    move |x, y| {
         let image = &tiles[&(x.div_euclid(512), y.div_euclid(512))];
         let at = ((y.rem_euclid(512) * 512 + x.rem_euclid(512)) * 4) as usize;
         image.pixels()[at..at + 4].try_into().unwrap()
-    };
+    }
+}
+
+#[test]
+fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
+    let design = effects_across_tiles();
+    let tab = mount(design.clone());
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+
+    let tiled = tiled_at_1x(&tab);
 
     // The Screen drawn in one piece, no tiles.
     let laid_out = zeron_design::layout::LaidOut::of(&design);
     let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
-    let whole = zeron_design::render::region(&design, &laid_out, &[0], area, 1., 0., (860, 600)).expect("drawn");
+    let whole = zeron_design::render::region(&design, &laid_out, &[0], area, 1., 0., (860, 600), &zeron_design::assets::NoAssets)
+        .expect("drawn");
     let one = |x: i32, y: i32| -> [u8; 4] {
         let at = ((y * 860 + x) * 4) as usize;
         whole[at..at + 4].try_into().unwrap()
@@ -475,4 +493,68 @@ fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
     // softening the stripes, the turned square.)
     assert_ne!(tiled(580, 150), tiled(300, 150));
     assert_ne!(tiled(514, 360), one(514, 280));
+}
+
+/// An 860 × 600 Screen at the Canvas's origin with an icon (a square, the
+/// engine's cached file of `mdi:square`) and a path, each across the 1x
+/// tiles' edges at 512.
+fn icon_and_path_across_tiles(dir: &std::path::Path) -> (Design, Vec<zeron_design::assets::Resolved>) {
+    let file = dir.join("square.svg");
+    // As Iconify serves it: sized in em, drawn in its text colour.
+    std::fs::write(
+        &file,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path fill="currentColor" d="M4 4h16v16H4z"/></svg>"#,
+    )
+    .unwrap();
+    let assets = vec![zeron_design::assets::Resolved { key: zeron_design::assets::AssetKey::icon("mdi:square"), path: file }];
+    let design = design(serde_json::json!({ "version": "1.0", "children": [
+        { "id": "screen", "type": "frame", "width": 860, "height": 600, "fill": "#FFFFFF", "children": [
+            { "id": "icon", "type": "icon", "icon": "mdi:square", "x": 464, "y": 464, "width": 96, "height": 96, "fill": "#EF4444" },
+            { "id": "star", "type": "path", "x": 380, "y": 60, "width": 240, "height": 200, "fill": "#4F46E5",
+              "geometry": "M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z", "viewBox": [0, 0, 100, 100] },
+        ] },
+    ] }));
+    (design, assets)
+}
+
+#[test]
+fn icons_and_paths_across_tile_edges_draw_as_the_engines_screenshot_does() {
+    let dir = std::env::temp_dir().join(format!("zeron-design-tiles-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (design, assets) = icon_and_path_across_tiles(&dir);
+    let tab = mount_with(design.clone(), assets.clone());
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+    let tiled = tiled_at_1x(&tab);
+
+    // The engine's screenshot of the Screen (at the Canvas's origin), its
+    // icon drawn from the same file.
+    let files = zeron_design::assets::Files::new(assets);
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &files).expect("a screenshot");
+    assert_eq!((shot.width, shot.height), (860, 600));
+    let mut reader = png::Decoder::new(std::io::Cursor::new(shot.png)).read_info().expect("a PNG");
+    let mut whole = vec![0; reader.output_buffer_size().expect("its size")];
+    reader.next_frame(&mut whole).expect("its pixels");
+    let one = |x: i32, y: i32| -> [u8; 4] {
+        let at = ((y * 860 + x) * 4) as usize;
+        whole[at..at + 4].try_into().unwrap()
+    };
+
+    // Every pixel of the icon and the star, and round them, as in the
+    // screenshot.
+    let mut off = Vec::new();
+    for (x, y) in (370..630).flat_map(|x| (50..270).map(move |y| (x, y))).chain((455..570).flat_map(|x| (455..570).map(move |y| (x, y)))) {
+        let (want, got) = (one(x, y), tiled(x, y));
+        if want.iter().zip(got).any(|(a, b)| a.abs_diff(b) > 2) {
+            off.push(((x, y), want, got));
+        }
+    }
+    assert!(off.is_empty(), "{} pixels differ from the screenshot, as {:?}", off.len(), &off[..off.len().min(6)]);
+    // (They were drawn: the icon's square either side of both edges, white
+    // round it; the star's arms either side of x 512.)
+    for (x, y) in [(500, 500), (520, 500), (500, 520), (520, 520)] {
+        assert_eq!(tiled(x, y), RED, "({x}, {y})");
+    }
+    assert_eq!(tiled(470, 470), WHITE);
+    assert_eq!((tiled(508, 120), tiled(516, 120)), (INDIGO, INDIGO));
+    let _ = std::fs::remove_dir_all(dir);
 }

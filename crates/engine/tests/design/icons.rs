@@ -160,3 +160,60 @@ async fn weight_thickens_icons_where_the_set_has_weights() {
     assert!(warnings.contains("Box") && warnings.contains("no weights"), "{}", unweighted.text);
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_design_tab_hears_the_files_of_the_icons_its_design_uses() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Watched",
+            r#"Insert({ type: "icon", icon: "mdi:square", width: 24, height: 24 });
+Insert({ type: "icon", icon: "ph:circle", weight: 700, width: 24, height: 24 });
+Insert({ type: "icon", icon: "mdi:square", x: 40, width: 24, height: 24 });"#,
+        )
+        .await;
+    let window = zeron_rpc::memory_client(seam.core.rpc_service());
+    let mut seen = window
+        .subscribe("WatchDesign", serde_json::json!({ "path": made.path() }))
+        .await
+        .expect("the window may watch a Design");
+    let heard = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Each icon once, as drawn (Phosphor's bold by name), with the file in
+    // the engine's cache that holds it.
+    let assets = heard["assets"].as_array().expect("assets").clone();
+    let names: Vec<_> = assets.iter().map(|asset| (asset["kind"].as_str(), asset["name"].as_str())).collect();
+    assert_eq!(names, [(Some("icon"), Some("mdi:square")), (Some("icon"), Some("ph:circle-bold"))], "{heard}");
+    let cache = seam.core.designs.icons().dir();
+    for asset in &assets {
+        let path = std::path::Path::new(asset["path"].as_str().unwrap());
+        assert!(path.is_absolute() && path.starts_with(cache), "{asset}");
+        assert!(std::fs::read_to_string(path).unwrap().starts_with("<svg"), "{asset}");
+    }
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn waiting_on_the_network_for_icons_does_not_count_against_the_snippet() {
+    let seam = Seam::new().await;
+    // Four new icons at 1.5 s each: past the snippet's 5 s, all waiting.
+    *seam.iconify.delay.lock().unwrap() = std::time::Duration::from_millis(1500);
+    let made = seam
+        .create(
+            "Slow",
+            r#"for (const icon of ["mdi:square", "lucide:minus", "ph:circle", "ph:circle-bold"])
+  Insert({ type: "icon", icon, width: 24, height: 24 });"#,
+        )
+        .await;
+    assert!(!made.is_error, "{}", made.text);
+    assert_eq!(seam.iconify.fetched.lock().unwrap().len(), 4);
+
+    // The snippet's own time still counts.
+    *seam.iconify.delay.lock().unwrap() = std::time::Duration::ZERO;
+    let spun = seam.create("Spun", "while (true) {}").await;
+    assert!(spun.is_error && spun.text.contains("limit"), "{}", spun.text);
+    seam.shutdown().await;
+}

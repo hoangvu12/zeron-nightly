@@ -57,33 +57,60 @@ impl Icons {
     }
 
     /// The SVG of the icon `icon` (`set:name`) at `weight`, as its source
-    /// served it. A weight picks the set's variant where it has them by
-    /// name (Phosphor's `-bold`); see [`prepare`] for the rest.
+    /// served it: the icon [`name`] gives.
     pub fn svg(&self, icon: &str, weight: Option<u16>) -> Result<Arc<str>, IconError> {
-        let (set, name) = split(icon)?;
-        let name = variant(set, name, weight);
-        let key = format!("{set}:{name}");
-        if let Some(svg) = lock(&self.loaded).get(&key) {
+        self.load(&name(icon, weight)?)
+    }
+
+    /// The SVG of the icon named `icon` (as [`name`] gives it), fetched and
+    /// cached on first use. A fetch's wait doesn't count against the
+    /// running snippet's time ([`crate::waits`]).
+    pub fn load(&self, icon: &str) -> Result<Arc<str>, IconError> {
+        if let Some(svg) = lock(&self.loaded).get(icon) {
             return Ok(svg.clone());
         }
+        let (set, name) = split(icon)?;
         let file = self.dir.join(set).join(format!("{name}.svg"));
         let svg: Arc<str> = match std::fs::read_to_string(&file) {
             Ok(svg) => svg.into(),
             Err(_) => {
                 let source = self.source.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let svg = source
-                    .fetch(set, &name)
-                    .map_err(|e| IconError::Unavailable(key.clone(), e))?
+                let fetched = crate::waits::network(|| source.fetch(set, name)).map_err(|cap| {
+                    let why = format!("this call has waited {}s on the network already", cap.as_secs());
+                    IconError::Unavailable(icon.into(), why)
+                })?;
+                let svg = fetched
+                    .map_err(|e| IconError::Unavailable(icon.into(), e))?
                     .filter(|svg| svg.trim_start().starts_with("<svg"))
-                    .ok_or_else(|| IconError::Unknown(key.clone()))?;
+                    .ok_or_else(|| IconError::Unknown(icon.into()))?;
                 // A cache that can't be written is only slower next time.
                 let _ = write_whole(&file, &svg);
                 svg.into()
             }
         };
-        lock(&self.loaded).insert(key, svg.clone());
+        lock(&self.loaded).insert(icon.into(), svg.clone());
         Ok(svg)
     }
+
+    /// The cached file of the icon named `icon` (as [`name`] gives it),
+    /// fetched first if it isn't cached.
+    pub fn file(&self, icon: &str) -> Result<PathBuf, IconError> {
+        self.load(icon)?;
+        let (set, name) = split(icon)?;
+        let file = self.dir.join(set).join(format!("{name}.svg"));
+        if !file.is_file() {
+            return Err(IconError::Unavailable(icon.into(), "it couldn't be cached".into()));
+        }
+        Ok(file)
+    }
+}
+
+/// The icon `icon` (`set:name`) at `weight`, as `set:name` of the icon
+/// drawn: a weight picks the set's variant where it has them by name
+/// (Phosphor's `-bold`); see [`prepare`] for the rest.
+pub fn name(icon: &str, weight: Option<u16>) -> Result<String, IconError> {
+    let (set, name) = split(icon)?;
+    Ok(format!("{set}:{}", variant(set, name, weight)))
 }
 
 /// `set:name`, both made of Iconify's characters (which also keeps a name

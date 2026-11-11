@@ -19,6 +19,7 @@ use rquickjs::context::EvalOptions;
 use rquickjs::{CatchResultExt, Context, Ctx, Exception, Function, Object, Runtime};
 
 use crate::edit::Draft;
+use crate::waits::Waits;
 use crate::layout::LaidOut;
 
 mod globals;
@@ -28,7 +29,11 @@ pub use globals::Globals;
 /// What one snippet may use.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
+    /// Its running time, not counting what its host calls wait on the
+    /// network ([`crate::waits`]).
     pub time: Duration,
+    /// The most its host calls wait on the network in all.
+    pub fetching: Duration,
     /// QuickJS's heap, in bytes.
     pub memory: usize,
     /// QuickJS's share of its thread's stack, in bytes.
@@ -39,6 +44,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             time: Duration::from_secs(5),
+            fetching: Duration::from_secs(30),
             memory: 64 * 1024 * 1024,
             stack: 1024 * 1024,
         }
@@ -122,10 +128,11 @@ fn run_here(
     runtime.set_memory_limit(limits.memory);
     runtime.set_max_stack_size(limits.stack);
     let timed_out = Arc::new(AtomicBool::new(false));
+    let waits = Waits::new(limits.fetching);
     {
-        let (deadline, timed_out) = (Instant::now() + limits.time, timed_out.clone());
+        let (deadline, timed_out, waits) = (Instant::now() + limits.time, timed_out.clone(), waits.clone());
         runtime.set_interrupt_handler(Some(Box::new(move || {
-            let past = Instant::now() >= deadline;
+            let past = Instant::now() >= deadline + waits.waited();
             if past {
                 timed_out.store(true, Ordering::Relaxed);
             }
@@ -134,7 +141,7 @@ fn run_here(
     }
     let context = Context::full(&runtime).map_err(sandbox)?;
     let draft = Rc::new(RefCell::new(draft));
-    let ran = context.with(|ctx| {
+    let ran = waits.during(|| context.with(|ctx| {
         install(&ctx, &draft).map_err(sandbox)?;
         ctx.eval::<(), _>(PRELUDE).map_err(sandbox)?;
         let builtins = globals::names(&ctx).map_err(sandbox)?;
@@ -150,7 +157,7 @@ fn run_here(
         globals::assigned(&ctx, &builtins)
             .catch(&ctx)
             .map_err(|e| SnippetError::Failed(e.to_string()))
-    });
+    }));
     if timed_out.load(Ordering::Relaxed) {
         return Err(SnippetError::TimedOut(limits.time));
     }

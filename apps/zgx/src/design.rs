@@ -35,6 +35,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use serde_json::{Value as Json, json};
 use zeron_design::Design;
+use zeron_design::assets::{Files, Resolved};
 use zeron_design::layout::LaidOut;
 use zeron_design::render::{self, Rect};
 use zgx::image::ImageData;
@@ -54,7 +55,14 @@ pub const ZOOM: (f32, f32) = (0.25, 5.);
 
 /// What a tab hears as it follows a Design: the Design whole after each
 /// change, or why it can't be followed.
-pub type Listener = Box<dyn FnMut(Result<Design, String>)>;
+pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
+
+/// A Design as a tab hears it, with the files of the assets it uses (its
+/// icons) in the engine's cache: tiles draw them from those files only.
+pub struct Heard {
+    pub design: Design,
+    pub assets: Vec<Resolved>,
+}
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
 pub trait Source {
@@ -92,7 +100,10 @@ impl Source for EngineSource {
             json!({ "path": path }),
             move |item: Json| {
                 let design = serde_json::from_value(item["design"].clone()).map_err(|e| format!("not a Design: {e}"));
-                (listener.borrow_mut())(design)
+                // (An asset not named draws nothing, as the engine does
+                // with one it couldn't fetch.)
+                let assets = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
+                (listener.borrow_mut())(design.map(|design| Heard { design, assets }))
             },
             move |why| {
                 // (A connection that ended is followed again on the next.)
@@ -106,23 +117,25 @@ impl Source for EngineSource {
 }
 
 /// A Design as tiles draw it: its version in this window (one more each
-/// time it's heard), the Design laid out, and where each of its top-level
-/// nodes draws.
+/// time it's heard), the Design laid out, its assets, and where each of its
+/// top-level nodes draws.
 struct Scene {
     version: u64,
     design: Design,
     laid_out: LaidOut,
+    assets: Files,
     tops: Vec<Rect>,
     /// How much more a tile draws round itself, for its blurs' sake.
     margin: f32,
 }
 
 impl Scene {
-    fn new(version: u64, design: Design) -> Self {
+    fn new(version: u64, heard: Heard) -> Self {
+        let Heard { design, assets } = heard;
         let laid_out = LaidOut::of(&design);
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
         let margin = render::blur_reach(&design, &laid_out);
-        Self { version, design, laid_out, tops, margin }
+        Self { version, design, laid_out, assets: Files::new(assets), tops, margin }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -241,7 +254,7 @@ fn draw(scene: &Scene, key: TileKey) -> Option<Arc<ImageData>> {
         return None;
     }
     let nodes: Vec<usize> = (0..scene.tops.len()).filter(|&i| scene.tops[i].meets(&around)).collect();
-    let pixels = render::region(&scene.design, &scene.laid_out, &nodes, area, key.level.scale(), m, (TILE, TILE))?;
+    let pixels = render::region(&scene.design, &scene.laid_out, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.assets)?;
     ImageData::new_premultiplied(TILE, TILE, pixels).ok().map(Arc::new)
 }
 
@@ -632,16 +645,16 @@ impl DesignTabs {
     }
 
     /// The Design of `tab` as it is now (or why it can't be followed).
-    fn heard(&self, tab: &str, heard: Result<Design, String>) {
+    fn heard(&self, tab: &str, heard: Result<Heard, String>) {
         {
             let mut tabs = self.tabs.borrow_mut();
             let Some(canvas) = tabs.get_mut(tab) else { return };
             match heard {
                 Err(why) => canvas.failed = Some(why),
-                Ok(design) => {
+                Ok(heard) => {
                     canvas.failed = None;
                     self.versions.set(self.versions.get() + 1);
-                    let scene = Arc::new(Scene::new(self.versions.get(), design));
+                    let scene = Arc::new(Scene::new(self.versions.get(), heard));
                     if let Some(old) = &canvas.scene {
                         let damage = old.damage(&scene);
                         let mut gone = Vec::new();

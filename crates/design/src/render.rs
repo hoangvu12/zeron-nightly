@@ -1,11 +1,12 @@
 //! Drawing a Design, behind an interface (ADR-0002): node types draw
-//! through a [`Painter`], and [`screenshot`] (an agent's) and [`region`]
-//! (the Design tab's tiles) (with [`is_path_data`]) are the only places that pick the backend
-//! (Skia's raster, [`crate::skia`]), so a tiny-skia renderer would replace
-//! those and a painter of its own. Both draw a node with [`paint_node`],
-//! so the tab shows what the agent's screenshot does.
+//! through a [`Painter`], and [`screenshot`] (an agent's), [`region`] (the
+//! Design tab's tiles) and [`is_path_data`] are the only places that pick
+//! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
+//! would replace those and a painter of its own. Both draw a node with
+//! [`paint_node`], its assets from an [`Assets`], so the tab shows what
+//! the agent's screenshot does.
 
-use crate::icons::Icons;
+use crate::assets::Assets;
 use crate::layout::LaidOut;
 use crate::model::{Color, Design, EffectKind, Effects, FillRule, Node, Paint, Shadow, StrokeStyle};
 
@@ -154,7 +155,7 @@ pub trait Painter {
     /// Blurs what's already drawn within `outline` by `radius`.
     fn background_blur(&mut self, outline: &Outline, radius: f32);
     /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
-    /// the painter has no icons or not that one.
+    /// the painter's assets haven't that one.
     fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
 }
 
@@ -339,7 +340,8 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// ones meeting `area` grown by `margin`, in order) drawn where `laid_out`
 /// puts them. It's drawn `margin` (Canvas units, [`blur_reach`]) wider all
 /// round and cut to `area`, so blurs at its edges read what they would
-/// with the whole Canvas drawn. `None` for an empty or oversized image.
+/// with the whole Canvas drawn. Its icons and other assets come from
+/// `assets`. `None` for an empty or oversized image.
 pub fn region(
     design: &Design,
     laid_out: &LaidOut,
@@ -348,13 +350,14 @@ pub fn region(
     scale: f32,
     margin: f32,
     (width, height): (u32, u32),
+    assets: &dyn Assets,
 ) -> Option<Vec<u8>> {
     // (At most a tile's worth each side: past that a blur is faint.)
     let pad = (margin * scale).ceil().clamp(0., 512.) as u32;
     let (wide, high) = (width + 2 * pad, height + 2 * pad);
     let mut drawn = vec![0; wide as usize * high as usize * 4];
     crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
-        let mut painter = crate::skia::SkiaPainter::new(canvas);
+        let mut painter = crate::skia::SkiaPainter::new(canvas).with_assets(assets);
         painter.translate(pad as f32, pad as f32);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
@@ -401,12 +404,12 @@ pub enum RenderError {
 
 /// Draws one node of `design` on a transparent background at 1x, or
 /// smaller when its longest side is over `max_side`, and encodes it. Its
-/// icons come from `icons`.
+/// icons and other assets come from `assets`.
 pub fn screenshot(
     design: &Design,
     id: &str,
     max_side: f32,
-    icons: &Icons,
+    assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let laid_out = LaidOut::of(design);
@@ -424,7 +427,7 @@ pub fn screenshot(
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas()).with_icons(icons);
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas()).with_assets(assets);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }

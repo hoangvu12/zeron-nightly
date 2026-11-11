@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::icons::Icons;
+use crate::assets::Cache;
 use crate::model::{Design, Kind, Node, warn};
 use crate::printed::Printed;
 
@@ -42,7 +42,7 @@ pub struct Draft {
     /// Nodes whose screenshots the call asked for, in order.
     screenshots: Vec<String>,
     /// Where icon names are checked; without, any name is taken.
-    icons: Option<Arc<Icons>>,
+    assets: Option<Arc<Cache>>,
     /// What the snippet printed, for the call's result.
     printed: Printed,
     /// What the agent should know about its edits that didn't fail them.
@@ -78,15 +78,16 @@ impl Draft {
             created: Vec::new(),
             changed: BTreeSet::new(),
             screenshots: Vec::new(),
-            icons: None,
+            assets: None,
             printed: Printed::default(),
             warnings: Vec::new(),
         }
     }
 
-    /// Checks the icons the call places against `icons`, fetching each.
-    pub fn with_icons(mut self, icons: Arc<Icons>) -> Self {
-        self.icons = Some(icons);
+    /// Checks the assets the call places (its icons) against `assets`,
+    /// fetching each.
+    pub fn with_assets(mut self, assets: Arc<Cache>) -> Self {
+        self.assets = Some(assets);
         self
     }
 
@@ -193,8 +194,8 @@ impl Draft {
     fn check(&self, node: &Node, warnings: &mut Vec<String>) -> Result<(), String> {
         match &node.kind {
             Kind::Icon(icon) => {
-                if let Some(icons) = &self.icons {
-                    let svg = icons.svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
+                if let Some(assets) = &self.assets {
+                    let svg = assets.icons().svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
                     if icon.weight.is_some() && !crate::icons::takes_weight(&icon.icon, &svg) {
                         warnings.push(format!(
                             "\"{}\" ({}) has no weights; its weight does nothing",

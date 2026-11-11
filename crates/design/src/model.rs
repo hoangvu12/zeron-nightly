@@ -10,9 +10,9 @@
 //! unknown properties, a node of an unknown type ([`Opaque`]) and the
 //! Design's unknown keys are written back as they were read.
 
-mod ellipse;
 mod corners;
 mod effects;
+mod ellipse;
 mod frame;
 mod icon;
 mod kept;
@@ -39,6 +39,7 @@ pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::assets::AssetKey;
 use crate::render::{Look, Painter};
 
 /// The format version new Designs are written with.
@@ -187,6 +188,11 @@ pub trait NodeKind {
     }
 
     /// Whether its children are cut off at its bounds.
+    /// The assets it draws with ([`crate::assets`]).
+    fn assets(&self) -> Vec<AssetKey> {
+        Vec::new()
+    }
+
     fn clips(&self) -> bool {
         false
     }

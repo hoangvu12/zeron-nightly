@@ -29,15 +29,18 @@ pub struct Seam {
 }
 
 /// Icons served from `fixtures/icons/<set>/<name>.svg` in place of
-/// Iconify's API, so tests run offline; it notes each icon asked for.
+/// Iconify's API, so tests run offline; it notes each icon asked for, and
+/// takes `delay` over each as a slow network would.
 #[derive(Default)]
 pub struct FixtureIcons {
     pub fetched: Mutex<Vec<String>>,
+    pub delay: Mutex<std::time::Duration>,
 }
 
 impl IconSource for FixtureIcons {
     fn fetch(&self, set: &str, name: &str) -> Result<Option<String>, String> {
         self.fetched.lock().unwrap().push(format!("{set}:{name}"));
+        std::thread::sleep(*self.delay.lock().unwrap());
         let file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/design/fixtures/icons")
             .join(set)

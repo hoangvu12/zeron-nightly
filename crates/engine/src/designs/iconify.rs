@@ -7,8 +7,9 @@ use zeron_design::icons::IconSource;
 
 const API: &str = "https://api.iconify.design";
 
-/// Short, as an icon is fetched inside a snippet's time limit.
-const TIMEOUT: Duration = Duration::from_secs(4);
+/// One fetch's longest; a call's fetches together stop at the snippet's
+/// `Limits::fetching`, off its own time limit.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fetches `<set>/<name>.svg` from Iconify's API.
 pub struct Iconify;
