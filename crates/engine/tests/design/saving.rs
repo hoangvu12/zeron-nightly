@@ -37,11 +37,23 @@ async fn project_design(seam: &Seam, project: &Path, name: &str) -> PathBuf {
     PathBuf::from(saving(seam, &path).await["path"].as_str().unwrap())
 }
 
-/// The backups Zeron keeps of unsaved changes.
+/// The backups Zeron keeps of unsaved changes (and anything kept with
+/// them).
 fn backups(seam: &Seam) -> Vec<String> {
     std::fs::read_dir(seam.data_dir().join("design-backups"))
-        .map(|entries| entries.flatten().map(|e| std::fs::read_to_string(e.path()).unwrap()).collect())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|e| e == "zdesign"))
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Everything in the backups folder.
+fn backup_files(seam: &Seam) -> usize {
+    std::fs::read_dir(seam.data_dir().join("design-backups")).map_or(0, |entries| entries.count())
 }
 
 /// An 8 × 8 PNG of one colour.
@@ -95,10 +107,15 @@ async fn designs_opened_from_elsewhere_change_on_disk_only_when_saved() {
 
     let changed = seam.execute(&path, &card("Card")).await;
     let card = changed.id("Card");
-    assert!(changed.json()["unsaved"].as_str().unwrap().contains("saves it"), "{}", changed.text);
+    // Told in one short line.
+    let notice = changed.json()["unsaved"].as_str().unwrap().to_owned();
+    assert!(notice.contains("saves the Design") && notice.len() < 100, "{notice}");
     assert_eq!(on_disk(&path), before);
     let state = saving(&seam, &path).await;
-    assert_eq!(state, json!({ "path": path, "managed": false, "unsaved": true, "recovered": false }));
+    assert_eq!(
+        state,
+        json!({ "path": path, "managed": false, "unsaved": true, "recovered": false, "stale": false })
+    );
     // The change is in a backup.
     let kept = backups(&seam);
     assert_eq!(kept.len(), 1);
@@ -108,7 +125,7 @@ async fn designs_opened_from_elsewhere_change_on_disk_only_when_saved() {
     let saved = seam.window("SaveDesign", json!({ "path": path })).await.unwrap();
     assert_eq!(saved["unsaved"], false);
     assert!(on_disk(&path).contains(&card));
-    assert!(backups(&seam).is_empty());
+    assert_eq!(backup_files(&seam), 0);
     seam.shutdown().await;
 }
 
@@ -125,6 +142,8 @@ async fn reopening_after_a_crash_restores_the_backup_marked_recovered() {
     let seam = seam.restart().await;
     let state = saving(&seam, &path).await;
     assert_eq!((state["unsaved"].clone(), state["recovered"].clone()), (json!(true), json!(true)), "{state}");
+    // Its file is as it was when the changes were made.
+    assert_eq!(state["stale"], false);
     let read = seam.execute(&path, &format!(r#"Print(Get("{card}", {{ depth: 0 }}).name);"#)).await;
     assert_eq!(read.printed(), ["Unsaved"]);
     assert_eq!(on_disk(&path), before);
@@ -150,6 +169,51 @@ async fn reopening_after_a_crash_restores_the_backup_marked_recovered() {
     assert_eq!(saving(&seam, &path).await["recovered"], true);
     let saved = seam.window("SaveDesign", json!({ "path": path })).await.unwrap();
     assert_eq!((saved["unsaved"].clone(), saved["recovered"].clone()), (json!(false), json!(false)));
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovered_changes_to_a_file_changed_on_disk_since_are_stale() {
+    let seam = Seam::new().await;
+    let project = tempfile::tempdir().unwrap();
+    let path = project_design(&seam, project.path(), "Pulled").await;
+    let card = seam.execute(&path, &card("Unsaved")).await.id("Unsaved");
+    // More changes after the first don't move what the backup began from.
+    seam.execute(&path, &self::card("More")).await.json();
+
+    // Zeron stops; the file changes on disk meanwhile (a `git pull`).
+    let seam = seam.restart().await;
+    let pulled = seam.create("Pulled elsewhere", SCREEN).await.path();
+    std::fs::copy(&pulled, &path).unwrap();
+
+    // Still recovered, and stale, here and to a tab following it.
+    let state = saving(&seam, &path).await;
+    assert_eq!(
+        (state["recovered"].clone(), state["stale"].clone()),
+        (json!(true), json!(true)),
+        "{state}"
+    );
+    let read = seam.execute(&path, &format!(r#"Print(Get("{card}", {{ depth: 0 }}).name);"#)).await;
+    assert_eq!(read.printed(), ["Unsaved"]);
+    let window = zeron_rpc::memory_client(seam.core.rpc_service());
+    let mut seen = window.subscribe("WatchDesign", json!({ "path": path })).await.unwrap();
+    assert_eq!(next(&mut seen).await["stale"], true);
+
+    // Saved, neither, and to the tab too.
+    let saved = seam.window("SaveDesign", json!({ "path": path })).await.unwrap();
+    assert_eq!((saved["recovered"].clone(), saved["stale"].clone()), (json!(false), json!(false)));
+    assert_eq!(next(&mut seen).await["stale"], false);
+    assert_eq!(backup_files(&seam), 0);
+
+    // A change after that measures from the file as saved: not stale.
+    seam.execute(&path, &self::card("Later")).await.json();
+    let seam = seam.restart().await;
+    let state = saving(&seam, &path).await;
+    assert_eq!(
+        (state["recovered"].clone(), state["stale"].clone()),
+        (json!(true), json!(false)),
+        "{state}"
+    );
     seam.shutdown().await;
 }
 

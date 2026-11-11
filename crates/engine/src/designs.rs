@@ -30,7 +30,8 @@
 //! anywhere else changes on disk only when it's saved ([`Designs::save`]);
 //! until then each change goes to a backup in `design-backups/` in the
 //! engine's data dir, which is the Design again, marked recovered, when
-//! it's next opened after Zeron stopped without saving it. Save as
+//! it's next opened after Zeron stopped without saving it (and stale when
+//! its file changed on disk since). Save as
 //! ([`Designs::save_as`]) writes the Design anywhere with the images and
 //! fonts beside it, and the Design is that file from then on.
 //!
@@ -82,7 +83,7 @@ const MAX_RECENT: usize = 50;
 pub const AUTOSAVE_AFTER: Duration = Duration::from_secs(3);
 
 /// What an agent's call on a Design that isn't managed is told.
-const UNSAVED_NOTICE: &str = "This Design's file changes only when the person saves it in its Design tab; until then your changes are kept in a backup, and other calls and its tabs see them.";
+const UNSAVED_NOTICE: &str = "Kept in a backup: the file changes when the person saves the Design.";
 
 /// The undo step of discarding a Design's unsaved changes.
 const DISCARD_DESCRIPTION: &str = "Discard unsaved changes";
@@ -242,6 +243,9 @@ struct Live {
     /// Zeron stopped without saving them; until it's saved or they're
     /// discarded.
     recovered: bool,
+    /// Its file changed on disk since the recovered changes were made to
+    /// it; as long as it's recovered.
+    stale: bool,
     /// Itself, for its autosave to come back to.
     me: Weak<Mutex<Live>>,
 }
@@ -270,10 +274,12 @@ struct Told {
     /// never download): those it has, by url.
     images: BTreeMap<String, PathBuf>,
     assets: Option<Vec<Resolved>>,
-    /// Its file, unsaved and recovered: as [`Designs::saving`] says.
+    /// Its file, unsaved, recovered and stale: as [`Designs::saving`]
+    /// says.
     path: PathBuf,
     unsaved: bool,
     recovered: bool,
+    stale: bool,
 }
 
 /// One change to a Design, as its tabs hear of it.
@@ -352,7 +358,9 @@ impl Designs {
 
     /// Whether the Design at `path` is managed, has unsaved changes, and
     /// recovered them (`DesignSaving`): `{path, managed, unsaved,
-    /// recovered}`. Blocking, like every call here that may read a file.
+    /// recovered, stale}`, `stale` when its file changed on disk since the
+    /// recovered changes were made to it. Blocking, like every call here
+    /// that may read a file.
     pub fn saving(&self, path: &Path) -> Result<Value, DesignError> {
         Ok(lock(&*self.open(path)?).saving())
     }
@@ -446,6 +454,7 @@ impl Designs {
         live.fonts = self.fonts_for(&to);
         live.unsaved = false;
         live.recovered = false;
+        live.stale = false;
         if renamed {
             // One undo step: undone, it draws its images by their old names.
             let before = std::mem::replace(&mut live.design, design);
@@ -485,14 +494,14 @@ impl Designs {
                 pending: false,
             }
         } else {
-            let key = format!("{:x}", sha2::Sha256::digest(path.to_string_lossy().as_bytes()));
+            let key = digest(path.to_string_lossy().as_bytes());
             Saving::Backup(self.inner.backups.join(format!("{}.{EXTENSION}", &key[..32])))
         }
     }
 
     /// The Design at `path` held live, as `design`; `recovered` when that
-    /// came from its backup.
-    fn hold(&self, path: PathBuf, design: Design, recovered: bool) -> Arc<Mutex<Live>> {
+    /// came from its backup, `stale` when its file changed since.
+    fn hold(&self, path: PathBuf, design: Design, recovered: bool, stale: bool) -> Arc<Mutex<Live>> {
         let fonts = self.fonts_for(&path);
         let saving = self.saving_for(&path);
         Arc::new_cyclic(|me| {
@@ -500,6 +509,7 @@ impl Designs {
             let mut live = Live::new(path, design, fonts, images, assets, saving, me.clone());
             live.unsaved = recovered;
             live.recovered = recovered;
+            live.stale = stale;
             Mutex::new(live)
         })
     }
@@ -609,7 +619,7 @@ impl Designs {
     /// design, changes: [{version, changed, by}]}`: the changes since the
     /// item before (none in the first), `by` "agent", "undo" or "file"
     /// (unsaved changes discarded, or Save as renaming images); and `path`,
-    /// `unsaved` and `recovered`, as [`Designs::saving`] says (heard again,
+    /// `unsaved`, `recovered` and `stale`, as [`Designs::saving`] says (heard again,
     /// with no changes, when only they change). A tab that falls behind
     /// hears the latest only. Blocking (it may read the file): run it off
     /// the async runtime.
@@ -640,6 +650,7 @@ impl Designs {
                     path: live.path.clone(),
                     unsaved: live.unsaved,
                     recovered: live.recovered,
+                    stale: live.stale,
                 });
                 break live.followers.subscribe();
             }
@@ -663,6 +674,7 @@ impl Designs {
                 "path": now.path,
                 "unsaved": now.unsaved,
                 "recovered": now.recovered,
+                "stale": now.stale,
             });
             Some((item, (told, Some(now.version))))
         }))
@@ -928,11 +940,18 @@ impl Designs {
             Saving::Autosave { .. } => None,
         };
         let recovered = backup.is_some();
+        // Stale when the file isn't as it was when the backup began.
+        let stale = recovered
+            && match self.saving_for(&path) {
+                Saving::Backup(backup) => std::fs::read_to_string(base_of(&backup))
+                    .is_ok_and(|base| base.trim() != digest(text.as_bytes())),
+                Saving::Autosave { .. } => false,
+            };
         let design = backup.unwrap_or(design);
         // Fetched now, outside its lock: telling its tabs and drawing it
         // only read what's cached.
         self.inner.assets.fetch(&design, path.parent());
-        let design = self.hold(path.clone(), design, recovered);
+        let design = self.hold(path.clone(), design, recovered, stale);
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -958,7 +977,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = self.hold(path.clone(), Design::default(), false);
+        let design = self.hold(path.clone(), Design::default(), false, false);
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -998,6 +1017,7 @@ impl Live {
             path: path.clone(),
             unsaved: false,
             recovered: false,
+            stale: false,
         };
         let images = DesignImages::new(&path, cache);
         Self {
@@ -1013,6 +1033,7 @@ impl Live {
             saving,
             unsaved: false,
             recovered: false,
+            stale: false,
             me,
         }
     }
@@ -1044,6 +1065,14 @@ impl Live {
             Saving::Backup(backup) => {
                 let io = |e: std::io::Error| DesignError::Io(format!("can't back up {}: {e}", backup.display()));
                 std::fs::create_dir_all(backup.parent().unwrap_or(Path::new("."))).map_err(io)?;
+                // The file as it is when the backup begins, to tell later
+                // whether it changed on disk since.
+                let base = base_of(backup);
+                if !base.exists()
+                    && let Ok(file) = std::fs::read(&self.path)
+                {
+                    write_whole(&base, digest(&file).as_bytes()).map_err(io)?;
+                }
                 write_whole(backup, design.to_json().as_bytes()).map_err(io)?;
                 self.unsaved = true;
             }
@@ -1090,6 +1119,7 @@ impl Live {
         }
         self.unsaved = false;
         self.recovered = false;
+        self.stale = false;
         self.tell_saving();
         Ok(())
     }
@@ -1112,6 +1142,7 @@ impl Live {
         remove_backup(&backup);
         self.unsaved = false;
         self.recovered = false;
+        self.stale = false;
         let before = self.put(design, Vec::new(), Changer::File);
         self.history.record(DISCARD_DESCRIPTION, &before, &self.design);
         Ok(())
@@ -1124,18 +1155,23 @@ impl Live {
             "managed": matches!(self.saving, Saving::Autosave { .. }),
             "unsaved": self.unsaved,
             "recovered": self.recovered,
+            "stale": self.stale,
         })
     }
 
-    /// Tells the Design's tabs its file, and whether it's unsaved or
-    /// recovered, when that changed.
+    /// Tells the Design's tabs its file, and whether it's unsaved,
+    /// recovered or stale, when that changed.
     fn tell_saving(&self) {
-        let (path, unsaved, recovered) = (&self.path, self.unsaved, self.recovered);
+        let (path, unsaved, recovered, stale) = (&self.path, self.unsaved, self.recovered, self.stale);
         self.followers.send_if_modified(|told| {
-            let changed = told.path != *path || told.unsaved != unsaved || told.recovered != recovered;
+            let changed = told.path != *path
+                || told.unsaved != unsaved
+                || told.recovered != recovered
+                || told.stale != stale;
             told.path.clone_from(path);
             told.unsaved = unsaved;
             told.recovered = recovered;
+            told.stale = stale;
             changed
         });
     }
@@ -1255,11 +1291,24 @@ const PERSIST_TRIES: u64 = 8;
 
 /// Removes a Design's backup, once its changes are saved or discarded.
 fn remove_backup(backup: &Path) {
-    if let Err(e) = std::fs::remove_file(backup)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("can't remove the backup {}: {e}", backup.display());
+    for file in [backup.to_owned(), base_of(backup)] {
+        if let Err(e) = std::fs::remove_file(&file)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("can't remove the backup {}: {e}", file.display());
+        }
     }
+}
+
+/// Beside a Design's backup: the digest of its file as it was when the
+/// backup began.
+fn base_of(backup: &Path) -> PathBuf {
+    backup.with_extension("base")
+}
+
+/// A file's contents' SHA-256, in hex.
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 /// `design` as saved in the folder `to` from the folder `from`: the image
