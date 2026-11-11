@@ -856,16 +856,16 @@ fn an_image_and_a_font_set_only_in_an_instances_overrides_draw_in_tiles() {
                 "words": { "fontFamily": "Instrument Serif" },
             } },
         ] },
-        { "id": "card", "type": "frame", "reusable": true, "x": 700, "width": 500, "height": 200, "fill": "#F3F4F6", "children": [
+        { "id": "card", "type": "frame", "reusable": true, "y": 340, "width": 500, "height": 200, "fill": "#F3F4F6", "children": [
             { "id": "swatch", "type": "rectangle", "x": 20, "y": 20, "width": 160, "height": 160, "fill": "#9CA3AF" },
             { "id": "words", "type": "text", "x": 200, "y": 60, "content": "Hamburgefonstiv", "fontSize": 40, "fill": "#111827" },
         ] },
     ] }));
-    let serif = FontFile {
-        family: "Instrument Serif".into(),
+    let serif = Resolved {
+        key: zeron_design::assets::AssetKey::font("Instrument Serif", 400),
         path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/InstrumentSerif-Regular.ttf"),
     };
-    let mut tab = mount_with_fonts(design.clone(), vec![serif.clone()]);
+    let mut tab = mount_with(design.clone(), vec![serif.clone()]);
     tab.engine.images.borrow_mut().insert("images/stripes.png".into(), file.clone());
     tab.engine.say(PATH, design.clone());
     tab.settle();
@@ -882,7 +882,7 @@ fn an_image_and_a_font_set_only_in_an_instances_overrides_draw_in_tiles() {
         reader.next_frame(&mut pixels).expect("its pixels");
         pixels
     };
-    let expected = shot(&Fonts::of_files(&[serif]));
+    let expected = shot(&Fonts::of_files(&[serif.font_file().expect("a font")]));
     // The override's font is drawn, not the Component's Geist.
     assert!(shot(&Fonts::default()) != expected, "the serif changes the text");
     let (left, top) = tab.on_screen(0., 0.);
