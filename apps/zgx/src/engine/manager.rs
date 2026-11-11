@@ -143,7 +143,7 @@ impl Config {
     /// callback port.
     pub fn from_env(edge: &str, client: &str, callback_port: u16) -> Result<Self, Refusal> {
         let var = |key: &str| std::env::var(key).ok().filter(|v: &String| !v.trim().is_empty());
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = home_of(|key| std::env::var_os(key));
         let exe = std::env::current_exe().ok();
         Self::from_vars(var, &home, exe.as_deref(), edge, client, callback_port)
     }
@@ -247,6 +247,15 @@ impl Config {
     pub fn describe(&self) -> String {
         format!("port {}, data {}", self.port, self.data_dir.display())
     }
+}
+
+/// The user's home: `HOME`, and on Windows, which seldom sets it, the
+/// profile dir first, as the engine takes it (crates/engine's repos.rs).
+/// Never empty where either is set: an empty home would put
+/// ~/.zeron-staging under whatever folder this app runs in.
+fn home_of(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    let keys: &[&str] = if cfg!(windows) { &["USERPROFILE", "HOME"] } else { &["HOME"] };
+    keys.iter().filter_map(|key| var(key)).find(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_default()
 }
 
 fn expand(path: &str, home: &Path) -> PathBuf {
@@ -517,6 +526,25 @@ mod tests {
         assert!(!spawner.start_if_due(&config), "held: nothing started");
         lock.unlock().unwrap();
         assert!(spawner.start_if_due(&config), "let go: started at once");
+    }
+
+    /// Home is `HOME`; on Windows, where it's seldom set, the profile dir,
+    /// so the staging data lands in it rather than the working dir.
+    #[test]
+    fn home_is_the_profile_dir_on_windows() {
+        let of = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            home_of(move |key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into()))
+        };
+        assert_eq!(of(&[("HOME", "/Users/someone")]), PathBuf::from("/Users/someone"));
+        assert_eq!(of(&[]), PathBuf::new());
+        if cfg!(windows) {
+            assert_eq!(of(&[("USERPROFILE", r"C:\Users\someone")]), PathBuf::from(r"C:\Users\someone"));
+            assert_eq!(of(&[("USERPROFILE", r"C:\Users\someone"), ("HOME", "/c/Users/someone")]), PathBuf::from(r"C:\Users\someone"));
+            assert_eq!(of(&[("USERPROFILE", ""), ("HOME", r"C:\Users\someone")]), PathBuf::from(r"C:\Users\someone"));
+        } else {
+            assert_eq!(of(&[("USERPROFILE", r"C:\Users\someone")]), PathBuf::new());
+        }
     }
 
     #[test]
