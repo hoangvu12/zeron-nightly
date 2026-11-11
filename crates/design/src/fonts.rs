@@ -432,8 +432,8 @@ fn fallback(c: char) -> Option<usize> {
         .position(|(_, ranges)| ranges.iter().any(|&(from, to)| (from..=to).contains(&c)))
 }
 
-/// A folder of font files as a [`FontSource`]: a family's file nearest the
-/// weight. Tests serve fonts this way in place of Google Fonts.
+/// A folder of font files as a [`FontSource`]: a family's upright file
+/// nearest the weight. Tests serve fonts this way in place of Google Fonts.
 pub struct FontFolder {
     dir: PathBuf,
 }
@@ -451,10 +451,13 @@ impl FontSource for FontFolder {
             .filter_map(|(path, _)| {
                 let bytes = std::fs::read(&path).ok()?;
                 let typeface = decode(&bytes)?;
-                let distance = (*typeface.font_style().weight() - i32::from(weight)).abs();
-                typeface.family_name().eq_ignore_ascii_case(family).then_some((distance, bytes))
+                let style = typeface.font_style();
+                // Upright before italic, then the nearest weight.
+                let slanted = style.slant() != skia_safe::font_style::Slant::Upright;
+                let distance = (*style.weight() - i32::from(weight)).abs();
+                typeface.family_name().eq_ignore_ascii_case(family).then_some(((slanted, distance), bytes))
             })
-            .min_by_key(|(distance, _)| *distance);
+            .min_by_key(|(nearness, _)| *nearness);
         Ok(nearest.map(|(_, bytes)| bytes))
     }
 }
