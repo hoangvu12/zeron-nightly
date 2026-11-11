@@ -3108,19 +3108,37 @@
     },
     "close_question": {
       "title": "关闭此标签页？",
+      "design_title": "保存对此设计的更改？",
+      "design": "“{title}”有未保存的更改。请在关闭标签页前保存，或舍弃它们。",
       "running": "“{title}”中仍有内容在运行。关闭标签页会结束运行。",
       "unsaved": "“{title}”有未保存的更改。关闭标签页会舍弃这些更改。"
     },
     "design": {
       "label": "画布",
       "empty": {
-        "title": "没有打开的设计",
-        "body": "打开一个 .zdesign 文件，在此查看其画布。"
+        "title": "开始一个设计",
+        "body": "新建设计，或打开你或你的智能体做过的设计。"
       },
+      "new": "新建设计",
       "open": "打开设计",
       "filter": "设计",
+      "recent": "最近的设计",
+      "no_recent": "这台电脑上还没有设计。",
+      "failed": "设计未能打开",
       "in_progress": "进行中",
-      "failed": "设计未能打开"
+      "save": "保存",
+      "remote": "设计只能为这台电脑上的对话打开。",
+      "command": {
+        "save": "保存设计",
+        "save_as": "设计另存为…"
+      },
+      "recovered": {
+        "title": "已恢复的更改",
+        "body": "找到了未保存的更改，并已恢复。",
+        "stale": "找到了未保存的更改，但文件在这些更改之后已在磁盘上改动。",
+        "keep": "保留",
+        "discard": "舍弃"
+      }
     },
     "terminal": {
       "no_session": "此标签页没有可供运行的会话。",

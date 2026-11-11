@@ -10,6 +10,7 @@
 //!                             extent? = { x, y, w, h },   where the Design draws
 //!                             flashes = { { id, version, x, y, w, h }… },  what an agent just changed
 //!                             working = { { id, name, x, y, w, h }… },  Screens in progress
+//!                             path, unsaved, recovered, stale }   its file, and whether it's current
 //!                             layers = { Layer… } }   the previous zoom's first
 //!         Layer             { level, tiles = { { id, src, x, y, size }… } }
 //! invoke  design.open       { tab, path }           follow the Design at `path`
@@ -17,6 +18,11 @@
 //! invoke  design.close      tab                      its watch and tiles let go
 //! invoke  design.tabs       { chat, paths }          a chat's Design tabs, front first
 //! invoke  design.flashed    { tab, version }         that flash is over
+//! call    design.new        { name? } → { name, path }   a new managed Design
+//! call    design.recent     → { recent = { { name, path, touchedAt }… } }
+//! call    design.save       { tab } → saving          its file written now (⌘S)
+//! call    design.save_as    { tab, to } → saving      written to `to`, the tab's from then
+//! call    design.discard    { tab } → saving          back as its file holds it
 //! ```
 //!
 //! A layer's tiles are placed in points at `level` points a Canvas unit, so
@@ -72,6 +78,22 @@ pub struct Heard {
     /// What its text draws in: the font files among its assets.
     pub fonts: Fonts,
     pub assets: Vec<Resolved>,
+    /// Its file and whether that's current (#28).
+    pub saving: Saving,
+}
+
+/// A Design's file and whether it's current, as the engine says (#28).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct Saving {
+    /// Its file now (another after Save as).
+    pub path: Option<String>,
+    /// It has changes its file doesn't.
+    pub unsaved: bool,
+    /// Its unsaved changes were found in its backup as it opened...
+    pub recovered: bool,
+    /// ...and its file changed on disk since they were made.
+    pub stale: bool,
 }
 
 /// `WatchDesign`'s item as a tab hears it: what an agent changed flashes;
@@ -107,7 +129,8 @@ pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
     if !fonts.is_of(&files) {
         *fonts = Fonts::of_files(&files);
     }
-    Ok(Heard { design, flash, fonts: fonts.clone(), assets })
+    let saving = serde_json::from_value(item.clone()).unwrap_or_default();
+    Ok(Heard { design, flash, fonts: fonts.clone(), assets, saving })
 }
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
@@ -120,12 +143,22 @@ pub trait Source {
     /// Says which Designs `chat`'s Design tabs show, the front one first
     /// (what its agent's calls naming no Design go by).
     fn set_tabs(&self, chat: &str, paths: &[String]);
+
+    /// One of the engine's Design calls (`NewDesign`, `RecentDesigns`,
+    /// `SaveDesign`, `SaveDesignAs`, `DiscardDesign`): its answer, or why
+    /// not.
+    fn ask(&self, method: &str, params: Json) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json, String>>>>;
 }
 
 /// The engine of this computer (ADR-0003), over its local connection.
 struct EngineSource;
 
 impl Source for EngineSource {
+    fn ask(&self, method: &str, params: Json) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json, String>>>> {
+        let method = method.to_owned();
+        Box::pin(async move { engine::get().call_soon(&method, params).await })
+    }
+
     fn set_tabs(&self, chat: &str, paths: &[String]) {
         let params = json!({ "chatId": chat, "paths": paths });
         engine::get().spawn(async move {
@@ -443,6 +476,7 @@ struct TabCanvas {
     tiles: HashMap<TileKey, Tile>,
     /// What flashes now, a flash for each version agents changed.
     flashes: Vec<Flash>,
+    saving: Saving,
 }
 
 /// The nodes agents changed in one version of a Design, lit for a moment.
@@ -501,6 +535,13 @@ impl TabCanvas {
         };
         let layers: Vec<Value> = [self.back.map(layer), self.front.map(layer)].into_iter().flatten().collect();
         let mut fields = vec![("state", Value::from(state)), ("layers", Value::List(layers.into()))];
+        // Its file, and whether that's current (#28).
+        fields.extend([
+            ("path", Value::from(self.path.as_str())),
+            ("unsaved", Value::Bool(self.saving.unsaved)),
+            ("recovered", Value::Bool(self.saving.recovered)),
+            ("stale", Value::Bool(self.saving.stale)),
+        ]);
         // The live touches (#34), on the Canvas: what an agent just changed,
         // and the Screens it marked in progress.
         if let Some(scene) = &self.scene {
@@ -594,7 +635,8 @@ pub fn install(cx: &mut zgx_desktop::WindowContext, host: &ScriptHost) {
 }
 
 /// The Design tabs' calls on `host`, following `source`: the tabs, and the
-/// task that takes finished tiles to them (for the window's tasks).
+/// task that takes finished tiles to them, which keeps them (spawn it on
+/// the window's tasks).
 pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, impl std::future::Future<Output = ()> + use<>) {
     let (wake, mut woken) = zgx::task::latest::<()>();
     let tabs = Rc::new(DesignTabs {
@@ -644,6 +686,40 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         tabs.publish(&tab);
     });
     let me = Rc::downgrade(&tabs);
+    // The engine's Design calls the tab makes (#31): New design and Recent
+    // designs, and saving a tab's Design (by its tab: its file may have
+    // changed since the script last heard).
+    for (action, method) in [("design.new", "NewDesign"), ("design.recent", "RecentDesigns")] {
+        let me = Rc::downgrade(&tabs);
+        host.async_action(action, move |arg| {
+            let me = me.clone();
+            async move {
+                let tabs = me.upgrade().ok_or("the window closed")?;
+                let asked = tabs.source.ask(method, crate::plugins::value_json(&arg));
+                drop(tabs);
+                Ok(crate::plugins::json_value(&asked.await?))
+            }
+        });
+    }
+    for (action, method) in [("design.save", "SaveDesign"), ("design.save_as", "SaveDesignAs"), ("design.discard", "DiscardDesign")] {
+        let me = Rc::downgrade(&tabs);
+        host.async_action(action, move |arg| {
+            let me = me.clone();
+            async move {
+                let tabs = me.upgrade().ok_or("the window closed")?;
+                let tab = arg.field("tab").map(crate::auth::text).unwrap_or_default();
+                let path = tabs.tabs.borrow().get(&tab).map(|c| c.path.clone()).ok_or("no Design in that tab")?;
+                let mut params = json!({ "path": path });
+                if let Some(to) = arg.field("to") {
+                    params["to"] = json!(crate::auth::text(to));
+                }
+                let asked = tabs.source.ask(method, params);
+                drop(tabs);
+                Ok(crate::plugins::json_value(&asked.await?))
+            }
+        });
+    }
+    let me = Rc::downgrade(&tabs);
     host.action("design.close", move |arg| {
         if let Some(tabs) = me.upgrade() {
             tabs.close(&crate::auth::text(&arg));
@@ -663,11 +739,12 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         tabs.source.set_tabs(&chat, &paths);
         tabs.chats.borrow_mut().insert(chat, paths);
     });
-    let me = Rc::downgrade(&tabs);
+    // (The task owns the tabs: its calls hold them only weakly, so they
+    // live as long as the window's tasks, and go with them.)
+    let held = tabs.clone();
     let pump = async move {
         while woken.recv().await.is_some() {
-            let Some(tabs) = me.upgrade() else { return };
-            tabs.take_drawn();
+            held.take_drawn();
         }
     };
     (tabs, pump)
@@ -694,6 +771,7 @@ impl DesignTabs {
             back: None,
             tiles: HashMap::new(),
             flashes: Vec::new(),
+            saving: Saving::default(),
         };
         self.tabs.borrow_mut().insert(tab.to_owned(), canvas);
         self.follow(tab);
@@ -760,8 +838,13 @@ impl DesignTabs {
             let Some(canvas) = tabs.get_mut(tab) else { return };
             match heard {
                 Err(why) => canvas.failed = Some(why),
-                Ok(Heard { design, flash, fonts, assets }) => {
+                Ok(Heard { design, flash, fonts, assets, saving }) => {
                     canvas.failed = None;
+                    // (Saved as another file: still this tab's, followed on.)
+                    if let Some(path) = &saving.path {
+                        canvas.path.clone_from(path);
+                    }
+                    canvas.saving = saving;
                     self.versions.set(self.versions.get() + 1);
                     let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, assets));
                     canvas.flashes.retain(|f| f.at.elapsed() < FLASH_STALE);

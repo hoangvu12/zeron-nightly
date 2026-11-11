@@ -164,6 +164,9 @@ end
 -- A Design tab's view (screens/panel/design), loaded the same way.
 type DesignModule = {
 	title: (tab: state.Tab) -> string?,
+	dirty: (tab: state.Tab) -> boolean,
+	save: (tab: state.Tab, done: (() -> ())?) -> (),
+	discard: (tab: state.Tab, done: (() -> ())?) -> (),
 	close: (tab: state.Tab) -> (),
 	Design: (props: { key: string, tab: string }) -> Node,
 }
@@ -672,8 +675,10 @@ local function title_of(tab: Tab): (string, boolean)
 		return if path then base_name(path) else ui.t("panel.tab.files"):get(), dirty
 	end
 	if tab.kind == "design" then
+		-- (Its Design's name, and the dot while it has unsaved changes.)
 		local t = if Design then Design.title(tab) else nil
-		return if t and t ~= "" then t else ui.t("panel.tab.design"):get(), false
+		local dirty = Design ~= nil and Design.dirty(tab)
+		return if t and t ~= "" then t else ui.t("panel.tab.design"):get(), dirty
 	end
 	-- (A run action's: its name, as the shipping app titles it.)
 	if tab.title and tab.title ~= "" then
@@ -735,6 +740,9 @@ M.Panel = ui.component(function(props: Props): Node
 	-- Closing: a file tab with unsaved changes asks first; a terminal with
 	-- something running asks too (its kind says).
 	local asking = ui.use_state(false)
+	-- A Design with unsaved changes asks Save or Discard as it closes.
+	local saving_asking = ui.use_state(false)
+	local saving_asked = ui.use_state(nil :: { key: string, id: string, title: string, why: string }?)
 	local asked = ui.use_state(nil :: { key: string, id: string, title: string, why: string }?)
 	ui.effect(function()
 		if not asking:get() and asked:peek() then
@@ -799,7 +807,11 @@ M.Panel = ui.component(function(props: Props): Node
 			return
 		end
 		local title, dirty = title_of(tab)
-		if dirty then
+		if dirty and tab.kind == "design" then
+			-- (A Design asks Save or Discard: the engine keeps its changes.)
+			saving_asked:set({ key = k, id = id, title = title, why = "design" })
+			saving_asking:set(true)
+		elseif dirty then
 			asked:set({ key = k, id = id, title = title, why = "unsaved" })
 			asking:set(true)
 		elseif tab.kind == "terminal" and Terminal and Terminal.closing then
@@ -1573,6 +1585,54 @@ M.Panel = ui.component(function(props: Props): Node
 		content,
 	}
 
+	-- A Design's unsaved changes, as its tab closes: saved, or discarded
+	-- (its file as it was), then closed.
+	local function close_design(how: "save" | "discard")
+		local a = saving_asked:peek()
+		local tab = if a then state.find(a.key, a.id) else nil
+		if not a or not tab or not Design then
+			return
+		end
+		local function closed()
+			close_now(a.key, a.id)
+		end
+		if how == "save" then
+			Design.save(tab, closed)
+		else
+			Design.discard(tab, closed)
+		end
+	end
+	local design_question = ui.div {
+		id = "panel-design-close-question",
+		hook = false,
+		ds.Dialog {
+			open = saving_asking,
+			title = ui.t("panel.close_question.design_title") :: any,
+			confirm = {
+				label = ui.t("panel.design.save") :: any,
+				on_click = function()
+					close_design("save")
+				end,
+			},
+			aside = {
+				label = ui.t("panel.design.recovered.discard") :: any,
+				on_click = function()
+					close_design("discard")
+				end,
+			},
+			ui.text {
+				function(): string
+					local a = saving_asked:get()
+					return if a then ui.t("panel.close_question.design", { title = a.title }):get() else ""
+				end,
+				literal = true,
+				wrap = true,
+				text_size = "$font.size.md",
+				color = "$text.secondary",
+			},
+		},
+	}
+
 	local question = ui.div {
 		-- (Closing loses work: no plugin reaches it.)
 		hook = false,
@@ -1727,6 +1787,7 @@ M.Panel = ui.component(function(props: Props): Node
 		ui.column(inner),
 	}
 	box[#box + 1] = question
+	box[#box + 1] = design_question
 	return ui.column(box)
 end)
 

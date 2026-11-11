@@ -9,10 +9,18 @@
 --
 -- The view (its pan and zoom) is kept per tab here, outside the views, so
 -- switching tabs or a reload finds it where it was. A tab with no Design
--- yet offers to open one.
+-- yet offers New design (in Zeron's designs folder), Recent designs (those
+-- touched on this computer, by agents too) and Open design (a .zdesign
+-- anywhere); nothing opens one on its own. Saving is the engine's (#28): a
+-- Design in Zeron's folder saves itself; one of your own is written on ⌘S
+-- (⌘⇧S saves it as another file), its changes kept meanwhile and offered
+-- back after a crash as Recovered changes.
 --
 --   Design.Design { key, tab }
 --   Design.title(tab)     the Design's name
+--   Design.dirty(tab)     whether it has changes its file doesn't
+--   Design.save(tab, done?)     its file written now (⌘S)
+--   Design.discard(tab, done?)  back as its file holds it
 --   Design.close(tab)     its tiles let go
 --   Design.fit(id)        the tab's view on all of its Design again
 --   Design.Empty { title, body, action? }   what shows in place of a Canvas
@@ -21,6 +29,7 @@
 local ds = require("@ds")
 local motion = require("@ds/motion")
 local state = require("@app/screens/panel/state")
+local api = require("@app/screens/panel/design_api")
 
 type Tab = state.Tab
 
@@ -45,16 +54,84 @@ local function shown(id: string): State<any>
 	return ui.shared(`design.tab.{id}`, nil :: any)
 end
 
+-- Its Design's name: its file's, as the host follows it (the tab's own
+-- record may be from before it had one, or before Save as).
 function M.title(tab: Tab): string?
-	local path = tab.path
+	local b = shown(tab.id):get()
+	local path = if b and type(b.path) == "string" and b.path ~= "" then b.path else tab.path
 	if not path then
 		return nil
 	end
 	return string.match(path, "([^/\\]+)%.zdesign$") or string.match(path, "([^/\\]+)$")
 end
 
+function M.dirty(tab: Tab): boolean
+	local b = shown(tab.id):get()
+	return b ~= nil and b.unsaved == true
+end
+
+-- (What fails is said by the engine's words, in the window's log: the tab
+-- keeps its marker, so nothing is lost by it.)
+local function said(what: string): (any) -> ()
+	return function(err: any)
+		print(`zeron-zgx: design: {what}: {if type(err) == "table" and err.message then err.message else tostring(err)}`)
+	end
+end
+
+-- (`done` once the engine has: a close waits for it.)
+function M.save(tab: Tab, done: (() -> ())?)
+	api.call("design.save", { tab = tab.id }):after(function()
+		if done then
+			done()
+		end
+	end, said("save"))
+end
+
+function M.discard(tab: Tab, done: (() -> ())?)
+	api.call("design.discard", { tab = tab.id }):after(function()
+		if done then
+			done()
+		end
+	end, said("discard"))
+end
+
+-- The Design tab showing now, and how to save it as another file (⌘S and
+-- ⌘⇧S act on it; one panel shows at a time).
+local front: { tab: Tab, save_as: () -> () }? = nil
+
+local function design_filter(): { any }
+	return { { ui.t("panel.design.filter"):get(), { "zdesign" } } }
+end
+
+ui.command {
+	id = "panel.design.save",
+	title = ui.t("panel.design.command.save"):get(),
+	menu = "File",
+	key = "cmd+s",
+	run = function(): boolean
+		if not front then
+			return false
+		end
+		M.save(front.tab)
+		return true
+	end,
+}
+ui.command {
+	id = "panel.design.save_as",
+	title = ui.t("panel.design.command.save_as"):get(),
+	menu = "File",
+	key = "cmd+shift+s",
+	run = function(): boolean
+		if not front then
+			return false
+		end
+		front.save_as()
+		return true
+	end,
+}
+
 function M.close(tab: Tab)
-	ui.invoke("design.close", tab.id)
+	api.invoke("design.close", tab.id)
 	views:set_key(tab.id, nil)
 end
 
@@ -86,7 +163,7 @@ function M.say_tabs(key: string)
 	for _, t in s.tabs do
 		add(t)
 	end
-	ui.invoke("design.tabs", { chat = chat, paths = paths })
+	api.invoke("design.tabs", { chat = chat, paths = paths })
 end
 
 -- What a Design tab shows instead of a Canvas: its kind's empty state.
@@ -121,7 +198,7 @@ local function canvas(id: string): Node
 		if not v or s.w <= 0 then
 			return
 		end
-		ui.invoke("design.view", { tab = id, x = v.x, y = v.y, zoom = v.zoom, w = s.w, h = s.h, settled = settled:get() })
+		api.invoke("design.view", { tab = id, x = v.x, y = v.y, zoom = v.zoom, w = s.w, h = s.h, settled = settled:get() })
 	end)
 	-- A Design seen for the first time: all of it in view, at most at 1x.
 	ui.effect(function()
@@ -251,7 +328,7 @@ local function canvas(id: string): Node
 			end)
 			ui.after(FLASH_MS, function()
 				-- (Over: the host lets it go, so a reload won't build it.)
-				ui.invoke("design.flashed", { tab = id, version = n.version })
+				api.invoke("design.flashed", { tab = id, version = n.version })
 				flashed:set_key(once, nil)
 			end)
 		end)
@@ -356,6 +433,102 @@ local function canvas(id: string): Node
 	}
 end
 
+-- A Design tab with no Design yet, as the Browser's start page stands: New
+-- design, Open design, and the Designs touched most recently on this
+-- computer (agents' too, made with no tab open), read as it shows.
+local function start(key: string, id: string): Node
+	local function open(path: string)
+		state.set_path(key, id, path)
+	end
+	local recent = ui.use_state(nil :: { any }?)
+	ui.effect(function()
+		api.call("design.recent", {}):after(function(r: any)
+			recent:set(if type(r) == "table" and type(r.recent) == "table" then r.recent else {})
+		end, function(err: any)
+			said("recent designs")(err)
+			recent:set({})
+		end)
+	end)
+	local PanelHome = require("@ds/panel_home")
+	local function row(r: any, i: number): Node
+		return PanelHome.Row {
+			id = `design-recent-{i}`,
+			icon = "palette",
+			label = r.name,
+			tooltip = r.path,
+			on_click = function()
+				open(r.path)
+			end,
+		}
+	end
+	return ui.column {
+		id = `design-start-{id}`,
+		w_full = true,
+		grow = 1,
+		min_h = 0,
+		items = "center",
+		justify = "center",
+		p = "$space.4",
+		gap = "$space.4",
+		ds.EmptyState {
+			icon = "palette",
+			size = "sm",
+			title = ui.t("panel.design.empty.title") :: any,
+			body = ui.t("panel.design.empty.body") :: any,
+			action = {
+				label = ui.t("panel.design.new") :: any,
+				icon = "plus",
+				on_click = function()
+					api.call("design.new", {}):after(function(made: any)
+						if type(made) == "table" and type(made.path) == "string" then
+							open(made.path)
+						end
+					end, said("new design"))
+				end,
+			},
+			secondary = {
+				label = ui.t("panel.design.open") :: any,
+				on_click = function()
+					ui.open_files({
+						title = ui.t("panel.design.open"):get(),
+						filters = design_filter(),
+					}):after(function(files: any)
+						local first = if type(files) == "table" then files[1] else nil
+						local picked = if type(first) == "table" then first.path else first
+						if type(picked) == "string" and picked ~= "" then
+							open(picked)
+						end
+					end, function() end)
+				end,
+			},
+		},
+		ui.column {
+			id = `design-recent-{id}`,
+			w_full = true,
+			max_w = ui.theme.get("zeron.form.list") :: number?,
+			gap = "$zeron.list.gap",
+			PanelHome.Heading { label = ui.t("panel.design.recent") },
+			ui.presence(function(): string
+				local r = recent:get()
+				return if r == nil then "loading" elseif #r == 0 then "none" else "some"
+			end, function(which: string): Node
+				if which == "none" then
+					return ds.Text { ui.t("panel.design.no_recent"), style = "caption", tone = "tertiary" }
+				elseif which == "loading" then
+					return ui.column {}
+				end
+				return ui.each(ui.computed(function(): { any }
+					return recent:get() or {}
+				end), row, {
+					key = function(r: any): string
+						return r.path
+					end,
+				})
+			end, { w_full = true }),
+		},
+	}
+end
+
 export type Props = { key: string, tab: string, [any]: any }
 
 M.Design = ui.component(function(props: Props): Node
@@ -384,7 +557,47 @@ M.Design = ui.component(function(props: Props): Node
 	ui.effect(function()
 		local p = path()
 		if p then
-			ui.invoke("design.open", { tab = id, path = p })
+			api.invoke("design.open", { tab = id, path = p })
+		end
+	end)
+	-- Saved as another file: the tab's from then on.
+	ui.effect(function()
+		local b, t = host:get(), tab()
+		if b and type(b.path) == "string" and b.path ~= "" and t and t.path and b.path ~= t.path then
+			state.set_path(key, id, b.path)
+		end
+	end)
+	local function save_as()
+		local t = tab()
+		if not t then
+			return
+		end
+		ui.save_file({
+			title = ui.t("panel.design.command.save_as"):get(),
+			name = `{M.title(t) or ui.t("panel.tab.design"):get()}.zdesign`,
+			filters = design_filter(),
+		}):after(function(file: any)
+			local to = if type(file) == "table" then file.path else file
+			if type(to) == "string" and to ~= "" then
+				api.call("design.save_as", { tab = id, to = to }):after(function() end, said("save as"))
+			end
+		end, function() end)
+	end
+	-- ⌘S and ⌘⇧S are this tab's while it shows.
+	local t0 = tab()
+	local mine = if t0 then { tab = t0, save_as = save_as } else nil
+	if mine then
+		front = mine
+	end
+	ui.effect(function()
+		local t = tab()
+		if t and mine then
+			mine.tab = t
+		end
+	end)
+	ui.on_cleanup(function()
+		if front == mine then
+			front = nil
 		end
 	end)
 	-- Which shows: a Design's Canvas, or why not (a real swap).
@@ -398,31 +611,68 @@ M.Design = ui.component(function(props: Props): Node
 		end
 		return "canvas"
 	end
+	-- Changes found in the backup as it opened: kept (dismissed here) or
+	-- discarded, its file as it is then.
+	local kept = ui.use_state(false)
+	local recovered = ui.show(function(): boolean
+		local b = host:get()
+		return b ~= nil and b.recovered == true and b.unsaved == true and not kept:get()
+	end, ui.row {
+		id = `design-recovered-{id}`,
+		w_full = true,
+		items = "center",
+		gap = "$space.2",
+		px = "$space.3",
+		py = "$space.2",
+		bg = "$surface.raised",
+		border = 1,
+		border_sides = { 0, 0, 1, 0 },
+		border_color = "$border.subtle",
+		ds.Icon { name = "info-circle", size = 14 },
+		ui.column {
+			grow = 1,
+			min_w = 0,
+			ds.Text { ui.t("panel.design.recovered.title"), style = "label" },
+			ds.Text {
+				function(): string
+					local b = host:get()
+					local stale = b ~= nil and b.stale == true
+					return ui.t(if stale then "panel.design.recovered.stale" else "panel.design.recovered.body"):get()
+				end,
+				style = "caption",
+				tone = "secondary",
+				wrap = true,
+			},
+		},
+		ds.Button {
+			ui.t("panel.design.recovered.keep"),
+			tone = "secondary",
+			size = "sm",
+			on_click = function()
+				kept:set(true)
+			end,
+		},
+		ds.Button {
+			ui.t("panel.design.recovered.discard"),
+			tone = "ghost",
+			size = "sm",
+			on_click = function()
+				local t = tab()
+				if t then
+					M.discard(t)
+				end
+			end,
+		},
+	})
 	return ui.column {
 		id = `panel-design-{id}`,
 		w_full = true,
 		grow = 1,
 		min_h = 0,
+		recovered,
 		ui.presence(kind, function(which: string): Node
 			if which == "none" then
-				return M.Empty {
-					title = ui.t("panel.design.empty.title"),
-					body = ui.t("panel.design.empty.body"),
-					action = {
-						label = ui.t("panel.design.open") :: any,
-						on_click = function()
-							ui.open_files({
-								title = ui.t("panel.design.open"):get(),
-								filters = { { ui.t("panel.design.filter"):get(), { "zdesign" } } },
-							}):after(function(files: any)
-								local first = if type(files) == "table" then files[1] else nil
-								if type(first) == "string" then
-									state.set_path(key, id, first)
-								end
-							end, function() end)
-						end,
-					},
-				}
+				return start(key, id)
 			elseif which == "failed" then
 				return M.Empty {
 					title = ui.t("panel.design.failed"),

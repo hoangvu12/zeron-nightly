@@ -184,6 +184,29 @@ test("each row opens what it says: browser, file viewer, terminal, side chat, fo
 	end)).to_be(true)
 end)
 
+test("the Design row and D open a Design tab here; on another device they say Designs open only here", function()
+	local app = home()
+	expect(app:has('#panel-open-design >> "D"')).to_be(true)
+	app:click("#panel-open-design")
+	expect(eventually(app, function(): boolean
+		return home_kinds(app) == "design"
+	end)).to_be(true)
+	back_home(app)
+	app:key("d")
+	expect(eventually(app, function(): boolean
+		return home_kinds(app) == "design,design"
+	end)).to_be(true)
+
+	-- A chat on the devbox: the row says so, and no tab opens.
+	app:set_state("test_home_session", { id = "chat-2", cwd = "/srv" })
+	expect(app:wait("#panel-home-design-note", { gone = true, timeout_ms = 15000 })).to_be(true)
+	app:frames(10)
+	app:click("#panel-open-design")
+	app:frames(10)
+	expect(app:has('#panel-home-design-note >> "Designs open only for chats on this computer."')).to_be(true)
+	expect(kinds(app, "chat-2")).to_be("")
+end)
+
 test("the letters work from a button outside the panel, and S and K make a side chat and a fork", function()
 	local app = home()
 	expect(app:has('#panel-open-side-chat >> "S"')).to_be(true)

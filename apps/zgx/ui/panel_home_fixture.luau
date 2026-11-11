@@ -41,6 +41,16 @@ local function settled(ok: boolean, value: any): any
 	}
 end
 
+-- The Design tab's host, stood in for: a Design tab opened here has
+-- nothing to follow, and no Designs on this computer.
+do
+	local dapi = require("@app/screens/panel/design_api") :: any
+	dapi.invoke = function(_name: string, _arg: any) end
+	dapi.call = function(_name: string, _arg: any): any
+		return settled(true, { recent = {} })
+	end
+end
+
 for _, scheme in { "light", "dark" } do
 	ui.command {
 		id = `fixture.{scheme}`,

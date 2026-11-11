@@ -8,7 +8,8 @@
 -- runs one in a terminal tab of its own, its gear edits it, a zeron.json
 -- action not yet added imports, Add action adds one). Then what can open
 -- here, each with the one key that opens it: Browser B, File viewer F,
--- Terminal T, Design D, Side chat S, Fork chat K (plugins' rows after them,
+-- Terminal T, Design D (for a chat on this computer; on another device,
+-- it says Designs open only here), Side chat S, Fork chat K (plugins' rows after them,
 -- `hook:panel.empty`; C and H are the Git plugin's). Last, the session's
 -- side chats and forks, and its subagents: each a part that folds (folded
 -- or not kept per session), a list that builds only the rows in view, a
@@ -1215,6 +1216,14 @@ type Choice = { id: string, icon: Icon.Name, label: string, key: string, run: ()
 
 M.Page = ui.component(function(props: Props): Node
 	local sid = props.session
+	-- Whether the session runs on another device, which Designs don't open
+	-- for; and whether the Design row said so.
+	local function elsewhere(): boolean
+		local c = chat_of(sid)
+		local d = if c then device_of(c.device) else nil
+		return d ~= nil and not d.here
+	end
+	local design_note = ui.use_state(false)
 	local choices: { Choice } = {
 		-- (Browser first, as the shipping app's picker lists them.)
 		{ id = "panel-open-browser", icon = "global", label = "panel.empty.browser", key = "B", run = function()
@@ -1227,7 +1236,13 @@ M.Page = ui.component(function(props: Props): Node
 			props.open_kind("terminal")
 		end },
 		{ id = "panel-open-design", icon = "palette", label = "panel.empty.design", key = "D", run = function()
-			props.open_kind("design")
+			-- Designs live on this computer's engine (ADR-0003): a chat on
+			-- another device says so rather than opening a tab.
+			if elsewhere() then
+				design_note:set(true)
+			else
+				props.open_kind("design")
+			end
 		end },
 	}
 	-- (A new chat with no project: no folder for a file viewer to show.)
@@ -1282,6 +1297,13 @@ M.Page = ui.component(function(props: Props): Node
 				gap = "$zeron.list.gap",
 				table.unpack(rows),
 			},
+			ui.show(function(): boolean
+				return design_note:get() and elsewhere()
+			end, ui.div {
+				id = "panel-home-design-note",
+				px = "$space.2",
+				ds.Text { locale.t("panel.design.remote"), style = "caption", tone = "secondary", wrap = true },
+			}),
 		}
 	)
 	if sid then

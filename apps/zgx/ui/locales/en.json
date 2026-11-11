@@ -3108,19 +3108,37 @@
     },
     "close_question": {
       "title": "Close this tab?",
+      "design_title": "Save changes to this Design?",
+      "design": "“{title}” has unsaved changes. Save them before the tab closes, or discard them.",
       "running": "Something is still running in “{title}”. Closing the tab ends it.",
       "unsaved": "“{title}” has unsaved changes. Closing the tab lets them go."
     },
     "design": {
       "label": "Canvas",
       "empty": {
-        "title": "No Design open",
-        "body": "Open a .zdesign file to see its Canvas here."
+        "title": "Start a Design",
+        "body": "Make a new Design, or open one you or your agents made."
       },
+      "new": "New design",
       "open": "Open design",
       "filter": "Designs",
+      "recent": "Recent designs",
+      "no_recent": "No Designs on this computer yet.",
+      "failed": "The Design didn't open",
       "in_progress": "In progress",
-      "failed": "The Design didn't open"
+      "save": "Save",
+      "remote": "Designs open only for chats on this computer.",
+      "command": {
+        "save": "Save Design",
+        "save_as": "Save Design As…"
+      },
+      "recovered": {
+        "title": "Recovered changes",
+        "body": "Changes that weren't saved were found and put back.",
+        "stale": "Changes that weren't saved were found, but the file has changed on disk since they were made.",
+        "keep": "Keep",
+        "discard": "Discard"
+      }
     },
     "terminal": {
       "no_session": "This tab has no session to run in.",
