@@ -166,13 +166,37 @@ struct Live {
     followers: tokio::sync::watch::Sender<Told>,
 }
 
-/// A Design as the tabs following it hear it: its version, and what the
-/// change that made it made or changed.
+/// A Design as the tabs following it hear it: its version, and the
+/// changes that made the latest versions (a tab that falls behind hears
+/// each change it missed, up to [`MAX_TOLD_CHANGES`]).
 #[derive(Clone)]
 struct Told {
     version: u64,
     design: Arc<Design>,
+    changes: Vec<Change>,
+}
+
+/// One change to a Design, as its tabs hear of it.
+#[derive(Clone, Serialize)]
+struct Change {
+    version: u64,
+    /// The nodes it made or changed.
     changed: Vec<String>,
+    by: Changer,
+}
+
+/// How many of the latest changes a Design's tabs are told of.
+const MAX_TOLD_CHANGES: usize = 32;
+
+/// Who changed a Design: its tabs flash an agent's changes. (The person's
+/// own edits in a Design tab come with #33.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Changer {
+    /// An agent's `design_execute` call.
+    Agent,
+    /// An undo or redo of an earlier change.
+    Undo,
 }
 
 impl Designs {
@@ -304,7 +328,8 @@ impl Designs {
 
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
-    /// design, changed}`. A tab that falls behind hears the latest only.
+    /// design, changes: [{version, changed, by}]}`: the changes since the
+    /// item before (none in the first), `by` "agent". A tab that falls behind hears the latest only.
     /// Blocking (it may read the file): run it off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
@@ -314,23 +339,28 @@ impl Designs {
             live.followers.send_if_modified(|told| {
                 let stale = told.version != live.version;
                 if stale {
-                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changed: Vec::new() };
+                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changes: Vec::new() };
                 }
                 stale
             });
             live.followers.subscribe()
         };
-        Ok(futures::stream::unfold((told, true), |(mut told, first)| async move {
-            if !first && told.changed().await.is_err() {
+        // (The version it last told, so each item tells the changes since.)
+        Ok(futures::stream::unfold((told, None::<u64>), |(mut told, last)| async move {
+            if last.is_some() && told.changed().await.is_err() {
                 return None;
             }
             let now = told.borrow_and_update().clone();
+            let since: Vec<&Change> = match last {
+                Some(last) => now.changes.iter().filter(|change| change.version > last).collect(),
+                None => Vec::new(),
+            };
             let item = json!({
                 "version": now.version,
                 "design": &*now.design,
-                "changed": now.changed,
+                "changes": since,
             });
-            Some((item, (told, false)))
+            Some((item, (told, Some(now.version))))
         }))
     }
 
@@ -351,7 +381,7 @@ impl Designs {
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
         let description = params.description.as_deref().unwrap_or(DEFAULT_DESCRIPTION);
-        let screenshots = live.commit(&edited, description).map_err(Ran::Design)?;
+        let screenshots = live.commit(&edited, description, Changer::Agent).map_err(Ran::Design)?;
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -587,7 +617,7 @@ impl Live {
         let told = Told {
             version: 0,
             design: Arc::new(design.clone()),
-            changed: Vec::new(),
+            changes: Vec::new(),
         };
         Self {
             path,
@@ -602,11 +632,11 @@ impl Live {
     /// Makes `design` the Design, as every change does: saves it, then
     /// tells other chats' next calls and the Design's tabs, with the nodes
     /// `changed`. Returns the Design as it was.
-    fn keep(&mut self, design: Design, changed: Vec<String>) -> Result<Design, DesignError> {
+    fn keep(&mut self, design: Design, changed: Vec<String>, by: Changer) -> Result<Design, DesignError> {
         save(&self.path, &design)?;
         let before = std::mem::replace(&mut self.design, design);
         self.version += 1;
-        self.tell(changed);
+        self.tell(changed, by);
         Ok(before)
     }
 
@@ -621,31 +651,39 @@ impl Live {
         let Some((design, _)) = step(&mut self.history, &self.design) else {
             return Ok(false);
         };
-        if let Err(e) = self.keep(design.clone(), Vec::new()) {
+        if let Err(e) = self.keep(design.clone(), Vec::new(), Changer::Undo) {
             back(&mut self.history, &design);
             return Err(e);
         }
         Ok(true)
     }
 
-    /// Tells the Design's tabs what a change made of it, and the nodes it
-    /// changed (copied for them only while some follow it).
-    fn tell(&self, changed: Vec<String>) {
+    /// Tells the Design's tabs what a change (`by` whom) made of it, and
+    /// the nodes it `changed` (copied for them only while some follow it).
+    fn tell(&self, changed: Vec<String>, by: Changer) {
         if self.followers.receiver_count() == 0 {
             return;
         }
-        self.followers.send_replace(Told {
+        let change = Change {
             version: self.version,
-            design: Arc::new(self.design.clone()),
             changed,
+            by,
+        };
+        let design = Arc::new(self.design.clone());
+        self.followers.send_modify(|told| {
+            told.version = change.version;
+            told.design = design;
+            told.changes.push(change);
+            let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
+            told.changes.drain(..over);
         });
     }
 
-    /// Keeps a successful call's draft as one undo step, described as
-    /// `description`: saves the file, then draws the screenshots the call
-    /// asked for.
-    fn commit(&mut self, edited: &Edited, description: &str) -> Result<Vec<Value>, DesignError> {
-        let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect())?;
+    /// Keeps a successful change's draft (`by` whom) as one undo step,
+    /// described as `description`: saves the file, then draws the
+    /// screenshots it asked for.
+    fn commit(&mut self, edited: &Edited, description: &str, by: Changer) -> Result<Vec<Value>, DesignError> {
+        let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect(), by)?;
         self.history.record(description, &before, &self.design);
         Ok(edited
             .screenshots
