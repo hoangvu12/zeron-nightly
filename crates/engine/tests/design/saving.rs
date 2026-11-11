@@ -44,7 +44,7 @@ fn backups(seam: &Seam) -> Vec<String> {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| e.path().extension().is_some_and(|e| e == "zdesign"))
+                .filter(|e| e.path().extension().is_some_and(|e| e == zeron_engine::designs::EXTENSION))
                 .map(|e| std::fs::read_to_string(e.path()).unwrap())
                 .collect()
         })
@@ -109,7 +109,7 @@ async fn designs_opened_from_elsewhere_change_on_disk_only_when_saved() {
     let card = changed.id("Card");
     // Told in one short line.
     let notice = changed.json()["unsaved"].as_str().unwrap().to_owned();
-    assert!(notice.contains("saves the Design") && notice.len() < 100, "{notice}");
+    assert!(notice.contains("saves the Design") && notice.len() < 100 && !notice.contains('\n'), "{notice}");
     assert_eq!(on_disk(&path), before);
     let state = saving(&seam, &path).await;
     assert_eq!(
@@ -212,6 +212,27 @@ async fn recovered_changes_to_a_file_changed_on_disk_since_are_stale() {
     assert_eq!(
         (state["recovered"].clone(), state["stale"].clone()),
         (json!(true), json!(false)),
+        "{state}"
+    );
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn changes_made_to_a_design_whose_file_changed_since_it_was_read_are_stale() {
+    let seam = Seam::new().await;
+    let project = tempfile::tempdir().unwrap();
+    let path = project_design(&seam, project.path(), "Read").await;
+    // Read by Zeron (`project_design` asks its saving state), then changed
+    // on disk before its first change here.
+    let pulled = seam.create("Pulled", SCREEN).await.path();
+    std::fs::copy(&pulled, &path).unwrap();
+    seam.execute(&path, &card("Unsaved")).await.json();
+
+    let seam = seam.restart().await;
+    let state = saving(&seam, &path).await;
+    assert_eq!(
+        (state["recovered"].clone(), state["stale"].clone()),
+        (json!(true), json!(true)),
         "{state}"
     );
     seam.shutdown().await;

@@ -244,8 +244,11 @@ struct Live {
     /// discarded.
     recovered: bool,
     /// Its file changed on disk since the recovered changes were made to
-    /// it; as long as it's recovered.
+    /// it (or that can't be told); as long as it's recovered.
     stale: bool,
+    /// The digest of its file as its changes began from: as it was read or
+    /// last saved (none for a recovered Design whose backup didn't say).
+    base: Option<String>,
     /// Itself, for its autosave to come back to.
     me: Weak<Mutex<Live>>,
 }
@@ -436,7 +439,8 @@ impl Designs {
             }
             by_path.insert(to.clone(), held.clone());
         }
-        if let Err(e) = write_whole(&to, design.to_json().as_bytes()) {
+        let json = design.to_json();
+        if let Err(e) = write_whole(&to, json.as_bytes()) {
             lock(&self.inner.live).remove(&to);
             return Err(io(e));
         }
@@ -452,9 +456,7 @@ impl Designs {
         }
         live.images = DesignImages::new(&to, self.inner.images.clone());
         live.fonts = self.fonts_for(&to);
-        live.unsaved = false;
-        live.recovered = false;
-        live.stale = false;
+        live.on_file(digest(json.as_bytes()));
         if renamed {
             // One undo step: undone, it draws its images by their old names.
             let before = std::mem::replace(&mut live.design, design);
@@ -499,17 +501,18 @@ impl Designs {
         }
     }
 
-    /// The Design at `path` held live, as `design`; `recovered` when that
-    /// came from its backup, `stale` when its file changed since.
-    fn hold(&self, path: PathBuf, design: Design, recovered: bool, stale: bool) -> Arc<Mutex<Live>> {
+    /// The Design at `path` held live, as `design`, its file as [`Opened`]
+    /// says.
+    fn hold(&self, path: PathBuf, design: Design, opened: Opened) -> Arc<Mutex<Live>> {
         let fonts = self.fonts_for(&path);
         let saving = self.saving_for(&path);
         Arc::new_cyclic(|me| {
             let (images, assets) = (self.inner.images.clone(), self.inner.assets.clone());
             let mut live = Live::new(path, design, fonts, images, assets, saving, me.clone());
-            live.unsaved = recovered;
-            live.recovered = recovered;
-            live.stale = stale;
+            live.unsaved = opened.recovered;
+            live.recovered = opened.recovered;
+            live.stale = opened.stale;
+            live.base = opened.base;
             Mutex::new(live)
         })
     }
@@ -930,28 +933,40 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        // Changes Zeron stopped without saving, from its backup.
+        let file = digest(text.as_bytes());
+        // Changes Zeron stopped without saving, from its backup: stale when
+        // the file isn't as they began from (or that can't be told).
         let backup = match self.saving_for(&path) {
             Saving::Backup(backup) => std::fs::read_to_string(&backup).ok().and_then(|text| {
-                Design::from_json(&text)
+                let design = Design::from_json(&text)
                     .inspect_err(|e| tracing::warn!("can't recover {} from {}: {e}", path.display(), backup.display()))
-                    .ok()
+                    .ok()?;
+                let base = std::fs::read_to_string(base_of(&backup)).ok().map(|base| base.trim().to_owned());
+                Some((design, base))
             }),
             Saving::Autosave { .. } => None,
         };
-        let recovered = backup.is_some();
-        // Stale when the file isn't as it was when the backup began.
-        let stale = recovered
-            && match self.saving_for(&path) {
-                Saving::Backup(backup) => std::fs::read_to_string(base_of(&backup))
-                    .is_ok_and(|base| base.trim() != digest(text.as_bytes())),
-                Saving::Autosave { .. } => false,
-            };
-        let design = backup.unwrap_or(design);
+        let (design, opened) = match backup {
+            Some((recovered, base)) => (
+                recovered,
+                Opened {
+                    recovered: true,
+                    stale: base.as_ref() != Some(&file),
+                    base,
+                },
+            ),
+            None => (
+                design,
+                Opened {
+                    base: Some(file),
+                    ..Opened::default()
+                },
+            ),
+        };
         // Fetched now, outside its lock: telling its tabs and drawing it
         // only read what's cached.
         self.inner.assets.fetch(&design, path.parent());
-        let design = self.hold(path.clone(), design, recovered, stale);
+        let design = self.hold(path.clone(), design, opened);
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -977,7 +992,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = self.hold(path.clone(), Design::default(), false, false);
+        let design = self.hold(path.clone(), Design::default(), Opened::default());
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -996,6 +1011,15 @@ const DEFAULT_DESCRIPTION: &str = "An agent's change";
 struct Target {
     live: Arc<Mutex<Live>>,
     new: bool,
+}
+
+/// What a Design held from its file starts with: as [`Live`]'s `base`,
+/// `recovered` and `stale` say.
+#[derive(Default)]
+struct Opened {
+    base: Option<String>,
+    recovered: bool,
+    stale: bool,
 }
 
 impl Live {
@@ -1034,6 +1058,7 @@ impl Live {
             unsaved: false,
             recovered: false,
             stale: false,
+            base: None,
             me,
         }
     }
@@ -1065,13 +1090,15 @@ impl Live {
             Saving::Backup(backup) => {
                 let io = |e: std::io::Error| DesignError::Io(format!("can't back up {}: {e}", backup.display()));
                 std::fs::create_dir_all(backup.parent().unwrap_or(Path::new("."))).map_err(io)?;
-                // The file as it is when the backup begins, to tell later
-                // whether it changed on disk since.
-                let base = base_of(backup);
-                if !base.exists()
-                    && let Ok(file) = std::fs::read(&self.path)
-                {
-                    write_whole(&base, digest(&file).as_bytes()).map_err(io)?;
+                // As a backup begins, the file its changes begin from, to
+                // tell later whether it changed on disk since.
+                if !backup.exists() {
+                    let base = base_of(backup);
+                    match &self.base {
+                        Some(digest) => write_whole(&base, digest.as_bytes()).map_err(io)?,
+                        // (Can't be told: so it's stale if recovered.)
+                        None => _ = std::fs::remove_file(&base),
+                    }
                 }
                 write_whole(backup, design.to_json().as_bytes()).map_err(io)?;
                 self.unsaved = true;
@@ -1113,15 +1140,23 @@ impl Live {
 
     /// Saves the Design to its file, its backup gone.
     fn save_file(&mut self) -> Result<(), DesignError> {
-        save(&self.path, &self.design)?;
+        let json = self.design.to_json();
+        save_json(&self.path, &json)?;
         if let Saving::Backup(backup) = &self.saving {
             remove_backup(backup);
         }
+        self.on_file(digest(json.as_bytes()));
+        self.tell_saving();
+        Ok(())
+    }
+
+    /// Its changes are all in its file, whose digest is `base`: it's no
+    /// longer unsaved, recovered or stale.
+    fn on_file(&mut self, base: String) {
+        self.base = Some(base);
         self.unsaved = false;
         self.recovered = false;
         self.stale = false;
-        self.tell_saving();
-        Ok(())
     }
 
     /// Puts the Design back as its file holds it, as one undo step, its
@@ -1140,9 +1175,7 @@ impl Live {
         let design = Design::from_json(&text)
             .map_err(|e| DesignError::Refused(format!("{} is not a Design: {e}", self.path.display())))?;
         remove_backup(&backup);
-        self.unsaved = false;
-        self.recovered = false;
-        self.stale = false;
+        self.on_file(digest(text.as_bytes()));
         let before = self.put(design, Vec::new(), Changer::File);
         self.history.record(DISCARD_DESCRIPTION, &before, &self.design);
         Ok(())
@@ -1257,12 +1290,17 @@ impl Live {
 /// Writes the file whole or not at all, making a new managed Design's
 /// folder (with its `images/`) on its first save.
 fn save(path: &Path, design: &Design) -> Result<(), DesignError> {
+    save_json(path, &design.to_json())
+}
+
+/// Saves a Design's JSON as [`save`] does.
+fn save_json(path: &Path, json: &str) -> Result<(), DesignError> {
     let io = |e: std::io::Error| DesignError::Io(format!("can't save {}: {e}", path.display()));
     let folder = path.parent().ok_or_else(|| DesignError::Io("a Design's path has no folder".into()))?;
     if !path.exists() {
         std::fs::create_dir_all(folder.join("images")).map_err(io)?;
     }
-    write_whole(path, design.to_json().as_bytes()).map_err(io)
+    write_whole(path, json.as_bytes()).map_err(io)
 }
 
 /// Writes `path` whole or not at all.
@@ -1289,7 +1327,8 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// How many times a save tries again to replace its file.
 const PERSIST_TRIES: u64 = 8;
 
-/// Removes a Design's backup, once its changes are saved or discarded.
+/// Removes a Design's backup (and the digest beside it), once its changes
+/// are saved or discarded.
 fn remove_backup(backup: &Path) {
     for file in [backup.to_owned(), base_of(backup)] {
         if let Err(e) = std::fs::remove_file(&file)
@@ -1300,8 +1339,8 @@ fn remove_backup(backup: &Path) {
     }
 }
 
-/// Beside a Design's backup: the digest of its file as it was when the
-/// backup began.
+/// Beside a Design's backup: the digest of its file as its changes began
+/// from.
 fn base_of(backup: &Path) -> PathBuf {
     backup.with_extension("base")
 }
