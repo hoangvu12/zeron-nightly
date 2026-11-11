@@ -6,10 +6,6 @@
 //! [`paint_node`], its assets from an [`Assets`], so the tab shows what
 //! the agent's screenshot does.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
 use crate::assets::Assets;
 use crate::fonts::Fonts;
 use crate::layout::LaidOut;
@@ -130,69 +126,6 @@ pub struct Look<'a> {
     pub fill: &'a [Paint],
     pub stroke: Option<&'a StrokeStyle>,
     pub effects: &'a Effects,
-}
-
-/// Where a drawing gets the images its image paints refer to
-/// ([`ImageFill`]): files from the Design's folder, and downloads.
-pub trait Images {
-    /// The encoded image `url` refers to, or why it can't be had (an image
-    /// that can't be had draws as a placeholder).
-    fn get(&self, url: &str) -> Result<Arc<[u8]>, String>;
-}
-
-/// No images to be had: every image paint draws as a placeholder.
-pub struct NoImages;
-
-impl Images for NoImages {
-    fn get(&self, _url: &str) -> Result<Arc<[u8]>, String> {
-        Err("no images are given to this drawing".into())
-    }
-}
-
-/// Images from files already on this computer, by url: what a Design tab
-/// draws with, the engine having found each url's file (the Design's
-/// folder, or its download cache). Nothing is downloaded; a url without a
-/// file draws as a placeholder. Each file is read once.
-#[derive(Debug, Default)]
-pub struct ImageFiles {
-    paths: HashMap<String, PathBuf>,
-    read: Mutex<HashMap<String, Result<Arc<[u8]>, String>>>,
-}
-
-impl ImageFiles {
-    pub fn new(paths: HashMap<String, PathBuf>) -> Self {
-        Self { paths, read: Mutex::default() }
-    }
-
-    /// Each url's file.
-    pub fn paths(&self) -> &HashMap<String, PathBuf> {
-        &self.paths
-    }
-}
-
-impl Images for ImageFiles {
-    fn get(&self, url: &str) -> Result<Arc<[u8]>, String> {
-        let mut read = self.read.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        read.entry(url.to_owned())
-            .or_insert_with(|| {
-                let path = self.paths.get(url).ok_or("not had yet")?;
-                std::fs::read(path)
-                    .map(Arc::from)
-                    .map_err(|e| format!("can't read {}: {e}", path.display()))
-            })
-            .clone()
-    }
-}
-
-/// Every image url `design` draws.
-pub fn image_urls(design: &Design) -> BTreeSet<String> {
-    // As drawn: images inside Instances, and those Tokens name, count.
-    let design = &crate::resolve::drawn(design);
-    let mut found = Vec::new();
-    for node in &design.children {
-        images_in(node, &mut found);
-    }
-    found.into_iter().map(|(_, image)| image.url.clone()).collect()
 }
 
 /// The image paints `node` and its descendants draw, each with the node
@@ -432,8 +365,8 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// puts them, their text set by `typesetter` (as it was laid out). It's
 /// drawn `margin` (Canvas units, [`blur_reach`]) wider all round and cut
 /// to `area`, so blurs at its edges read what they would with the whole
-/// Canvas drawn. Image paints draw what `images` has, icons and other
-/// assets what `assets` has. `None` for an empty or oversized image.
+/// Canvas drawn. Images, icons and other assets draw what `assets` has.
+/// `None` for an empty or oversized image.
 #[allow(clippy::too_many_arguments)]
 pub fn region(
     design: &Design,
@@ -444,7 +377,6 @@ pub fn region(
     scale: f32,
     margin: f32,
     (width, height): (u32, u32),
-    images: &dyn Images,
     assets: &dyn Assets,
 ) -> Option<Vec<u8>> {
     // (At most a tile's worth each side: past that a blur is faint.)
@@ -452,7 +384,7 @@ pub fn region(
     let (wide, high) = (width + 2 * pad, height + 2 * pad);
     let mut drawn = vec![0; wide as usize * high as usize * 4];
     crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
-        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_images(images).with_assets(assets);
+        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_assets(assets);
         painter.translate(pad as f32, pad as f32);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
@@ -498,15 +430,13 @@ pub enum RenderError {
 }
 
 /// Draws one node of `design` on a transparent background at 1x, or
-/// smaller when its longest side is over `max_side`, with the images
-/// `images` has and the icons and other assets `assets` has, and encodes
-/// it. Its text is set in `fonts`.
+/// smaller when its longest side is over `max_side`, with the images,
+/// icons and other assets `assets` has, and encodes it. Its text is set in `fonts`.
 pub fn screenshot(
     design: &Design,
     id: &str,
     max_side: f32,
     fonts: &Fonts,
-    images: &dyn Images,
     assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
     let scale = |width: f32, height: f32| (max_side / width.max(height)).min(1.);
@@ -553,7 +483,7 @@ fn picture(
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_images(images).with_assets(assets);
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_assets(assets);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }

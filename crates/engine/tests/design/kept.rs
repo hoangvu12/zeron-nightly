@@ -49,6 +49,7 @@ TakeScreenshot(["scr01"]);"##,
     assert_eq!(shot.rgba(30, 20), [79, 70, 229, 255]);
     assert_eq!(shot.rgba(150, 50), [255, 255, 255, 255]);
 
+    seam.save(&path).await;
     let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(file["generator"], original["generator"]);
     let screen = &file["children"][0];

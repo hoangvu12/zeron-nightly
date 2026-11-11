@@ -14,6 +14,7 @@ pub mod export;
 pub mod fonts;
 pub mod history;
 pub mod icons;
+pub mod images;
 pub mod layout;
 pub mod model;
 pub mod printed;

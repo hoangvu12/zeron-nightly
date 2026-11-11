@@ -1,10 +1,11 @@
-//! Assets: what a Design draws with beyond its own file, as icons and
-//! fonts are (and images will be). The engine resolves them, fetching, caching
+//! Assets: what a Design draws with beyond its own file, as icons, fonts
+//! and images are. The engine resolves them, fetching, caching
 //! and checking each ([`Cache`]); it tells the window which a Design uses
 //! and the file holding each ([`Resolved`]), and the window reads only
 //! those files, never the network ([`Files`]). A painter asks either for an
 //! asset's bytes through [`Assets`], so a Design tab draws what an agent's
-//! screenshot does.
+//! screenshot does. An image in the Design's folder is found through the
+//! Design's view of the cache ([`Beside`]) where no folder is given.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::fonts::{FontFile, FontSource, Fonts};
 use crate::icons::{IconSource, Icons};
-use crate::model::Design;
+use crate::images::{self, ImageSource, Images};
+use crate::model::{Design, ImageFill};
 
 /// The kinds of asset; a kind is added with a variant here and its arms in
 /// [`Cache`].
@@ -26,6 +28,9 @@ pub enum AssetKind {
     /// A font file, named `family@weight` as text asks for it, or
     /// `family@file` for one of a family beside the Design.
     Font,
+    /// An image fill's file, named by its url as written: a path relative
+    /// to the Design's folder, or an http(s) URL.
+    Image,
 }
 
 /// One asset, by kind and name.
@@ -38,6 +43,15 @@ pub struct AssetKey {
 impl AssetKey {
     pub fn icon(name: impl Into<String>) -> Self {
         Self { kind: AssetKind::Icon, name: name.into() }
+    }
+
+    pub fn image(url: impl Into<String>) -> Self {
+        Self { kind: AssetKind::Image, name: url.into() }
+    }
+
+    /// An image in the Design's folder, rather than downloaded.
+    fn is_beside(&self) -> bool {
+        self.kind == AssetKind::Image && !ImageFill::is_remote(&self.name)
     }
 
     /// `family` at `weight` (100 to 900).
@@ -107,21 +121,39 @@ pub struct Cache {
     dir: PathBuf,
     icons: Icons,
     fonts: RwLock<Fonts>,
+    images: Images,
 }
 
 impl Cache {
-    /// Assets cached in `dir`, icons fetched from `icons`; fonts only from
-    /// the cache until given a source ([`Cache::set_font_source`]).
+    /// Assets cached in `dir`, icons fetched from `icons`; fonts and images
+    /// only from the cache until given a source ([`Cache::set_font_source`],
+    /// [`Cache::set_image_source`]).
     pub fn new(dir: &Path, icons: Arc<dyn IconSource>) -> Self {
         Self {
             dir: dir.to_owned(),
             icons: Icons::new(dir.join("icons"), icons),
             fonts: RwLock::new(Fonts::new(Some(dir.join("fonts")), None)),
+            images: Images::new(dir.join("images")),
         }
     }
 
     pub fn icons(&self) -> &Icons {
         &self.icons
+    }
+
+    pub fn images(&self) -> &Images {
+        &self.images
+    }
+
+    /// Downloads images the cache hasn't got from `source` from now on.
+    pub fn set_image_source(&self, source: Arc<dyn ImageSource>) {
+        self.images.set_source(source);
+    }
+
+    /// The assets of a Design in `folder`, for drawing it: this cache's,
+    /// and the images beside it.
+    pub fn beside(self: &Arc<Self>, folder: &Path) -> Beside {
+        Beside { cache: self.clone(), folder: folder.to_owned() }
     }
 
     /// This computer's fonts.
@@ -155,6 +187,10 @@ impl Cache {
                         fonts.fetch(family, weight);
                     }
                 }
+                AssetKind::Image if !key.is_beside() => {
+                    let _ = self.images.load(&key.name);
+                }
+                AssetKind::Image => {}
             }
         }
     }
@@ -190,6 +226,14 @@ impl Cache {
                         })
                         .collect::<Vec<_>>()
                 }
+                AssetKind::Image => {
+                    let path = match folder {
+                        _ if !key.is_beside() => self.images.file_of(&key.name),
+                        Some(folder) => folder.join(key.name.replace('\\', "/")),
+                        None => return Vec::new(),
+                    };
+                    path.is_file().then_some(Resolved { key, path }).into_iter().collect()
+                }
             })
             .collect();
         // (A family beside the Design is all of its files for each weight
@@ -219,7 +263,38 @@ impl Assets for Cache {
                 let path = self.fonts().found(family, weight).into_iter().next()?;
                 std::fs::read(path).ok().map(Arc::from)
             }
+            AssetKind::Image if !key.is_beside() => std::fs::read(self.images.file_of(&key.name)).ok().map(Arc::from),
+            AssetKind::Image => None,
         }
+    }
+}
+
+/// One Design's assets: the [`Cache`]'s, and the images in its folder.
+pub struct Beside {
+    cache: Arc<Cache>,
+    folder: PathBuf,
+}
+
+impl Beside {
+    /// The file of the image at `url`, or why it can't be drawn. Never
+    /// downloads: a call downloads the images it places as it runs, within
+    /// its time on the network.
+    pub fn image(&self, url: &str) -> Result<PathBuf, String> {
+        if ImageFill::is_remote(url) {
+            self.cache.images.had(url)
+        } else {
+            images::beside(&self.folder, url)
+        }
+    }
+}
+
+/// What's here only: drawing never fetches.
+impl Assets for Beside {
+    fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
+        if !key.is_beside() {
+            return self.cache.get(key);
+        }
+        std::fs::read(self.folder.join(key.name.replace('\\', "/"))).ok().map(Arc::from)
     }
 }
 
@@ -236,6 +311,11 @@ impl Files {
             paths: resolved.into_iter().map(|resolved| (resolved.key, resolved.path)).collect(),
             read: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Each asset's file.
+    pub fn paths(&self) -> &HashMap<AssetKey, PathBuf> {
+        &self.paths
     }
 }
 

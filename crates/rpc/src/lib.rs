@@ -365,15 +365,30 @@ pub mod methods {
     /// guide}`. Local only, like `DesignExecute`.
     pub const DESIGN_STATE: &str = "DesignState";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
-    /// changes}`: the Design whole as it is, then after each change, with
-    /// each change since the item before as `{version, changed, by}` (the
-    /// ids it made or changed; `by` "agent"). Local only.
+    /// changes, path, unsaved, recovered}`: the Design whole as it is, then
+    /// after each change, with each change since the item before as
+    /// `{version, changed, by}` (the ids it made or changed; `by` "agent",
+    /// "undo" or "file"), and again when only its file or saving state
+    /// changes (`DesignSaving`). Local only.
     pub const WATCH_DESIGN: &str = "WatchDesign";
     /// `{chatId, paths}` → `{}`: the Designs a chat's Design tabs show, the
     /// front one first (none: it has none), as the app's tabs open, close
     /// and come to the front; what `design_state` and a call naming no
     /// Design go by. Local only.
     pub const SET_DESIGN_TABS: &str = "SetDesignTabs";
+    /// `{path}` → `{path, managed, unsaved, recovered}`: whether a Design
+    /// is in Zeron's designs folder (it saves itself), has changes its file
+    /// doesn't, and found them in its backup when it opened. Local only.
+    pub const DESIGN_SAVING: &str = "DesignSaving";
+    /// `{path}` → as `DesignSaving`: saves a Design to its file now (Ctrl+S).
+    /// Local only.
+    pub const SAVE_DESIGN: &str = "SaveDesign";
+    /// `{path, to}` → as `DesignSaving`, for `to`: writes a Design to `to`
+    /// with its images and fonts, and it's that file from then on. Local only.
+    pub const SAVE_DESIGN_AS: &str = "SaveDesignAs";
+    /// `{path}` → as `DesignSaving`: puts a Design back as its file holds
+    /// it, its unsaved changes gone (one undo step). Local only.
+    pub const DISCARD_DESIGN: &str = "DiscardDesign";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -739,6 +754,10 @@ pub fn local_only(method: &str) -> bool {
             | methods::DESIGN_STATE
             | methods::WATCH_DESIGN
             | methods::SET_DESIGN_TABS
+            | methods::DESIGN_SAVING
+            | methods::SAVE_DESIGN
+            | methods::SAVE_DESIGN_AS
+            | methods::DISCARD_DESIGN
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME

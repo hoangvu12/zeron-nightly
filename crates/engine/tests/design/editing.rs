@@ -173,6 +173,7 @@ async fn an_updated_property_the_model_doesnt_know_is_written_once() {
     let warnings = updated.json()["warnings"].clone();
     assert_eq!(warnings.as_array().map(Vec::len), Some(1), "{warnings}");
     assert_eq!((warnings[0]["node"].as_str(), warnings[0]["property"].as_str()), (Some("card1"), Some("glowz")));
+    seam.save(&path).await;
     let text = std::fs::read_to_string(&path).unwrap();
     assert_eq!(text.matches("\"glowz\"").count(), 1, "{text}");
     assert_eq!(file(&path)["children"][0]["glowz"], 2);
@@ -188,6 +189,7 @@ Update("card1", { glowz: null });"##,
         )
         .await;
     assert!(fixed.json().get("warnings").is_none(), "{}", fixed.text);
+    seam.save(&path).await;
     assert!(!std::fs::read_to_string(&path).unwrap().contains("glowz"));
     seam.shutdown().await;
 }

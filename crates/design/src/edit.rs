@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::assets::Cache;
+use crate::assets::{AssetKind, Cache};
 use crate::fonts::Fonts;
-use crate::model::{Design, Kind, Node, warn};
+use crate::model::{Design, ImageFill, Kind, Node, PaintKind, warn};
 use crate::printed::Printed;
 
 mod copy;
@@ -322,6 +322,27 @@ impl Draft {
             Kind::Path(path) => path.problem().map_or(Ok(()), Err)?,
             Kind::Polygon(polygon) => polygon.problem().map_or(Ok(()), Err)?,
             _ => {}
+        }
+        // Its images downloaded now, so they're cached to draw; one that
+        // can't be had draws a placeholder, and the call warns of it.
+        if let Some(assets) = &self.assets {
+            for key in node.kind.get().assets() {
+                if key.kind == AssetKind::Image && ImageFill::is_remote(&key.name) {
+                    let _ = assets.images().load(&key.name);
+                }
+            }
+        }
+        let stroke = node.kind.get().look((0., 0.)).and_then(|look| look.stroke);
+        if stroke.is_some_and(|stroke| stroke.fill.iter().any(|paint| matches!(paint.kind, PaintKind::Image(_)))) {
+            warnings.push(Warning {
+                node: Some(node.id.clone()),
+                property: Some("stroke".into()),
+                message: format!(
+                    "\"{}\" ({}) has an image paint on its stroke: images draw only as fills; it's kept, but draws nothing",
+                    node.name,
+                    node.kind.name()
+                ),
+            });
         }
         Ok(())
     }

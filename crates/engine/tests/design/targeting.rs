@@ -51,6 +51,8 @@ async fn an_explicit_path_targets_any_zdesign_on_disk() {
         .await;
     assert_eq!(changed.json()["design"]["name"], "Mine");
     assert!(same_file(&changed.path(), &mine));
+    // On disk once the person saves it.
+    seam.save(&mine).await;
     assert_eq!(ids_on_disk(&mine), [made.id("Screen"), changed.id("Card")]);
     // The managed one is a Design of its own.
     assert_eq!(ids_on_disk(&made.path()), [made.id("Screen")]);

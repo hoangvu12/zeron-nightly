@@ -751,6 +751,9 @@ impl EngineCore {
         }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
+        // Managed Designs' changes still waiting to save themselves.
+        let designs = self.designs.clone();
+        let _ = tokio::task::spawn_blocking(move || designs.flush()).await;
         self.sessions.stop_activity_projection().await;
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();

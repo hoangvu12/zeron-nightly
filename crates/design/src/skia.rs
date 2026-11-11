@@ -26,7 +26,7 @@ use crate::model::{
     BlendMode, Cap, Color, FillRule, Gradient, GradientShape, ImageFill, ImageMode, Join, Paint, PaintKind,
     Shadow, Sides, StrokeAlign, StrokeStyle, Text, TextAlign, VerticalAlign,
 };
-use crate::render::{Images, NoImages, Outline, Painter, Rect};
+use crate::render::{Outline, Painter, Rect};
 
 /// A transparent raster surface of `width` × `height` pixels (RGBA,
 /// premultiplied), or `None` for an empty or oversized one.
@@ -165,36 +165,29 @@ pub fn is_image(encoded: &[u8]) -> bool {
 pub struct SkiaPainter<'a> {
     canvas: &'a skia_safe::Canvas,
     typesetter: &'a Typesetter,
-    images: &'a dyn Images,
+    assets: Option<&'a dyn Assets>,
     /// Images decoded so far, by url; `None` for one that can't be had.
     decoded: HashMap<String, Option<skia_safe::Image>>,
-    assets: Option<&'a dyn Assets>,
 }
 
 impl<'a> SkiaPainter<'a> {
-    /// A painter with no images: image paints draw as placeholders.
     pub fn new(canvas: &'a skia_safe::Canvas, typesetter: &'a Typesetter) -> Self {
-        Self { canvas, typesetter, images: &NoImages, decoded: HashMap::new(), assets: None }
+        Self { canvas, typesetter, assets: None, decoded: HashMap::new() }
     }
 
-    /// Draws icons and other assets from `assets` (without, they draw
-    /// nothing).
+    /// Draws icons, images and other assets from `assets` (without, icons
+    /// draw nothing and images a placeholder).
     pub fn with_assets(mut self, assets: &'a dyn Assets) -> Self {
         self.assets = Some(assets);
         self
     }
 
-    /// The painter drawing image paints with the images `images` has.
-    pub fn with_images(self, images: &'a dyn Images) -> Self {
-        Self { images, ..self }
-    }
-
     fn image(&mut self, url: &str) -> Option<skia_safe::Image> {
-        let images = self.images;
+        let assets = self.assets;
         self.decoded
             .entry(url.to_owned())
             .or_insert_with(|| {
-                let encoded = images.get(url).ok()?;
+                let encoded = assets?.get(&AssetKey::image(url))?;
                 let image = skia_safe::images::deferred_from_encoded_data(Data::new_copy(&encoded), None)?;
                 // Decoded now, once, rather than each time it's drawn.
                 image.make_raster_image(None, None)
