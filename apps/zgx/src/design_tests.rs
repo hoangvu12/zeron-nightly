@@ -653,3 +653,54 @@ fn in_progress_screens_look_in_progress_until_the_mark_is_cleared() {
     tab.app.frames(4);
     assert!(tab.app.wait_until(|app| app.find(".design-working").is_none()), "{}", tab.app.tree());
 }
+
+#[test]
+fn instances_and_themed_tokens_draw_in_tiles_as_in_the_engines_screenshot() {
+    // A Component (a card of `$surface` holding an `$accent` dot), and a
+    // Screen with two Instances of it: one in the Design's light Theme,
+    // one set dark.
+    let design = design(serde_json::json!({
+        "version": "1.0",
+        "themes": { "mode": ["light", "dark"] },
+        "tokens": {
+            "surface": { "type": "color", "value": [
+                { "value": "#FFFFFF", "theme": { "mode": "light" } },
+                { "value": "#000000", "theme": { "mode": "dark" } },
+            ] },
+            "accent": { "type": "color", "value": "#4F46E5" },
+        },
+        "children": [
+            { "id": "screen", "type": "frame", "width": 500, "height": 400, "fill": "#F3F4F6", "children": [
+                { "id": "one", "type": "instance", "ref": "card", "x": 40, "y": 40 },
+                { "id": "two", "type": "instance", "ref": "card", "x": 260, "y": 40, "theme": { "mode": "dark" } },
+            ] },
+            { "id": "card", "type": "frame", "reusable": true, "x": 600, "width": 200, "height": 100, "fill": "$surface",
+              "children": [{ "id": "dot", "type": "rectangle", "x": 20, "y": 20, "width": 60, "height": 60, "fill": "$accent" }] },
+        ],
+    }));
+    let mut tab = mount(design.clone());
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+    let shown = tab.picture();
+
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default()).expect("a screenshot");
+    let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
+    let mut reader = decoder.read_info().expect("a PNG");
+    let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
+    reader.next_frame(&mut expected).expect("its pixels");
+    let (w, h) = (shot.width as usize, shot.height as usize);
+    let (left, top) = tab.on_screen(0., 0.);
+    let off = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let want = &expected[(y * w + x) * 4..][..4];
+            want.iter().zip(shown.rgba((left + x, top + y))).any(|(a, b)| a.abs_diff(b) > 2)
+        })
+        .count();
+    assert_eq!(off, 0, "pixels differ from the screenshot");
+    // The light Instance's card white, the dark one's black, both dots the
+    // accent.
+    assert_eq!(shown.rgba(tab.on_screen(50., 50.)), WHITE);
+    assert_eq!(shown.rgba(tab.on_screen(270., 50.)), [0, 0, 0, 255]);
+    assert_eq!(shown.rgba(tab.on_screen(90., 90.)), INDIGO);
+    assert_eq!(shown.rgba(tab.on_screen(310., 90.)), INDIGO);
+}
