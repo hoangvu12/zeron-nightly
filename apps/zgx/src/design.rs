@@ -39,6 +39,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use serde_json::{Value as Json, json};
 use zeron_design::Design;
+use zeron_design::assets::{Files, Resolved};
 use zeron_design::fonts::{FontFile, Fonts};
 use zeron_design::layout::LaidOut;
 use zeron_design::render::{self, ImageFiles, Rect};
@@ -66,12 +67,16 @@ pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
 /// With it, the file each image it draws is in on this computer, by url,
 /// as the engine found (and downloaded) them: the window reads images from
 /// those files only, and never downloads.
+/// And the files of the other assets it uses (its icons and fonts) in the
+/// engine's cache, or beside the Design: tiles draw them from those files
+/// only.
 pub struct Heard {
     pub design: Design,
     pub flash: Vec<String>,
-    /// What its text draws in: the font files the engine says it uses.
+    /// What its text draws in: the font files among its assets.
     pub fonts: Fonts,
     pub images: HashMap<String, PathBuf>,
+    pub assets: Vec<Resolved>,
 }
 
 /// `WatchDesign`'s item as a tab hears it: what an agent changed flashes;
@@ -100,13 +105,16 @@ pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
             flash.push(id);
         }
     }
-    let files: Vec<FontFile> = serde_json::from_value(item["fonts"].clone()).unwrap_or_default();
+    // (An older engine says no images: they draw as placeholders.)
+    let images = serde_json::from_value(item["images"].clone()).unwrap_or_default();
+    // (An asset not named draws nothing, as the engine does with one it
+    // couldn't fetch.)
+    let assets: Vec<Resolved> = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
+    let files: Vec<FontFile> = assets.iter().filter_map(Resolved::font_file).collect();
     if !fonts.is_of(&files) {
         *fonts = Fonts::of_files(&files);
     }
-    // (An older engine says no images: they draw as placeholders.)
-    let images = serde_json::from_value(item["images"].clone()).unwrap_or_default();
-    Ok(Heard { design, flash, fonts: fonts.clone(), images })
+    Ok(Heard { design, flash, fonts: fonts.clone(), images, assets })
 }
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
@@ -155,13 +163,14 @@ impl Source for EngineSource {
 }
 
 /// A Design as tiles draw it: its version in this window (one more each
-/// time it's heard), the Design laid out in its fonts, and where each of
-/// its top-level nodes draws.
+/// time it's heard), the Design laid out in its fonts, its other assets,
+/// and where each of its top-level nodes draws.
 struct Scene {
     version: u64,
     design: Design,
     fonts: Fonts,
     laid_out: LaidOut,
+    assets: Files,
     tops: Vec<Rect>,
     /// How much more a tile draws round itself, for its blurs' sake.
     margin: f32,
@@ -169,11 +178,11 @@ struct Scene {
 }
 
 impl Scene {
-    fn new(version: u64, design: Design, fonts: Fonts, images: HashMap<String, PathBuf>) -> Self {
+    fn new(version: u64, design: Design, fonts: Fonts, images: HashMap<String, PathBuf>, assets: Vec<Resolved>) -> Self {
         let laid_out = LaidOut::of(&design, &fonts.typesetter(&design));
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
         let margin = render::blur_reach(&design, &laid_out);
-        Self { version, design, fonts, laid_out, tops, margin, images: ImageFiles::new(images) }
+        Self { version, design, fonts, laid_out, assets: Files::new(assets), tops, margin, images: ImageFiles::new(images) }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -296,7 +305,7 @@ fn draw(scene: &Scene, key: TileKey) -> Option<Arc<ImageData>> {
     let nodes: Vec<usize> = (0..scene.tops.len()).filter(|&i| scene.tops[i].meets(&around)).collect();
     // (Made per tile: Skia's text layout isn't shared across threads.)
     let typesetter = scene.fonts.typesetter(&scene.design);
-    let pixels = render::region(&scene.design, &scene.laid_out, &typesetter, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.images)?;
+    let pixels = render::region(&scene.design, &scene.laid_out, &typesetter, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.images, &scene.assets)?;
     ImageData::new_premultiplied(TILE, TILE, pixels).ok().map(Arc::new)
 }
 
@@ -756,10 +765,10 @@ impl DesignTabs {
             let Some(canvas) = tabs.get_mut(tab) else { return };
             match heard {
                 Err(why) => canvas.failed = Some(why),
-                Ok(Heard { design, flash, fonts, images }) => {
+                Ok(Heard { design, flash, fonts, images, assets }) => {
                     canvas.failed = None;
                     self.versions.set(self.versions.get() + 1);
-                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, images));
+                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, images, assets));
                     canvas.flashes.retain(|f| f.at.elapsed() < FLASH_STALE);
                     if !flash.is_empty() {
                         canvas.flashes.push(Flash { version: scene.version, ids: flash, at: std::time::Instant::now() });

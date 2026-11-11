@@ -8,9 +8,11 @@
 //! edits, screenshots and exports) and its zgx app (the Design tab's
 //! tiles), so the two draw alike.
 
+pub mod assets;
 pub mod edit;
 pub mod fonts;
 pub mod history;
+pub mod icons;
 pub mod layout;
 pub mod model;
 pub mod printed;
@@ -20,5 +22,6 @@ pub mod skia;
 #[cfg(feature = "snippet")]
 pub mod snippet;
 pub mod space;
+pub mod waits;
 
 pub use model::Design;

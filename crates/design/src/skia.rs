@@ -6,6 +6,7 @@
 pub use skia_safe;
 
 use skia_safe::canvas::SaveLayerRec;
+use skia_safe::matrix::ScaleToFit;
 use skia_safe::paint::{Cap as PaintCap, Join as PaintJoin, Style as PaintStyle};
 use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextAlign as SkiaAlign, TextDecoration, TextStyle,
@@ -15,13 +16,14 @@ use skia_safe::{
     AlphaType, BlurStyle, ClipOp, Color4f, ColorType, Data, EncodedImageFormat, FilterMode, FontMgr,
     FontStyle, ImageInfo, MaskFilter, Matrix, MipmapMode, PathBuilder, PathFillType, Point, RRect,
     SamplingOptions, Surface, TileMode, Vector, dash_path_effect, font_style, gradient, image_filters,
-    surfaces,
+    surfaces, svg,
 };
 
 use std::collections::HashMap;
 
+use crate::assets::{AssetKey, Assets};
 use crate::model::{
-    BlendMode, Cap, Color, Gradient, GradientShape, ImageFill, ImageMode, Join, Paint, PaintKind,
+    BlendMode, Cap, Color, FillRule, Gradient, GradientShape, ImageFill, ImageMode, Join, Paint, PaintKind,
     Shadow, Sides, StrokeAlign, StrokeStyle, Text, TextAlign, VerticalAlign,
 };
 use crate::render::{Images, NoImages, Outline, Painter, Rect};
@@ -147,6 +149,11 @@ pub fn png(surface: &mut Surface) -> Option<Vec<u8>> {
     surface.peek_pixels()?.encode(EncodedImageFormat::PNG, None)
 }
 
+/// SVG path data as a Skia path, or `None` when it isn't path data.
+pub fn svg_path(geometry: &str) -> Option<skia_safe::Path> {
+    skia_safe::utils::parse_path::from_svg(geometry)
+}
+
 /// Whether `encoded` is an image Skia can draw (PNG, JPEG, WebP, GIF, BMP
 /// or ICO), going by its header.
 pub fn is_image(encoded: &[u8]) -> bool {
@@ -161,12 +168,20 @@ pub struct SkiaPainter<'a> {
     images: &'a dyn Images,
     /// Images decoded so far, by url; `None` for one that can't be had.
     decoded: HashMap<String, Option<skia_safe::Image>>,
+    assets: Option<&'a dyn Assets>,
 }
 
 impl<'a> SkiaPainter<'a> {
     /// A painter with no images: image paints draw as placeholders.
     pub fn new(canvas: &'a skia_safe::Canvas, typesetter: &'a Typesetter) -> Self {
-        Self { canvas, typesetter, images: &NoImages, decoded: HashMap::new() }
+        Self { canvas, typesetter, images: &NoImages, decoded: HashMap::new(), assets: None }
+    }
+
+    /// Draws icons and other assets from `assets` (without, they draw
+    /// nothing).
+    pub fn with_assets(mut self, assets: &'a dyn Assets) -> Self {
+        self.assets = Some(assets);
+        self
     }
 
     /// The painter drawing image paints with the images `images` has.
@@ -189,10 +204,10 @@ impl<'a> SkiaPainter<'a> {
 
     /// Fills `shape` with `image` laid over `bounds` as `fill` says, or a
     /// placeholder when the image can't be had.
-    fn fill_image(&mut self, shape: RRect, bounds: Rect, paint: &Paint, fill: &ImageFill) {
+    fn fill_image(&mut self, shape: &Shape, bounds: Rect, paint: &Paint, fill: &ImageFill) {
         match self.image(&fill.url).and_then(|image| image_paint(paint, fill, &image, bounds)) {
             Some(image) => {
-                self.canvas.draw_rrect(shape, &image);
+                shape.draw(self.canvas, &image);
             }
             None => placeholder(self.canvas, shape),
         }
@@ -201,17 +216,17 @@ impl<'a> SkiaPainter<'a> {
 
 /// A grey shape crossed corner to corner: where an image that can't be had
 /// would be.
-fn placeholder(canvas: &skia_safe::Canvas, shape: RRect) {
+fn placeholder(canvas: &skia_safe::Canvas, shape: &Shape) {
     let mut paint = skia_safe::Paint::default();
     paint.set_anti_alias(true).set_color(skia_safe::Color::from_rgb(228, 228, 231));
-    canvas.draw_rrect(shape, &paint);
-    let r = shape.rect();
+    shape.draw(canvas, &paint);
+    let r = shape.bounds();
     paint
         .set_color(skia_safe::Color::from_rgb(161, 161, 170))
         .set_style(PaintStyle::Stroke)
         .set_stroke_width(1.5);
     canvas.save();
-    canvas.clip_rrect(shape, ClipOp::Intersect, true);
+    shape.clip(canvas, ClipOp::Intersect);
     canvas.draw_line((r.left, r.top), (r.right, r.bottom), &paint);
     canvas.draw_line((r.right, r.top), (r.left, r.bottom), &paint);
     canvas.restore();
@@ -254,8 +269,12 @@ fn sigma(radius: f32) -> f32 {
 
 /// The outline moved in by `sides` (out, where they're negative), its
 /// corners' radii shrinking (growing) with it; a square corner stays square.
+/// Only rounded rectangles are drawn this way; another shape is its bounds.
 fn inset(outline: &Outline, sides: Sides) -> RRect {
-    let Outline::Rounded { rect: bounds, radii } = *outline;
+    let (bounds, radii) = match *outline {
+        Outline::Rounded { rect, radii } => (rect, radii),
+        _ => (outline.bounds(), [0.; 4]),
+    };
     let Sides { top, right, bottom, left } = sides;
     let moved = skia_safe::Rect::from_ltrb(
         bounds.x + left,
@@ -283,6 +302,91 @@ fn inset(outline: &Outline, sides: Sides) -> RRect {
 
 fn rrect(outline: &Outline) -> RRect {
     inset(outline, Sides::default())
+}
+
+/// An outline as Skia draws it: a rounded rectangle as one, any other
+/// shape as a path.
+enum Shape {
+    Rounded(RRect),
+    Path(skia_safe::Path),
+}
+
+fn shape(outline: &Outline) -> Shape {
+    match *outline {
+        Outline::Rounded { .. } => Shape::Rounded(rrect(outline)),
+        Outline::Ellipse { rect: bounds, start, sweep, inner } => {
+            let outer = rect(bounds);
+            let inner = inner.clamp(0., 1.);
+            let hole = (inner > 0.).then(|| {
+                let (dx, dy) = (outer.width() * (1. - inner) / 2., outer.height() * (1. - inner) / 2.);
+                outer.with_inset((dx, dy))
+            });
+            let mut path = PathBuilder::new();
+            if sweep.abs() >= 360. {
+                path.add_oval(outer, None, None);
+                if let Some(hole) = hole {
+                    path.add_oval(hole, None, None);
+                    path.set_fill_type(PathFillType::EvenOdd);
+                }
+            } else {
+                match hole {
+                    None => {
+                        path.move_to(outer.center());
+                        path.arc_to(outer, start, sweep, false);
+                    }
+                    Some(hole) => {
+                        path.arc_to(outer, start, sweep, true);
+                        path.arc_to(hole, start + sweep, -sweep, false);
+                    }
+                }
+                path.close();
+            }
+            Shape::Path(path.detach())
+        }
+        Outline::Polygon { rect, sides } => {
+            let corners: Vec<Point> = crate::render::polygon(rect, sides)
+                .into_iter()
+                .map(|(x, y)| Point::new(x, y))
+                .collect();
+            Shape::Path(PathBuilder::new().add_polygon(&corners, true).detach())
+        }
+        Outline::Path { rect: bounds, geometry, view_box, fill_rule } => {
+            // Geometry that can't be read or placed draws nothing.
+            let placed = svg_path(geometry).and_then(|path| {
+                let from = view_box.map(rect).unwrap_or_else(|| path.compute_tight_bounds());
+                let onto = Matrix::rect_2_rect(from, rect(bounds), ScaleToFit::Fill)?;
+                Some(path.make_transform(&onto))
+            });
+            let fill_type = match fill_rule {
+                FillRule::Nonzero => PathFillType::Winding,
+                FillRule::Evenodd => PathFillType::EvenOdd,
+            };
+            Shape::Path(placed.unwrap_or_default().with_fill_type(fill_type))
+        }
+    }
+}
+
+impl Shape {
+    fn bounds(&self) -> skia_safe::Rect {
+        match self {
+            Shape::Rounded(rrect) => *rrect.rect(),
+            Shape::Path(path) => *path.bounds(),
+        }
+    }
+
+    fn clip(&self, canvas: &skia_safe::Canvas, op: ClipOp) {
+        match self {
+            Shape::Rounded(rrect) => canvas.clip_rrect(rrect, op, true),
+            Shape::Path(path) => canvas.clip_path(path, op, true),
+        };
+    }
+
+    fn draw(&self, canvas: &skia_safe::Canvas, paint: &skia_safe::Paint) {
+        match self {
+            Shape::Rounded(rrect) => canvas.draw_rrect(rrect, paint),
+            Shape::Path(path) => canvas.draw_path(path, paint),
+        };
+    }
 }
 
 /// The area between two rounded rectangles, `inner` within `outer`.
@@ -426,25 +530,34 @@ impl Painter for SkiaPainter<'_> {
     }
 
     fn clip(&mut self, outline: &Outline) {
-        self.canvas.clip_rrect(rrect(outline), None, true);
+        shape(outline).clip(self.canvas, ClipOp::Intersect);
     }
 
     fn fill(&mut self, outline: &Outline, paints: &[Paint]) {
-        let shape = rrect(outline);
+        let shape = shape(outline);
         for paint in paints {
             if let PaintKind::Image(image) = &paint.kind {
                 if paint.enabled {
-                    self.fill_image(shape, outline.bounds(), paint, image);
+                    self.fill_image(&shape, outline.bounds(), paint, image);
                 }
             } else if let Some(fill) = skia_paint(paint, outline.bounds()) {
-                self.canvas.draw_rrect(shape, &fill);
+                shape.draw(self.canvas, &fill);
             }
         }
     }
 
     fn stroke(&mut self, outline: &Outline, stroke: &StrokeStyle) {
         let thickness = stroke.thickness;
-        let Some(width) = thickness.uniform() else {
+        let shape = shape(outline);
+        // A shape other than a rectangle has no sides: its widest is its width.
+        let width = match shape {
+            Shape::Rounded(_) => thickness.uniform(),
+            Shape::Path(_) => {
+                let Sides { top, right, bottom, left } = thickness;
+                Some(top.max(right).max(bottom).max(left))
+            }
+        };
+        let Some(width) = width else {
             // A width per side: the ring between the outline moved out and
             // in by them, as the alignment splits them.
             let (outer, inner) = match stroke.align {
@@ -463,18 +576,17 @@ impl Painter for SkiaPainter<'_> {
         if width <= 0. {
             return;
         }
-        let shape = rrect(outline);
         // Inside and outside are a centred line twice as wide, cut to the
         // outline's one side.
         self.canvas.save();
         let width = match stroke.align {
             StrokeAlign::Center => width,
             StrokeAlign::Inside => {
-                self.canvas.clip_rrect(shape, ClipOp::Intersect, true);
+                shape.clip(self.canvas, ClipOp::Intersect);
                 width * 2.
             }
             StrokeAlign::Outside => {
-                self.canvas.clip_rrect(shape, ClipOp::Difference, true);
+                shape.clip(self.canvas, ClipOp::Difference);
                 width * 2.
             }
         };
@@ -502,7 +614,7 @@ impl Painter for SkiaPainter<'_> {
                 }
                 line.set_path_effect(dash_path_effect::new(&dashes, 0.));
             }
-            self.canvas.draw_rrect(shape, &line);
+            shape.draw(self.canvas, &line);
         }
         self.canvas.restore();
     }
@@ -517,6 +629,10 @@ impl Painter for SkiaPainter<'_> {
             paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, sigma(shadow.blur), true));
         }
         let (dx, dy) = shadow.offset;
+        if let Shape::Path(path) = shape(outline) {
+            self.path_shadow(&path, shadow, paint);
+            return;
+        }
         if !shadow.inner {
             let mut shape = inset(outline, Sides::all(-shadow.spread));
             shape.offset((dx, dy));
@@ -547,7 +663,7 @@ impl Painter for SkiaPainter<'_> {
             return;
         };
         self.canvas.save();
-        self.canvas.clip_rrect(rrect(outline), ClipOp::Intersect, true);
+        shape(outline).clip(self.canvas, ClipOp::Intersect);
         self.canvas.save_layer(
             &SaveLayerRec::default()
                 .backdrop(&blur)
@@ -574,5 +690,59 @@ impl Painter for SkiaPainter<'_> {
             // so an export) puts it all after.
             paragraph.paint(self.canvas, (-text.letter_spacing / 2., top));
         }
+    }
+
+    fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, bounds: Rect) {
+        let Some(svg) = crate::icons::name(icon, weight)
+            .ok()
+            .and_then(|name| self.assets?.get(&AssetKey::icon(name)))
+        else {
+            return;
+        };
+        let Ok(svg) = std::str::from_utf8(&svg) else {
+            return;
+        };
+        let svg = crate::icons::prepare(svg, color, weight, bounds.width, bounds.height);
+        let Ok(dom) = svg::Dom::from_str(svg, FontMgr::empty()) else {
+            return;
+        };
+        let before = self.canvas.save();
+        self.canvas.translate((bounds.x, bounds.y));
+        if color.a < 255 {
+            self.canvas.save_layer_alpha(None, color.a.into());
+        }
+        dom.render(self.canvas);
+        self.canvas.restore_to_count(before);
+    }
+}
+
+impl SkiaPainter<'_> {
+    /// A shadow of a shape other than a rectangle: the spread grows it by
+    /// a line around it, as a path has no sides to move.
+    fn path_shadow(&mut self, path: &skia_safe::Path, shadow: &Shadow, mut paint: skia_safe::Paint) {
+        let (dx, dy) = shadow.offset;
+        let moved = path.make_transform(&Matrix::translate((dx, dy)));
+        let spread = shadow.spread.max(0.);
+        if !shadow.inner {
+            if spread > 0. {
+                paint.set_style(PaintStyle::StrokeAndFill).set_stroke_width(spread * 2.);
+            }
+            self.canvas.draw_path(&moved, &paint);
+            return;
+        }
+        // Inside the shape, the shade around it moved over by the offset.
+        let reach = shadow.blur * 2. + dx.abs() + dy.abs() + spread + 1.;
+        let mut around = path.compute_tight_bounds();
+        around.outset((reach, reach));
+        let mut shade = PathBuilder::new_with_fill_type(PathFillType::EvenOdd);
+        shade.add_rect(around, None, None).add_path(&moved, None);
+        self.canvas.save();
+        self.canvas.clip_path(path, ClipOp::Intersect, true);
+        self.canvas.draw_path(&shade.detach(), &paint);
+        if spread > 0. {
+            paint.set_style(PaintStyle::Stroke).set_stroke_width(spread * 2.);
+            self.canvas.draw_path(&moved, &paint);
+        }
+        self.canvas.restore();
     }
 }

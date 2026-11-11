@@ -3,6 +3,7 @@
 
 mod editing;
 mod failing;
+mod icons;
 mod images;
 mod kept;
 mod layout;
@@ -10,6 +11,7 @@ mod looks;
 mod reading;
 mod saving;
 mod seam;
+mod shapes;
 mod targeting;
 mod text;
 mod tracer;

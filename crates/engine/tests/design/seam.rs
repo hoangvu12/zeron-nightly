@@ -8,11 +8,12 @@
 //! (`saving.rs` sets an autosave delay of its own).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
 use zeron_design::fonts::{FontFolder, Fonts};
+use zeron_design::icons::IconSource;
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_mcp::{Origin, Tools, Zeron};
 use zeron_proto::HarnessId;
@@ -30,7 +31,30 @@ pub const FONTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/zgx/fon
 pub struct Seam {
     pub core: EngineCore,
     tools: Tools,
+    /// Iconify, played by the fixture icons.
+    pub iconify: Arc<FixtureIcons>,
     dir: tempfile::TempDir,
+}
+
+/// Icons served from `fixtures/icons/<set>/<name>.svg` in place of
+/// Iconify's API, so tests run offline; it notes each icon asked for, and
+/// takes `delay` over each as a slow network would.
+#[derive(Default)]
+pub struct FixtureIcons {
+    pub fetched: Mutex<Vec<String>>,
+    pub delay: Mutex<std::time::Duration>,
+}
+
+impl IconSource for FixtureIcons {
+    fn fetch(&self, set: &str, name: &str) -> Result<Option<String>, String> {
+        self.fetched.lock().unwrap().push(format!("{set}:{name}"));
+        std::thread::sleep(*self.delay.lock().unwrap());
+        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/design/fixtures/icons")
+            .join(set)
+            .join(format!("{name}.svg"));
+        Ok(std::fs::read_to_string(file).ok())
+    }
 }
 
 /// One tool call's result, as the agent's client gets it.
@@ -99,7 +123,7 @@ impl Seam {
     /// Zeron restarts (or crashes: a stop saves no Design that isn't
     /// managed).
     pub async fn restart(self) -> Self {
-        let Self { core, tools, dir } = self;
+        let Self { core, tools, dir, .. } = self;
         core.shutdown().await;
         // (Its data folder's lock goes with it.)
         drop((core, tools));
@@ -120,9 +144,12 @@ impl Seam {
         ));
         core.designs.autosave_after(std::time::Duration::ZERO);
         let tools = agent_tools(&core, CHAT);
+        let iconify = Arc::new(FixtureIcons::default());
+        core.designs.icons().set_source(iconify.clone());
         Self {
             core,
             tools,
+            iconify,
             dir,
         }
     }

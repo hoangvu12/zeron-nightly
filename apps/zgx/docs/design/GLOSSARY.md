@@ -40,3 +40,7 @@ _Avoid_: Variable, style
 A set of Token values chosen together, such as light or dark.
 A Design's Themes belong to that Design and colour only its nodes; Zeron's own look is the app's theme family and variant (CONTEXT.md), which never changes a Design.
 _Avoid_: Mode, skin
+
+**Asset**:
+What a Design draws with beyond its own file: an icon, a font, and later an image. The engine fetches and caches each (a font may sit beside the Design instead); a Design tab draws from the files the engine names.
+_Avoid_: Resource, attachment

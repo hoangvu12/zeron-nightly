@@ -12,22 +12,30 @@
 
 mod corners;
 mod effects;
+mod ellipse;
 mod frame;
+mod icon;
 mod image;
 mod kept;
 mod layout;
 mod paint;
+mod path;
+mod polygon;
 mod rectangle;
 mod stroke;
 mod text;
 pub mod warn;
 
+pub use ellipse::Ellipse;
 pub use corners::Corners;
 pub use effects::{Effect, EffectKind, Effects, Shadow};
 pub use frame::Frame;
+pub use icon::Icon;
 pub use image::{ImageFill, ImageMode};
 pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
+pub use path::{FillRule, Path};
+pub use polygon::Polygon;
 pub use rectangle::Rectangle;
 pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
 pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign};
@@ -35,6 +43,7 @@ pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign}
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::assets::AssetKey;
 use crate::render::{Look, Painter};
 use crate::skia::Typesetter;
 
@@ -199,6 +208,11 @@ pub trait NodeKind {
         None
     }
 
+    /// The assets it draws with ([`crate::assets`]).
+    fn assets(&self) -> Vec<AssetKey> {
+        Vec::new()
+    }
+
     /// Whether its children are cut off at its bounds.
     fn clips(&self) -> bool {
         false
@@ -273,6 +287,10 @@ kinds! {
     Frame = "frame",
     Rectangle = "rectangle",
     Text = "text",
+    Ellipse = "ellipse",
+    Polygon = "polygon",
+    Path = "path",
+    Icon = "icon",
 }
 
 /// A node of a type the model doesn't know (one a newer Zeron wrote, say):
