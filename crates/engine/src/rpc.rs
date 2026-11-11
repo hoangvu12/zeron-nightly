@@ -5848,6 +5848,29 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({}))
             }
+            methods::DESIGN_SAVING | methods::SAVE_DESIGN | methods::SAVE_DESIGN_AS | methods::DISCARD_DESIGN => {
+                let designs = self.designs()?.clone();
+                let method = method.to_owned();
+                let saving = tokio::task::spawn_blocking(move || {
+                    let path = |p: &crate::designs::PathParams| std::path::PathBuf::from(&p.path);
+                    match method.as_str() {
+                        methods::SAVE_DESIGN_AS => {
+                            let p: crate::designs::SaveAsParams = parse_params(params)?;
+                            Ok(designs.save_as(std::path::Path::new(&p.path), std::path::Path::new(&p.to)))
+                        }
+                        methods::SAVE_DESIGN => parse_params(params).map(|p| designs.save(&path(&p))),
+                        methods::DISCARD_DESIGN => parse_params(params).map(|p| designs.discard(&path(&p))),
+                        _ => parse_params(params).map(|p| designs.saving(&path(&p))),
+                    }
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))??
+                .map_err(|e| match e {
+                    crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
+                    e => RpcError::Failed(e.to_string()),
+                })?;
+                RpcReply::value(&saving)
+            }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self

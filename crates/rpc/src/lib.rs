@@ -374,6 +374,19 @@ pub mod methods {
     /// and come to the front; what `design_state` and a call naming no
     /// Design go by. Local only.
     pub const SET_DESIGN_TABS: &str = "SetDesignTabs";
+    /// `{path}` → `{path, managed, unsaved, recovered}`: whether a Design
+    /// is in Zeron's designs folder (it saves itself), has changes its file
+    /// doesn't, and found them in its backup when it opened. Local only.
+    pub const DESIGN_SAVING: &str = "DesignSaving";
+    /// `{path}` → as `DesignSaving`: saves a Design to its file now (Ctrl+S).
+    /// Local only.
+    pub const SAVE_DESIGN: &str = "SaveDesign";
+    /// `{path, to}` → as `DesignSaving`, for `to`: writes a Design to `to`
+    /// with its images and fonts, and it's that file from then on. Local only.
+    pub const SAVE_DESIGN_AS: &str = "SaveDesignAs";
+    /// `{path}` → as `DesignSaving`: puts a Design back as its file holds
+    /// it, its unsaved changes gone (one undo step). Local only.
+    pub const DISCARD_DESIGN: &str = "DiscardDesign";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -739,6 +752,10 @@ pub fn local_only(method: &str) -> bool {
             | methods::DESIGN_STATE
             | methods::WATCH_DESIGN
             | methods::SET_DESIGN_TABS
+            | methods::DESIGN_SAVING
+            | methods::SAVE_DESIGN
+            | methods::SAVE_DESIGN_AS
+            | methods::DISCARD_DESIGN
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME
