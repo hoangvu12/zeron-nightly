@@ -1,8 +1,8 @@
-From d6e85b5d5187ab17a26a04186fea78cfc486a944 Mon Sep 17 00:00:00 2001
+From bca07e003085fa08cd95f383e1d8730ed9c12763 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 11:02:36 +0700
-Subject: [PATCH] engine: the person's Stop on a child is held, and what they
- write next corrects the task
+Subject: [PATCH 3/3] engine: the person's Stop on a child is held, and what
+ they write next corrects the task
 
 When the person stopped a child chat to steer it, the parent heard "the
 person stopped it" at once, woke, and reacted mid-correction; the child
@@ -248,10 +248,10 @@ index c69f47695d34ab46d1f04fa62ca52a869aeb7a9a..a47926857e537a66fa49d0deffa89454
  /// spacing, or most of them, one inside the other.
  fn repeats(reply: &str, sent: &str) -> bool {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index e02dd7d7537ae9c3b9c2b10605c37c5158dc1991..e7dc9b8e7753445a407be1931ca9f04e4edb74db 100644
+index fdfa9d22e54f0bbd5df45582214ddd41d8ed47a0..e5bb43c5e5982ea52a17bf94782c269a35c4457a 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -7573,6 +7573,7 @@ mod tests {
+@@ -7624,6 +7624,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_WAKE_GRACE_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_WINDOW_MS", "1000") };
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
@@ -259,7 +259,7 @@ index e02dd7d7537ae9c3b9c2b10605c37c5158dc1991..e7dc9b8e7753445a407be1931ca9f04e
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -7660,7 +7661,7 @@ mod tests {
+@@ -7711,7 +7712,7 @@ mod tests {
  
          /// Until `check` holds (a few seconds at most).
          async fn until(&self, what: &str, check: impl Fn(&Self) -> bool) {
@@ -268,7 +268,7 @@ index e02dd7d7537ae9c3b9c2b10605c37c5158dc1991..e7dc9b8e7753445a407be1931ca9f04e
                  if check(self) {
                      return;
                  }
-@@ -8202,7 +8203,8 @@ mod tests {
+@@ -8253,7 +8254,8 @@ mod tests {
          rig.quiet().await;
          assert!(rig.reports("lead").is_empty());
          assert!(rig.queued("lead").is_empty());
@@ -278,7 +278,7 @@ index e02dd7d7537ae9c3b9c2b10605c37c5158dc1991..e7dc9b8e7753445a407be1931ca9f04e
          rpc.handle(zeron_rpc::methods::QUEUE_COMMAND, stop("kid-b")).await.unwrap();
          rig.until("the lead hears Docs stopped", |r| !r.reports("lead").is_empty()).await;
          assert_eq!(statuses(&rig.reports("lead")[0]), [("kid-b".to_owned(), ReportStatus::Stopped)]);
-@@ -8622,6 +8624,144 @@ mod tests {
+@@ -8673,6 +8675,144 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  

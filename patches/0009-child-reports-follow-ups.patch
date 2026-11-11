@@ -1,7 +1,7 @@
-From 7ccf9db7f81826951f62264e33d9a90c9dc9edd3 Mon Sep 17 00:00:00 2001
+From 8c6084fead2c8336155050edffb75b48de403170 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 09:39:39 +0700
-Subject: [PATCH] engine: child reports cover follow-up turns, thanks and
+Subject: [PATCH 2/3] engine: child reports cover follow-up turns, thanks and
  handoffs
 
 Real use of child reports (twenty parent chats over three days) found
@@ -74,10 +74,10 @@ providers in its own settings, so it now reads as unknown, and connected.
  14 files changed, 809 insertions(+), 84 deletions(-)
 
 diff --git a/crates/doc/src/registry.rs b/crates/doc/src/registry.rs
-index dae15f24cd16ce84d4af2529453e6640a799ab7f..8843d83281eac98fa80cf0d92feadb15d6bac9db 100644
+index dfd84de6685c63910a0158380e91f1a56e49d664..adf8663d2da8aadeaf283778463ac1f63925c33b 100644
 --- a/crates/doc/src/registry.rs
 +++ b/crates/doc/src/registry.rs
-@@ -1453,6 +1453,20 @@ impl RegistryDoc {
+@@ -1460,6 +1460,20 @@ impl RegistryDoc {
          Ok(true)
      }
  
@@ -99,10 +99,10 @@ index dae15f24cd16ce84d4af2529453e6640a799ab7f..8843d83281eac98fa80cf0d92feadb15
          if !self.row_exists(KIND_CHATS, chat_id) {
              return Ok(false);
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 4bae060738b1a20ac8fe8828ee6f7c5646168109..41db7a8be2b266ddced82a3c3f1a43cc52486c53 100644
+index 395e87c6aa20041d50484623247bda5744a5190b..6a4588dcfba901dac51c5c28a1bde0824a35a6e8 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -4663,13 +4663,23 @@ impl DocHost {
+@@ -4980,13 +4980,23 @@ impl DocHost {
          // unnecessary while it waited simply finds nothing to do.
          let _drain = handle.drain_lock.lock().await;
          self.thaw_recovered_queue(handle, &sessions);
@@ -127,7 +127,7 @@ index 4bae060738b1a20ac8fe8828ee6f7c5646168109..41db7a8be2b266ddced82a3c3f1a43cc
              match &head.delivery_gate {
                  Some(QueueDeliveryGate::Editing {
                      lease_id,
-@@ -6209,6 +6219,11 @@ impl DocHost {
+@@ -6526,6 +6536,11 @@ impl DocHost {
                      if message_id.ends_with(crate::sessions::REPORT_WAITED) {
                          return Ok((SessionCommandStatus::Applied, Some("its wait returned it".into())));
                      }
@@ -139,7 +139,7 @@ index 4bae060738b1a20ac8fe8828ee6f7c5646168109..41db7a8be2b266ddced82a3c3f1a43cc
                      // Sent again (a restart, a retry): it's here already.
                      let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
                          c.id != entry.id
-@@ -6616,6 +6631,26 @@ impl DocHost {
+@@ -6933,6 +6948,26 @@ impl DocHost {
          });
      }
  
@@ -886,7 +886,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..c69f47695d34ab46d1f04fa62ca52a86
          "{}\n\n[Cut at 16 KB. Read the whole reply with the Zeron `read_chat` tool, chat {child}.]",
          body[..end].trim_end()
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c5158dc1991 100644
+index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41d8ed47a0 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -41,7 +41,7 @@ use crate::doc_host::{ChatDocHandle, DocHost};
@@ -898,7 +898,7 @@ index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c51
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
  use crate::{EngineError, new_id, now_ms};
-@@ -8445,7 +8445,7 @@ mod tests {
+@@ -8496,7 +8496,7 @@ mod tests {
              (
                  "kid-a".into(),
                  ReportStatus::Stopped,
@@ -907,7 +907,7 @@ index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c51
              ),
              ("kid-a".into(), ReportStatus::Finished, "Rebased.".into()),
          ];
-@@ -8501,7 +8501,7 @@ mod tests {
+@@ -8552,7 +8552,7 @@ mod tests {
              (
                  "kid-a".into(),
                  ReportStatus::Stopped,
@@ -916,7 +916,7 @@ index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c51
              ),
          ];
          // (The finished one says the next turn's reply, whatever it is.)
-@@ -8607,7 +8607,7 @@ mod tests {
+@@ -8658,7 +8658,7 @@ mod tests {
              .doc_host
              .queue_command("kid-r", zeron_doc::SessionCommandPayload::Run { request: ask, message_id: "r-m1".into() })
              .unwrap();
@@ -925,7 +925,7 @@ index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c51
          // Its host ran it and reported; this copy of its doc never caught up.
          let mut report = request();
          report.prompt = zeron_proto::agent_messages::child_report("Remote (kid-r)", "kid-r", ReportStatus::Finished, "LGTM.");
-@@ -8621,4 +8621,164 @@ mod tests {
+@@ -8672,4 +8672,164 @@ mod tests {
          assert_eq!(rig.roster(), "No child is working for you now.");
          rig.core.sessions.shutdown().await;
      }
@@ -1091,10 +1091,10 @@ index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c51
 +    }
  }
 diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
-index 5ae3feca44cc2db973fa3074796165eb38c520b1..dab440425136211951897afb75b766e4ca0ae8b6 100644
+index d471b1da10fa5faa84427cafd50f7d529a48b750..61669fc1af9add39f5979f36aefb1f1246024f3a 100644
 --- a/crates/engine/src/workspace_host.rs
 +++ b/crates/engine/src/workspace_host.rs
-@@ -1395,6 +1395,11 @@ impl WorkspaceHost {
+@@ -1419,6 +1419,11 @@ impl WorkspaceHost {
          Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)
      }
  
@@ -1201,10 +1201,10 @@ index 5f37b345b93d6e59a9cdc695b747c6dff3fbd792..9d287ad84c0d50e609ee1c6e6044a217
  `show_visual` is available, write a Luau visual script and show it with `show_visual` before \
  your final reply. Zeron renders it with its own native interface and enforces its style: \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 49cefa6309c4e1df58179afbef00159521c823fa..dbed283beb38202f6e3ea6443e8526cc7f4ad856 100644
+index 7572be48fbdb8a0578b9b8d8209f51f8abcb71e6..0e73d14cdadfcd72b0e40aed00668740858132cb 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -918,7 +918,7 @@ impl Tools {
+@@ -926,7 +926,7 @@ impl Tools {
                  match result {
                      Ok(result) => json!({"index": index, "isError": false, "result": result}),
                      Err(error) => {
@@ -1213,7 +1213,7 @@ index 49cefa6309c4e1df58179afbef00159521c823fa..dbed283beb38202f6e3ea6443e8526cc
                      }
                  }
              },
-@@ -1472,14 +1472,15 @@ impl Tools {
+@@ -1480,14 +1480,15 @@ impl Tools {
          if text.is_empty() {
              anyhow::bail!("text is empty");
          }
