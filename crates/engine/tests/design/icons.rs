@@ -121,5 +121,16 @@ async fn weight_thickens_icons_where_the_set_has_weights() {
     assert_eq!((regular.rgba(128, 30), bold.rgba(128, 30)), (RED, RED));
     assert_eq!(regular.rgba(128, 22)[3], 0);
     assert_eq!(bold.rgba(128, 22), RED);
+    assert!(made.json().get("warnings").is_none(), "{}", made.text);
+
+    // A set without weights draws the icon and says the weight does nothing.
+    let unweighted = seam
+        .execute(
+            &made.path(),
+            r#"Insert({ type: "icon", name: "Box", icon: "mdi:square", width: 24, height: 24, weight: 700 });"#,
+        )
+        .await;
+    let warnings = unweighted.json()["warnings"].to_string();
+    assert!(warnings.contains("Box") && warnings.contains("no weights"), "{}", unweighted.text);
     seam.shutdown().await;
 }

@@ -20,15 +20,6 @@ pub trait IconSource: Send + Sync {
     fn fetch(&self, set: &str, name: &str) -> Result<Option<String>, String>;
 }
 
-/// A source with nothing in it, for drawing only what's cached.
-pub struct CacheOnly;
-
-impl IconSource for CacheOnly {
-    fn fetch(&self, _: &str, _: &str) -> Result<Option<String>, String> {
-        Err("icons aren't fetched here".into())
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum IconError {
     #[error("\"{0}\" is not an icon name: write the Iconify set and name, as in \"lucide:house\"")]
@@ -129,6 +120,12 @@ fn variant(set: &str, name: &str, weight: Option<u16>) -> String {
         351..=550 => name.into(),
         _ => format!("{name}-bold"),
     }
+}
+
+/// Whether a weight changes `icon` (`set:name`, served as `svg`): in
+/// Phosphor, by name; elsewhere, where it's drawn with strokes.
+pub fn takes_weight(icon: &str, svg: &str) -> bool {
+    icon.starts_with("ph:") || svg.contains("stroke-width=")
 }
 
 /// `svg` ready to draw at `width` × `height` pixels: the root sized in

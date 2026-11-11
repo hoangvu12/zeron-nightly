@@ -23,11 +23,10 @@ impl Icon {
     pub fn color(&self) -> Color {
         self.fill
             .fill
-            .iter()
+            .first()
             .map(|paint| match *paint {
                 Paint::Solid(color) => color,
             })
-            .next()
             .unwrap_or(Color { r: 0, g: 0, b: 0, a: 255 })
     }
 }

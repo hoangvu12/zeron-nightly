@@ -15,7 +15,7 @@ use crate::icons::Icons;
 use crate::model::{Color, FillRule, Paint};
 use crate::render::{Painter, Rect, Shape};
 
-/// A transparent raster surface of `width` Ã— `height` pixels (RGBA,
+/// A transparent raster surface of `width` × `height` pixels (RGBA,
 /// premultiplied), or `None` for an empty or oversized one.
 pub fn surface(width: i32, height: i32) -> Option<Surface> {
     surfaces::raster_n32_premul((width, height))
@@ -40,7 +40,7 @@ pub fn fonts(files: &[&[u8]]) -> FontCollection {
 }
 
 /// The surface's pixels as a PNG file. Encoding takes about 100 ms for a
-/// 1440 Ã— 1024 image, ten times its drawing: encode only what is returned.
+/// 1440 × 1024 image, ten times its drawing: encode only what is returned.
 pub fn png(surface: &mut Surface) -> Option<Vec<u8>> {
     surface.peek_pixels()?.encode(EncodedImageFormat::PNG, None)
 }

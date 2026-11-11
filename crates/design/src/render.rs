@@ -1,7 +1,7 @@
 //! Drawing a Design, behind an interface (ADR-0002): node types draw
-//! through a [`Painter`], and [`screenshot`] is the one place that picks
-//! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
-//! would replace that and a painter of its own.
+//! through a [`Painter`], and [`screenshot`] (with [`is_path_data`]) is the
+//! one place that picks the backend (Skia's raster, [`crate::skia`]), so a
+//! tiny-skia renderer would replace those and a painter of its own.
 
 use crate::icons::Icons;
 use crate::model::{Color, Design, FillRule, Node, Paint};
@@ -58,6 +58,12 @@ pub trait Painter {
     /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
     /// the painter has no icons or not that one.
     fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
+}
+
+/// Whether `geometry` is SVG path data that draws something, as the
+/// backend reads it.
+pub fn is_path_data(geometry: &str) -> bool {
+    crate::skia::svg_path(geometry).is_some_and(|path| !path.is_empty())
 }
 
 /// Draws `node` and its descendants with its top-left at the painter's

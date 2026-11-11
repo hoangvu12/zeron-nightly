@@ -106,8 +106,9 @@ impl Draft {
         self.prepare(&mut node, &mut made)?;
         let node: Node = serde_json::from_value(node)
             .map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
-        self.check(&node).map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
         let mut warnings = Vec::new();
+        self.check(&node, &mut warnings)
+            .map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
         warn_unknown(&node, &mut warnings);
         let siblings = match parent {
             None => &mut self.design.children,
@@ -165,19 +166,31 @@ impl Draft {
 
     /// Refuses what `node` or its children can't be drawn with: an icon
     /// Iconify doesn't have (fetching it now, so it's cached to draw), a
-    /// path that isn't path data, a polygon's side count.
-    fn check(&self, node: &Node) -> Result<(), String> {
+    /// path that isn't path data, a polygon's side count; and warns of a
+    /// weight on an icon without weights. An edit that sets these
+    /// properties on a node checks it here too.
+    fn check(&self, node: &Node, warnings: &mut Vec<String>) -> Result<(), String> {
         match &node.kind {
             Kind::Icon(icon) => {
                 if let Some(icons) = &self.icons {
-                    icons.svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
+                    let svg = icons.svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
+                    if icon.weight.is_some() && !crate::icons::takes_weight(&icon.icon, &svg) {
+                        warnings.push(format!(
+                            "\"{}\" ({}) has no weights; its weight does nothing",
+                            node.name, icon.icon
+                        ));
+                    }
                 }
             }
             Kind::Path(path) => path.problem().map_or(Ok(()), Err)?,
             Kind::Polygon(polygon) => polygon.problem().map_or(Ok(()), Err)?,
             _ => {}
         }
-        node.kind.get().children().iter().try_for_each(|child| self.check(child))
+        node.kind
+            .get()
+            .children()
+            .iter()
+            .try_for_each(|child| self.check(child, warnings))
     }
 
     /// Gives `node` and its inline children new ids and default names,

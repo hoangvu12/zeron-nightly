@@ -39,7 +39,7 @@ impl FillRule {
 impl Path {
     /// Why the path can't be drawn as written, if it can't.
     pub fn problem(&self) -> Option<String> {
-        if crate::skia::svg_path(&self.geometry).is_none_or(|path| path.is_empty()) {
+        if !crate::render::is_path_data(&self.geometry) {
             return Some(format!(
                 "\"{}\" is not SVG path data (as in \"M0 0 L10 0 L5 10 Z\")",
                 self.geometry
