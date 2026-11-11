@@ -15,6 +15,7 @@ impl Live {
     /// that couldn't be (the call's edits are kept all the same).
     pub(super) fn export(&self, exports: &[Export]) -> (Vec<String>, Vec<Warning>) {
         let (mut written, mut warnings) = (Vec::new(), Vec::new());
+        let assets = self.assets.beside(&self.folder());
         let mut wrote = |path: &Path, bytes: Result<Vec<u8>, String>| match bytes
             .and_then(|bytes| write_whole(path, &bytes).map_err(|e| e.to_string()))
         {
@@ -25,7 +26,7 @@ impl Live {
             match export {
                 Export::Png { ids, files, scale } => {
                     for (id, file) in ids.iter().zip(files) {
-                        let png = render::png(&self.design, id, *scale, &self.fonts, &self.images, &*self.assets)
+                        let png = render::png(&self.design, id, *scale, &self.fonts, &assets)
                             .map(|shot| shot.png)
                             .map_err(|e| e.to_string());
                         wrote(file, png);
@@ -35,7 +36,7 @@ impl Live {
                     let page_folder = file.parent().unwrap_or(Path::new("."));
                     let design_folder = self.path.parent().unwrap_or(Path::new("."));
                     let image_href = |url: &str| href(url, design_folder, page_folder);
-                    let sources = Sources { fonts: &self.fonts, assets: &*self.assets, image_href: &image_href };
+                    let sources = Sources { fonts: &self.fonts, assets: &assets, image_href: &image_href };
                     let html = export::html(&self.design, ids, *options, &sources).map(String::into_bytes);
                     wrote(file, html);
                 }
