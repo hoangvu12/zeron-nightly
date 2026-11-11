@@ -498,8 +498,11 @@ pub struct GoogleFonts {
 #[cfg(feature = "google-fonts")]
 impl Default for GoogleFonts {
     fn default() -> Self {
+        // The system's roots: with ureq's default, Mozilla's alone, every
+        // fetch fails on Windows, whose chain ends at a root of its own.
         let tls = ureq::tls::TlsConfig::builder()
             .provider(ureq::tls::TlsProvider::NativeTls)
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
             .build();
         let config = ureq::Agent::config_builder()
             .tls_config(tls)

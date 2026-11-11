@@ -258,9 +258,22 @@ async fn mcp(tools: &Arc<Tools>, method: &'static str, params: Value) -> Value {
     answer.await.expect("the MCP server answered")
 }
 
+/// What the agent's client keeps of a call's result. Clients that take a
+/// structured copy (Claude Code and Codex) keep it alone, in place of the
+/// content, so here a result that has one is read as that copy's JSON and
+/// nothing else: a guide or image a client would drop isn't seen either.
 async fn call(tools: &Arc<Tools>, tool: &str, arguments: Value) -> Called {
     let reply = mcp(tools, "tools/call", json!({ "name": tool, "arguments": arguments })).await;
     let result = &reply["result"];
+    let is_error = result["isError"] == true;
+    if let Some(structured) = result.get("structuredContent") {
+        return Called {
+            is_error,
+            text: structured.to_string(),
+            guide: None,
+            images: Vec::new(),
+        };
+    }
     let content = result["content"].as_array().expect("content");
     let mut texts = content
         .iter()
@@ -285,7 +298,7 @@ async fn call(tools: &Arc<Tools>, tool: &str, arguments: Value) -> Called {
         })
         .collect();
     Called {
-        is_error: result["isError"] == true,
+        is_error,
         text,
         guide,
         images,
