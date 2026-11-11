@@ -265,9 +265,10 @@ async fn mcp(tools: &Arc<Tools>, method: &'static str, params: Value) -> Value {
 async fn call(tools: &Arc<Tools>, tool: &str, arguments: Value) -> Called {
     let reply = mcp(tools, "tools/call", json!({ "name": tool, "arguments": arguments })).await;
     let result = &reply["result"];
+    let is_error = result["isError"] == true;
     if let Some(structured) = result.get("structuredContent") {
         return Called {
-            is_error: result["isError"] == true,
+            is_error,
             text: structured.to_string(),
             guide: None,
             images: Vec::new(),
@@ -297,7 +298,7 @@ async fn call(tools: &Arc<Tools>, tool: &str, arguments: Value) -> Called {
         })
         .collect();
     Called {
-        is_error: result["isError"] == true,
+        is_error,
         text,
         guide,
         images,

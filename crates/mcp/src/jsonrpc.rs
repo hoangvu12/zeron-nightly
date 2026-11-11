@@ -324,15 +324,15 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                     let texts = value
                         .as_object_mut()
                         .and_then(|value| value.remove(crate::tools::TEXT_CONTENT));
-                    let mut content = vec![json!({ "type": "text", "text": pretty(&value) })];
-                    if let Some(Value::Array(texts)) = texts {
-                        let texts = texts.iter().filter_map(Value::as_str);
-                        content.extend(texts.map(|text| json!({ "type": "text", "text": text })));
-                    }
-                    if let Some(Value::Array(images)) = images {
-                        content.extend(images);
-                    }
-                    ok_response(id, call_result(content, value))
+                    let texts: Vec<String> = match texts {
+                        Some(Value::Array(texts)) => texts.iter().filter_map(Value::as_str).map(String::from).collect(),
+                        _ => Vec::new(),
+                    };
+                    let images = match images {
+                        Some(Value::Array(images)) => images,
+                        _ => Vec::new(),
+                    };
+                    ok_response(id, call_result(value, texts, images))
                 }
                 Err(message) => ok_response(
                     id,
@@ -402,14 +402,14 @@ fn cap_reply(response: Value) -> Value {
     })
 }
 
-/// A successful `tools/call` result: `content`, and `value` as its
-/// structured copy only when `content` is `value`'s text alone. Clients that
-/// take a structured copy keep it in place of the content (Claude Code and
-/// Codex do), so one beside texts or images (the design guides, a
-/// screenshot) would lose them. No tool declares an output schema, so no
-/// structured copy is owed.
-fn call_result(content: Vec<Value>, value: Value) -> Value {
-    let alone = content.len() == 1;
+/// A successful `tools/call` result: `value` as text, then `texts` and
+/// `images`; a structured copy only with neither, since clients that take
+/// one keep it in place of the content (Claude Code and Codex do).
+fn call_result(value: Value, texts: Vec<String>, images: Vec<Value>) -> Value {
+    let alone = texts.is_empty() && images.is_empty();
+    let mut content = vec![json!({ "type": "text", "text": pretty(&value) })];
+    content.extend(texts.into_iter().map(|text| json!({ "type": "text", "text": text })));
+    content.extend(images);
     let mut result = json!({ "content": content, "isError": false });
     if alone {
         result["structuredContent"] = wrap_structured(value);
@@ -536,22 +536,19 @@ mod tests {
         assert!(side_chats.ends_with("with `create_chats` (or `create_chat`)."));
     }
 
-    /// A structured copy goes only with a result that's its JSON alone: a
-    /// client keeping it in place of the content would lose a guide's text
-    /// or a screenshot.
     #[test]
     fn a_result_with_texts_or_images_beside_its_json_has_no_structured_copy() {
         let value = json!({ "topic": "core" });
-        let json_text = json!({ "type": "text", "text": pretty(&value) });
-        let alone = call_result(vec![json_text.clone()], value.clone());
+        let alone = call_result(value.clone(), Vec::new(), Vec::new());
         assert_eq!(alone["structuredContent"], value);
-        let guide = json!({ "type": "text", "text": "# The design guide" });
+        assert_eq!(alone["content"][0]["text"], pretty(&value));
+        let guide = call_result(value.clone(), vec!["# The design guide".into()], Vec::new());
+        assert!(guide.get("structuredContent").is_none(), "{guide}");
+        assert_eq!(guide["content"][1], json!({ "type": "text", "text": "# The design guide" }));
         let image = json!({ "type": "image", "data": "", "mimeType": "image/png" });
-        for beside in [guide, image] {
-            let result = call_result(vec![json_text.clone(), beside.clone()], value.clone());
-            assert!(result.get("structuredContent").is_none(), "{result}");
-            assert_eq!(result["content"][1], beside);
-        }
+        let shot = call_result(value, Vec::new(), vec![image.clone()]);
+        assert!(shot.get("structuredContent").is_none(), "{shot}");
+        assert_eq!(shot["content"][1], image);
     }
 
     #[test]
