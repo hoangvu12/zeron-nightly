@@ -357,6 +357,10 @@ pub mod methods {
     /// screenshots: [{id, width, height, mimeType, data}]}`. Local only:
     /// Designs live on the engine of their computer.
     pub const DESIGN_EXECUTE: &str = "DesignExecute";
+    /// The Designs a chat has open (`design_state`): `{chatId?}` →
+    /// `{designs: [{name, path, front}], recent: [{name, path, touchedAt}],
+    /// guide}`. Local only, like `DesignExecute`.
+    pub const DESIGN_STATE: &str = "DesignState";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -719,6 +723,7 @@ pub fn local_only(method: &str) -> bool {
             | methods::DESCRIBE_ELEMENTS
             // Designs: this computer's own (ADR-0003).
             | methods::DESIGN_EXECUTE
+            | methods::DESIGN_STATE
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME
@@ -799,8 +804,9 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::PUBLISH_IMAGE
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
-            // Designs: running snippets against them.
+            // Designs: running snippets against them, and which are open.
             | methods::DESIGN_EXECUTE
+            | methods::DESIGN_STATE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, exporting (to Zeron's plugin-exports
             // folder only: the engine refuses an agent's `to`), and their

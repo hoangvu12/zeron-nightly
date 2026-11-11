@@ -16,10 +16,13 @@ use zeron_proto::HarnessId;
 /// The chat the agent calls from.
 pub const CHAT: &str = "designer";
 
+/// A second chat, for Designs shared between chats.
+pub const OTHER: &str = "implementer";
+
 pub struct Seam {
     pub core: EngineCore,
     tools: Tools,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 /// One tool call's result, as the agent's client gets it.
@@ -87,8 +90,13 @@ impl Seam {
         Self {
             core,
             tools,
-            _dir: dir,
+            dir,
         }
+    }
+
+    /// The engine's data folder.
+    pub fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("engine")
     }
 
     /// Zeron's MCP tool list, as `tools/list` gives it.
