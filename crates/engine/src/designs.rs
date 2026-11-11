@@ -26,11 +26,14 @@
 //! Text is set in Google Fonts fetched on first use into `design-fonts/`
 //! in the engine's data dir, or in font files beside its Design
 //! ([`zeron_design::fonts`]); tabs following a Design are told the font
-//! files it uses, and draw with those.
+//! files it uses, and draw with those. Image paints draw files from the
+//! Design's folder, and downloads cached for every Design ([`images`]);
+//! tabs are told the image files too.
 
+mod images;
 mod retry;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +50,8 @@ use zeron_design::snippet::{self, Globals, Limits, SnippetError};
 
 pub use retry::{Edit, Failure};
 use retry::{Failed, Kept, Retarget};
+
+use self::images::{DesignImages, ImageCache};
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -160,6 +165,8 @@ struct Inner {
     recent_file: PathBuf,
     /// This computer's fonts, for every Design's text.
     fonts: Mutex<Fonts>,
+    /// Images downloaded, for every Design.
+    images: Arc<ImageCache>,
 }
 
 /// One Design as the engine holds it.
@@ -175,6 +182,8 @@ struct Live {
     seen: HashMap<String, u64>,
     /// What the Design tabs following it hear: it after each change.
     followers: tokio::sync::watch::Sender<Told>,
+    /// The images its paints refer to.
+    images: DesignImages,
 }
 
 /// A Design as the tabs following it hear it: its version, the changes
@@ -187,6 +196,9 @@ struct Told {
     design: Arc<Design>,
     changes: Vec<Change>,
     fonts: Option<Arc<Vec<FontFile>>>,
+    /// The file each image it draws is in, for the tabs to read (they
+    /// never download): those it has, by url.
+    images: BTreeMap<String, PathBuf>,
 }
 
 /// One change to a Design, as its tabs hear of it.
@@ -240,6 +252,7 @@ impl Designs {
                     Some(data_dir.join("design-fonts")),
                     Some(Box::new(GoogleFonts::default())),
                 )),
+                images: Arc::new(ImageCache::new(data_dir.join("image-cache"))),
             }),
         }
     }
@@ -353,14 +366,14 @@ impl Designs {
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
         let told = loop {
-            let (version, design, fonts) = {
+            let (version, design, fonts, images) = {
                 let live = lock(&live);
                 let told = live.followers.borrow();
                 if told.version == live.version && told.fonts.is_some() {
                     drop(told);
                     break live.followers.subscribe();
                 }
-                (live.version, live.design.clone(), self.fonts_for(&live.path))
+                (live.version, live.design.clone(), self.fonts_for(&live.path), live.images.files(&live.design))
             };
             // Its fonts found (fetched, maybe) without holding the Design up.
             let files = Arc::new(fonts.files(&design));
@@ -373,6 +386,7 @@ impl Designs {
                     design: Arc::new(design),
                     changes: Vec::new(),
                     fonts: Some(files),
+                    images,
                 });
                 break live.followers.subscribe();
             }
@@ -392,6 +406,7 @@ impl Designs {
                 "design": &*now.design,
                 "changes": since,
                 "fonts": now.fonts.as_deref(),
+                "images": now.images,
             });
             Some((item, (told, Some(now.version))))
         }))
@@ -427,16 +442,24 @@ impl Designs {
         let draft = Draft::new(live.design.clone()).with_fonts(live.fonts.clone());
         let (draft, globals) = snippet::run(draft, globals, code, self.inner.limits).map_err(Ran::Snippet)?;
         let mut edited = draft.finish();
-        // Fonts the call's text couldn't get.
+        // Fonts the call's text couldn't get, and images it can't have, as
+        // drawn (inside Instances, named by Tokens).
+        let drawn = zeron_design::resolve::drawn(&edited.design);
         let mut texts = Vec::new();
-        edited.design.walk(&mut |node| {
+        drawn.walk(&mut |node| {
+            let top = node.id.split('/').next().unwrap_or_default();
             if let Kind::Text(text) = &node.kind
-                && edited.changed.contains(&node.id)
+                && (edited.changed.contains(&node.id) || edited.changed.contains(top))
             {
                 texts.push(text.clone());
             }
         });
         edited.warnings.extend(live.fonts.warnings(&texts).into_iter().map(Warning::fonts));
+        // Images the call placed or looked at that can't be had (those it
+        // can, downloaded now, for its screenshots and the tabs).
+        let looked_at = edited.changed.iter().chain(&edited.screenshots);
+        let missing = images::warnings(looked_at.filter_map(|id| drawn.find(id)), &live.images);
+        edited.warnings.extend(missing);
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
@@ -625,7 +648,7 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        let design = Arc::new(Mutex::new(Live::new(path.clone(), design, self.fonts_for(&path))));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), design, self.fonts_for(&path), self.inner.images.clone())));
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -651,7 +674,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default(), self.fonts_for(&path))));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default(), self.fonts_for(&path), self.inner.images.clone())));
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -673,13 +696,15 @@ struct Target {
 }
 
 impl Live {
-    fn new(path: PathBuf, design: Design, fonts: Fonts) -> Self {
+    fn new(path: PathBuf, design: Design, fonts: Fonts, cache: Arc<ImageCache>) -> Self {
         let told = Told {
             version: 0,
             design: Arc::new(design.clone()),
             changes: Vec::new(),
             fonts: None,
+            images: BTreeMap::new(),
         };
+        let images = DesignImages::new(&path, cache);
         Self {
             path,
             design,
@@ -688,6 +713,7 @@ impl Live {
             version: 0,
             seen: HashMap::new(),
             followers: tokio::sync::watch::channel(told).0,
+            images,
         }
     }
 
@@ -734,10 +760,13 @@ impl Live {
         let design = Arc::new(self.design.clone());
         // (Loaded as the change set its text, so found without a fetch.)
         let fonts = Arc::new(self.fonts.files(&self.design));
+        // (Downloaded already, by the call that placed them.)
+        let images = self.images.files(&self.design);
         self.followers.send_modify(|told| {
             told.version = change.version;
             told.design = design;
             told.fonts = Some(fonts);
+            told.images = images;
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
             told.changes.drain(..over);
@@ -759,6 +788,7 @@ impl Live {
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
                     &self.fonts,
+                    &self.images,
                 );
                 match shot {
                     Ok(shot) => json!({

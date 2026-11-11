@@ -190,8 +190,10 @@ impl Fonts {
     }
 
     /// The font files `design`'s text uses (fetched first when needed), for
-    /// the window to draw it with ([`Fonts::of_files`]).
+    /// the window to draw it with ([`Fonts::of_files`]): as drawn, so
+    /// text inside Instances and fonts named by Tokens count.
     pub fn files(&self, design: &Design) -> Vec<FontFile> {
+        let design = &crate::resolve::drawn(design);
         let mut files = Vec::new();
         self.each_face(design, &mut |family, (_, path)| {
             if let Some(path) = path {

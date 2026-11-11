@@ -5,9 +5,13 @@
 //! those and a painter of its own. Both draw a node with [`paint_node`],
 //! so the tab shows what the agent's screenshot does.
 
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use crate::fonts::Fonts;
 use crate::layout::LaidOut;
-use crate::model::{Design, EffectKind, Effects, Node, Paint, Shadow, StrokeStyle, Text};
+use crate::model::{Design, EffectKind, Effects, ImageFill, Node, Paint, PaintKind, Shadow, StrokeStyle, Text};
 use crate::skia::Typesetter;
 
 /// The longest side of an agent's screenshot, in pixels.
@@ -74,6 +78,86 @@ pub struct Look<'a> {
     pub fill: &'a [Paint],
     pub stroke: Option<&'a StrokeStyle>,
     pub effects: &'a Effects,
+}
+
+/// Where a drawing gets the images its image paints refer to
+/// ([`ImageFill`]): files from the Design's folder, and downloads.
+pub trait Images {
+    /// The encoded image `url` refers to, or why it can't be had (an image
+    /// that can't be had draws as a placeholder).
+    fn get(&self, url: &str) -> Result<Arc<[u8]>, String>;
+}
+
+/// No images to be had: every image paint draws as a placeholder.
+pub struct NoImages;
+
+impl Images for NoImages {
+    fn get(&self, _url: &str) -> Result<Arc<[u8]>, String> {
+        Err("no images are given to this drawing".into())
+    }
+}
+
+/// Images from files already on this computer, by url: what a Design tab
+/// draws with, the engine having found each url's file (the Design's
+/// folder, or its download cache). Nothing is downloaded; a url without a
+/// file draws as a placeholder. Each file is read once.
+#[derive(Debug, Default)]
+pub struct ImageFiles {
+    paths: HashMap<String, PathBuf>,
+    read: Mutex<HashMap<String, Result<Arc<[u8]>, String>>>,
+}
+
+impl ImageFiles {
+    pub fn new(paths: HashMap<String, PathBuf>) -> Self {
+        Self { paths, read: Mutex::default() }
+    }
+
+    /// Each url's file.
+    pub fn paths(&self) -> &HashMap<String, PathBuf> {
+        &self.paths
+    }
+}
+
+impl Images for ImageFiles {
+    fn get(&self, url: &str) -> Result<Arc<[u8]>, String> {
+        let mut read = self.read.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        read.entry(url.to_owned())
+            .or_insert_with(|| {
+                let path = self.paths.get(url).ok_or("not had yet")?;
+                std::fs::read(path)
+                    .map(Arc::from)
+                    .map_err(|e| format!("can't read {}: {e}", path.display()))
+            })
+            .clone()
+    }
+}
+
+/// Every image url `design` draws.
+pub fn image_urls(design: &Design) -> BTreeSet<String> {
+    // As drawn: images inside Instances, and those Tokens name, count.
+    let design = &crate::resolve::drawn(design);
+    let mut found = Vec::new();
+    for node in &design.children {
+        images_in(node, &mut found);
+    }
+    found.into_iter().map(|(_, image)| image.url.clone()).collect()
+}
+
+/// The image paints `node` and its descendants draw, each with the node
+/// it's on: their enabled fills (a stroke draws no image).
+pub fn images_in<'a>(node: &'a Node, found: &mut Vec<(&'a Node, &'a ImageFill)>) {
+    let kind = node.kind.get();
+    // A paint doesn't depend on the size it's drawn at.
+    if let Some(look) = kind.look((0., 0.)) {
+        for paint in look.fill.iter().filter(|paint| paint.enabled) {
+            if let PaintKind::Image(image) = &paint.kind {
+                found.push((node, image));
+            }
+        }
+    }
+    for child in kind.children() {
+        images_in(child, found);
+    }
 }
 
 /// What node types draw with. Calls stack as on a canvas: `save` and
@@ -293,7 +377,9 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// puts them, their text set by `typesetter` (as it was laid out). It's
 /// drawn `margin` (Canvas units, [`blur_reach`]) wider all round and cut
 /// to `area`, so blurs at its edges read what they would with the whole
-/// Canvas drawn. `None` for an empty or oversized image.
+/// Canvas drawn. Image paints draw what `images` has. `None` for an
+/// empty or oversized image.
+#[allow(clippy::too_many_arguments)]
 pub fn region(
     design: &Design,
     laid_out: &LaidOut,
@@ -303,13 +389,14 @@ pub fn region(
     scale: f32,
     margin: f32,
     (width, height): (u32, u32),
+    images: &dyn Images,
 ) -> Option<Vec<u8>> {
     // (At most a tile's worth each side: past that a blur is faint.)
     let pad = (margin * scale).ceil().clamp(0., 512.) as u32;
     let (wide, high) = (width + 2 * pad, height + 2 * pad);
     let mut drawn = vec![0; wide as usize * high as usize * 4];
     crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
-        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter);
+        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_images(images);
         painter.translate(pad as f32, pad as f32);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
@@ -355,8 +442,15 @@ pub enum RenderError {
 }
 
 /// Draws one node of `design` on a transparent background at 1x, or
-/// smaller when its longest side is over `max_side`, and encodes it.
-pub fn screenshot(design: &Design, id: &str, max_side: f32, fonts: &Fonts) -> Result<Screenshot, RenderError> {
+/// smaller when its longest side is over `max_side`, with the images
+/// `images` has, and encodes it.
+pub fn screenshot(
+    design: &Design,
+    id: &str,
+    max_side: f32,
+    fonts: &Fonts,
+    images: &dyn Images,
+) -> Result<Screenshot, RenderError> {
     let design = &crate::resolve::drawn(design);
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let typesetter = fonts.typesetter(design);
@@ -375,7 +469,7 @@ pub fn screenshot(design: &Design, id: &str, max_side: f32, fonts: &Fonts) -> Re
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter);
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_images(images);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }

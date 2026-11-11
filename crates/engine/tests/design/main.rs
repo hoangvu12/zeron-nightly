@@ -3,6 +3,7 @@
 
 mod editing;
 mod failing;
+mod images;
 mod kept;
 mod layout;
 mod looks;

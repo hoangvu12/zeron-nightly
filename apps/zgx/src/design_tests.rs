@@ -85,6 +85,8 @@ struct StandIn {
     designs: RefCell<HashMap<String, Design>>,
     /// The font files its Designs use, as the engine would say them.
     fonts: RefCell<Vec<FontFile>>,
+    /// The file each image is in, by url, as the engine says them.
+    images: RefCell<HashMap<String, std::path::PathBuf>>,
     following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
     /// What each chat's Design tabs were said to be, in order.
     tabs_said: RefCell<Vec<(String, Vec<String>)>>,
@@ -116,6 +118,7 @@ impl StandIn {
             "design": design,
             "changes": [{ "changed": changed, "by": by }],
             "fonts": *self.fonts.borrow(),
+            "images": *self.images.borrow(),
         });
         let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
         for listener in listeners {
@@ -132,7 +135,8 @@ impl Source for Engine {
         self.0.following.borrow_mut().push((path.into(), Rc::downgrade(&listener)));
         let now = self.0.designs.borrow().get(path).cloned();
         let fonts = Fonts::of_files(&self.0.fonts.borrow());
-        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts }).ok_or_else(|| format!("can't open {path}")));
+        let images = self.0.images.borrow().clone();
+        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts, images }).ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
     }
 
@@ -261,7 +265,7 @@ fn the_tab_draws_its_design_as_the_engines_screenshot_does() {
     // The engine's screenshot of the Screen (crates/engine designs.rs),
     // against where the Screen shows in the tab.
     let design = landing("#EF4444", false);
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default()).expect("a screenshot");
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::render::NoImages).expect("a screenshot");
     let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
     let mut reader = decoder.read_info().expect("a PNG");
     let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
@@ -483,7 +487,7 @@ fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
     let typesetter = Fonts::default().typesetter(&design);
     let laid_out = zeron_design::layout::LaidOut::of(&design, &typesetter);
     let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
-    let whole = zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600)).expect("drawn");
+    let whole = zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::render::NoImages).expect("drawn");
     let one = |x: i32, y: i32| -> [u8; 4] {
         let at = ((y * 860 + x) * 4) as usize;
         whole[at..at + 4].try_into().unwrap()
@@ -554,7 +558,7 @@ fn text_draws_in_tiles_as_it_does_whole_in_the_fonts_the_engine_names() {
         let typesetter = fonts.typesetter(&design);
         let laid_out = zeron_design::layout::LaidOut::of(&design, &typesetter);
         let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
-        zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600)).expect("drawn")
+        zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::render::NoImages).expect("drawn")
     };
     let one = whole(&Fonts::of_files(&[serif]));
     // As the engine draws it, fetching the font itself (from the same
@@ -652,4 +656,68 @@ fn in_progress_screens_look_in_progress_until_the_mark_is_cleared() {
     tab.engine.say_by_agent(PATH, landing("#EF4444", true), &["screen"]);
     tab.app.frames(4);
     assert!(tab.app.wait_until(|app| app.find(".design-working").is_none()), "{}", tab.app.tree());
+}
+
+/// A 40 × 20 PNG of four upright stripes: red, green, blue and black.
+fn stripes() -> Vec<u8> {
+    let mut png = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png, 40, 20);
+    encoder.set_color(png::ColorType::Rgba);
+    let mut writer = encoder.write_header().expect("a PNG header");
+    let colours = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [0, 0, 0, 255]];
+    let pixels: Vec<u8> = (0..20).flat_map(|_| (0..40).flat_map(|x: usize| colours[x / 10])).collect();
+    writer.write_image_data(&pixels).expect("its pixels");
+    writer.finish().expect("a PNG");
+    png
+}
+
+#[test]
+fn image_fills_draw_from_the_files_the_engine_names_across_tile_edges() {
+    // The engine names each image's file; one it hasn't (a download that
+    // failed) draws as a placeholder, as the window never downloads.
+    let folder = tempfile::tempdir().expect("a folder");
+    let file = folder.path().join("stripes.png");
+    std::fs::write(&file, stripes()).expect("the image written");
+    let design = design(serde_json::json!({ "version": "1.0", "children": [
+        { "id": "screen", "type": "frame", "width": 860, "height": 600, "fill": "#F3F4F6", "children": [
+            { "id": "photo", "type": "rectangle", "x": 400, "y": 300, "width": 240, "height": 260,
+              "fill": { "type": "image", "url": "images/stripes.png", "mode": "stretch" } },
+            { "id": "gone", "type": "rectangle", "x": 100, "y": 100, "width": 100, "height": 100,
+              "fill": { "type": "image", "url": "https://example.com/gone.png" } },
+        ] },
+    ] }));
+    let mut tab = mount(design.clone());
+    tab.engine.images.borrow_mut().insert("images/stripes.png".into(), file.clone());
+    tab.engine.say(PATH, design.clone());
+    tab.settle();
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+    let shown = tab.picture();
+    // Stretched, a stripe 60 wide each, across the tiles' edges at 512.
+    for (x, colour) in [(430., [255, 0, 0, 255]), (490., [0, 255, 0, 255]), (550., [0, 0, 255, 255]), (610., [0, 0, 0, 255])] {
+        for y in [320., 540.] {
+            let got = shown.rgba(tab.on_screen(x, y));
+            assert!(got.iter().zip(colour).all(|(a, b)| a.abs_diff(b) <= 2), "at ({x}, {y}): {got:?}, not {colour:?}");
+        }
+    }
+    let placeholder = shown.rgba(tab.on_screen(150., 120.));
+    assert!(placeholder.iter().zip([228, 228, 231, 255]).all(|(a, b)| a.abs_diff(b) <= 2), "{placeholder:?}");
+
+    // As the engine's screenshot draws it, with the same files.
+    let images = zeron_design::render::ImageFiles::new([("images/stripes.png".to_string(), file)].into());
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &images).expect("a screenshot");
+    let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
+    let mut reader = decoder.read_info().expect("a PNG");
+    let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
+    reader.next_frame(&mut expected).expect("its pixels");
+    let (left, top) = tab.on_screen(0., 0.);
+    let mut off = 0;
+    for y in 0..600 {
+        for x in 0..860 {
+            let want = &expected[(y * 860 + x) * 4..][..4];
+            if want.iter().zip(shown.rgba((left + x, top + y))).any(|(a, b)| a.abs_diff(b) > 2) {
+                off += 1;
+            }
+        }
+    }
+    assert!(off <= 860 * 600 / 1000, "{off} pixels differ from the screenshot");
 }
