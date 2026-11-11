@@ -395,3 +395,84 @@ fn the_engine_hears_which_designs_a_chats_tabs_show() {
 fn tab_feed(tab: &Tab) -> Vec<(String, Vec<String>)> {
     tab.engine.tabs_said.borrow().clone()
 }
+
+/// An 860 × 600 Screen at the Canvas's origin (so at 1x its tiles' edges
+/// are at 512): across the edges, a card with a drop shadow, glass with a
+/// background blur over stripes, a blurred square and a turned one.
+fn effects_across_tiles() -> Design {
+    let mut children = Vec::new();
+    for i in 0..40 {
+        children.push(serde_json::json!({
+            "id": format!("stripe{i}"), "type": "rectangle", "x": 380 + 8 * i, "y": 280, "width": 4, "height": 160,
+            "fill": if i % 2 == 0 { "#EF4444" } else { "#4F46E5" },
+        }));
+    }
+    children.extend([
+        serde_json::json!({ "id": "card", "type": "rectangle", "x": 450, "y": 80, "width": 120, "height": 120, "fill": "#FFFFFF",
+            "effect": { "type": "shadow", "color": "#00000080", "offset": { "x": 12, "y": 12 }, "blur": 24, "spread": 4 } }),
+        serde_json::json!({ "id": "glass", "type": "rectangle", "x": 440, "y": 300, "width": 150, "height": 120,
+            "effect": { "type": "background_blur", "radius": 16 } }),
+        serde_json::json!({ "id": "soft", "type": "rectangle", "x": 200, "y": 470, "width": 80, "height": 80, "fill": "#22C55E",
+            "effect": { "type": "blur", "radius": 12 } }),
+        serde_json::json!({ "id": "turned", "type": "rectangle", "x": 480, "y": 440, "width": 100, "height": 100, "fill": "#4F46E5",
+            "rotation": 30 }),
+    ]);
+    design(serde_json::json!({ "version": "1.0", "children": [
+        { "id": "screen", "type": "frame", "width": 860, "height": 600, "fill": "#F3F4F6", "children": children },
+    ] }))
+}
+
+#[test]
+fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
+    let design = effects_across_tiles();
+    let tab = mount(design.clone());
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+
+    // At 1x a tile is 512 Canvas pixels: each Canvas pixel read from the
+    // tile holding it ("design-tile-<tab>-<level>_<x>_<y>").
+    let tiles: HashMap<(i32, i32), std::sync::Arc<zgx::image::ImageData>> = tab
+        .canvas
+        .shown(TAB)
+        .into_iter()
+        .map(|(id, image)| {
+            let key = id.strip_prefix(&format!("design-tile-{TAB}-")).expect("a tile's id");
+            let at: Vec<i32> = key.split('_').skip(1).map(|n| n.parse().unwrap()).collect();
+            ((at[0], at[1]), image)
+        })
+        .collect();
+    let tiled = |x: i32, y: i32| -> [u8; 4] {
+        let image = &tiles[&(x.div_euclid(512), y.div_euclid(512))];
+        let at = ((y.rem_euclid(512) * 512 + x.rem_euclid(512)) * 4) as usize;
+        image.pixels()[at..at + 4].try_into().unwrap()
+    };
+
+    // The Screen drawn in one piece, no tiles.
+    let laid_out = zeron_design::layout::LaidOut::of(&design);
+    let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
+    let whole = zeron_design::render::region(&design, &laid_out, &[0], area, 1., 0., (860, 600)).expect("drawn");
+    let one = |x: i32, y: i32| -> [u8; 4] {
+        let at = ((y * 860 + x) * 4) as usize;
+        whole[at..at + 4].try_into().unwrap()
+    };
+
+    // Along each tile edge in the Screen, a few pixels either side: the
+    // shadow, the glass and the blurred square as drawn whole. (A turned
+    // edge's anti-aliasing moves a few levels with where on the surface it's
+    // drawn, tiles or not: within the turned square's box, a seam would show
+    // as more than that.)
+    let mut off = Vec::new();
+    let near = [-4, -2, -1, 0, 1, 3];
+    let edges = (0..600).flat_map(|y| near.map(|d| (512 + d, y))).chain((0..860).flat_map(|x| near.map(|d| (x, 512 + d))));
+    for (x, y) in edges {
+        let turned = (475..575).contains(&x) && (385..545).contains(&y);
+        let (want, got) = (one(x, y), tiled(x, y));
+        if want.iter().zip(got).any(|(a, b)| a.abs_diff(b) > if turned { 24 } else { 2 }) {
+            off.push(((x, y), want, got));
+        }
+    }
+    assert!(off.is_empty(), "{} pixels along the tile edges differ from the whole, as {:?}", off.len(), &off[..off.len().min(6)]);
+    // (They were drawn: the shadow's shade right of the edge, the glass
+    // softening the stripes, the turned square.)
+    assert_ne!(tiled(580, 150), tiled(300, 150));
+    assert_ne!(tiled(514, 360), one(514, 280));
+}

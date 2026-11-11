@@ -113,13 +113,16 @@ struct Scene {
     design: Design,
     laid_out: LaidOut,
     tops: Vec<Rect>,
+    /// How much more a tile draws round itself, for its blurs' sake.
+    margin: f32,
 }
 
 impl Scene {
     fn new(version: u64, design: Design) -> Self {
         let laid_out = LaidOut::of(&design);
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
-        Self { version, design, laid_out, tops }
+        let margin = render::blur_reach(&design, &laid_out);
+        Self { version, design, laid_out, tops, margin }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -231,11 +234,14 @@ struct Drawn {
 /// Draws one tile.
 fn draw(scene: &Scene, key: TileKey) -> Option<Arc<ImageData>> {
     let area = key.rect();
-    let nodes: Vec<usize> = (0..scene.tops.len()).filter(|&i| scene.tops[i].meets(&area)).collect();
-    if nodes.is_empty() {
+    // (What blurs at its edges read from round it is drawn too.)
+    let m = scene.margin;
+    let around = Rect { x: area.x - m, y: area.y - m, width: area.width + 2. * m, height: area.height + 2. * m };
+    if !scene.draws_in(&area) {
         return None;
     }
-    let pixels = render::region(&scene.design, &scene.laid_out, &nodes, area, key.level.scale(), TILE, TILE)?;
+    let nodes: Vec<usize> = (0..scene.tops.len()).filter(|&i| scene.tops[i].meets(&around)).collect();
+    let pixels = render::region(&scene.design, &scene.laid_out, &nodes, area, key.level.scale(), m, (TILE, TILE))?;
     ImageData::new_premultiplied(TILE, TILE, pixels).ok().map(Arc::new)
 }
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, Layout, Node, NodeKind, Size, Sizing};
-use crate::render::{Painter, Rect};
+use super::{Corners, Effects, Fill, Layout, Node, NodeKind, Size, Sizing, Stroke};
+use crate::render::{Look, Outline, Rect};
 
 /// A container node, holding its children where they place themselves or
 /// laying them out in a row or column. Its size fits its content unless set.
@@ -12,7 +12,13 @@ pub struct Frame {
     #[serde(flatten)]
     pub layout: Layout,
     #[serde(flatten)]
+    pub corners: Corners,
+    #[serde(flatten)]
     pub fill: Fill,
+    #[serde(flatten)]
+    pub stroke: Stroke,
+    #[serde(flatten)]
+    pub effects: Effects,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clip: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -40,7 +46,12 @@ impl NodeKind for Frame {
         self.clip
     }
 
-    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
-        painter.fill_rect(Rect::sized(size), &self.fill.fill);
+    fn look(&self, size: (f32, f32)) -> Option<Look<'_>> {
+        Some(Look {
+            outline: Outline::rounded(Rect::sized(size), self.corners.radii),
+            fill: &self.fill.fill,
+            stroke: self.stroke.stroke.as_ref(),
+            effects: &self.effects,
+        })
     }
 }

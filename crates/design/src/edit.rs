@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::model::{Design, Kind, Node};
+use crate::model::{Design, Kind, Node, warn};
 use crate::printed::Printed;
 
 /// Characters a generated node id is made of.
@@ -109,9 +109,13 @@ impl Draft {
         }
         let mut made = Vec::new();
         self.prepare(&mut node, &mut made)?;
-        let node: Node = serde_json::from_value(node)
-            .map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
-        let mut warnings = Vec::new();
+        // Unsupported values, as the model read them; then unknown properties.
+        let (node, unsupported) = warn::collect(|| serde_json::from_value::<Node>(node));
+        let node = node.map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
+        let mut warnings: Vec<_> = unsupported
+            .into_iter()
+            .map(|warning| format!("Insert \"{}\": {warning}", node.name))
+            .collect();
         warn_unknown(&node, &mut warnings);
         let siblings = match parent {
             None => &mut self.design.children,
