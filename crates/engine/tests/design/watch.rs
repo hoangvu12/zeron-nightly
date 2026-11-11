@@ -47,7 +47,7 @@ async fn a_watched_design_is_heard_whole_then_after_each_change() {
     let after = next(&mut seen).await;
     assert!(after["version"].as_u64().unwrap() > version, "{after}");
     assert_eq!(after["design"]["children"][0]["children"][0]["id"], hero, "{after}");
-    let changed: Vec<&str> = after["changed"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    let changed: Vec<&str> = after["changes"][0]["changed"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert!(changed.contains(&hero.as_str()), "{after}");
 
     // A failed call says nothing.
@@ -115,18 +115,32 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 #[tokio::test]
-async fn the_window_hears_that_an_agent_made_a_change() {
+async fn the_window_hears_each_change_an_agent_made_even_after_falling_behind() {
     let seam = Seam::new().await;
     let made = seam.create("Touched", SCREEN).await;
+    let screen = made.id("Screen");
     let window = zeron_rpc::memory_client(seam.core.rpc_service());
     let mut seen = window.subscribe("WatchDesign", json!({ "path": made.path() })).await.unwrap();
     let first = next(&mut seen).await;
-    // (As it was opened: nobody's change.)
-    assert_eq!(first["by"], Value::Null, "{first}");
-    seam.execute(&made.path(), &format!(r##"Insert("{}", {{ type: "rectangle", name: "Dot", width: 4, height: 4 }});"##, made.id("Screen")))
+    // (As it was opened: no change told.)
+    assert_eq!(first["changes"], json!([]), "{first}");
+
+    // Two calls before the window reads again: it hears both, by an agent.
+    let one = seam
+        .execute(&made.path(), &format!(r##"Insert("{screen}", {{ type: "rectangle", name: "One", width: 4, height: 4 }});"##))
         .await;
-    let after = next(&mut seen).await;
-    assert_eq!(after["by"], "agent", "{after}");
+    let two = seam
+        .execute(&made.path(), &format!(r##"Insert("{screen}", {{ type: "rectangle", name: "Two", width: 4, height: 4 }});"##))
+        .await;
+    let mut changes = Vec::new();
+    while changes.len() < 2 {
+        let item = next(&mut seen).await;
+        changes.extend(item["changes"].as_array().unwrap().clone());
+    }
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert!(changes.iter().all(|change| change["by"] == "agent"), "{changes:?}");
+    assert_eq!(changes[0]["changed"], json!([one.id("One")]));
+    assert_eq!(changes[1]["changed"], json!([two.id("Two")]));
     seam.shutdown().await;
 }
 

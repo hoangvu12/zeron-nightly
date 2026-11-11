@@ -36,6 +36,8 @@ local FLASH_MS = 900
 -- Each tab's view: where the Canvas's origin is in it, and its zoom.
 type View = { x: number, y: number, zoom: number }
 local views = ui.state("design_views", {} :: { [string]: View })
+-- The flashes already shown (`tab:version:node`), kept across reloads.
+local flashed = ui.state("design_flashed", {} :: { [string]: boolean })
 
 -- What the host says of a tab's Canvas (src/design.rs): its state, where
 -- its Design draws and its tiles' layers.
@@ -235,12 +237,23 @@ local function canvas(id: string): Node
 	-- What an agent just changed: lit as it comes, fading out; then the
 	-- host's told it's over (a reload doesn't flash it again).
 	local function flash(n: any): Node
-		local lit = ui.use_state(true)
-		ui.after(0, function()
-			lit:set(false)
-		end)
-		ui.after(FLASH_MS, function()
-			ui.invoke("design.flashed", { tab = id, version = n.version })
+		local once = `{id}:{n.version}:{n.id}`
+		-- (Lit only the first time it's built: rebuilt by a reload while it
+		-- fades, it stays out.)
+		local lit = ui.use_state(not flashed:peek()[once])
+		ui.effect(function()
+			if flashed:peek()[once] then
+				return
+			end
+			flashed:set_key(once, true)
+			ui.after(0, function()
+				lit:set(false)
+			end)
+			ui.after(FLASH_MS, function()
+				-- (Over: the host lets it go, so a reload won't build it.)
+				ui.invoke("design.flashed", { tab = id, version = n.version })
+				flashed:set_key(once, nil)
+			end)
 		end)
 		local box = over(n)
 		box.id = `design-flash-{id}-{n.id}`
@@ -268,19 +281,7 @@ local function canvas(id: string): Node
 			left = 0,
 			bottom = "100%",
 			mb = "$space.1",
-			px = "$space.2",
-			py = "$zeron.space.hair",
-			rounded = "$radius.full",
-			bg = "$accent",
-			-- (The label style, in the ink that reads on the accent.)
-			ui.text {
-				ui.t("panel.design.in_progress"),
-				font = "$font.sans",
-				text_size = "$font.size.xs",
-				line_height = "$font.line.xs",
-				weight = "$font.weight.medium",
-				color = "$accent.text",
-			},
+			ds.Badge { ui.t("panel.design.in_progress"), tone = "accent", look = "solid", shape = "pill" },
 		}
 		return ui.div(box)
 	end

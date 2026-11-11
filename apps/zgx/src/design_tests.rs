@@ -14,7 +14,7 @@ use zeron_design::Design;
 use zgx::input::InputEvent;
 use zgx_script::{ScriptHost, testing::TestApp};
 
-use crate::design::{CACHE_BYTES, DesignTabs, Heard, Listener, Source};
+use crate::design::{CACHE_BYTES, DesignTabs, Heard, Listener, Source, heard_of};
 
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
@@ -88,21 +88,24 @@ struct StandIn {
 
 impl StandIn {
     /// A new version of the Design at `path`, said to whoever follows it.
+    /// A new version the person made (in a Design tab, as #33's edits will
+    /// be told): it doesn't flash.
     fn say(&self, path: &str, design: Design) {
-        self.tell(path, design, &[]);
+        self.tell(path, design, &[], "person");
     }
 
     /// A new version an agent's call made, changing `changed`.
     fn say_by_agent(&self, path: &str, design: Design, changed: &[&str]) {
-        self.tell(path, design, changed);
+        self.tell(path, design, changed, "agent");
     }
 
-    fn tell(&self, path: &str, design: Design, flash: &[&str]) {
+    /// As the engine's `WatchDesign` says it, read as the window reads it.
+    fn tell(&self, path: &str, design: Design, changed: &[&str], by: &str) {
         self.designs.borrow_mut().insert(path.into(), design.clone());
+        let item = serde_json::json!({ "design": design, "changes": [{ "changed": changed, "by": by }] });
         let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
         for listener in listeners {
-            let flash = flash.iter().map(|id| id.to_string()).collect();
-            (listener.borrow_mut())(Ok(Heard { design: design.clone(), flash }));
+            (listener.borrow_mut())(heard_of(&item));
         }
     }
 }
@@ -515,6 +518,16 @@ fn an_agents_change_flashes_what_it_changed_and_no_one_elses_does() {
     let gone = tab.app.wait_until(|app| app.find(".design-flash").is_none());
     assert!(gone, "the flash stays:
 {}", tab.app.tree());
+
+    // Two calls one after the other, each changing its node: both flash.
+    tab.engine.say_by_agent(PATH, landing("#EF4444", false), &["badge"]);
+    let mut moved = landing("#EF4444", false);
+    moved.children[0].name = "Landing".into();
+    tab.engine.say_by_agent(PATH, moved, &["hero"]);
+    tab.app.frames(2);
+    assert!(tab.app.find(&format!("#design-flash-{TAB}-badge")).is_some(), "{}", tab.app.tree());
+    assert!(tab.app.find(&format!("#design-flash-{TAB}-hero")).is_some(), "{}", tab.app.tree());
+    assert!(tab.app.wait_until(|app| app.find(".design-flash").is_none()));
 
     // A change that isn't an agent's (the person's own) doesn't flash.
     tab.engine.say(PATH, landing("#EF4444", false));

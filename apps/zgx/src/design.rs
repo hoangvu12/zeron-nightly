@@ -59,11 +59,38 @@ pub const ZOOM: (f32, f32) = (0.25, 5.);
 /// change, or why it can't be followed.
 pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
 
-/// A Design as it is now, and the nodes an agent's change to it made or
-/// changed (none when the change wasn't an agent's), which flash.
+/// A Design as it is now, and the nodes agents' changes to it made or
+/// changed since the tab last heard (none for anyone else's), which flash.
 pub struct Heard {
     pub design: Design,
     pub flash: Vec<String>,
+}
+
+/// `WatchDesign`'s item as a tab hears it: what an agent changed flashes;
+/// the person's own changes don't.
+pub fn heard_of(item: &Json) -> Result<Heard, String> {
+    #[derive(serde::Deserialize)]
+    struct Change {
+        #[serde(default)]
+        changed: Vec<String>,
+        by: Changer,
+    }
+    #[derive(serde::Deserialize, PartialEq)]
+    #[serde(rename_all = "lowercase")]
+    enum Changer {
+        Agent,
+        #[serde(other)]
+        Other,
+    }
+    let design = serde_json::from_value(item["design"].clone()).map_err(|e| format!("not a Design: {e}"))?;
+    let changes: Vec<Change> = serde_json::from_value(item["changes"].clone()).unwrap_or_default();
+    let mut flash: Vec<String> = Vec::new();
+    for id in changes.into_iter().filter(|c| c.by == Changer::Agent).flat_map(|c| c.changed) {
+        if !flash.contains(&id) {
+            flash.push(id);
+        }
+    }
+    Ok(Heard { design, flash })
 }
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
@@ -98,21 +125,7 @@ impl Source for EngineSource {
         let watch = rpc.watch_ending(
             "WatchDesign",
             json!({ "path": path }),
-            move |item: Json| {
-                let heard = serde_json::from_value(item["design"].clone())
-                    .map(|design| Heard {
-                        design,
-                        // (What an agent changed flashes; the person's own
-                        // changes don't.)
-                        flash: if item["by"] == "agent" {
-                            item["changed"].as_array().into_iter().flatten().filter_map(|id| id.as_str().map(str::to_owned)).collect()
-                        } else {
-                            Vec::new()
-                        },
-                    })
-                    .map_err(|e| format!("not a Design: {e}"));
-                (listener.borrow_mut())(heard)
-            },
+            move |item: Json| (listener.borrow_mut())(heard_of(&item)),
             move |why| {
                 // (A connection that ended is followed again on the next.)
                 if why != "closed" {
@@ -401,11 +414,22 @@ struct TabCanvas {
     front: Option<Level>,
     back: Option<Level>,
     tiles: HashMap<TileKey, Tile>,
-    /// What flashes now: the nodes the last agent change made or changed,
-    /// and which change (so the script tells one flash from the next).
-    flash: Vec<String>,
-    flash_version: u64,
+    /// What flashes now, a flash for each version agents changed.
+    flashes: Vec<Flash>,
 }
+
+/// The nodes agents changed in one version of a Design, lit for a moment.
+struct Flash {
+    /// The version (so the script tells one flash from the next).
+    version: u64,
+    ids: Vec<String>,
+    /// When it was heard: one not shown by [`FLASH_STALE`] (its tab in the
+    /// back) never is.
+    at: std::time::Instant,
+}
+
+/// How long a flash may wait to be shown.
+const FLASH_STALE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl TabCanvas {
     fn drawn(&self, key: &TileKey) -> bool {
@@ -454,7 +478,12 @@ impl TabCanvas {
         // and the Screens it marked in progress.
         if let Some(scene) = &self.scene {
             let placed = |id: &str, extra: Vec<(&str, Value)>| {
-                let bounds = scene.laid_out.get(id)?.bounds;
+                let placed = scene.laid_out.get(id)?;
+                // (Nothing of it shows: nothing to light.)
+                if placed.problems.contains(&zeron_design::layout::Problem::FullyClipped) {
+                    return None;
+                }
+                let bounds = placed.bounds;
                 let mut fields = vec![
                     ("id", Value::from(id)),
                     ("x", Value::Num(bounds.x as f64)),
@@ -465,8 +494,12 @@ impl TabCanvas {
                 fields.extend(extra);
                 Some(Value::record(fields))
             };
-            let version = Value::Num(self.flash_version as f64);
-            let flashes: Vec<Value> = self.flash.iter().filter_map(|id| placed(id, vec![("version", version.clone())])).collect();
+            let flashes: Vec<Value> = self
+                .flashes
+                .iter()
+                .filter(|f| f.at.elapsed() < FLASH_STALE)
+                .flat_map(|f| f.ids.iter().filter_map(move |id| placed(id, vec![("version", Value::Num(f.version as f64))])))
+                .collect();
             let working: Vec<Value> = scene
                 .design
                 .children
@@ -578,8 +611,8 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         let tab = text(&arg, "tab");
         let version = arg.field("version").and_then(Value::as_f64).unwrap_or(0.) as u64;
         // (Over, so a reload doesn't flash it again; a newer flash stays.)
-        if let Some(canvas) = tabs.tabs.borrow_mut().get_mut(&tab).filter(|c| c.flash_version == version) {
-            canvas.flash.clear();
+        if let Some(canvas) = tabs.tabs.borrow_mut().get_mut(&tab) {
+            canvas.flashes.retain(|f| f.version != version);
         }
         tabs.publish(&tab);
     });
@@ -633,8 +666,7 @@ impl DesignTabs {
             front: None,
             back: None,
             tiles: HashMap::new(),
-            flash: Vec::new(),
-            flash_version: 0,
+            flashes: Vec::new(),
         };
         self.tabs.borrow_mut().insert(tab.to_owned(), canvas);
         self.follow(tab);
@@ -705,9 +737,9 @@ impl DesignTabs {
                     canvas.failed = None;
                     self.versions.set(self.versions.get() + 1);
                     let scene = Arc::new(Scene::new(self.versions.get(), design));
+                    canvas.flashes.retain(|f| f.at.elapsed() < FLASH_STALE);
                     if !flash.is_empty() {
-                        canvas.flash = flash;
-                        canvas.flash_version = scene.version;
+                        canvas.flashes.push(Flash { version: scene.version, ids: flash, at: std::time::Instant::now() });
                     }
                     if let Some(old) = &canvas.scene {
                         let damage = old.damage(&scene);

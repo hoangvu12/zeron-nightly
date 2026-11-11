@@ -142,19 +142,30 @@ struct Live {
     followers: tokio::sync::watch::Sender<Told>,
 }
 
-/// A Design as the tabs following it hear it: its version, and what the
-/// change that made it made or changed.
+/// A Design as the tabs following it hear it: its version, and the
+/// changes that made the latest versions (a tab that falls behind hears
+/// each change it missed, up to [`MAX_TOLD_CHANGES`]).
 #[derive(Clone)]
 struct Told {
     version: u64,
     design: Arc<Design>,
-    changed: Vec<String>,
-    /// Who made the change: the tabs flash an agent's, not the person's.
-    by: Option<Changer>,
+    changes: Vec<Change>,
 }
 
-/// Who changed a Design (the person's own edits in a Design tab come with
-/// #33, as `Person`).
+/// One change to a Design, as its tabs hear of it.
+#[derive(Clone, Serialize)]
+struct Change {
+    version: u64,
+    /// The nodes it made or changed.
+    changed: Vec<String>,
+    by: Changer,
+}
+
+/// How many of the latest changes a Design's tabs are told of.
+const MAX_TOLD_CHANGES: usize = 32;
+
+/// Who changed a Design: its tabs flash an agent's changes. (The person's
+/// own edits in a Design tab come with #33.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Changer {
@@ -213,7 +224,8 @@ impl Designs {
 
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
-    /// design, changed, by}` (`by`: "agent", "person", or null as opened). A tab that falls behind hears the latest only.
+    /// design, changes: [{version, changed, by}]}`: the changes since the
+    /// item before (none in the first), `by` "agent". A tab that falls behind hears the latest only.
     /// Blocking (it may read the file): run it off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
@@ -223,24 +235,28 @@ impl Designs {
             live.followers.send_if_modified(|told| {
                 let stale = told.version != live.version;
                 if stale {
-                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changed: Vec::new(), by: None };
+                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changes: Vec::new() };
                 }
                 stale
             });
             live.followers.subscribe()
         };
-        Ok(futures::stream::unfold((told, true), |(mut told, first)| async move {
-            if !first && told.changed().await.is_err() {
+        // (The version it last told, so each item tells the changes since.)
+        Ok(futures::stream::unfold((told, None::<u64>), |(mut told, last)| async move {
+            if last.is_some() && told.changed().await.is_err() {
                 return None;
             }
             let now = told.borrow_and_update().clone();
+            let since: Vec<&Change> = match last {
+                Some(last) => now.changes.iter().filter(|change| change.version > last).collect(),
+                None => Vec::new(),
+            };
             let item = json!({
                 "version": now.version,
                 "design": &*now.design,
-                "changed": now.changed,
-                "by": now.by,
+                "changes": since,
             });
-            Some((item, (told, false)))
+            Some((item, (told, Some(now.version))))
         }))
     }
 
@@ -487,8 +503,7 @@ impl Live {
         let told = Told {
             version: 0,
             design: Arc::new(design.clone()),
-            changed: Vec::new(),
-            by: None,
+            changes: Vec::new(),
         };
         Self {
             path,
@@ -505,11 +520,18 @@ impl Live {
         if self.followers.receiver_count() == 0 {
             return;
         }
-        self.followers.send_replace(Told {
+        let change = Change {
             version: self.version,
-            design: Arc::new(self.design.clone()),
             changed: edited.changed.iter().cloned().collect(),
-            by: Some(by),
+            by,
+        };
+        let design = Arc::new(self.design.clone());
+        self.followers.send_modify(|told| {
+            told.version = change.version;
+            told.design = design;
+            told.changes.push(change);
+            let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
+            told.changes.drain(..over);
         });
     }
 
