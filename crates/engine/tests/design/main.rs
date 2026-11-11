@@ -2,5 +2,7 @@
 //! agent calls them ([`seam`]), one module per part of the feature.
 
 mod kept;
+mod layout;
+mod reading;
 mod seam;
 mod tracer;

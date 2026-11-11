@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
-use zeron_design::snippet::{self, Limits};
+use zeron_design::snippet::{self, Globals, Limits};
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -66,6 +66,8 @@ struct Inner {
     limits: Limits,
     /// Designs held live, by file: one owner each, so calls apply in order.
     live: Mutex<HashMap<PathBuf, Arc<Mutex<Live>>>>,
+    /// Each chat's snippet globals, carried to its next call.
+    globals: Mutex<HashMap<String, Globals>>,
 }
 
 /// One Design as the engine holds it.
@@ -88,6 +90,7 @@ impl Designs {
                 root,
                 limits: Limits::default(),
                 live: Mutex::new(HashMap::new()),
+                globals: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -99,14 +102,14 @@ impl Designs {
 
     /// Runs one `design_execute` call to its end (blocking: run it off the
     /// async runtime). Returns the Design's name and path, the name-to-id
-    /// map of the nodes the call made, its screenshots as base64 PNG, and
-    /// any warnings about its edits.
+    /// map of the nodes the call made, its screenshots as base64 PNG, the
+    /// lines it printed and any warnings about its edits.
     pub fn execute(&self, params: ExecuteParams) -> Result<Value, DesignError> {
         if params.snippet.trim().is_empty() {
             return Err(DesignError::Refused("the snippet is empty".into()));
         }
         let target = self.target(&params)?;
-        let ran = self.run(&target.live, &params.snippet);
+        let ran = self.run(&target.live, &params.snippet, params.chat_id.as_deref());
         if ran.is_err() && target.new {
             // Nothing was made: the name is free again.
             lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
@@ -114,16 +117,30 @@ impl Designs {
         ran
     }
 
-    fn run(&self, live: &Mutex<Live>, code: &str) -> Result<Value, DesignError> {
+    /// Runs `code` with `chat`'s globals, keeping the globals it leaves
+    /// when it succeeds. Read once the Design is held, so calls queued on
+    /// one Design see each other's; calls on two Designs at once each
+    /// start from what was there, and the later to end wins.
+    fn run(&self, live: &Mutex<Live>, code: &str, chat: Option<&str>) -> Result<Value, DesignError> {
         let mut live = lock(live);
-        let draft = snippet::run(Draft::new(live.design.clone()), code, self.inner.limits)?;
+        let globals = chat
+            .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
+            .unwrap_or_default();
+        let (draft, globals) =
+            snippet::run(Draft::new(live.design.clone()), globals, code, self.inner.limits)?;
         let edited = draft.finish();
         let screenshots = live.commit(&edited)?;
+        if let Some(chat) = chat {
+            lock(&self.inner.globals).insert(chat.to_owned(), globals);
+        }
         let mut result = json!({
             "design": { "name": design_name(&live.path), "path": live.path },
             "ids": edited.names,
             "screenshots": screenshots,
         });
+        if !edited.printed.is_empty() {
+            result["printed"] = json!(edited.printed);
+        }
         if !edited.warnings.is_empty() {
             result["warnings"] = json!(edited.warnings);
         }
