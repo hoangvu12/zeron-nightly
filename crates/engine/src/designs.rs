@@ -1212,18 +1212,21 @@ impl Live {
     /// Tells the Design's tabs its file, and whether it's unsaved,
     /// recovered or stale, when that changed.
     fn tell_saving(&self) {
-        let (path, unsaved, recovered, stale) = (&self.path, self.unsaved, self.recovered, self.stale);
-        self.followers.send_if_modified(|told| {
-            let changed = told.path != *path
-                || told.unsaved != unsaved
-                || told.recovered != recovered
-                || told.stale != stale;
-            told.path.clone_from(path);
-            told.unsaved = unsaved;
-            told.recovered = recovered;
-            told.stale = stale;
-            changed
-        });
+        self.followers.send_if_modified(|told| self.saving_into(told));
+    }
+
+    /// Sets what `told` says of its file, unsaved, recovered and stale to
+    /// how they are; true when that changed it.
+    fn saving_into(&self, told: &mut Told) -> bool {
+        let changed = told.path != self.path
+            || told.unsaved != self.unsaved
+            || told.recovered != self.recovered
+            || told.stale != self.stale;
+        told.path.clone_from(&self.path);
+        told.unsaved = self.unsaved;
+        told.recovered = self.recovered;
+        told.stale = self.stale;
+        changed
     }
 
     /// Takes one step through the Design's history with `step` (undo or
@@ -1244,8 +1247,9 @@ impl Live {
         Ok(true)
     }
 
-    /// Tells the Design's tabs what a change (`by` whom) made of it, and
-    /// the nodes it `changed` (copied for them only while some follow it).
+    /// Tells the Design's tabs what a change (`by` whom) made of it, the
+    /// nodes it `changed` (copied for them only while some follow it), and
+    /// its saving state as the change left it.
     fn tell(&self, changed: Vec<String>, by: Changer) {
         if self.followers.receiver_count() == 0 {
             return;
@@ -1262,6 +1266,9 @@ impl Live {
             told.version = change.version;
             told.design = design;
             told.assets = Some(assets);
+            // With the change, so no tab hears it saved before it's told
+            // otherwise.
+            self.saving_into(told);
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
             told.changes.drain(..over);
