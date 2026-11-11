@@ -813,7 +813,7 @@ fn instances_and_themed_tokens_draw_in_tiles_as_in_the_engines_screenshot() {
     assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
     let shown = tab.picture();
 
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::render::ImageFiles::default(), &zeron_design::assets::NoAssets).expect("a screenshot");
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::assets::NoAssets).expect("a screenshot");
     let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
     let mut reader = decoder.read_info().expect("a PNG");
     let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
@@ -860,16 +860,14 @@ fn an_image_and_a_font_set_only_in_an_instances_overrides_draw_in_tiles() {
         key: zeron_design::assets::AssetKey::font("Instrument Serif", 400),
         path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/InstrumentSerif-Regular.ttf"),
     };
-    let mut tab = mount_with(design.clone(), vec![serif.clone()]);
-    tab.engine.images.borrow_mut().insert("images/stripes.png".into(), file.clone());
-    tab.engine.say(PATH, design.clone());
-    tab.settle();
+    let image = Resolved { key: zeron_design::assets::AssetKey::image("images/stripes.png"), path: file };
+    let mut tab = mount_with(design.clone(), vec![serif.clone(), image.clone()]);
     assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
     let shown = tab.picture();
 
-    let images = zeron_design::render::ImageFiles::new([("images/stripes.png".to_string(), file)].into());
+    let images = zeron_design::assets::Files::new([image]);
     let shot = |fonts: &Fonts| {
-        let shot = zeron_design::render::screenshot(&design, "screen", 10_000., fonts, &images, &zeron_design::assets::NoAssets)
+        let shot = zeron_design::render::screenshot(&design, "screen", 10_000., fonts, &images)
             .expect("a screenshot");
         let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
         let mut reader = decoder.read_info().expect("a PNG");
