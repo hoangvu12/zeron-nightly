@@ -5826,6 +5826,27 @@ impl RpcService for EngineRpc {
                 let p: crate::designs::StateParams = parse_params(params)?;
                 RpcReply::value(&designs.state(p.chat_id.as_deref()))
             }
+            methods::WATCH_DESIGN => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::WatchParams = parse_params(params)?;
+                let told = tokio::task::spawn_blocking(move || designs.watch(&p.path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| match e {
+                        crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
+                        e => RpcError::Failed(e.to_string()),
+                    })?;
+                Ok(RpcReply::Stream(told.boxed()))
+            }
+            methods::SET_DESIGN_TABS => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::TabsParams = parse_params(params)?;
+                // (It keeps the recent list on disk.)
+                tokio::task::spawn_blocking(move || designs.set_tabs(&p.chat_id, p.paths))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self
