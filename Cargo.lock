@@ -13794,6 +13794,8 @@ dependencies = [
  "serde_json",
  "skia-safe",
  "thiserror 2.0.20",
+ "tracing",
+ "ureq",
  "uuid",
 ]
 

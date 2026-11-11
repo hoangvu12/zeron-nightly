@@ -39,6 +39,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use serde_json::{Value as Json, json};
 use zeron_design::Design;
+use zeron_design::fonts::{FontFile, Fonts};
 use zeron_design::layout::LaidOut;
 use zeron_design::render::{self, ImageFiles, Rect};
 use zgx::image::ImageData;
@@ -68,12 +69,16 @@ pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
 pub struct Heard {
     pub design: Design,
     pub flash: Vec<String>,
+    /// What its text draws in: the font files the engine says it uses.
+    pub fonts: Fonts,
     pub images: HashMap<String, PathBuf>,
 }
 
 /// `WatchDesign`'s item as a tab hears it: what an agent changed flashes;
-/// the person's own changes don't.
-pub fn heard_of(item: &Json) -> Result<Heard, String> {
+/// the person's own changes don't. `fonts` are those last heard, read
+/// again only when the files change (font files that can't be read draw as
+/// the engine said the families it can't get do: in the bundled one).
+pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
     #[derive(serde::Deserialize)]
     struct Change {
         #[serde(default)]
@@ -95,9 +100,13 @@ pub fn heard_of(item: &Json) -> Result<Heard, String> {
             flash.push(id);
         }
     }
+    let files: Vec<FontFile> = serde_json::from_value(item["fonts"].clone()).unwrap_or_default();
+    if !fonts.is_of(&files) {
+        *fonts = Fonts::of_files(&files);
+    }
     // (An older engine says no images: they draw as placeholders.)
     let images = serde_json::from_value(item["images"].clone()).unwrap_or_default();
-    Ok(Heard { design, flash, images })
+    Ok(Heard { design, flash, fonts: fonts.clone(), images })
 }
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
@@ -129,10 +138,11 @@ impl Source for EngineSource {
         let rpc = engine::get().current()?;
         let listener = Rc::new(RefCell::new(listener));
         let ended = listener.clone();
+        let mut fonts = Fonts::default();
         let watch = rpc.watch_ending(
             "WatchDesign",
             json!({ "path": path }),
-            move |item: Json| (listener.borrow_mut())(heard_of(&item)),
+            move |item: Json| (listener.borrow_mut())(heard_of(&item, &mut fonts)),
             move |why| {
                 // (A connection that ended is followed again on the next.)
                 if why != "closed" {
@@ -145,11 +155,12 @@ impl Source for EngineSource {
 }
 
 /// A Design as tiles draw it: its version in this window (one more each
-/// time it's heard), the Design laid out, and where each of its top-level
-/// nodes draws.
+/// time it's heard), the Design laid out in its fonts, and where each of
+/// its top-level nodes draws.
 struct Scene {
     version: u64,
     design: Design,
+    fonts: Fonts,
     laid_out: LaidOut,
     tops: Vec<Rect>,
     /// How much more a tile draws round itself, for its blurs' sake.
@@ -158,11 +169,11 @@ struct Scene {
 }
 
 impl Scene {
-    fn new(version: u64, design: Design, images: HashMap<String, PathBuf>) -> Self {
-        let laid_out = LaidOut::of(&design);
+    fn new(version: u64, design: Design, fonts: Fonts, images: HashMap<String, PathBuf>) -> Self {
+        let laid_out = LaidOut::of(&design, &fonts.typesetter(&design));
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
         let margin = render::blur_reach(&design, &laid_out);
-        Self { version, design, laid_out, tops, margin, images: ImageFiles::new(images) }
+        Self { version, design, fonts, laid_out, tops, margin, images: ImageFiles::new(images) }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -283,7 +294,9 @@ fn draw(scene: &Scene, key: TileKey) -> Option<Arc<ImageData>> {
         return None;
     }
     let nodes: Vec<usize> = (0..scene.tops.len()).filter(|&i| scene.tops[i].meets(&around)).collect();
-    let pixels = render::region(&scene.design, &scene.laid_out, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.images)?;
+    // (Made per tile: Skia's text layout isn't shared across threads.)
+    let typesetter = scene.fonts.typesetter(&scene.design);
+    let pixels = render::region(&scene.design, &scene.laid_out, &typesetter, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.images)?;
     ImageData::new_premultiplied(TILE, TILE, pixels).ok().map(Arc::new)
 }
 
@@ -743,10 +756,10 @@ impl DesignTabs {
             let Some(canvas) = tabs.get_mut(tab) else { return };
             match heard {
                 Err(why) => canvas.failed = Some(why),
-                Ok(Heard { design, flash, images }) => {
+                Ok(Heard { design, flash, fonts, images }) => {
                     canvas.failed = None;
                     self.versions.set(self.versions.get() + 1);
-                    let scene = Arc::new(Scene::new(self.versions.get(), design, images));
+                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, images));
                     canvas.flashes.retain(|f| f.at.elapsed() < FLASH_STALE);
                     if !flash.is_empty() {
                         canvas.flashes.push(Flash { version: scene.version, ids: flash, at: std::time::Instant::now() });

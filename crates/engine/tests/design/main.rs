@@ -10,5 +10,6 @@ mod looks;
 mod reading;
 mod seam;
 mod targeting;
+mod text;
 mod tracer;
 mod watch;

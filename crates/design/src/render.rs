@@ -9,10 +9,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::fonts::Fonts;
 use crate::layout::LaidOut;
-use crate::model::{
-    Design, EffectKind, Effects, ImageFill, Node, Paint, PaintKind, Shadow, StrokeStyle,
-};
+use crate::model::{Design, EffectKind, Effects, ImageFill, Node, Paint, PaintKind, Shadow, StrokeStyle, Text};
+use crate::skia::Typesetter;
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -188,6 +188,9 @@ pub trait Painter {
     fn shadow(&mut self, outline: &Outline, shadow: &Shadow);
     /// Blurs what's already drawn within `outline` by `radius`.
     fn background_blur(&mut self, outline: &Outline, radius: f32);
+    /// Draws `text` in a box of `size` at the origin, in each of its fill's
+    /// paints in turn.
+    fn text(&mut self, text: &Text, size: (f32, f32));
 }
 
 /// Draws `node` and its descendants where `laid_out` puts them, with its
@@ -369,14 +372,16 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// transparent `width` × `height` image (RGBA, premultiplied): the
 /// Canvas's top-level nodes at `nodes` (indices into its children, the
 /// ones meeting `area` grown by `margin`, in order) drawn where `laid_out`
-/// puts them. It's drawn `margin` (Canvas units, [`blur_reach`]) wider all
-/// round and cut to `area`, so blurs at its edges read what they would
-/// with the whole Canvas drawn. Image paints draw what `images` has. `None`
-/// for an empty or oversized image.
+/// puts them, their text set by `typesetter` (as it was laid out). It's
+/// drawn `margin` (Canvas units, [`blur_reach`]) wider all round and cut
+/// to `area`, so blurs at its edges read what they would with the whole
+/// Canvas drawn. Image paints draw what `images` has. `None` for an
+/// empty or oversized image.
 #[allow(clippy::too_many_arguments)]
 pub fn region(
     design: &Design,
     laid_out: &LaidOut,
+    typesetter: &Typesetter,
     nodes: &[usize],
     area: Rect,
     scale: f32,
@@ -389,7 +394,7 @@ pub fn region(
     let (wide, high) = (width + 2 * pad, height + 2 * pad);
     let mut drawn = vec![0; wide as usize * high as usize * 4];
     crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
-        let mut painter = crate::skia::SkiaPainter::with_images(canvas, images);
+        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_images(images);
         painter.translate(pad as f32, pad as f32);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
@@ -441,10 +446,12 @@ pub fn screenshot(
     design: &Design,
     id: &str,
     max_side: f32,
+    fonts: &Fonts,
     images: &dyn Images,
 ) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
-    let laid_out = LaidOut::of(design);
+    let typesetter = fonts.typesetter(design);
+    let laid_out = LaidOut::of(design, &typesetter);
     let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
     let (width, height) = (bounds.width, bounds.height);
     if !(width > 0. && height > 0.) {
@@ -459,7 +466,7 @@ pub fn screenshot(
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::with_images(surface.canvas(), images);
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_images(images);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }
