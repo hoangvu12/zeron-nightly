@@ -582,7 +582,12 @@ end
 
 test("the home stands a little over the panel's middle as its parts open, close and grow", function()
 	local app = home()
-	-- (The lift: the composer's, here with no strip over the page.)
+	-- (The lift: the composer's, here with no strip over the page; read
+	-- with the subagents folded, so the home is short enough to take all of
+	-- it rather than only the room it has left.)
+	-- (The stopgap Design row makes the home a row taller; #31 replaces it.)
+	app:click("#panel-home-subagents-head")
+	app:frames(30)
 	local py, ph = span_of(app, "#panel-empty")
 	local by, bh = span_of(app, "#panel-home-block")
 	local lift = (py + ph - by - bh) - (by - py)
@@ -590,7 +595,6 @@ test("the home stands a little over the panel's middle as its parts open, close 
 	app:click("#panel-home-subagents-head")
 	app:frames(30)
 	expect(centred(app, lift)).to_be(true)
-	app:click("#panel-home-subagents-head")
 	app:command("many")
 	app:frames(30)
 	expect(centred(app, lift)).to_be(true)
