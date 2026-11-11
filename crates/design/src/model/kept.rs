@@ -34,6 +34,8 @@ struct Common {
     flip_y: bool,
     #[serde(default = "opaque", deserialize_with = "opacity")]
     opacity: f32,
+    #[serde(default, rename = "inProgress")]
+    in_progress: bool,
 }
 
 fn opaque() -> f32 {
@@ -66,6 +68,8 @@ struct Written<'a> {
     opacity: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     absolute: bool,
+    #[serde(rename = "inProgress", skip_serializing_if = "std::ops::Not::not")]
+    in_progress: bool,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     kind: Option<&'a Kind>,
     #[serde(flatten)]
@@ -91,6 +95,7 @@ impl Node {
             flip_y: known && self.flip_y,
             opacity: (known && self.opacity != 1.).then_some(self.opacity),
             absolute: known && self.absolute,
+            in_progress: known && self.in_progress,
             kind: known.then_some(&self.kind),
             extra: &self.extra,
         }
@@ -123,6 +128,7 @@ impl Node {
                 flip_y: false,
                 opacity: 1.,
                 absolute: false,
+                in_progress: false,
                 kind: Kind::Opaque(Opaque { type_name }),
                 extra,
             });
@@ -144,6 +150,7 @@ impl Node {
             flip_y: common.flip_y,
             opacity: common.opacity,
             absolute: common.absolute,
+            in_progress: common.in_progress,
             kind,
             extra: Map::new(),
         };

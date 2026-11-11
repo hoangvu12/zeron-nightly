@@ -65,9 +65,10 @@ fn near(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() < 0.5
 }
 
+/// The call's warnings' messages.
 fn warnings(called: &Called) -> Vec<String> {
-    match called.json().get("warnings") {
-        Some(warnings) => serde_json::from_value(warnings.clone()).unwrap(),
+    match called.json().get("warnings").and_then(Value::as_array) {
+        Some(warnings) => warnings.iter().map(|w| w["message"].as_str().unwrap().to_owned()).collect(),
         None => Vec::new(),
     }
 }
@@ -177,6 +178,14 @@ Insert(screen, { type: "text", name: "Seen", content: "Hi", fill: "#000000" });"
     let warnings = warnings(&made);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("\"Ghost\" (text) has no fill") && warnings[0].contains("invisible"), "{warnings:?}");
+    let warning = &made.json()["warnings"][0];
+    assert_eq!((&warning["node"], &warning["property"]), (&Value::from(made.id("Ghost")), &Value::from("fill")));
+
+    // Its fill taken away later is warned of too.
+    let cleared = seam
+        .execute(&made.path(), &format!(r#"Update("{}", {{ fill: [] }});"#, made.id("Seen")))
+        .await;
+    assert!(self::warnings(&cleared).iter().any(|w| w.contains("\"Seen\" (text) has no fill")), "{}", cleared.text);
     seam.shutdown().await;
 }
 

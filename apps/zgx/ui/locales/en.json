@@ -3119,6 +3119,7 @@
       },
       "open": "Open design",
       "filter": "Designs",
+      "in_progress": "In progress",
       "failed": "The Design didn't open"
     },
     "terminal": {

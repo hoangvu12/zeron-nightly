@@ -3119,6 +3119,7 @@
       },
       "open": "打开设计",
       "filter": "设计",
+      "in_progress": "进行中",
       "failed": "设计未能打开"
     },
     "terminal": {
