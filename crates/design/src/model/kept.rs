@@ -17,7 +17,9 @@ use serde_json::{Map, Value, json};
 
 use super::{Kind, Node, Opaque, paint, token, warn};
 
-/// The properties every node has, by name.
+/// The properties every node has, by name: what an Instance takes as its
+/// own rather than an override of its Component's ([`super::Instance`]).
+/// (Kept beside [`Common`], which reads them.)
 pub(super) const COMMON: &[&str] = &[
     "id", "name", "x", "y", "absolute", "rotation", "flipX", "flipY", "opacity", "inProgress", "enabled", "theme",
 ];

@@ -19,8 +19,10 @@ impl Draft {
         }
         for id in ids {
             if self.design.find(id).is_some() {
-                let (_, _, node) = self.take(id)?;
+                let (parent, _, node) = self.take(id)?;
                 self.forget(&node);
+                // What held it changed with it.
+                self.changed.extend(parent);
             }
         }
         Ok(())

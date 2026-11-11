@@ -50,9 +50,7 @@ pub fn resolved(design: &Design, how: Resolve) -> (Design, Vec<Problem>) {
     }
     let mut components = HashMap::new();
     design.walk(&mut |node| {
-        if let Kind::Frame(frame) = &node.kind
-            && frame.reusable
-        {
+        if node.is_component() {
             components.insert(node.id.clone(), node.clone());
         }
     });
@@ -95,12 +93,16 @@ impl Resolver {
         if self.how.enabled_only && !node.enabled {
             return None;
         }
-        let mut theme = theme.clone();
-        theme.extend(node.theme.clone());
         let mut expanded = None;
         if self.how.instances && matches!(node.kind, Kind::Instance(_)) {
             (node, expanded) = self.expand(node, nesting);
+        } else if node.is_component() {
+            // So an Instance of a Component inside it is caught at once.
+            expanded = Some(node.id.clone());
         }
+        // After expanding, so the Component's own Theme counts.
+        let mut theme = theme.clone();
+        theme.extend(node.theme.clone());
         if self.how.tokens && !node.refs.is_empty() {
             self.substitute(&mut node, &theme);
         }
@@ -126,8 +128,12 @@ impl Resolver {
             self.problem(&node.id, format!("its Component \"{}\" isn't in the Design", instance.component));
             return (node, None);
         };
-        if nesting.contains(&instance.component) || nesting.len() >= MAX_NESTING {
+        if nesting.contains(&instance.component) {
             self.problem(&node.id, format!("its Component \"{}\" holds an Instance of itself", instance.component));
+            return (node, None);
+        }
+        if nesting.len() >= MAX_NESTING {
+            self.problem(&node.id, format!("Instances nest at most {MAX_NESTING} deep inside their Components"));
             return (node, None);
         }
         let mut copy = component.clone();
@@ -154,7 +160,10 @@ impl Resolver {
             let message = format!("its Component has no property \"{key}\" to override; it's kept, but does nothing");
             self.problem(&node.id, message);
         }
-        for (key, value) in &instance.descendants {
+        // By name first, so an override by id or path wins over one by name.
+        let by_id = |key: &str| key.contains('/') || holds(&copy, &format!("{}/{key}", node.id));
+        let (by_id, by_name): (Vec<_>, Vec<_>) = instance.descendants.iter().partition(|(key, _)| by_id(key));
+        for (key, value) in by_name.into_iter().chain(by_id) {
             self.override_descendant(&mut copy, key, value);
         }
         (copy, Some(instance.component.clone()))
@@ -204,8 +213,22 @@ impl Resolver {
             .map(|(key, value)| (key.clone(), self.value(value, theme, &node.id)))
             .collect();
         node.refs = refs;
-        if let Err(e) = node.set_props(&resolved) {
-            self.problem(&node.id, format!("with its Tokens' values, {e}"));
+        match node.set_props(&resolved) {
+            Ok(unsupported) => {
+                for message in unsupported {
+                    self.problem(&node.id, format!("with its Tokens' values, {message}"));
+                }
+                let unknown: Vec<String> = node
+                    .unknown_properties()
+                    .filter(|key| resolved.contains_key(*key))
+                    .map(str::to_owned)
+                    .collect();
+                for key in unknown {
+                    let message = format!("has a property \"{key}\" Zeron doesn't know; it's kept, but does nothing");
+                    self.problem(&node.id, message);
+                }
+            }
+            Err(e) => self.problem(&node.id, format!("with its Tokens' values, {e}")),
         }
     }
 
@@ -291,6 +314,11 @@ fn find_mut<'a>(node: &'a mut Node, id: &str) -> Option<&'a mut Node> {
         return Some(node);
     }
     node.kind.get_mut().children_mut()?.iter_mut().find_map(|child| find_mut(child, id))
+}
+
+/// Whether the node `id` is `node` or inside it.
+fn holds(node: &Node, id: &str) -> bool {
+    node.id == id || node.kind.get().children().iter().any(|child| holds(child, id))
 }
 
 /// The ids of the nodes inside `node` named `name`.

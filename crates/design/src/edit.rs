@@ -139,12 +139,19 @@ impl Draft {
     }
 
     pub fn finish(mut self) -> Edited {
-        // What can't be drawn as asked, about the nodes this call changed
-        // (or the Instances they're in).
+        // What can't be drawn as asked, about the nodes this call changed,
+        // the Instances they're in, or Instances of Components it changed.
         let (_, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
         for problem in problems {
             let top = problem.node.split('/').next().unwrap_or_default();
-            if self.changed.contains(&problem.node) || self.changed.contains(top) {
+            let follows_changed = match self.design.find(top).map(|node| &node.kind) {
+                Some(Kind::Instance(instance)) => self
+                    .design
+                    .find(&instance.component)
+                    .is_some_and(|component| touches(component, &self.changed)),
+                _ => false,
+            };
+            if self.changed.contains(&problem.node) || self.changed.contains(top) || follows_changed {
                 self.warn(&problem.node, None, problem.message);
             }
         }
@@ -363,6 +370,11 @@ fn capitalised(word: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// Whether `node` or any node inside it is among `ids`.
+fn touches(node: &Node, ids: &BTreeSet<String>) -> bool {
+    ids.contains(&node.id) || node.kind.get().children().iter().any(|child| touches(child, ids))
 }
 
 /// Whether the node `id` is among `node`'s descendants.

@@ -198,6 +198,13 @@ pub struct Node {
     pub extra: Map<String, Value>,
 }
 
+impl Node {
+    /// Whether it's a Component: a Frame marked reusable.
+    pub fn is_component(&self) -> bool {
+        matches!(&self.kind, Kind::Frame(frame) if frame.reusable)
+    }
+}
+
 /// What each node type answers, so walking, editing and drawing a Design
 /// needn't know the types.
 pub trait NodeKind {

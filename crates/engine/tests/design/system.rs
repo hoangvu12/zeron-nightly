@@ -141,6 +141,51 @@ TakeScreenshot([screen]);"##
 }
 
 #[tokio::test]
+async fn overrides_by_id_win_and_component_changes_that_break_instances_warn() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Precedence",
+            &format!(
+                r##"{BUTTONS}
+Update(`${{plain}}/${{label}}`, {{ fill: "#0000FF" }});
+Update(plain, {{ descendants: {{ Label: {{ fill: "#00FF00" }}, [label]: {{ fill: "#0000FF" }} }} }});
+TakeScreenshot([screen]);"##
+            ),
+        )
+        .await;
+    // By id over by name, whichever came first.
+    assert_eq!(made.images[0].rgba(50, 20), BLUE);
+
+    // Deleting the Label from the Component leaves the red Instance's
+    // override with nothing to override: said, though only the Component changed.
+    let broke = seam.execute(&made.path(), "Delete(label);").await;
+    let warnings = broke.json()["warnings"].to_string();
+    assert!(warnings.contains("Label") && warnings.contains("to override"), "{warnings}");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_components_theme_reaches_inside_its_instances() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Themed",
+            r##"SetTokens({ surface: { type: "color", value: [{ value: "#FFFFFF", theme: { scheme: "light" } }, { value: "#000000", theme: { scheme: "dark" } }] } });
+const card = Insert({ type: "frame", name: "Card", reusable: true, theme: { scheme: "dark" }, x: 0, y: 200, width: 40, height: 40,
+  children: [{ type: "rectangle", name: "Inside", width: 40, height: 40, fill: "$surface" }] });
+const screen = Insert({ type: "frame", name: "Screen", width: 100, height: 40, fill: "#4F46E5" });
+Copy(card, screen, { x: 0, y: 0 });
+Copy(card, screen, { x: 50, y: 0, theme: { scheme: "light" } });
+TakeScreenshot([screen]);"##,
+        )
+        .await;
+    let shot = &made.images[0];
+    assert_eq!((shot.rgba(20, 20), shot.rgba(70, 20)), (BLACK, WHITE));
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn themed_tokens_resolve_per_theme_and_theme_overrides_reach_a_subtree() {
     let seam = Seam::new().await;
     let made = seam

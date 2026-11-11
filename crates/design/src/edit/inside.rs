@@ -45,9 +45,9 @@ impl Draft {
     /// Replace on the node `path` inside an Instance: the new node takes
     /// its place, and its path. Returns the path.
     pub(super) fn replace_inside(&mut self, path: &str, node: Value) -> Result<String, EditError> {
-        self.inside(path)?;
-        let depth = path.matches('/').count() + 1;
-        let built = self.build(node, depth, "Replace")?;
+        let expanded = expanded(&self.design);
+        let depth = expanded.depth_of(path).ok_or_else(|| EditError::NotFound(path.into()))?;
+        let built = self.build(node, depth - 1, "Replace")?;
         let (instance, key) = path.split_once('/').expect("a path has a slash");
         let Value::Object(mut written) = serde_json::to_value(&built.node).expect("a node serializes") else {
             unreachable!("a node is written as an object");

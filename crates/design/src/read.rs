@@ -29,6 +29,7 @@ pub struct Options {
 
 /// The Design as `Get` reads the node `id` (or the Canvas) with `options`.
 pub fn view<'a>(design: &'a Design, id: Option<&str>, options: &Options) -> Cow<'a, Design> {
+    // A slash path names a node inside an Instance.
     let inside_instance = id.is_some_and(|id| id.contains('/'));
     if !(options.resolve_tokens || options.expand_instances || inside_instance) {
         return Cow::Borrowed(design);

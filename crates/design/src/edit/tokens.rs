@@ -9,8 +9,9 @@ use crate::model::{Token, token};
 impl Draft {
     /// Sets the Design's Tokens: `tokens` (name to Token, or `null` to
     /// remove one) merged into them, or in place of them all with
-    /// `replace`. Each axis and value a themed value is for joins the
-    /// Design's Themes. All or none: a Token that isn't one fails with why.
+    /// `replace` (Themes and all). Each axis and value a themed value is
+    /// for joins the Design's Themes. All or none: a Token that isn't one
+    /// fails with why.
     pub fn set_tokens(&mut self, tokens: Value, replace: bool) -> Result<(), EditError> {
         let invalid = |e: String| EditError::Invalid(format!("SetTokens: {e}"));
         let Value::Object(tokens) = tokens else {
@@ -26,7 +27,9 @@ impl Draft {
             }
         }
         if replace {
+            // The Themes are the replaced Tokens' no longer.
             self.design.tokens.clear();
+            self.design.themes.clear();
         }
         for (name, written) in tokens {
             if written.is_null() {

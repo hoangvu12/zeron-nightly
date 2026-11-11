@@ -34,10 +34,7 @@ impl Draft {
             false => self.design.find(id).cloned(),
         };
         let mut copy = source.ok_or_else(|| EditError::NotFound(id.into()))?;
-        if let Kind::Frame(frame) = &copy.kind
-            && frame.reusable
-            && !is_inside(id)
-        {
+        if copy.is_component() && !is_inside(id) {
             return self.instance_of(&copy, parent, props, descendants);
         }
         let depth = self.depth_inside(parent)?;
@@ -100,6 +97,10 @@ impl Draft {
         }
         let depth = self.depth_inside(parent)?;
         self.children_of(parent)?;
+        // As deep as the Component's nodes go, once it's drawn.
+        if depth + height(component) > MAX_DEPTH {
+            return Err(EditError::Invalid(format!("Copy: nodes nest at most {MAX_DEPTH} deep")));
+        }
         let built = self.build(Value::Object(props), depth, "Copy")?;
         Ok(self.attach(parent, None, built))
     }
