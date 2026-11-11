@@ -50,6 +50,12 @@ impl Called {
         PathBuf::from(self.json()["design"]["path"].as_str().expect("a path"))
     }
 
+    /// A failed call's failure: its error, line and edit id.
+    pub fn failure(&self) -> Value {
+        assert!(self.is_error, "the call succeeded: {}", self.text);
+        serde_json::from_str(&self.text).unwrap_or_else(|_| panic!("a failure's text is JSON: {}", self.text))
+    }
+
     /// The lines the snippet printed.
     pub fn printed(&self) -> Vec<String> {
         match self.json().get("printed") {
@@ -115,6 +121,12 @@ impl Seam {
     /// `design_execute` on the Design at `path`.
     pub async fn execute(&self, path: &Path, snippet: &str) -> Called {
         self.call("design_execute", json!({ "path": path, "snippet": snippet }))
+            .await
+    }
+
+    /// `design_execute` retrying the failed call `edit_id` with `edits`.
+    pub async fn retry(&self, edit_id: &Value, edits: Value) -> Called {
+        self.call("design_execute", json!({ "editId": edit_id, "edits": edits }))
             .await
     }
 

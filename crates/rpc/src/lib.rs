@@ -353,9 +353,12 @@ pub mod methods {
     /// turn as an image part (`show_image`). Local only, like `PublishVisual`.
     pub const PUBLISH_IMAGE: &str = "PublishImage";
     /// Run an agent's snippet against a Design (`design_execute`): `{chatId?,
-    /// snippet, description?, path? | name?}` → `{design: {name, path}, ids,
-    /// screenshots: [{id, width, height, mimeType, data}]}`. Local only:
-    /// Designs live on the engine of their computer.
+    /// snippet, description?, path? | name?}`, or a failed call's retry
+    /// `{chatId?, editId, edits: [{find, replace}]}` → `{design: {name,
+    /// path}, ids, screenshots: [{id, width, height, mimeType, data}],
+    /// printed?, warnings?}`, or `{failed: {error, line?, code?, editId,
+    /// retry}}` when the snippet ran and failed. Local only: Designs live on
+    /// the engine of their computer.
     pub const DESIGN_EXECUTE: &str = "DesignExecute";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.

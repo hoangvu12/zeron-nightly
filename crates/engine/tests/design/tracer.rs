@@ -28,7 +28,9 @@ async fn design_execute_is_offered_with_a_one_line_description() {
         .expect("design_execute is listed");
     let description = tool["description"].as_str().unwrap();
     assert!(!description.is_empty() && !description.contains('\n'), "{description}");
-    assert_eq!(tool["inputSchema"]["required"], serde_json::json!(["snippet"]));
+    // A retry sends an edit id and edits in place of the snippet.
+    let properties = &tool["inputSchema"]["properties"];
+    assert!(properties["snippet"].is_object() && properties["editId"].is_object() && properties["edits"].is_object());
     seam.shutdown().await;
 }
 

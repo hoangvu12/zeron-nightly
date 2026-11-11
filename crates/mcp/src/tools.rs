@@ -284,13 +284,22 @@ fn catalog() -> Vec<ToolDef> {
             "properties": {
                 "snippet": {
                     "type": "string",
-                    "description": "JavaScript run in a sandbox. `Insert(parent, node)` adds a node as the last child of the node with id `parent` (or on the Canvas with `Insert(node)`) and returns its id; a node is {type: \"frame\" | \"rectangle\", name, x, y, width, height, fill: \"#RRGGBB\"}, and a frame takes `children` inline. `TakeScreenshot([ids])` attaches a PNG of each node once the call succeeds, at most 400 px on its longest side. A snippet that throws changes nothing; a property Zeron doesn't know is kept, with a warning in the result."
+                    "description": "JavaScript run in a sandbox. `Insert(parent, node)` adds a node as the last child of the node with id `parent` (or on the Canvas with `Insert(node)`) and returns its id; a node is {type: \"frame\" | \"rectangle\", name, x, y, width, height, fill: \"#RRGGBB\"}, and a frame takes `children` inline. `TakeScreenshot([ids])` attaches a PNG of each node once the call succeeds, at most 400 px on its longest side. `Copy(id, parent, {...props, descendants: {id: props}})` copies a node with new ids and returns the copy's; `Update(id, props)` sets properties (null unsets one); `Replace(id, node)` puts a new node in its place; `Move(id, parent, index?)`; `Delete(id | [ids])`; `FindEmptySpace({width, height, direction?, padding?, from?})` returns a free {x, y} on the Canvas. A snippet that fails changes nothing and returns an editId; a property Zeron doesn't know is kept, with a warning in the result."
                 },
                 "description": { "type": "string", "description": "What this call does, in a few words." },
                 "name": { "type": "string", "description": "A name for a new Design, made in Zeron's designs folder." },
-                "path": { "type": "string", "description": "The .zdesign file to change (a previous call's `design.path`)." }
-            },
-            "required": ["snippet"]
+                "path": { "type": "string", "description": "The .zdesign file to change (a previous call's `design.path`)." },
+                "editId": { "type": "string", "description": "Retries the failed call with this edit id, its snippet changed by `edits`; send no snippet, path or name with it." },
+                "edits": {
+                    "type": "array",
+                    "description": "With editId: find-and-replace edits to the failed snippet, made in order; each find must be in it once.",
+                    "items": {
+                        "type": "object",
+                        "properties": { "find": { "type": "string" }, "replace": { "type": "string" } },
+                        "required": ["find", "replace"]
+                    }
+                }
+            }
         }),
     });
     tools.push(ToolDef {
@@ -596,13 +605,18 @@ struct ShowImageArgs {
 
 #[derive(Deserialize)]
 struct DesignExecuteArgs {
-    snippet: String,
+    #[serde(default)]
+    snippet: Option<String>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default, rename = "editId")]
+    edit_id: Option<String>,
+    #[serde(default)]
+    edits: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1672,9 +1686,15 @@ impl Tools {
                     "description": args.description,
                     "name": args.name,
                     "path": args.path,
+                    "editId": args.edit_id,
+                    "edits": args.edits.unwrap_or_else(|| json!([])),
                 }),
             )
             .await?;
+        // A failed call reads as an error carrying its edit id.
+        if let Some(failed) = executed.get("failed") {
+            anyhow::bail!("{failed}");
+        }
         // Each screenshot's PNG goes to the client as an image; its id and
         // size stay in the text.
         let mut images = Vec::new();

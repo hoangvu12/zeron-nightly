@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
-use rquickjs::{CatchResultExt, Context, Ctx, Exception, Function, Object, Runtime};
+use rquickjs::{CatchResultExt, CaughtError, Context, Ctx, Exception, Function, Object, Runtime};
 
 use crate::edit::Draft;
 use crate::layout::LaidOut;
@@ -49,12 +49,16 @@ impl Default for Limits {
 /// it calls and Rust's own frames.
 const THREAD_STACK_HEADROOM: usize = 2 * 1024 * 1024;
 
+/// The name the snippet runs as, for finding its lines in a stack.
+const SNIPPET_FILE: &str = "snippet";
+
 #[derive(Debug, thiserror::Error)]
 pub enum SnippetError {
     /// The snippet threw, or broke a limit QuickJS reports as an error
-    /// (memory, stack).
-    #[error("{0}")]
-    Failed(String),
+    /// (memory, stack); `line` is the snippet's line it failed on, from 1,
+    /// when QuickJS says.
+    #[error("{}{message}", line.map(|line| format!("line {line}: ")).unwrap_or_default())]
+    Failed { message: String, line: Option<usize> },
     #[error("the snippet ran past its {}-second limit", .0.as_secs_f32())]
     TimedOut(Duration),
     #[error("the snippet sandbox failed: {0}")]
@@ -67,6 +71,25 @@ const PRELUDE: &str = r#"(function (native) {
   globalThis.Insert = function (parent, node) {
     if (arguments.length < 2) { node = parent; parent = null; }
     return native.insert(parent == null ? null : String(parent), json(node));
+  };
+  const id = (value) => value == null ? null : String(value);
+  globalThis.Copy = function (node, parent, props) {
+    return native.copy(String(node), id(parent), json(props));
+  };
+  globalThis.Update = function (node, props) {
+    native.update(String(node), json(props));
+  };
+  globalThis.Replace = function (node, replacement) {
+    return native.replace(String(node), json(replacement));
+  };
+  globalThis.Move = function (node, parent, index) {
+    native.move(String(node), id(parent), index == null ? null : Number(index));
+  };
+  globalThis.Delete = function (nodes) {
+    for (const node of Array.isArray(nodes) ? nodes : [nodes]) native.delete(String(node));
+  };
+  globalThis.FindEmptySpace = function (wanted) {
+    return JSON.parse(native.emptySpace(json(wanted)));
   };
   globalThis.TakeScreenshot = function (ids) {
     native.screenshot(json(Array.isArray(ids) ? ids : [ids]));
@@ -144,12 +167,11 @@ fn run_here(
         // Not strict, so assigning an undeclared name makes a global.
         let mut options = EvalOptions::default();
         options.strict = false;
+        options.filename = Some(SNIPPET_FILE.into());
         ctx.eval_with_options::<(), _>(wrapped, options)
             .catch(&ctx)
-            .map_err(|e| SnippetError::Failed(e.to_string()))?;
-        globals::assigned(&ctx, &builtins)
-            .catch(&ctx)
-            .map_err(|e| SnippetError::Failed(e.to_string()))
+            .map_err(failed)?;
+        globals::assigned(&ctx, &builtins).catch(&ctx).map_err(failed)
     });
     if timed_out.load(Ordering::Relaxed) {
         return Err(SnippetError::TimedOut(limits.time));
@@ -176,6 +198,88 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
                     .borrow_mut()
                     .insert(parent.as_deref(), node)
                     .map_err(|e| thrown(&ctx, e))
+            })?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "copy",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, id: String, parent: Option<String>, props: String| {
+                    let props = serde_json::from_str(&props).map_err(|e| thrown(&ctx, e))?;
+                    draft
+                        .borrow_mut()
+                        .copy(&id, parent.as_deref(), props)
+                        .map_err(|e| thrown(&ctx, e))
+                },
+            )?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "update",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String, props: String| {
+                let props = serde_json::from_str(&props).map_err(|e| thrown(&ctx, e))?;
+                draft.borrow_mut().update(&id, props).map_err(|e| thrown(&ctx, e))
+            })?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "replace",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String, node: String| {
+                let node = serde_json::from_str(&node).map_err(|e| thrown(&ctx, e))?;
+                draft.borrow_mut().replace(&id, node).map_err(|e| thrown(&ctx, e))
+            })?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "move",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, id: String, parent: Option<String>, index: Option<f64>| {
+                    let index = match index {
+                        Some(index) if index >= 0. && index.fract() == 0. => Some(index as usize),
+                        Some(index) => {
+                            return Err(thrown(&ctx, format!("Move's index is a whole number, 0 or more, not {index}")));
+                        }
+                        None => None,
+                    };
+                    draft
+                        .borrow_mut()
+                        .move_to(&id, parent.as_deref(), index)
+                        .map_err(|e| thrown(&ctx, e))
+                },
+            )?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "delete",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String| {
+                draft.borrow_mut().delete(&id).map_err(|e| thrown(&ctx, e))
+            })?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "emptySpace",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, wanted: String| {
+                let wanted: crate::space::Wanted = serde_json::from_str(&wanted).map_err(|e| {
+                    thrown(&ctx, format!("FindEmptySpace takes {{ width, height, direction, padding, from }}: {e}"))
+                })?;
+                let draft = draft.borrow();
+                let laid_out = LaidOut::of(draft.design());
+                let (x, y) = crate::space::find(draft.design(), &laid_out, &wanted).map_err(|e| thrown(&ctx, e))?;
+                Ok::<_, rquickjs::Error>(serde_json::json!({ "x": x, "y": y }).to_string())
             })?,
         )?;
     }
@@ -223,6 +327,35 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
         )?;
     }
     ctx.globals().set("__zd", native)
+}
+
+/// What the snippet failed with, and on which of its lines.
+fn failed(caught: CaughtError<'_>) -> SnippetError {
+    let (message, stack) = match &caught {
+        CaughtError::Exception(exception) => {
+            let name: Option<String> = exception.get("name").ok();
+            let message = exception.message().unwrap_or_default();
+            let message = match name {
+                Some(name) if !name.is_empty() => format!("{name}: {message}"),
+                _ => message,
+            };
+            (message, exception.stack())
+        }
+        other => (other.to_string(), None),
+    };
+    SnippetError::Failed {
+        message,
+        line: stack.as_deref().and_then(snippet_line),
+    }
+}
+
+/// The snippet's innermost line in a QuickJS stack (`at f (snippet:3:7)`).
+fn snippet_line(stack: &str) -> Option<usize> {
+    let marker = format!("{SNIPPET_FILE}:");
+    stack.match_indices(&marker).find_map(|(at, _)| {
+        let digits: String = stack[at + marker.len()..].chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
 }
 
 fn thrown(ctx: &Ctx<'_>, message: impl std::fmt::Display) -> rquickjs::Error {

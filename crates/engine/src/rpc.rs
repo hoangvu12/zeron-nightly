@@ -5807,16 +5807,17 @@ impl RpcService for EngineRpc {
                 let p: crate::designs::ExecuteParams = parse_params(params)?;
                 let executed = tokio::task::spawn_blocking(move || designs.execute(p))
                     .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(|e| match e {
-                        crate::designs::DesignError::Refused(_)
-                        | crate::designs::DesignError::Snippet(
-                            zeron_design::snippet::SnippetError::Failed(_)
-                            | zeron_design::snippet::SnippetError::TimedOut(_),
-                        ) => RpcError::BadParams(e.to_string()),
-                        e => RpcError::Failed(e.to_string()),
-                    })?;
-                RpcReply::value(&executed)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // A call that ran and failed is an answer, not an RPC error:
+                // the agent gets its edit id to retry with.
+                match executed {
+                    Ok(executed) => RpcReply::value(&executed),
+                    Err(crate::designs::DesignError::Failed(failure)) => {
+                        RpcReply::value(&serde_json::json!({ "failed": failure }))
+                    }
+                    Err(e @ crate::designs::DesignError::Refused(_)) => Err(RpcError::BadParams(e.to_string())),
+                    Err(e) => Err(RpcError::Failed(e.to_string())),
+                }
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
