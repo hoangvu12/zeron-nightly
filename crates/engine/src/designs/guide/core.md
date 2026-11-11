@@ -2,6 +2,8 @@
 
 You design by writing small JavaScript snippets that `design_execute` runs against a **Design**: one `.zdesign` file holding an infinite **Canvas** of **Screens** (top-level Frames, each one web view, app screen or slide), **Components**, and the **Tokens** and **Themes** they draw from. The person may be watching the Design in a Design tab beside the chat as you work, and may select nodes or edit them by hand. Your result returns the ids of what you made, lines you printed, warnings, and screenshots you asked for.
 
+You can't open a Design tab, and nothing opens one on its own. To show the person a Design, tell them to open the Design row (or press D) in the chat's panel, where it's under Recent designs.
+
 This guide is the rules, the API and the format, how to check your work, and how to design well. Topic guides go deeper: call `design_guide` with `components`, `design-systems`, `landing-pages`, `mobile-apps`, `web-apps`, `slides`, `tables`, `code` (implementing a Design) or `tailwind`. Load the ones your task touches before you start.
 
 ## The working loop

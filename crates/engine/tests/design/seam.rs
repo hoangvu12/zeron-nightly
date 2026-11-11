@@ -30,7 +30,7 @@ pub const FONTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/zgx/fon
 
 pub struct Seam {
     pub core: EngineCore,
-    tools: Tools,
+    tools: Arc<Tools>,
     /// Iconify, played by the fixture icons.
     pub iconify: Arc<FixtureIcons>,
     dir: tempfile::TempDir,
@@ -164,13 +164,13 @@ impl Seam {
 
     /// Zeron's MCP tool list, as `tools/list` gives it.
     pub async fn tool_list(&self) -> Vec<Value> {
-        let reply = zeron_mcp::handle_request(&self.tools, json!(1), "tools/list", json!({})).await;
+        let reply = mcp(&self.tools, "tools/list", json!({})).await;
         reply["result"]["tools"].as_array().expect("a tool list").clone()
     }
 
     /// What `initialize` tells the agent about Zeron's tools.
     pub async fn instructions(&self) -> String {
-        let reply = zeron_mcp::handle_request(&self.tools, json!(1), "initialize", json!({})).await;
+        let reply = mcp(&self.tools, "initialize", json!({})).await;
         reply["result"]["instructions"].as_str().expect("instructions").to_owned()
     }
 
@@ -226,30 +226,40 @@ impl Seam {
 }
 
 /// Zeron's MCP server for `chat`'s agent, making the chat if it's new.
-fn agent_tools(core: &EngineCore, chat: &str) -> Tools {
+fn agent_tools(core: &EngineCore, chat: &str) -> Arc<Tools> {
     if core.workspace.chat(chat).unwrap().is_none() {
         core.workspace
             .create_chat(chat, None, Some(&core.device_id), None, None)
             .unwrap();
     }
-    Tools::new(Arc::new(Zeron::with_client(
+    Arc::new(Tools::new(Arc::new(Zeron::with_client(
         zeron_rpc::agent_memory_client(core.rpc_service(), Some(chat.into())),
         Origin {
             chat_id: Some(chat.into()),
             device_id: Some(core.device_id.clone()),
             ..Default::default()
         },
-    )))
+    ))))
 }
 
-async fn call(tools: &Tools, tool: &str, arguments: Value) -> Called {
-    let reply = zeron_mcp::handle_request(
-        tools,
-        json!(1),
-        "tools/call",
-        json!({ "name": tool, "arguments": arguments }),
-    )
-    .await;
+/// An MCP request, answered as the agent's MCP server answers it: a
+/// process of its own (`zeron mcp`), so here a thread of its own, apart from
+/// the engine's (the two polled on one test thread are deeper than its
+/// stack in a Windows debug build).
+async fn mcp(tools: &Arc<Tools>, method: &'static str, params: Value) -> Value {
+    let (tools, (tell, answer)) = (tools.clone(), tokio::sync::oneshot::channel());
+    std::thread::Builder::new()
+        .name("zeron-mcp".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = tell.send(runtime.block_on(zeron_mcp::handle_request(&tools, json!(1), method, params)));
+        })
+        .unwrap();
+    answer.await.expect("the MCP server answered")
+}
+
+async fn call(tools: &Arc<Tools>, tool: &str, arguments: Value) -> Called {
+    let reply = mcp(tools, "tools/call", json!({ "name": tool, "arguments": arguments })).await;
     let result = &reply["result"];
     let content = result["content"].as_array().expect("content");
     let mut texts = content

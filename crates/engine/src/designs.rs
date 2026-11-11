@@ -212,6 +212,27 @@ pub enum DesignError {
     Io(String),
 }
 
+/// The stack a Design call runs on ([`on_design_thread`]): resolving,
+/// laying out and drawing recurse once a nesting level (48 at most,
+/// `edit::MAX_DEPTH`), which a debug build's frames take about 1 MiB for;
+/// this leaves room many times over in any build.
+pub const DESIGN_STACK: usize = 8 << 20;
+
+/// Runs `work` (blocking: a Design call) on a thread of its own with
+/// [`DESIGN_STACK`], not on the runtime's, whose stack is the platform's
+/// default; its answer once done.
+pub async fn on_design_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, DesignError> {
+    let (tell, answer) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("zeron-design".into())
+        .stack_size(DESIGN_STACK)
+        .spawn(move || {
+            let _ = tell.send(work());
+        })
+        .map_err(|e| DesignError::Io(format!("can't start a Design call: {e}")))?;
+    answer.await.map_err(|_| DesignError::Io("a Design call stopped".into()))
+}
+
 #[derive(Clone)]
 pub struct Designs {
     inner: Arc<Inner>,
@@ -1216,7 +1237,8 @@ impl Live {
                 if !*pending {
                     *pending = true;
                     let (me, after) = (self.me.clone(), *after);
-                    std::thread::spawn(move || {
+                    // (Saving recurses through the Design: a Design call's stack.)
+                    let _ = std::thread::Builder::new().stack_size(DESIGN_STACK).spawn(move || {
                         std::thread::sleep(after);
                         if let Some(live) = me.upgrade() {
                             lock(&live).autosave();

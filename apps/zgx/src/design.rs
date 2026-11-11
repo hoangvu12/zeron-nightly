@@ -389,7 +389,10 @@ impl Pool {
         let count = std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, 6);
         for _ in 0..count {
             let (queue, tx, wake) = (self.queue.clone(), tx.clone(), self.wake.clone());
-            std::thread::spawn(move || {
+            // (Drawing recurses once a nesting level: the engine's Design
+            // stack, `zeron_engine::designs::DESIGN_STACK`, so the deepest
+            // Design draws here as it does there.)
+            let _ = std::thread::Builder::new().name("zeron-design-tiles".into()).stack_size(8 << 20).spawn(move || {
                 while let Some(job) = queue.next() {
                     let image = draw(&job.scene, job.key);
                     let drawn = Drawn { tab: job.tab, key: job.key, version: job.scene.version, image };

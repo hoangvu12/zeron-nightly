@@ -970,6 +970,92 @@ impl EngineRpc {
 
     /// Runs a saving call on Designs off the async runtime (it reads and
     /// writes files), and replies with what it says.
+    /// The Design methods (`DesignExecute`, `WatchDesign`, saving…), apart
+    /// from [`RpcService::handle`]'s match.
+    async fn design_rpc(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        match method {
+            methods::DESIGN_EXECUTE => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::ExecuteParams = parse_params(params)?;
+                let executed = crate::designs::on_design_thread(move || designs.execute(p))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // A call that ran and failed is an answer, not an RPC error:
+                // the agent gets its edit id to retry with.
+                match executed {
+                    Ok(executed) => RpcReply::value(&executed),
+                    Err(crate::designs::DesignError::Failed(failure)) => {
+                        RpcReply::value(&serde_json::json!({ "failed": failure }))
+                    }
+                    Err(e @ crate::designs::DesignError::Refused(_)) => Err(RpcError::BadParams(e.to_string())),
+                    Err(e) => Err(RpcError::Failed(e.to_string())),
+                }
+            }
+            methods::DESIGN_STATE => {
+                let designs = self.designs()?;
+                let p: crate::designs::StateParams = parse_params(params)?;
+                RpcReply::value(&designs.state(p.chat_id.as_deref()))
+            }
+            methods::DESIGN_GUIDE => {
+                let designs = self.designs()?;
+                let p: crate::designs::GuideParams = parse_params(params)?;
+                let guide = designs
+                    .guide(p.chat_id.as_deref(), p.topic.as_deref())
+                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                RpcReply::value(&guide)
+            }
+            methods::WATCH_DESIGN => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::WatchParams = parse_params(params)?;
+                let told = crate::designs::on_design_thread(move || designs.watch(&p.path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| match e {
+                        crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
+                        e => RpcError::Failed(e.to_string()),
+                    })?;
+                Ok(RpcReply::Stream(told.boxed()))
+            }
+            methods::SET_DESIGN_TABS => {
+                let designs = self.designs()?.clone();
+                let p: crate::designs::TabsParams = parse_params(params)?;
+                // (It keeps the recent list on disk.)
+                crate::designs::on_design_thread(move || designs.set_tabs(&p.chat_id, p.paths))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
+            }
+            methods::DESIGN_SAVING => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.saving(&p.path)).await
+            }
+            methods::SAVE_DESIGN => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.save(&p.path)).await
+            }
+            methods::SAVE_DESIGN_AS => {
+                let p: crate::designs::SaveAsParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.save_as(&p.path, &p.to)).await
+            }
+            methods::DISCARD_DESIGN => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.discard(&p.path)).await
+            }
+            methods::NEW_DESIGN => {
+                let p: crate::designs::NewParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.new_design(p.name.as_deref())).await
+            }
+            methods::RECENT_DESIGNS => {
+                let designs = self.designs()?.clone();
+                let recent = crate::designs::on_design_thread(move || designs.recent())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "recent": recent }))
+            }
+            other => Err(RpcError::UnknownMethod(other.to_string())),
+        }
+    }
+
     async fn design_saving(
         &self,
         call: impl FnOnce(&crate::designs::Designs) -> Result<serde_json::Value, crate::designs::DesignError>
@@ -977,7 +1063,7 @@ impl EngineRpc {
         + 'static,
     ) -> Result<RpcReply, RpcError> {
         let designs = self.designs()?.clone();
-        let saving = tokio::task::spawn_blocking(move || call(&designs))
+        let saving = crate::designs::on_design_thread(move || call(&designs))
             .await
             .map_err(|e| RpcError::Failed(e.to_string()))?
             .map_err(|e| match e {
@@ -5824,84 +5910,19 @@ impl RpcService for EngineRpc {
                     "bytes": image.size,
                 }))
             }
-            methods::DESIGN_EXECUTE => {
-                let designs = self.designs()?.clone();
-                let p: crate::designs::ExecuteParams = parse_params(params)?;
-                let executed = tokio::task::spawn_blocking(move || designs.execute(p))
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                // A call that ran and failed is an answer, not an RPC error:
-                // the agent gets its edit id to retry with.
-                match executed {
-                    Ok(executed) => RpcReply::value(&executed),
-                    Err(crate::designs::DesignError::Failed(failure)) => {
-                        RpcReply::value(&serde_json::json!({ "failed": failure }))
-                    }
-                    Err(e @ crate::designs::DesignError::Refused(_)) => Err(RpcError::BadParams(e.to_string())),
-                    Err(e) => Err(RpcError::Failed(e.to_string())),
-                }
-            }
-            methods::DESIGN_STATE => {
-                let designs = self.designs()?;
-                let p: crate::designs::StateParams = parse_params(params)?;
-                RpcReply::value(&designs.state(p.chat_id.as_deref()))
-            }
-            methods::DESIGN_GUIDE => {
-                let designs = self.designs()?;
-                let p: crate::designs::GuideParams = parse_params(params)?;
-                let guide = designs
-                    .guide(p.chat_id.as_deref(), p.topic.as_deref())
-                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
-                RpcReply::value(&guide)
-            }
-            methods::WATCH_DESIGN => {
-                let designs = self.designs()?.clone();
-                let p: crate::designs::WatchParams = parse_params(params)?;
-                let told = tokio::task::spawn_blocking(move || designs.watch(&p.path))
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(|e| match e {
-                        crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
-                        e => RpcError::Failed(e.to_string()),
-                    })?;
-                Ok(RpcReply::Stream(told.boxed()))
-            }
-            methods::SET_DESIGN_TABS => {
-                let designs = self.designs()?.clone();
-                let p: crate::designs::TabsParams = parse_params(params)?;
-                // (It keeps the recent list on disk.)
-                tokio::task::spawn_blocking(move || designs.set_tabs(&p.chat_id, p.paths))
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({}))
-            }
-            methods::DESIGN_SAVING => {
-                let p: crate::designs::PathParams = parse_params(params)?;
-                self.design_saving(move |designs| designs.saving(&p.path)).await
-            }
-            methods::SAVE_DESIGN => {
-                let p: crate::designs::PathParams = parse_params(params)?;
-                self.design_saving(move |designs| designs.save(&p.path)).await
-            }
-            methods::SAVE_DESIGN_AS => {
-                let p: crate::designs::SaveAsParams = parse_params(params)?;
-                self.design_saving(move |designs| designs.save_as(&p.path, &p.to)).await
-            }
-            methods::DISCARD_DESIGN => {
-                let p: crate::designs::PathParams = parse_params(params)?;
-                self.design_saving(move |designs| designs.discard(&p.path)).await
-            }
-            methods::NEW_DESIGN => {
-                let p: crate::designs::NewParams = parse_params(params)?;
-                self.design_saving(move |designs| designs.new_design(p.name.as_deref())).await
-            }
-            methods::RECENT_DESIGNS => {
-                let designs = self.designs()?.clone();
-                let recent = tokio::task::spawn_blocking(move || designs.recent())
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "recent": recent }))
-            }
+            // Designs (designs.rs): their own future, so their calls don't
+            // add to this one's (a debug build's frame here is large).
+            methods::DESIGN_EXECUTE
+            | methods::DESIGN_STATE
+            | methods::DESIGN_GUIDE
+            | methods::WATCH_DESIGN
+            | methods::SET_DESIGN_TABS
+            | methods::DESIGN_SAVING
+            | methods::SAVE_DESIGN
+            | methods::SAVE_DESIGN_AS
+            | methods::DISCARD_DESIGN
+            | methods::NEW_DESIGN
+            | methods::RECENT_DESIGNS => Box::pin(self.design_rpc(method, params)).await,
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self
