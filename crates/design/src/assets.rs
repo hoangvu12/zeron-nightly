@@ -86,27 +86,39 @@ impl Cache {
         &self.icons
     }
 
-    /// The file holding `key`, fetched first if it isn't cached.
-    pub fn resolve(&self, key: &AssetKey) -> Result<PathBuf, String> {
-        match key.kind {
-            AssetKind::Icon => self.icons.file(&key.name).map_err(|e| e.to_string()),
+    /// Fetches what `design` uses that isn't cached (a Design read from a
+    /// file made on another computer). One that can't be fetched draws
+    /// nothing, and isn't asked for again for a while.
+    pub fn fetch(&self, design: &Design) {
+        for key in used(design) {
+            match key.kind {
+                AssetKind::Icon => {
+                    let _ = self.icons.load(&key.name);
+                }
+            }
         }
     }
 
-    /// Each asset `design` uses and its file; one that can't be resolved
-    /// is left out, and draws nothing.
+    /// Each asset `design` uses that's cached, and its file; one that isn't
+    /// is left out, and draws nothing. Never fetches.
     pub fn resolved(&self, design: &Design) -> Vec<Resolved> {
         used(design)
             .into_iter()
-            .filter_map(|key| Some(Resolved { path: self.resolve(&key).ok()?, key }))
+            .filter_map(|key| {
+                let path = match key.kind {
+                    AssetKind::Icon => self.icons.file_of(&key.name).ok()?,
+                };
+                path.is_file().then_some(Resolved { key, path })
+            })
             .collect()
     }
 }
 
+/// What's cached only: drawing never fetches.
 impl Assets for Cache {
     fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
         match key.kind {
-            AssetKind::Icon => self.icons.load(&key.name).ok().map(Arc::from),
+            AssetKind::Icon => self.icons.cached(&key.name).map(Arc::from),
         }
     }
 }
@@ -129,9 +141,13 @@ impl Files {
 
 impl Assets for Files {
     fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
-        let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
-        read.entry(key.clone())
-            .or_insert_with(|| std::fs::read(self.paths.get(key)?).ok().map(Arc::from))
-            .clone()
+        let read = || self.read.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bytes) = read().get(key) {
+            return bytes.clone();
+        }
+        // (Read without the lock, so tiles drawn at once don't wait on it.)
+        let bytes: Option<Arc<[u8]>> = self.paths.get(key).and_then(|path| std::fs::read(path).ok()).map(Arc::from);
+        read().insert(key.clone(), bytes.clone());
+        bytes
     }
 }

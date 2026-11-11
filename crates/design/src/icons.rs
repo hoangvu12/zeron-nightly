@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::model::Color;
 
@@ -20,7 +21,7 @@ pub trait IconSource: Send + Sync {
     fn fetch(&self, set: &str, name: &str) -> Result<Option<String>, String>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum IconError {
     #[error("\"{0}\" is not an icon name: write the Iconify set and name, as in \"lucide:house\"")]
     BadName(String),
@@ -28,13 +29,21 @@ pub enum IconError {
     Unknown(String),
     #[error("couldn't fetch the icon \"{0}\": {1}")]
     Unavailable(String, String),
+    #[error("couldn't fetch the icon \"{0}\": this call has waited {1}s on the network already")]
+    Waited(String, u64),
 }
+
+/// How long an icon that couldn't be fetched isn't asked for again (one
+/// Iconify hasn't got, never again in this run).
+const RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// The icons cache: in memory, then on disk, then the source.
 pub struct Icons {
     dir: PathBuf,
     source: RwLock<Arc<dyn IconSource>>,
     loaded: Mutex<HashMap<String, Arc<str>>>,
+    /// Icons the source didn't give, and when it was asked.
+    failed: Mutex<HashMap<String, (IconError, Instant)>>,
 }
 
 impl Icons {
@@ -44,6 +53,7 @@ impl Icons {
             dir: dir.into(),
             source: RwLock::new(source),
             loaded: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -66,42 +76,53 @@ impl Icons {
     /// cached on first use. A fetch's wait doesn't count against the
     /// running snippet's time ([`crate::waits`]).
     pub fn load(&self, icon: &str) -> Result<Arc<str>, IconError> {
-        if let Some(svg) = lock(&self.loaded).get(icon) {
-            return Ok(svg.clone());
+        if let Some(svg) = self.cached(icon) {
+            return Ok(svg);
         }
-        let (set, name) = split(icon)?;
-        let file = self.dir.join(set).join(format!("{name}.svg"));
-        let svg: Arc<str> = match std::fs::read_to_string(&file) {
-            Ok(svg) => svg.into(),
-            Err(_) => {
-                let source = self.source.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let fetched = crate::waits::network(|| source.fetch(set, name)).map_err(|cap| {
-                    let why = format!("this call has waited {}s on the network already", cap.as_secs());
-                    IconError::Unavailable(icon.into(), why)
-                })?;
-                let svg = fetched
-                    .map_err(|e| IconError::Unavailable(icon.into(), e))?
-                    .filter(|svg| svg.trim_start().starts_with("<svg"))
-                    .ok_or_else(|| IconError::Unknown(icon.into()))?;
-                // A cache that can't be written is only slower next time.
-                let _ = write_whole(&file, &svg);
-                svg.into()
-            }
-        };
+        if let Some((failed, at)) = lock(&self.failed).get(icon)
+            && (matches!(failed, IconError::Unknown(_)) || at.elapsed() < RETRY_AFTER)
+        {
+            return Err(failed.clone());
+        }
+        let fetched = self.fetch(icon);
+        // (Not one this call had no time left for: the next may fetch it.)
+        if let Err(failed @ (IconError::Unknown(_) | IconError::Unavailable(..))) = &fetched {
+            lock(&self.failed).insert(icon.into(), (failed.clone(), Instant::now()));
+        }
+        let svg = fetched?;
         lock(&self.loaded).insert(icon.into(), svg.clone());
         Ok(svg)
     }
 
-    /// The cached file of the icon named `icon` (as [`name`] gives it),
-    /// fetched first if it isn't cached.
-    pub fn file(&self, icon: &str) -> Result<PathBuf, IconError> {
-        self.load(icon)?;
-        let (set, name) = split(icon)?;
-        let file = self.dir.join(set).join(format!("{name}.svg"));
-        if !file.is_file() {
-            return Err(IconError::Unavailable(icon.into(), "it couldn't be cached".into()));
+    /// The SVG of the icon named `icon` if it's cached, without fetching.
+    pub fn cached(&self, icon: &str) -> Option<Arc<str>> {
+        if let Some(svg) = lock(&self.loaded).get(icon) {
+            return Some(svg.clone());
         }
-        Ok(file)
+        let svg: Arc<str> = std::fs::read_to_string(self.file_of(icon).ok()?).ok()?.into();
+        lock(&self.loaded).insert(icon.into(), svg.clone());
+        Some(svg)
+    }
+
+    /// The file the icon named `icon` is cached in, whether it is yet or not.
+    pub fn file_of(&self, icon: &str) -> Result<PathBuf, IconError> {
+        let (set, name) = split(icon)?;
+        Ok(self.dir.join(set).join(format!("{name}.svg")))
+    }
+
+    /// The icon from the source, cached on disk.
+    fn fetch(&self, icon: &str) -> Result<Arc<str>, IconError> {
+        let (set, name) = split(icon)?;
+        let source = self.source.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let fetched = crate::waits::network(|| source.fetch(set, name))
+            .map_err(|cap| IconError::Waited(icon.into(), cap.as_secs()))?;
+        let svg = fetched
+            .map_err(|e| IconError::Unavailable(icon.into(), e))?
+            .filter(|svg| svg.trim_start().starts_with("<svg"))
+            .ok_or_else(|| IconError::Unknown(icon.into()))?;
+        // A cache that can't be written is only slower next time.
+        let _ = write_whole(&self.file_of(icon)?, &svg);
+        Ok(svg.into())
     }
 }
 

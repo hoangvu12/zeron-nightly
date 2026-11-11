@@ -224,12 +224,23 @@ impl Draft {
         Ok(Built { node, made, warnings })
     }
 
-    /// Refuses what `node` or its descendants can't be drawn with: an icon
-    /// Iconify doesn't have (fetching it now, so it's cached to draw), a
-    /// path that isn't path data, a polygon's side count; and warns of a
-    /// weight on an icon without weights. Every edit that makes a node or
-    /// sets its properties checks it here.
+    /// Refuses what `node` or its descendants can't be drawn with, as
+    /// [`Draft::check_one`]: for a node an edit made.
     fn check(&self, node: &Node, warnings: &mut Vec<Warning>) -> Result<(), String> {
+        self.check_one(node, warnings)?;
+        node.kind
+            .get()
+            .children()
+            .iter()
+            .try_for_each(|child| self.check(child, warnings))
+    }
+
+    /// Refuses what `node` itself can't be drawn with: an icon Iconify
+    /// doesn't have (fetching it now, so it's cached to draw), a path that
+    /// isn't path data, a polygon's side count; and warns of a weight on an
+    /// icon without weights. Every edit that makes a node or sets its
+    /// properties checks it here (Update and Copy only the nodes they set).
+    fn check_one(&self, node: &Node, warnings: &mut Vec<Warning>) -> Result<(), String> {
         match &node.kind {
             Kind::Icon(icon) => {
                 if let Some(assets) = &self.assets {
@@ -247,11 +258,7 @@ impl Draft {
             Kind::Polygon(polygon) => polygon.problem().map_or(Ok(()), Err)?,
             _ => {}
         }
-        node.kind
-            .get()
-            .children()
-            .iter()
-            .try_for_each(|child| self.check(child, warnings))
+        Ok(())
     }
 
     /// Puts a built node among `parent`'s children (already checked to

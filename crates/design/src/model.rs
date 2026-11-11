@@ -203,12 +203,12 @@ pub trait NodeKind {
         None
     }
 
-    /// Whether its children are cut off at its bounds.
     /// The assets it draws with ([`crate::assets`]).
     fn assets(&self) -> Vec<AssetKey> {
         Vec::new()
     }
 
+    /// Whether its children are cut off at its bounds.
     fn clips(&self) -> bool {
         false
     }

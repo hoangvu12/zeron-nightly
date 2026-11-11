@@ -598,6 +598,9 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
+        // Fetched now, outside its lock: telling its tabs and drawing it
+        // only read what's cached.
+        self.inner.assets.fetch(&design);
         let design = Arc::new(Mutex::new(Live::new(path.clone(), design, self.inner.assets.clone())));
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }

@@ -253,3 +253,34 @@ Print(Get("{mark}").icon, Get("{mark}").width);"#),
     assert_eq!(caught.printed(), ["mdi:square 24"], "{}", caught.text);
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_design_read_from_disk_fetches_its_icons_once_and_edits_around_one_it_cannot() {
+    let seam = Seam::new().await;
+    // Made elsewhere: one icon this computer hasn't cached, one Iconify hasn't got.
+    let folder = seam.designs_folder().join("Handmade");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("Handmade.zdesign");
+    let design = serde_json::json!({ "version": "1.0", "children": [
+        { "id": "card", "type": "frame", "width": 100, "height": 100, "children": [
+            { "id": "known", "type": "icon", "icon": "mdi:square", "width": 24, "height": 24 },
+            { "id": "gone", "type": "icon", "icon": "lucide:no-such-icon", "x": 30, "width": 24, "height": 24 },
+        ] },
+    ] });
+    std::fs::write(&path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+
+    // Edits that don't touch the missing icon go through, and its card
+    // draws with the icon it has.
+    for fill in ["#FFFFFF", "#EEEEEE"] {
+        let edited = seam
+            .execute(&path, &format!(r#"Update("card", {{ fill: "{fill}" }}); TakeScreenshot("known");"#))
+            .await;
+        assert!(!edited.is_error, "{}", edited.text);
+        assert_eq!(edited.images[0].rgba(12, 12), [0, 0, 0, 255]);
+    }
+    // Each was asked for once, as the Design was read.
+    let mut fetched = seam.iconify.fetched.lock().unwrap().clone();
+    fetched.sort();
+    assert_eq!(fetched, ["lucide:no-such-icon", "mdi:square"]);
+    seam.shutdown().await;
+}

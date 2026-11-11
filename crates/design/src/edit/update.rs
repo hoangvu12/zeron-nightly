@@ -21,7 +21,7 @@ impl Draft {
         let unsupported = set(node, &props, "Update")?;
         let node = self.design.find(id).expect("the node was just updated");
         let mut warnings = unsupported_warnings(node, "Update", unsupported);
-        if let Err(e) = self.check(node, &mut warnings) {
+        if let Err(e) = self.check_one(node, &mut warnings) {
             *self.design.find_mut(id).expect("the node was just updated") = before;
             return Err(EditError::Invalid(format!("Update: {e}")));
         }

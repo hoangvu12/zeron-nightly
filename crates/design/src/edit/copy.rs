@@ -40,14 +40,18 @@ impl Draft {
                 EditError::Invalid(format!("Copy: no node inside \"{id}\" has the id \"{descendant}\""))
             })?;
             let unsupported = set(inside, &props, "Copy")?;
+            self.check_one(inside, &mut warnings)
+                .map_err(|e| EditError::Invalid(format!("Copy: {e}")))?;
             warnings.extend(unsupported_warnings(inside, "Copy", unsupported));
             warnings.extend(set_warnings(inside, &props));
         }
         let unsupported = set(&mut copy, &props, "Copy")?;
         warnings.extend(unsupported_warnings(&copy, "Copy", unsupported));
         warnings.extend(set_warnings(&copy, &props));
-        self.check(&copy, &mut warnings)
-            .map_err(|e| EditError::Invalid(format!("Copy: {e}")))?;
+        if !props.is_empty() {
+            self.check_one(&copy, &mut warnings)
+                .map_err(|e| EditError::Invalid(format!("Copy: {e}")))?;
+        }
 
         let (mut renamed, mut made) = (HashMap::new(), Vec::new());
         self.renew_ids(&mut copy, &mut renamed, &mut made);
