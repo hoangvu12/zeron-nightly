@@ -332,14 +332,7 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                     if let Some(Value::Array(images)) = images {
                         content.extend(images);
                     }
-                    ok_response(
-                        id,
-                        json!({
-                            "content": content,
-                            "structuredContent": wrap_structured(value),
-                            "isError": false,
-                        }),
-                    )
+                    ok_response(id, call_result(content, value))
                 }
                 Err(message) => ok_response(
                     id,
@@ -407,6 +400,21 @@ fn cap_reply(response: Value) -> Value {
             "isError": result["isError"],
         },
     })
+}
+
+/// A successful `tools/call` result: `content`, and `value` as its
+/// structured copy only when `content` is `value`'s text alone. Clients that
+/// take a structured copy keep it in place of the content (Claude Code and
+/// Codex do), so one beside texts or images (the design guides, a
+/// screenshot) would lose them. No tool declares an output schema, so no
+/// structured copy is owed.
+fn call_result(content: Vec<Value>, value: Value) -> Value {
+    let alone = content.len() == 1;
+    let mut result = json!({ "content": content, "isError": false });
+    if alone {
+        result["structuredContent"] = wrap_structured(value);
+    }
+    result
 }
 
 /// `structuredContent` must be an object; arrays and scalars are wrapped.
@@ -526,6 +534,24 @@ mod tests {
         let side_chats = instructions(false, true);
         assert!(side_chats.starts_with(INSTRUCTIONS));
         assert!(side_chats.ends_with("with `create_chats` (or `create_chat`)."));
+    }
+
+    /// A structured copy goes only with a result that's its JSON alone: a
+    /// client keeping it in place of the content would lose a guide's text
+    /// or a screenshot.
+    #[test]
+    fn a_result_with_texts_or_images_beside_its_json_has_no_structured_copy() {
+        let value = json!({ "topic": "core" });
+        let json_text = json!({ "type": "text", "text": pretty(&value) });
+        let alone = call_result(vec![json_text.clone()], value.clone());
+        assert_eq!(alone["structuredContent"], value);
+        let guide = json!({ "type": "text", "text": "# The design guide" });
+        let image = json!({ "type": "image", "data": "", "mimeType": "image/png" });
+        for beside in [guide, image] {
+            let result = call_result(vec![json_text.clone(), beside.clone()], value.clone());
+            assert!(result.get("structuredContent").is_none(), "{result}");
+            assert_eq!(result["content"][1], beside);
+        }
     }
 
     #[test]
