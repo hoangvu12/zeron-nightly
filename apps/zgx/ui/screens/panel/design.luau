@@ -4,6 +4,8 @@
 -- moves them as the Canvas is panned and zoomed (the wheel pans, ⌘ or Ctrl
 -- with it and a pinch zoom, from 0.25x to 5x, and a drag pans), so the
 -- Canvas moves at once and the host fills in sharper tiles behind it.
+-- Over the tiles, the live touches: what an agent just changed flashes,
+-- and a Screen it marked in progress looks so until it clears the mark.
 --
 -- The view (its pan and zoom) is kept per tab here, outside the views, so
 -- switching tabs or a reload finds it where it was. A tab with no Design
@@ -17,6 +19,7 @@
 --   Design.say_tabs(key)  the engine told which Designs the chat's tabs show
 
 local ds = require("@ds")
+local motion = require("@ds/motion")
 local state = require("@app/screens/panel/state")
 
 type Tab = state.Tab
@@ -27,6 +30,8 @@ local ZOOM_MIN, ZOOM_MAX = 0.25, 5
 -- How long after the last wheel step a zoom is over, and its tiles drawn
 -- at its own level.
 local SETTLE_MS = 150
+-- How long what an agent just changed flashes (pen.dev's live touches).
+local FLASH_MS = 900
 
 -- Each tab's view: where the Canvas's origin is in it, and its zoom.
 type View = { x: number, y: number, zoom: number }
@@ -204,6 +209,88 @@ local function canvas(id: string): Node
 		}
 	end
 
+	-- A box over a node of the Canvas, in the tab's points: where the view
+	-- puts it, crisp at any zoom (not scaled with the tiles).
+	local function over(n: any): { [string]: any }
+		return {
+			absolute = true,
+			left = function(): number
+				local v = view()
+				return if v then v.x + n.x * v.zoom else 0
+			end,
+			top = function(): number
+				local v = view()
+				return if v then v.y + n.y * v.zoom else 0
+			end,
+			w = function(): number
+				local v = view()
+				return if v then n.w * v.zoom else 0
+			end,
+			h = function(): number
+				local v = view()
+				return if v then n.h * v.zoom else 0
+			end,
+		}
+	end
+	-- What an agent just changed: lit as it comes, fading out; then the
+	-- host's told it's over (a reload doesn't flash it again).
+	local function flash(n: any): Node
+		local lit = ui.use_state(true)
+		ui.after(0, function()
+			lit:set(false)
+		end)
+		ui.after(FLASH_MS, function()
+			ui.invoke("design.flashed", { tab = id, version = n.version })
+		end)
+		local box = over(n)
+		box.id = `design-flash-{id}-{n.id}`
+		box.class = "design-flash"
+		box.aria_hidden = true
+		box.border = 2
+		box.border_color = "$accent"
+		box.bg = "$selection.item"
+		box.opacity = motion.tween(ui.computed(function(): number
+			return if lit:get() then 1 else 0
+		end), { duration = FLASH_MS, ease = "outQuad" })
+		return ui.div(box)
+	end
+	-- A Screen an agent marked in progress: outlined, veiled, and saying so
+	-- over its corner, until the agent clears the mark.
+	local function working(n: any): Node
+		local box = over(n)
+		box.id = `design-working-{id}-{n.id}`
+		box.class = "design-working"
+		box.border = 2
+		box.border_color = "$accent"
+		box.bg = "$hover"
+		box[1] = ui.div {
+			absolute = true,
+			left = 0,
+			bottom = "100%",
+			mb = "$space.1",
+			px = "$space.2",
+			py = "$zeron.space.hair",
+			rounded = "$radius.full",
+			bg = "$accent",
+			-- (The label style, in the ink that reads on the accent.)
+			ui.text {
+				ui.t("panel.design.in_progress"),
+				font = "$font.sans",
+				text_size = "$font.size.xs",
+				line_height = "$font.line.xs",
+				weight = "$font.weight.medium",
+				color = "$accent.text",
+			},
+		}
+		return ui.div(box)
+	end
+	local function touches(kind: string): any
+		return ui.computed(function(): { any }
+			local b = told()
+			return if b and b[kind] then b[kind] else {}
+		end)
+	end
+
 	return ui.overlay {
 		id = `design-canvas-{id}`,
 		class = "design-canvas",
@@ -252,6 +339,17 @@ local function canvas(id: string): Node
 		end), layer, {
 			key = function(l: any): string
 				return tostring(l.level)
+			end,
+		}),
+		ui.each(touches("working"), working, {
+			key = function(n: any): string
+				return n.id
+			end,
+		}),
+		-- (A new flash of the same node is a new one: keyed by its change.)
+		ui.each(touches("flashes"), flash, {
+			key = function(n: any): string
+				return `{n.version}:{n.id}`
 			end,
 		}),
 	}

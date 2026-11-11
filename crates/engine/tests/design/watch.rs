@@ -113,3 +113,38 @@ async fn agents_cannot_say_a_chats_design_tabs() {
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
 }
+
+#[tokio::test]
+async fn the_window_hears_that_an_agent_made_a_change() {
+    let seam = Seam::new().await;
+    let made = seam.create("Touched", SCREEN).await;
+    let window = zeron_rpc::memory_client(seam.core.rpc_service());
+    let mut seen = window.subscribe("WatchDesign", json!({ "path": made.path() })).await.unwrap();
+    let first = next(&mut seen).await;
+    // (As it was opened: nobody's change.)
+    assert_eq!(first["by"], Value::Null, "{first}");
+    seam.execute(&made.path(), &format!(r##"Insert("{}", {{ type: "rectangle", name: "Dot", width: 4, height: 4 }});"##, made.id("Screen")))
+        .await;
+    let after = next(&mut seen).await;
+    assert_eq!(after["by"], "agent", "{after}");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_screen_is_marked_in_progress_while_an_agent_builds_it() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create("Working", r##"Insert({ type: "frame", name: "Screen", width: 400, height: 300, fill: "#FFFFFF", inProgress: true });"##)
+        .await;
+    let result = made.json();
+    assert!(result.get("warnings").is_none(), "inProgress is known: {result}");
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(made.path()).unwrap()).unwrap();
+    assert_eq!(file["children"][0]["inProgress"], true);
+    // Not written when it's off.
+    let done = seam
+        .execute(&made.path(), r##"Insert({ type: "frame", name: "Done", width: 10, height: 10, inProgress: false });"##)
+        .await;
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(done.path()).unwrap()).unwrap();
+    assert!(file["children"][1].get("inProgress").is_none(), "{file}");
+    seam.shutdown().await;
+}

@@ -8,12 +8,15 @@
 //! ```text
 //! shared  design.tab.<tab>  { state = "opening" | "ready" | "failed", error?,
 //!                             extent? = { x, y, w, h },   where the Design draws
+//!                             flashes = { { id, version, x, y, w, h }… },  what an agent just changed
+//!                             working = { { id, name, x, y, w, h }… },  Screens in progress
 //!                             layers = { Layer… } }   the previous zoom's first
 //!         Layer             { level, tiles = { { id, src, x, y, size }… } }
 //! invoke  design.open       { tab, path }           follow the Design at `path`
 //! invoke  design.view       { tab, x, y, zoom, w, h, settled }
 //! invoke  design.close      tab                      its watch and tiles let go
 //! invoke  design.tabs       { chat, paths }          a chat's Design tabs, front first
+//! invoke  design.flashed    { tab, version }         that flash is over
 //! ```
 //!
 //! A layer's tiles are placed in points at `level` points a Canvas unit, so
@@ -54,7 +57,14 @@ pub const ZOOM: (f32, f32) = (0.25, 5.);
 
 /// What a tab hears as it follows a Design: the Design whole after each
 /// change, or why it can't be followed.
-pub type Listener = Box<dyn FnMut(Result<Design, String>)>;
+pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
+
+/// A Design as it is now, and the nodes an agent's change to it made or
+/// changed (none when the change wasn't an agent's), which flash.
+pub struct Heard {
+    pub design: Design,
+    pub flash: Vec<String>,
+}
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
 pub trait Source {
@@ -85,14 +95,23 @@ impl Source for EngineSource {
         let rpc = engine::get().current()?;
         let listener = Rc::new(RefCell::new(listener));
         let ended = listener.clone();
-        // (`WatchDesign` also names what each call made or changed, for the
-        // tab's flashes: not read yet.)
         let watch = rpc.watch_ending(
             "WatchDesign",
             json!({ "path": path }),
             move |item: Json| {
-                let design = serde_json::from_value(item["design"].clone()).map_err(|e| format!("not a Design: {e}"));
-                (listener.borrow_mut())(design)
+                let heard = serde_json::from_value(item["design"].clone())
+                    .map(|design| Heard {
+                        design,
+                        // (What an agent changed flashes; the person's own
+                        // changes don't.)
+                        flash: if item["by"] == "agent" {
+                            item["changed"].as_array().into_iter().flatten().filter_map(|id| id.as_str().map(str::to_owned)).collect()
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                    .map_err(|e| format!("not a Design: {e}"));
+                (listener.borrow_mut())(heard)
             },
             move |why| {
                 // (A connection that ended is followed again on the next.)
@@ -382,6 +401,10 @@ struct TabCanvas {
     front: Option<Level>,
     back: Option<Level>,
     tiles: HashMap<TileKey, Tile>,
+    /// What flashes now: the nodes the last agent change made or changed,
+    /// and which change (so the script tells one flash from the next).
+    flash: Vec<String>,
+    flash_version: u64,
 }
 
 impl TabCanvas {
@@ -427,6 +450,33 @@ impl TabCanvas {
         };
         let layers: Vec<Value> = [self.back.map(layer), self.front.map(layer)].into_iter().flatten().collect();
         let mut fields = vec![("state", Value::from(state)), ("layers", Value::List(layers.into()))];
+        // The live touches (#34), on the Canvas: what an agent just changed,
+        // and the Screens it marked in progress.
+        if let Some(scene) = &self.scene {
+            let placed = |id: &str, extra: Vec<(&str, Value)>| {
+                let bounds = scene.laid_out.get(id)?.bounds;
+                let mut fields = vec![
+                    ("id", Value::from(id)),
+                    ("x", Value::Num(bounds.x as f64)),
+                    ("y", Value::Num(bounds.y as f64)),
+                    ("w", Value::Num(bounds.width as f64)),
+                    ("h", Value::Num(bounds.height as f64)),
+                ];
+                fields.extend(extra);
+                Some(Value::record(fields))
+            };
+            let version = Value::Num(self.flash_version as f64);
+            let flashes: Vec<Value> = self.flash.iter().filter_map(|id| placed(id, vec![("version", version.clone())])).collect();
+            let working: Vec<Value> = scene
+                .design
+                .children
+                .iter()
+                .filter(|node| node.in_progress)
+                .filter_map(|node| placed(&node.id, vec![("name", Value::from(node.name.as_str()))]))
+                .collect();
+            fields.push(("flashes", Value::List(flashes.into())));
+            fields.push(("working", Value::List(working.into())));
+        }
         if let Some(why) = &self.failed {
             fields.push(("error", Value::from(why.as_str())));
         }
@@ -523,6 +573,17 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         tabs.update(&tab);
     });
     let me = Rc::downgrade(&tabs);
+    host.action("design.flashed", move |arg| {
+        let Some(tabs) = me.upgrade() else { return };
+        let tab = text(&arg, "tab");
+        let version = arg.field("version").and_then(Value::as_f64).unwrap_or(0.) as u64;
+        // (Over, so a reload doesn't flash it again; a newer flash stays.)
+        if let Some(canvas) = tabs.tabs.borrow_mut().get_mut(&tab).filter(|c| c.flash_version == version) {
+            canvas.flash.clear();
+        }
+        tabs.publish(&tab);
+    });
+    let me = Rc::downgrade(&tabs);
     host.action("design.close", move |arg| {
         if let Some(tabs) = me.upgrade() {
             tabs.close(&crate::auth::text(&arg));
@@ -572,6 +633,8 @@ impl DesignTabs {
             front: None,
             back: None,
             tiles: HashMap::new(),
+            flash: Vec::new(),
+            flash_version: 0,
         };
         self.tabs.borrow_mut().insert(tab.to_owned(), canvas);
         self.follow(tab);
@@ -632,16 +695,20 @@ impl DesignTabs {
     }
 
     /// The Design of `tab` as it is now (or why it can't be followed).
-    fn heard(&self, tab: &str, heard: Result<Design, String>) {
+    fn heard(&self, tab: &str, heard: Result<Heard, String>) {
         {
             let mut tabs = self.tabs.borrow_mut();
             let Some(canvas) = tabs.get_mut(tab) else { return };
             match heard {
                 Err(why) => canvas.failed = Some(why),
-                Ok(design) => {
+                Ok(Heard { design, flash }) => {
                     canvas.failed = None;
                     self.versions.set(self.versions.get() + 1);
                     let scene = Arc::new(Scene::new(self.versions.get(), design));
+                    if !flash.is_empty() {
+                        canvas.flash = flash;
+                        canvas.flash_version = scene.version;
+                    }
                     if let Some(old) = &canvas.scene {
                         let damage = old.damage(&scene);
                         let mut gone = Vec::new();

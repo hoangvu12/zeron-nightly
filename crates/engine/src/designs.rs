@@ -149,6 +149,17 @@ struct Told {
     version: u64,
     design: Arc<Design>,
     changed: Vec<String>,
+    /// Who made the change: the tabs flash an agent's, not the person's.
+    by: Option<Changer>,
+}
+
+/// Who changed a Design (the person's own edits in a Design tab come with
+/// #33, as `Person`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Changer {
+    /// An agent's `design_execute` call.
+    Agent,
 }
 
 impl Designs {
@@ -202,7 +213,7 @@ impl Designs {
 
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
-    /// design, changed}`. A tab that falls behind hears the latest only.
+    /// design, changed, by}` (`by`: "agent", "person", or null as opened). A tab that falls behind hears the latest only.
     /// Blocking (it may read the file): run it off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
@@ -212,7 +223,7 @@ impl Designs {
             live.followers.send_if_modified(|told| {
                 let stale = told.version != live.version;
                 if stale {
-                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changed: Vec::new() };
+                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changed: Vec::new(), by: None };
                 }
                 stale
             });
@@ -227,6 +238,7 @@ impl Designs {
                 "version": now.version,
                 "design": &*now.design,
                 "changed": now.changed,
+                "by": now.by,
             });
             Some((item, (told, false)))
         }))
@@ -248,7 +260,7 @@ impl Designs {
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
-        let screenshots = live.commit(&edited)?;
+        let screenshots = live.commit(&edited, Changer::Agent)?;
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -476,6 +488,7 @@ impl Live {
             version: 0,
             design: Arc::new(design.clone()),
             changed: Vec::new(),
+            by: None,
         };
         Self {
             path,
@@ -488,7 +501,7 @@ impl Live {
 
     /// Tells the Design's tabs what a change made of it (copied for them
     /// only while some follow it).
-    fn tell(&self, edited: &Edited) {
+    fn tell(&self, edited: &Edited, by: Changer) {
         if self.followers.receiver_count() == 0 {
             return;
         }
@@ -496,16 +509,17 @@ impl Live {
             version: self.version,
             design: Arc::new(self.design.clone()),
             changed: edited.changed.iter().cloned().collect(),
+            by: Some(by),
         });
     }
 
-    /// Keeps a successful call's draft: saves the file, then draws the
-    /// screenshots the call asked for.
-    fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
+    /// Keeps a successful change's draft (`by` whom): saves the file, then
+    /// draws the screenshots it asked for.
+    fn commit(&mut self, edited: &Edited, by: Changer) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
         self.version += 1;
-        self.tell(edited);
+        self.tell(edited, by);
         Ok(edited
             .screenshots
             .iter()

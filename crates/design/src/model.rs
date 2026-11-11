@@ -151,6 +151,9 @@ pub struct Node {
     /// Placed at its x and y even in a parent that lays its children out,
     /// and left out of that layout.
     pub absolute: bool,
+    /// An agent is still building it (a Screen's mark while it works): the
+    /// Design tab shows it as in progress.
+    pub in_progress: bool,
     pub kind: Kind,
     /// Properties the model doesn't know (all but its id, for an
     /// [`Opaque`] node), written back as they were read.
