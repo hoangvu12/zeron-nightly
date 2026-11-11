@@ -4,6 +4,7 @@
 //! tiny-skia renderer would replace those and a painter of its own.
 
 use crate::icons::Icons;
+use crate::layout::LaidOut;
 use crate::model::{Color, Design, FillRule, Node, Paint};
 
 /// The longest side of an agent's screenshot, in pixels.
@@ -66,22 +67,30 @@ pub fn is_path_data(geometry: &str) -> bool {
     crate::skia::svg_path(geometry).is_some_and(|path| !path.is_empty())
 }
 
-/// Draws `node` and its descendants with its top-left at the painter's
-/// origin, wherever it sits in its parent.
-pub fn paint_node(node: &Node, painter: &mut dyn Painter) {
+/// Draws `node` and its descendants where `laid_out` puts them, with its
+/// top-left at the painter's origin wherever it sits in its parent.
+pub fn paint_node(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter) {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return;
+    };
+    let bounds = placed.bounds;
+    let size = (bounds.width, bounds.height);
     let kind = node.kind.get();
-    kind.paint(painter);
+    kind.paint(size, painter);
     if kind.children().is_empty() {
         return;
     }
     painter.save();
     if kind.clips() {
-        painter.clip_rect(Rect::sized(kind.size()));
+        painter.clip_rect(Rect::sized(size));
     }
     for child in kind.children() {
+        let Some(at) = laid_out.get(&child.id) else {
+            continue;
+        };
         painter.save();
-        painter.translate(child.x, child.y);
-        paint_node(child, painter);
+        painter.translate(at.bounds.x - bounds.x, at.bounds.y - bounds.y);
+        paint_node(child, laid_out, painter);
         painter.restore();
     }
     painter.restore();
@@ -116,7 +125,9 @@ pub fn screenshot(
     icons: &Icons,
 ) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
-    let (width, height) = node.kind.get().size();
+    let laid_out = LaidOut::of(design);
+    let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
+    let (width, height) = (bounds.width, bounds.height);
     if !(width > 0. && height > 0.) {
         return Err(RenderError::Empty(id.into()));
     }
@@ -131,7 +142,7 @@ pub fn screenshot(
     {
         let mut painter = crate::skia::SkiaPainter::new(surface.canvas()).with_icons(icons);
         painter.scale(scale);
-        paint_node(node, &mut painter);
+        paint_node(node, &laid_out, &mut painter);
     }
     let png = crate::skia::png(&mut surface).ok_or_else(failed)?;
     Ok(Screenshot {

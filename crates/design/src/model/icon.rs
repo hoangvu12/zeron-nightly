@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Color, Fill, NodeKind, Paint, Size};
+use super::{Color, Fill, NodeKind, Paint, Size, Sizing};
 use crate::render::{Painter, Rect};
 
 /// An Iconify icon (`icon`, as `set:name`) drawn into its box in its fill's
@@ -32,11 +32,11 @@ impl Icon {
 }
 
 impl NodeKind for Icon {
-    fn size(&self) -> (f32, f32) {
-        (self.size.width, self.size.height)
+    fn size(&self) -> (Sizing, Sizing) {
+        self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, painter: &mut dyn Painter) {
-        painter.icon(&self.icon, self.weight, self.color(), Rect::sized(self.size()));
+    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
+        painter.icon(&self.icon, self.weight, self.color(), Rect::sized(size));
     }
 }

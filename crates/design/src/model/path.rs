@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, NodeKind, Size};
+use super::{Fill, NodeKind, Size, Sizing};
 use crate::render::{Painter, Rect, Shape};
 
 /// SVG path data (`geometry`) whose `viewBox` is stretched onto its box;
@@ -55,15 +55,15 @@ impl Path {
 }
 
 impl NodeKind for Path {
-    fn size(&self) -> (f32, f32) {
-        (self.size.width, self.size.height)
+    fn size(&self) -> (Sizing, Sizing) {
+        self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, painter: &mut dyn Painter) {
+    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
         let shape = Shape::Path {
             geometry: &self.geometry,
             view_box: self.view_box.map(|[x, y, width, height]| Rect { x, y, width, height }),
-            rect: Rect::sized(self.size()),
+            rect: Rect::sized(size),
             fill_rule: self.fill_rule,
         };
         painter.fill_shape(shape, &self.fill.fill);

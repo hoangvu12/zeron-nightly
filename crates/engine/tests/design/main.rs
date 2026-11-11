@@ -3,6 +3,8 @@
 
 mod icons;
 mod kept;
+mod layout;
+mod reading;
 mod seam;
 mod shapes;
 mod tracer;

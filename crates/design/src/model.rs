@@ -14,6 +14,7 @@ mod ellipse;
 mod frame;
 mod icon;
 mod kept;
+mod layout;
 mod paint;
 mod path;
 mod polygon;
@@ -22,6 +23,7 @@ mod rectangle;
 pub use ellipse::Ellipse;
 pub use frame::Frame;
 pub use icon::Icon;
+pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{Color, Fill, Paint};
 pub use path::{FillRule, Path};
 pub use polygon::Polygon;
@@ -138,6 +140,9 @@ pub struct Node {
     /// Its top-left corner, from its parent's (or the Canvas's origin).
     pub x: f32,
     pub y: f32,
+    /// Placed at its x and y even in a parent that lays its children out,
+    /// and left out of that layout.
+    pub absolute: bool,
     pub kind: Kind,
     /// Properties the model doesn't know (all but its id, for an
     /// [`Opaque`] node), written back as they were read.
@@ -147,7 +152,13 @@ pub struct Node {
 /// What each node type answers, so walking, editing and drawing a Design
 /// needn't know the types.
 pub trait NodeKind {
-    fn size(&self) -> (f32, f32);
+    /// Its width and height as set, or its type's defaults.
+    fn size(&self) -> (Sizing, Sizing);
+
+    /// How it lays its children out, for the types that can.
+    fn layout(&self) -> Option<&Layout> {
+        None
+    }
 
     /// Its children, for the types that hold them.
     fn children(&self) -> &[Node] {
@@ -164,9 +175,9 @@ pub trait NodeKind {
         false
     }
 
-    /// Draws the node itself, not its children, with its top-left at the
-    /// painter's origin.
-    fn paint(&self, painter: &mut dyn Painter);
+    /// Draws the node itself, not its children, at its laid-out `size`
+    /// with its top-left at the painter's origin.
+    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter);
 }
 
 macro_rules! kinds {
@@ -234,18 +245,26 @@ pub struct Opaque {
 }
 
 impl NodeKind for Opaque {
-    fn size(&self) -> (f32, f32) {
-        (0., 0.)
+    fn size(&self) -> (Sizing, Sizing) {
+        (Sizing::Fixed(0.), Sizing::Fixed(0.))
     }
 
-    fn paint(&self, _painter: &mut dyn Painter) {}
+    fn paint(&self, _size: (f32, f32), _painter: &mut dyn Painter) {}
 }
 
-/// A fixed width and height, in pixels at 1x.
+/// A width and height, each fixed, fit content or fill container; unset,
+/// each is its type's default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Size {
-    #[serde(default)]
-    pub width: f32,
-    #[serde(default)]
-    pub height: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<Sizing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<Sizing>,
+}
+
+impl Size {
+    /// Each side as set, or `default`.
+    pub fn or(self, default: Sizing) -> (Sizing, Sizing) {
+        (self.width.unwrap_or(default), self.height.unwrap_or(default))
+    }
 }

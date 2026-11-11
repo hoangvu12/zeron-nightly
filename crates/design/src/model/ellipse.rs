@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, NodeKind, Size};
+use super::{Fill, NodeKind, Size, Sizing};
 use crate::render::{Painter, Rect, Shape};
 
 /// The ellipse filling its box: whole, or an arc from `startAngle` through
@@ -46,13 +46,13 @@ fn is_zero(value: &f32) -> bool {
 }
 
 impl NodeKind for Ellipse {
-    fn size(&self) -> (f32, f32) {
-        (self.size.width, self.size.height)
+    fn size(&self) -> (Sizing, Sizing) {
+        self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, painter: &mut dyn Painter) {
+    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
         let shape = Shape::Ellipse {
-            rect: Rect::sized(self.size()),
+            rect: Rect::sized(size),
             start: self.start_angle,
             sweep: self.sweep_angle,
             inner: self.inner_radius,

@@ -2,7 +2,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, NodeKind, Size};
+use super::{Fill, NodeKind, Size, Sizing};
 use crate::render::{Painter, Shape};
 
 /// The fewest and most sides a polygon draws with.
@@ -48,8 +48,8 @@ impl Polygon {
         })
     }
 
-    /// Its corners in its box, clockwise from the top.
-    pub fn corners(&self) -> Vec<(f32, f32)> {
+    /// Its corners in a box of this size, clockwise from the top.
+    pub fn corners(&self, (width, height): (f32, f32)) -> Vec<(f32, f32)> {
         let sides = self.polygon_count.clamp(*SIDES.start(), *SIDES.end());
         let unit: Vec<(f32, f32)> = (0..sides)
             .map(|i| {
@@ -62,7 +62,6 @@ impl Polygon {
         for &(x, y) in &unit {
             (left, top, right, bottom) = (left.min(x), top.min(y), right.max(x), bottom.max(y));
         }
-        let (width, height) = self.size();
         unit.into_iter()
             .map(|(x, y)| {
                 (
@@ -75,11 +74,11 @@ impl Polygon {
 }
 
 impl NodeKind for Polygon {
-    fn size(&self) -> (f32, f32) {
-        (self.size.width, self.size.height)
+    fn size(&self) -> (Sizing, Sizing) {
+        self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, painter: &mut dyn Painter) {
-        painter.fill_shape(Shape::Polygon(&self.corners()), &self.fill.fill);
+    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
+        painter.fill_shape(Shape::Polygon(&self.corners(size)), &self.fill.fill);
     }
 }
