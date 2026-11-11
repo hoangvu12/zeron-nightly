@@ -93,6 +93,6 @@ TakeScreenshot([darkAlert, darkNav]);
 
 ## Rules
 
-- Every value in a Component comes from a Token, but for structure (a gap of 4 inside an icon button is fine as a number when it isn't on the scale's Tokens).
+- Colours, type and radii in a Component come from Tokens. Small structural numbers (a 4 px gap between an icon and its label) can stay literal.
 - One idea per card; tables of four to seven columns; reuse a Component before building a custom frame.
 - When implementation follows, `GetTokens({css: true})` gives the Tokens as CSS custom properties, with each Theme under a data attribute.
