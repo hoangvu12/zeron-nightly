@@ -82,10 +82,13 @@ const MAX_RECENT: usize = 50;
 pub const AUTOSAVE_AFTER: Duration = Duration::from_secs(3);
 
 /// What an agent's call on a Design that isn't managed is told.
-const UNSAVED_NOTICE: &str = "This Design's file changes only when the person saves it (Ctrl+S in its Design tab); until then your changes are kept in a backup, and other calls and its tabs see them.";
+const UNSAVED_NOTICE: &str = "This Design's file changes only when the person saves it in its Design tab; until then your changes are kept in a backup, and other calls and its tabs see them.";
 
 /// The undo step of discarding a Design's unsaved changes.
 const DISCARD_DESCRIPTION: &str = "Discard unsaved changes";
+
+/// The undo step of Save as renaming images it copied.
+const SAVE_AS_DESCRIPTION: &str = "Save as, renaming images";
 
 /// What `design_state` reminds an agent of.
 pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide comes with your first design call in a chat; call design_guide for it again (after your context was compacted, say) or for a topic guide.";
@@ -140,16 +143,16 @@ pub struct TabsParams {
 #[derive(Debug, Deserialize)]
 pub struct PathParams {
     /// The `.zdesign` file.
-    pub path: String,
+    pub path: PathBuf,
 }
 
 /// `SaveDesignAs`'s params.
 #[derive(Debug, Deserialize)]
 pub struct SaveAsParams {
     /// The `.zdesign` file the Design is now.
-    pub path: String,
+    pub path: PathBuf,
     /// The `.zdesign` file to write it to (its folder is made if need be).
-    pub to: String,
+    pub to: PathBuf,
 }
 
 /// `DesignState`'s params, as Zeron's `design_state` tool sends them.
@@ -341,7 +344,8 @@ impl Designs {
     }
 
     /// Managed Designs opened from now on save themselves `after` a change
-    /// in place of [`AUTOSAVE_AFTER`]; with zero, at once.
+    /// in place of [`AUTOSAVE_AFTER`]; with zero, at once (for tests, which
+    /// read the file each call left).
     pub fn autosave_after(&self, after: Duration) {
         *lock(&self.inner.autosave) = after;
     }
@@ -388,47 +392,72 @@ impl Designs {
         };
         let io = |e: std::io::Error| DesignError::Io(format!("can't save to {}: {e}", to.display()));
         std::fs::create_dir_all(folder).map_err(io)?;
-        let folder = canonical(folder).map_err(io)?;
-        let to = folder.join(file);
+        // As the file system spells it (its case, its long names), so a
+        // Design held by that file is found.
+        let to = canonical(to)
+            .or_else(|_| canonical(folder).map(|folder| folder.join(file)))
+            .map_err(io)?;
+        let folder = to.parent().unwrap_or(Path::new(".")).to_owned();
         let held = self.open(path)?;
-        let mut live = lock(&held);
-        if live.path == to {
-            live.save_file()?;
-            return Ok(live.saving());
+        // The files copied without holding the Design up; again if it
+        // changed meanwhile.
+        let ((design, renamed), mut live) = loop {
+            let (version, design, from) = {
+                let live = lock(&held);
+                if live.path == to {
+                    drop(live);
+                    return self.save(&to);
+                }
+                let from = live.path.parent().unwrap_or(Path::new(".")).to_owned();
+                (live.version, live.design.clone(), from)
+            };
+            let copied = copy_beside(&design, &from, &folder)?;
+            let live = lock(&held);
+            if live.version == version {
+                break (copied, live);
+            }
+        };
+        // The file is this Design's from now on: no other may open it.
+        {
+            let mut by_path = lock(&self.inner.live);
+            if by_path.get(&to).is_some_and(|other| !Arc::ptr_eq(other, &held)) {
+                return Err(DesignError::Refused(format!(
+                    "{} is open as another Design: save this one somewhere else",
+                    to.display()
+                )));
+            }
+            by_path.insert(to.clone(), held.clone());
         }
-        if lock(&self.inner.live).contains_key(&to) {
-            return Err(DesignError::Refused(format!(
-                "{} is open as another Design: save this one somewhere else",
-                to.display()
-            )));
+        if let Err(e) = write_whole(&to, design.to_json().as_bytes()) {
+            lock(&self.inner.live).remove(&to);
+            return Err(io(e));
         }
-        let from = live.path.parent().unwrap_or(Path::new(".")).to_owned();
-        let (design, renamed) = copy_beside(&live.design, &from, &folder)?;
-        save(&to, &design)?;
+        lock(&self.inner.live).remove(&live.path);
         if let Saving::Backup(backup) = &live.saving {
             remove_backup(backup);
         }
         let old = std::mem::replace(&mut live.path, to.clone());
         live.saving = self.saving_for(&to);
+        // Nor is what was unsaved in a file it replaced recovered later.
+        if let Saving::Backup(backup) = &live.saving {
+            remove_backup(backup);
+        }
         live.images = DesignImages::new(&to, self.inner.images.clone());
         live.fonts = self.fonts_for(&to);
         live.unsaved = false;
         live.recovered = false;
         if renamed {
-            // Its undo steps refer to images by the names they had.
-            live.design = design;
-            live.history = History::default();
-            live.version += 1;
-            live.tell(Vec::new(), Changer::File);
+            // One undo step: undone, it draws its images by their old names.
+            let before = std::mem::replace(&mut live.design, design);
+            let Live { history, design, .. } = &mut *live;
+            history.record(SAVE_AS_DESCRIPTION, &before, design);
         }
+        // Its tabs draw its images and fonts from where it is now.
+        live.version += 1;
+        live.tell(Vec::new(), Changer::File);
         live.tell_saving();
         let saving = live.saving();
         drop(live);
-        {
-            let mut held_by_path = lock(&self.inner.live);
-            held_by_path.remove(&old);
-            held_by_path.insert(to.clone(), held);
-        }
         for tabs in lock(&self.inner.tabs).values_mut() {
             for tab in tabs.iter_mut().filter(|tab| **tab == old) {
                 tab.clone_from(&to);
@@ -578,7 +607,8 @@ impl Designs {
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
     /// design, changes: [{version, changed, by}]}`: the changes since the
-    /// item before (none in the first), `by` "agent"; and `path`,
+    /// item before (none in the first), `by` "agent", "undo" or "file"
+    /// (unsaved changes discarded, or Save as renaming images); and `path`,
     /// `unsaved` and `recovered`, as [`Designs::saving`] says (heard again,
     /// with no changes, when only they change). A tab that falls behind
     /// hears the latest only. Blocking (it may read the file): run it off
@@ -987,11 +1017,17 @@ impl Live {
     /// was.
     fn keep(&mut self, design: Design, changed: Vec<String>, by: Changer) -> Result<Design, DesignError> {
         self.write(&design)?;
+        Ok(self.put(design, changed, by))
+    }
+
+    /// Makes `design` the Design, already on disk as it should be, and
+    /// tells of it as [`Live::keep`] does.
+    fn put(&mut self, design: Design, changed: Vec<String>, by: Changer) -> Design {
         let before = std::mem::replace(&mut self.design, design);
         self.version += 1;
         self.tell(changed, by);
         self.tell_saving();
-        Ok(before)
+        before
     }
 
     /// Puts a change on disk as the Design saves: in its backup, or in its
@@ -1067,12 +1103,11 @@ impl Live {
             .map_err(|e| DesignError::Io(format!("can't read {}: {e}", self.path.display())))?;
         let design = Design::from_json(&text)
             .map_err(|e| DesignError::Refused(format!("{} is not a Design: {e}", self.path.display())))?;
-        let before = self.keep(design, Vec::new(), Changer::File)?;
-        self.history.record(DISCARD_DESCRIPTION, &before, &self.design);
         remove_backup(&backup);
         self.unsaved = false;
         self.recovered = false;
-        self.tell_saving();
+        let before = self.put(design, Vec::new(), Changer::File);
+        self.history.record(DISCARD_DESCRIPTION, &before, &self.design);
         Ok(())
     }
 

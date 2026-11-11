@@ -365,9 +365,11 @@ pub mod methods {
     /// guide}`. Local only, like `DesignExecute`.
     pub const DESIGN_STATE: &str = "DesignState";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
-    /// changes}`: the Design whole as it is, then after each change, with
-    /// each change since the item before as `{version, changed, by}` (the
-    /// ids it made or changed; `by` "agent"). Local only.
+    /// changes, path, unsaved, recovered}`: the Design whole as it is, then
+    /// after each change, with each change since the item before as
+    /// `{version, changed, by}` (the ids it made or changed; `by` "agent",
+    /// "undo" or "file"), and again when only its file or saving state
+    /// changes (`DesignSaving`). Local only.
     pub const WATCH_DESIGN: &str = "WatchDesign";
     /// `{chatId, paths}` → `{}`: the Designs a chat's Design tabs show, the
     /// front one first (none: it has none), as the app's tabs open, close

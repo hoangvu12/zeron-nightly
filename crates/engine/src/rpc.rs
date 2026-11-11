@@ -968,6 +968,25 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))
     }
 
+    /// Runs a saving call on Designs off the async runtime (it reads and
+    /// writes files), and replies with what it says.
+    async fn design_saving(
+        &self,
+        call: impl FnOnce(&crate::designs::Designs) -> Result<serde_json::Value, crate::designs::DesignError>
+        + Send
+        + 'static,
+    ) -> Result<RpcReply, RpcError> {
+        let designs = self.designs()?.clone();
+        let saving = tokio::task::spawn_blocking(move || call(&designs))
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .map_err(|e| match e {
+                crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
+                e => RpcError::Failed(e.to_string()),
+            })?;
+        RpcReply::value(&saving)
+    }
+
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
         self
@@ -5848,28 +5867,21 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({}))
             }
-            methods::DESIGN_SAVING | methods::SAVE_DESIGN | methods::SAVE_DESIGN_AS | methods::DISCARD_DESIGN => {
-                let designs = self.designs()?.clone();
-                let method = method.to_owned();
-                let saving = tokio::task::spawn_blocking(move || {
-                    let path = |p: &crate::designs::PathParams| std::path::PathBuf::from(&p.path);
-                    match method.as_str() {
-                        methods::SAVE_DESIGN_AS => {
-                            let p: crate::designs::SaveAsParams = parse_params(params)?;
-                            Ok(designs.save_as(std::path::Path::new(&p.path), std::path::Path::new(&p.to)))
-                        }
-                        methods::SAVE_DESIGN => parse_params(params).map(|p| designs.save(&path(&p))),
-                        methods::DISCARD_DESIGN => parse_params(params).map(|p| designs.discard(&path(&p))),
-                        _ => parse_params(params).map(|p| designs.saving(&path(&p))),
-                    }
-                })
-                .await
-                .map_err(|e| RpcError::Failed(e.to_string()))??
-                .map_err(|e| match e {
-                    crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
-                    e => RpcError::Failed(e.to_string()),
-                })?;
-                RpcReply::value(&saving)
+            methods::DESIGN_SAVING => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.saving(&p.path)).await
+            }
+            methods::SAVE_DESIGN => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.save(&p.path)).await
+            }
+            methods::SAVE_DESIGN_AS => {
+                let p: crate::designs::SaveAsParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.save_as(&p.path, &p.to)).await
+            }
+            methods::DISCARD_DESIGN => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.discard(&p.path)).await
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;

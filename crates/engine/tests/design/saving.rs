@@ -262,6 +262,28 @@ TakeScreenshot("{screen}");"##
     seam.shutdown().await;
 }
 
+#[tokio::test]
+async fn save_as_over_a_file_with_a_backup_leaves_nothing_to_recover() {
+    let seam = Seam::new().await;
+    let project = tempfile::tempdir().unwrap();
+    // Zeron stopped with changes to the project's Design unsaved.
+    let path = project_design(&seam, project.path(), "Over").await;
+    seam.execute(&path, &card("Stale")).await.json();
+    let seam = seam.restart().await;
+
+    // Another Design saved over it: what's there now is that one, not
+    // recovered, and nothing else lands beside it.
+    let other = seam.create("Other", SCREEN).await.path();
+    let saved = seam.window("SaveDesignAs", json!({ "path": other, "to": path })).await.unwrap();
+    assert_eq!((saved["unsaved"].clone(), saved["recovered"].clone()), (json!(false), json!(false)));
+    assert!(backups(&seam).is_empty());
+    assert!(!project.path().join("images").exists());
+    let seam = seam.restart().await;
+    assert_eq!(saving(&seam, &path).await["recovered"], false);
+    assert!(!on_disk(&path).contains("Stale"));
+    seam.shutdown().await;
+}
+
 /// The next thing a watch says, within a few seconds.
 async fn next(seen: &mut tokio::sync::mpsc::Receiver<Value>) -> Value {
     tokio::time::timeout(Duration::from_secs(5), seen.recv())
