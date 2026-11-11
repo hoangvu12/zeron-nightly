@@ -803,3 +803,112 @@ fn image_fills_draw_from_the_files_the_engine_names_across_tile_edges() {
     }
     assert!(off <= 860 * 600 / 1000, "{off} pixels differ from the screenshot");
 }
+
+#[test]
+fn instances_and_themed_tokens_draw_in_tiles_as_in_the_engines_screenshot() {
+    // A Component (a card of `$surface` holding an `$accent` dot), and a
+    // Screen with two Instances of it: one in the Design's light Theme,
+    // one set dark.
+    let design = design(serde_json::json!({
+        "version": "1.0",
+        "themes": { "mode": ["light", "dark"] },
+        "tokens": {
+            "surface": { "type": "color", "value": [
+                { "value": "#FFFFFF", "theme": { "mode": "light" } },
+                { "value": "#000000", "theme": { "mode": "dark" } },
+            ] },
+            "accent": { "type": "color", "value": "#4F46E5" },
+        },
+        "children": [
+            { "id": "screen", "type": "frame", "width": 500, "height": 400, "fill": "#F3F4F6", "children": [
+                { "id": "one", "type": "instance", "ref": "card", "x": 40, "y": 40 },
+                { "id": "two", "type": "instance", "ref": "card", "x": 260, "y": 40, "theme": { "mode": "dark" } },
+            ] },
+            { "id": "card", "type": "frame", "reusable": true, "x": 600, "width": 200, "height": 100, "fill": "$surface",
+              "children": [{ "id": "dot", "type": "rectangle", "x": 20, "y": 20, "width": 60, "height": 60, "fill": "$accent" }] },
+        ],
+    }));
+    let mut tab = mount(design.clone());
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+    let shown = tab.picture();
+
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::render::ImageFiles::default(), &zeron_design::assets::NoAssets).expect("a screenshot");
+    let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
+    let mut reader = decoder.read_info().expect("a PNG");
+    let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
+    reader.next_frame(&mut expected).expect("its pixels");
+    let (w, h) = (shot.width as usize, shot.height as usize);
+    let (left, top) = tab.on_screen(0., 0.);
+    let off = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let want = &expected[(y * w + x) * 4..][..4];
+            want.iter().zip(shown.rgba((left + x, top + y))).any(|(a, b)| a.abs_diff(b) > 2)
+        })
+        .count();
+    assert_eq!(off, 0, "pixels differ from the screenshot");
+    // The light Instance's card white, the dark one's black, both dots the
+    // accent.
+    assert_eq!(shown.rgba(tab.on_screen(50., 50.)), WHITE);
+    assert_eq!(shown.rgba(tab.on_screen(270., 50.)), [0, 0, 0, 255]);
+    assert_eq!(shown.rgba(tab.on_screen(90., 90.)), INDIGO);
+    assert_eq!(shown.rgba(tab.on_screen(310., 90.)), INDIGO);
+}
+
+#[test]
+fn an_image_and_a_font_set_only_in_an_instances_overrides_draw_in_tiles() {
+    // A Component of a plain swatch and a line of Geist text; its Instance
+    // overrides the swatch with an image and the text with a font the
+    // engine names, neither anywhere else in the Design.
+    let folder = tempfile::tempdir().expect("a folder");
+    let file = folder.path().join("stripes.png");
+    std::fs::write(&file, stripes()).expect("the image written");
+    let design = design(serde_json::json!({ "version": "1.0", "children": [
+        { "id": "screen", "type": "frame", "width": 600, "height": 300, "fill": "#FFFFFF", "children": [
+            { "id": "one", "type": "instance", "ref": "card", "x": 40, "y": 40, "descendants": {
+                "swatch": { "fill": { "type": "image", "url": "images/stripes.png", "mode": "stretch" } },
+                "words": { "fontFamily": "Instrument Serif" },
+            } },
+        ] },
+        { "id": "card", "type": "frame", "reusable": true, "x": 700, "width": 500, "height": 200, "fill": "#F3F4F6", "children": [
+            { "id": "swatch", "type": "rectangle", "x": 20, "y": 20, "width": 160, "height": 160, "fill": "#9CA3AF" },
+            { "id": "words", "type": "text", "x": 200, "y": 60, "content": "Hamburgefonstiv", "fontSize": 40, "fill": "#111827" },
+        ] },
+    ] }));
+    let serif = FontFile {
+        family: "Instrument Serif".into(),
+        path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/InstrumentSerif-Regular.ttf"),
+    };
+    let mut tab = mount_with_fonts(design.clone(), vec![serif.clone()]);
+    tab.engine.images.borrow_mut().insert("images/stripes.png".into(), file.clone());
+    tab.engine.say(PATH, design.clone());
+    tab.settle();
+    assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
+    let shown = tab.picture();
+
+    let images = zeron_design::render::ImageFiles::new([("images/stripes.png".to_string(), file)].into());
+    let shot = |fonts: &Fonts| {
+        let shot = zeron_design::render::screenshot(&design, "screen", 10_000., fonts, &images, &zeron_design::assets::NoAssets)
+            .expect("a screenshot");
+        let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
+        let mut reader = decoder.read_info().expect("a PNG");
+        let mut pixels = vec![0; reader.output_buffer_size().expect("its size")];
+        reader.next_frame(&mut pixels).expect("its pixels");
+        pixels
+    };
+    let expected = shot(&Fonts::of_files(&[serif]));
+    // The override's font is drawn, not the Component's Geist.
+    assert!(shot(&Fonts::default()) != expected, "the serif changes the text");
+    let (left, top) = tab.on_screen(0., 0.);
+    let off = (0..300usize)
+        .flat_map(|y| (0..600usize).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let want = &expected[(y * 600 + x) * 4..][..4];
+            want.iter().zip(shown.rgba((left + x, top + y))).any(|(a, b)| a.abs_diff(b) > 2)
+        })
+        .count();
+    assert!(off <= 600 * 300 / 1000, "{off} pixels differ from the screenshot");
+    // The image's first and last stripes, stretched over the swatch.
+    assert_eq!(shown.rgba(tab.on_screen(70., 140.)), [255, 0, 0, 255]);
+    assert_eq!(shown.rgba(tab.on_screen(210., 140.)), [0, 0, 0, 255]);
+}
