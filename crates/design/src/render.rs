@@ -439,6 +439,7 @@ pub fn screenshot(
     fonts: &Fonts,
     assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
+    let design = &crate::resolve::drawn(design);
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let typesetter = fonts.typesetter(design);
     let laid_out = LaidOut::of(design, &typesetter);

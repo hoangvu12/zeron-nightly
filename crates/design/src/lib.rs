@@ -19,6 +19,7 @@ pub mod model;
 pub mod printed;
 pub mod read;
 pub mod render;
+pub mod resolve;
 pub mod skia;
 #[cfg(feature = "snippet")]
 pub mod snippet;

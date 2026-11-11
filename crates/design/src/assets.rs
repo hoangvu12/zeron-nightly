@@ -106,8 +106,10 @@ impl Assets for NoAssets {
     }
 }
 
-/// The assets `design` draws with, each once.
+/// The assets `design` draws with, each once: as drawn, so icons inside
+/// Instances, and those Tokens name, count.
 pub fn used(design: &Design) -> BTreeSet<AssetKey> {
+    let design = &crate::resolve::drawn(design);
     let mut used = BTreeSet::new();
     design.walk(&mut |node| used.extend(node.kind.get().assets()));
     used

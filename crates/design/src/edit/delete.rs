@@ -7,13 +7,22 @@ impl Draft {
     /// Deletes the nodes `ids` and their descendants: all of them, or none
     /// when one isn't there. A node inside another one deleted goes with it.
     pub fn delete(&mut self, ids: &[String]) -> Result<(), EditError> {
+        if let Some(inside) = ids.iter().find(|id| super::inside::is_inside(id)) {
+            return Err(EditError::Invalid(format!(
+                "Delete can't delete \"{inside}\": it's inside an Instance, which has its Component's nodes. \
+                 Hide it in this Instance with Update(\"{inside}\", {{ enabled: false }}), or delete it from \
+                 the Component"
+            )));
+        }
         if let Some(missing) = ids.iter().find(|id| self.design.find(id).is_none()) {
             return Err(EditError::NotFound(missing.clone()));
         }
         for id in ids {
             if self.design.find(id).is_some() {
-                let (_, _, node) = self.take(id)?;
+                let (parent, _, node) = self.take(id)?;
                 self.forget(&node);
+                // What held it changed with it.
+                self.changed.extend(parent);
             }
         }
         Ok(())

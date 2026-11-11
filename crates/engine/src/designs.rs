@@ -446,11 +446,17 @@ impl Designs {
             .with_assets(self.inner.assets.clone());
         let (draft, globals) = snippet::run(draft, globals, code, self.inner.limits).map_err(Ran::Snippet)?;
         let mut edited = draft.finish();
-        // Fonts the call's text couldn't get.
+        // What it draws with that no edit's check fetched: icons and fonts
+        // inside Instances, or named by Tokens (`assets::used` resolves).
+        self.inner.assets.fetch(&edited.design, live.path.parent());
+        // Fonts the call's text couldn't get, and images it can't have, as
+        // drawn (inside Instances, named by Tokens).
+        let drawn = zeron_design::resolve::drawn(&edited.design);
         let mut texts = Vec::new();
-        edited.design.walk(&mut |node| {
+        drawn.walk(&mut |node| {
+            let top = node.id.split('/').next().unwrap_or_default();
             if let Kind::Text(text) = &node.kind
-                && edited.changed.contains(&node.id)
+                && (edited.changed.contains(&node.id) || edited.changed.contains(top))
             {
                 texts.push(text.clone());
             }
@@ -460,7 +466,7 @@ impl Designs {
         // can, downloaded now, for its screenshots and the tabs).
         let looked_at = edited.changed.iter().chain(&edited.screenshots);
         let assets = live.assets.beside(&live.folder());
-        let missing = images::warnings(looked_at.filter_map(|id| edited.design.find(id)), &assets);
+        let missing = images::warnings(looked_at.filter_map(|id| drawn.find(id)), &assets);
         edited.warnings.extend(missing);
         let changed = chat
             .and_then(|chat| live.seen.get(chat))

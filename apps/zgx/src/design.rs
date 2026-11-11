@@ -171,6 +171,8 @@ struct Scene {
 
 impl Scene {
     fn new(version: u64, design: Design, fonts: Fonts, assets: Vec<Resolved>) -> Self {
+        // As drawn: Instances expanded, Tokens resolved.
+        let design = zeron_design::resolve::drawn(&design);
         let laid_out = LaidOut::of(&design, &fonts.typesetter(&design));
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
         let margin = render::blur_reach(&design, &laid_out);
