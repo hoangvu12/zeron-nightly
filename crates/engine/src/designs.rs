@@ -80,7 +80,8 @@ struct Inner {
 /// One Design as the engine holds it.
 struct Live {
     path: PathBuf,
-    design: Design,
+    /// (Shared with the tabs following it, not copied for them.)
+    design: Arc<Design>,
     /// What its Design tabs follow: it after each call.
     seen: tokio::sync::watch::Sender<Seen>,
 }
@@ -158,7 +159,7 @@ impl Designs {
 
     fn run(&self, live: &Mutex<Live>, code: &str) -> Result<Value, DesignError> {
         let mut live = lock(live);
-        let draft = snippet::run(Draft::new(live.design.clone()), code, self.inner.limits)?;
+        let draft = snippet::run(Draft::new((*live.design).clone()), code, self.inner.limits)?;
         let edited = draft.finish();
         let screenshots = live.commit(&edited)?;
         let mut result = json!({
@@ -252,9 +253,10 @@ struct Target {
 
 impl Live {
     fn new(path: PathBuf, design: Design) -> Self {
+        let design = Arc::new(design);
         let seen = Seen {
             version: 0,
-            design: Arc::new(design.clone()),
+            design: design.clone(),
             changed: Vec::new(),
         };
         Self {
@@ -266,7 +268,7 @@ impl Live {
 
     /// Tells the Design's tabs what a call made of it.
     fn tell(&self, edited: &Edited) {
-        let design = Arc::new(self.design.clone());
+        let design = self.design.clone();
         self.seen.send_modify(|seen| {
             seen.version += 1;
             seen.design = design;
@@ -278,7 +280,7 @@ impl Live {
     /// screenshots the call asked for.
     fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
-        self.design = edited.design.clone();
+        self.design = Arc::new(edited.design.clone());
         self.tell(edited);
         Ok(edited
             .screenshots

@@ -5827,7 +5827,10 @@ impl RpcService for EngineRpc {
                 let seen = tokio::task::spawn_blocking(move || designs.watch(&p.path))
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                    .map_err(|e| match e {
+                        crate::designs::DesignError::Refused(_) => RpcError::BadParams(e.to_string()),
+                        e => RpcError::Failed(e.to_string()),
+                    })?;
                 Ok(RpcReply::Stream(seen.boxed()))
             }
             methods::FETCH_TOOL_BLOB => {

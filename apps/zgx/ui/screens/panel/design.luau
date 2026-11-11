@@ -13,6 +13,7 @@
 --   Design.title(tab)     the Design's name
 --   Design.close(tab)     its tiles let go
 --   Design.fit(id)        the tab's view on all of its Design again
+--   Design.Empty { title, body, action? }   what shows in place of a Canvas
 
 local ds = require("@ds")
 local state = require("@app/screens/panel/state")
@@ -29,7 +30,12 @@ local SETTLE_MS = 150
 -- Each tab's view: where the Canvas's origin is in it, and its zoom.
 type View = { x: number, y: number, zoom: number }
 local views = ui.state("design_views", {} :: { [string]: View })
-local boards = ui.shared("design.boards", {} :: { [string]: any })
+
+-- What the host says of a tab's Canvas (src/design.rs): its state, where
+-- its Design draws and its tiles' layers.
+local function shown(id: string): State<any>
+	return ui.shared(`design.tab.{id}`, nil :: any)
+end
 
 function M.title(tab: Tab): string?
 	local path = tab.path
@@ -48,10 +54,23 @@ function M.fit(id: string)
 	views:set_key(id, nil)
 end
 
--- A tab's Design, once it has one: the host's board for it.
+-- What a Design tab shows instead of a Canvas: its kind's empty state.
+function M.Empty(props: { title: any, body: any, action: any? }): Node
+	return ds.EmptyState {
+		icon = "palette",
+		size = "sm",
+		fill = true,
+		title = props.title,
+		body = props.body,
+		action = props.action,
+	}
+end
+
+-- A tab's Design, once it has one, as the host draws it.
 local function canvas(id: string): Node
-	local function board(): any
-		return boards:get()[id]
+	local host = shown(id)
+	local function told(): any
+		return host:get()
 	end
 	local function view(): View?
 		return views:get()[id]
@@ -71,7 +90,7 @@ local function canvas(id: string): Node
 	end)
 	-- A Design seen for the first time: all of it in view, at most at 1x.
 	ui.effect(function()
-		local b, s = board(), size:get()
+		local b, s = told(), size:get()
 		if view() or not b or b.state ~= "ready" or s.w <= 0 then
 			return
 		end
@@ -200,7 +219,7 @@ local function canvas(id: string): Node
 			pointer = nil
 		end,
 		ui.each(ui.computed(function(): { any }
-			local b = board()
+			local b = told()
 			return if b then b.layers else {}
 		end), layer, {
 			key = function(l: any): string
@@ -214,6 +233,7 @@ export type Props = { key: string, tab: string, [any]: any }
 
 M.Design = ui.component(function(props: Props): Node
 	local key, id = props.key, props.tab
+	local host = shown(id)
 	local function tab(): Tab?
 		state.of(key)
 		return state.find(key, id)
@@ -223,7 +243,7 @@ M.Design = ui.component(function(props: Props): Node
 		return if t then t.path else nil
 	end
 	-- Its Design followed as it's named (and again after a reload: the host
-	-- keeps one board a tab).
+	-- keeps one Canvas a tab).
 	ui.effect(function()
 		local p = path()
 		if p then
@@ -235,7 +255,7 @@ M.Design = ui.component(function(props: Props): Node
 		if not path() then
 			return "none"
 		end
-		local b = boards:get()[id]
+		local b = host:get()
 		if b and b.state == "failed" then
 			return "failed"
 		end
@@ -248,12 +268,9 @@ M.Design = ui.component(function(props: Props): Node
 		min_h = 0,
 		ui.presence(kind, function(which: string): Node
 			if which == "none" then
-				return ds.EmptyState {
-					icon = "palette",
-					size = "sm",
-					fill = true,
-					title = ui.t("panel.design.empty.title") :: any,
-					body = ui.t("panel.design.empty.body") :: any,
+				return M.Empty {
+					title = ui.t("panel.design.empty.title"),
+					body = ui.t("panel.design.empty.body"),
 					action = {
 						label = ui.t("panel.design.open") :: any,
 						on_click = function()
@@ -270,13 +287,12 @@ M.Design = ui.component(function(props: Props): Node
 					},
 				}
 			elseif which == "failed" then
-				local b = boards:peek()[id]
-				return ds.EmptyState {
-					icon = "palette",
-					size = "sm",
-					fill = true,
-					title = ui.t("panel.design.failed") :: any,
-					body = (if b and b.error then b.error else "") :: any,
+				return M.Empty {
+					title = ui.t("panel.design.failed"),
+					body = function(): string
+						local b = host:get()
+						return if b and b.error then b.error else ""
+					end,
 				}
 			end
 			return canvas(id)

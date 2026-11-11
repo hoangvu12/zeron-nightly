@@ -14,7 +14,7 @@ use zeron_design::Design;
 use zgx::input::InputEvent;
 use zgx_script::{ScriptHost, testing::TestApp};
 
-use crate::design::{CACHE_BYTES, Canvas, Heard, Seen, Source};
+use crate::design::{CACHE_BYTES, DesignTabs, Listener, Source};
 
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
@@ -72,23 +72,17 @@ fn many_screens() -> Design {
 /// The engine, stood in for: Designs by path, and who follows each.
 #[derive(Default)]
 struct StandIn {
-    designs: RefCell<HashMap<String, (u64, Design)>>,
-    following: RefCell<Vec<(String, Weak<RefCell<Heard>>)>>,
+    designs: RefCell<HashMap<String, Design>>,
+    following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
 }
 
 impl StandIn {
     /// A new version of the Design at `path`, said to whoever follows it.
     fn say(&self, path: &str, design: Design) {
-        let version = {
-            let mut designs = self.designs.borrow_mut();
-            let entry = designs.entry(path.into()).or_insert((0, Design::default()));
-            entry.0 += 1;
-            entry.1 = design.clone();
-            entry.0
-        };
-        let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, h)| h.upgrade()).collect();
-        for heard in listeners {
-            (heard.borrow_mut())(Ok(Seen { version, design: design.clone() }));
+        self.designs.borrow_mut().insert(path.into(), design.clone());
+        let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
+        for listener in listeners {
+            (listener.borrow_mut())(Ok(design.clone()));
         }
     }
 }
@@ -96,21 +90,18 @@ impl StandIn {
 struct Engine(Rc<StandIn>);
 
 impl Source for Engine {
-    fn follow(&self, path: &str, heard: Heard) -> Option<Box<dyn std::any::Any>> {
-        let heard = Rc::new(RefCell::new(heard));
-        self.0.following.borrow_mut().push((path.into(), Rc::downgrade(&heard)));
+    fn follow(&self, path: &str, listener: Listener) -> Option<Box<dyn std::any::Any>> {
+        let listener = Rc::new(RefCell::new(listener));
+        self.0.following.borrow_mut().push((path.into(), Rc::downgrade(&listener)));
         let now = self.0.designs.borrow().get(path).cloned();
-        match now {
-            Some((version, design)) => (heard.borrow_mut())(Ok(Seen { version, design })),
-            None => (heard.borrow_mut())(Err(format!("can't open {path}"))),
-        }
-        Some(Box::new(heard))
+        (listener.borrow_mut())(now.ok_or_else(|| format!("can't open {path}")));
+        Some(Box::new(listener))
     }
 }
 
 struct Tab {
     app: TestApp,
-    canvas: Rc<Canvas>,
+    canvas: Rc<DesignTabs>,
     engine: Rc<StandIn>,
 }
 
