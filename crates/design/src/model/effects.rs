@@ -1,6 +1,7 @@
 //! Effects: drop and inner shadows, a blur of the node itself (layer blur)
 //! and a blur of what's behind it (background blur). An `effect` is one
-//! effect or a list of them.
+//! effect or a list of them; one of a type not supported is kept as
+//! written, but not drawn.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -36,6 +37,8 @@ pub enum EffectKind {
     LayerBlur(f32),
     /// Blurs what's behind the node, within its outline, by this radius.
     BackgroundBlur(f32),
+    /// An effect type not supported, as written.
+    Unsupported(Value),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +75,7 @@ impl Effect {
     fn to_value(&self) -> Value {
         let mut props = Map::new();
         match &self.kind {
+            EffectKind::Unsupported(value) => return value.clone(),
             EffectKind::Shadow(shadow) => {
                 props.insert("type".into(), json!("shadow"));
                 props.insert("shadowType".into(), json!(if shadow.inner { "inner" } else { "outer" }));
@@ -98,9 +102,9 @@ impl Effect {
         Value::Object(props)
     }
 
-    /// The effect `value` describes, or `None` (with a warning) for an
-    /// effect type that isn't supported.
-    fn from_value(value: &Value) -> Result<Option<Self>, String> {
+    /// The effect `value` describes; one of a type that isn't supported is
+    /// kept as written, with a warning.
+    fn from_value(value: &Value) -> Result<Self, String> {
         let Value::Object(props) = value else {
             return Err(format!("an effect is an object with a \"type\", not {value}"));
         };
@@ -114,11 +118,11 @@ impl Effect {
             Some(other) => {
                 let supported = ["shadow", "blur", "background_blur"].into_iter();
                 warn(warn::unsupported("effect type", other, supported));
-                return Ok(None);
+                EffectKind::Unsupported(value.clone())
             }
             None => return Err("an effect needs a \"type\"".into()),
         };
-        Ok(Some(Self { kind, enabled: flag(props, "enabled", true)? }))
+        Ok(Self { kind, enabled: flag(props, "enabled", true)? })
     }
 }
 
@@ -164,7 +168,6 @@ fn read<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Effect>, D::Er
     effects
         .iter()
         .map(Effect::from_value)
-        .filter_map(Result::transpose)
         .collect::<Result<_, _>>()
         .map_err(D::Error::custom)
 }

@@ -3,6 +3,7 @@
 //! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
 //! would replace that and a painter of its own.
 
+use crate::layout::LaidOut;
 use crate::model::{Design, EffectKind, Effects, Node, Paint, Shadow, StrokeStyle};
 
 /// The longest side of an agent's screenshot, in pixels.
@@ -85,21 +86,25 @@ pub trait Painter {
     fn background_blur(&mut self, outline: &Outline, radius: f32);
 }
 
-/// Draws `node` and its descendants with its top-left at the painter's
-/// origin, wherever it sits in its parent, turned and flipped as it is.
-pub fn paint_node(node: &Node, painter: &mut dyn Painter) {
+/// Draws `node` and its descendants where `laid_out` puts them, with its
+/// top-left at the painter's origin wherever it sits in its parent, turned
+/// and flipped as it is.
+pub fn paint_node(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter) {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return;
+    };
     let turned = node.rotation != 0. || node.flip_x || node.flip_y;
     if turned {
         painter.save();
         painter.rotate(-node.rotation);
         if node.flip_x || node.flip_y {
-            let (width, height) = node.kind.get().size();
+            let (width, height) = (placed.bounds.width, placed.bounds.height);
             painter.translate(width / 2., height / 2.);
             painter.flip(node.flip_x, node.flip_y);
             painter.translate(-width / 2., -height / 2.);
         }
     }
-    paint_upright(node, painter);
+    paint_upright(node, laid_out, painter);
     if turned {
         painter.restore();
     }
@@ -107,45 +112,59 @@ pub fn paint_node(node: &Node, painter: &mut dyn Painter) {
 
 /// Draws `node` and its descendants as [`paint_node`] does, without the
 /// node's own rotation and flip: a node seen on its own.
-pub fn paint_upright(node: &Node, painter: &mut dyn Painter) {
+pub fn paint_upright(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter) {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return;
+    };
+    let bounds = placed.bounds;
+    let size = (bounds.width, bounds.height);
     let kind = node.kind.get();
-    let look = kind.look();
+    let look = kind.look(size);
+    if let Some(look) = &look {
+        // Before any layer of the node's own, which would hide what's
+        // behind it from the blur.
+        for effect in look.effects.enabled() {
+            if let EffectKind::BackgroundBlur(radius) = effect {
+                painter.background_blur(&look.outline, *radius);
+            }
+        }
+    }
     let blur = look.as_ref().map_or(0., |look| look.effects.layer_blur());
     let layered = node.opacity < 1. || blur > 0.;
     if layered {
         painter.save_layer(node.opacity, blur);
     }
     if let Some(look) = &look {
-        let effects = || look.effects.enabled();
-        for effect in effects() {
-            match effect {
-                EffectKind::Shadow(shadow) if !shadow.inner => painter.shadow(&look.outline, shadow),
-                EffectKind::BackgroundBlur(radius) => painter.background_blur(&look.outline, *radius),
-                _ => {}
-            }
+        let shadows = |inner: bool| {
+            look.effects.enabled().filter_map(move |effect| match effect {
+                EffectKind::Shadow(shadow) if shadow.inner == inner => Some(shadow),
+                _ => None,
+            })
+        };
+        for shadow in shadows(false) {
+            painter.shadow(&look.outline, shadow);
         }
         painter.fill(&look.outline, look.fill);
-        for effect in effects() {
-            if let EffectKind::Shadow(shadow) = effect
-                && shadow.inner
-            {
-                painter.shadow(&look.outline, shadow);
-            }
+        for shadow in shadows(true) {
+            painter.shadow(&look.outline, shadow);
         }
     }
-    kind.paint(painter);
+    kind.paint(size, painter);
     if !kind.children().is_empty() {
         painter.save();
         if kind.clips() {
             match &look {
                 Some(look) => painter.clip(&look.outline),
-                None => painter.clip_rect(Rect::sized(kind.size())),
+                None => painter.clip_rect(Rect::sized(size)),
             }
         }
         for child in kind.children() {
+            let Some(at) = laid_out.get(&child.id) else {
+                continue;
+            };
             painter.save();
-            painter.translate(child.x, child.y);
-            paint_node(child, painter);
+            painter.translate(at.bounds.x - bounds.x, at.bounds.y - bounds.y);
+            paint_node(child, laid_out, painter);
             painter.restore();
         }
         painter.restore();
@@ -184,7 +203,9 @@ pub enum RenderError {
 /// smaller when its longest side is over `max_side`, and encodes it.
 pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
-    let (width, height) = node.kind.get().size();
+    let laid_out = LaidOut::of(design);
+    let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
+    let (width, height) = (bounds.width, bounds.height);
     if !(width > 0. && height > 0.) {
         return Err(RenderError::Empty(id.into()));
     }
@@ -199,7 +220,7 @@ pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot
     {
         let mut painter = crate::skia::SkiaPainter::new(surface.canvas());
         painter.scale(scale);
-        paint_upright(node, &mut painter);
+        paint_upright(node, &laid_out, &mut painter);
     }
     let png = crate::skia::png(&mut surface).ok_or_else(failed)?;
     Ok(Screenshot {

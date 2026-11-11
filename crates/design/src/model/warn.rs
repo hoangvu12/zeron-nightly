@@ -1,8 +1,8 @@
 //! Warnings about values the model doesn't support, such as an unknown
-//! blend mode. Reading one drops it (or falls back to the default) and
-//! warns, rather than failing the whole read; an edit collects its
-//! warnings for the call's result ([`collect`]), and reading a file
-//! ignores them.
+//! blend mode. Reading one falls back to the default (or keeps a paint or
+//! effect of an unknown type as written, undrawn) and warns, rather than
+//! failing the whole read; an edit collects its warnings for the call's
+//! result ([`collect`]), and reading a file ignores them.
 
 use std::cell::RefCell;
 
@@ -14,9 +14,17 @@ thread_local! {
 
 /// Runs `read`, returning what it gives and the warnings it raised.
 pub fn collect<T>(read: impl FnOnce() -> T) -> (T, Vec<String>) {
-    let outer = WARNINGS.with(|w| w.borrow_mut().replace(Vec::new()));
+    /// Puts back the warnings of the `collect` this one runs in, even when
+    /// `read` panics.
+    struct Outer(Option<Vec<String>>);
+    impl Drop for Outer {
+        fn drop(&mut self) {
+            WARNINGS.with(|w| *w.borrow_mut() = self.0.take());
+        }
+    }
+    let _outer = Outer(WARNINGS.with(|w| w.borrow_mut().replace(Vec::new())));
     let value = read();
-    let warnings = WARNINGS.with(|w| std::mem::replace(&mut *w.borrow_mut(), outer));
+    let warnings = WARNINGS.with(|w| w.borrow_mut().take());
     (value, warnings.unwrap_or_default())
 }
 
@@ -50,10 +58,15 @@ pub(crate) fn choice<T: Copy>(
     }
 }
 
+/// The name `value` has among `options`.
+pub(crate) fn name_of<T: PartialEq + Copy>(options: &[(&'static str, T)], value: T) -> &'static str {
+    options.iter().find(|(_, v)| *v == value).map(|(name, _)| *name).unwrap_or_default()
+}
+
 /// The message for a value `name` that isn't one of `supported`.
 pub(crate) fn unsupported<'a>(what: &str, name: &str, supported: impl Iterator<Item = &'a str>) -> String {
     format!(
-        "unsupported {what} \"{name}\" (supported: {}); ignored",
+        "unsupported {what} \"{name}\" (supported: {}); it has no effect",
         supported.collect::<Vec<_>>().join(", ")
     )
 }

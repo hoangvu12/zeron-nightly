@@ -25,6 +25,8 @@ struct Common {
     #[serde(default)]
     y: f32,
     #[serde(default)]
+    absolute: bool,
+    #[serde(default)]
     rotation: f32,
     #[serde(default, rename = "flipX")]
     flip_x: bool,
@@ -62,6 +64,8 @@ struct Written<'a> {
     flip_y: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     opacity: Option<f32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    absolute: bool,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     kind: Option<&'a Kind>,
     #[serde(flatten)]
@@ -86,6 +90,7 @@ impl Node {
             flip_x: known && self.flip_x,
             flip_y: known && self.flip_y,
             opacity: (known && self.opacity != 1.).then_some(self.opacity),
+            absolute: known && self.absolute,
             kind: known.then_some(&self.kind),
             extra: &self.extra,
         }
@@ -117,6 +122,7 @@ impl Node {
                 flip_x: false,
                 flip_y: false,
                 opacity: 1.,
+                absolute: false,
                 kind: Kind::Opaque(Opaque { type_name }),
                 extra,
             });
@@ -137,6 +143,7 @@ impl Node {
             flip_x: common.flip_x,
             flip_y: common.flip_y,
             opacity: common.opacity,
+            absolute: common.absolute,
             kind,
             extra: Map::new(),
         };
@@ -186,8 +193,7 @@ impl Node {
 /// Values of about the same shape as `value`, one of which a model reading
 /// `value` would read differently. Several for a number, as a model may
 /// keep a number within bounds (an opacity of 2 and of 3 both read as 1, a
-/// radius of -5 and of -4 as 0),
-/// and for an object, which a model may drop.
+/// radius of -5 and of -4 as 0), and for an object, which a model may drop.
 fn others_than(value: &Value) -> Vec<Value> {
     match value {
         Value::Null => vec![json!(1)],

@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::Paint;
 use super::paint::{paints_from, paints_to_value};
-use super::warn::{at_least_zero, choice, number, warn};
+use super::warn::{at_least_zero, choice, name_of, number, warn};
 
 /// The stroke property group, flattened into the types that have one.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -26,7 +26,7 @@ pub struct Stroke {
 pub struct StrokeStyle {
     pub fill: Vec<Paint>,
     pub thickness: Sides,
-    pub align: Align,
+    pub align: StrokeAlign,
     pub join: Join,
     pub cap: Cap,
     /// Dash and gap lengths in turn; none for a solid line.
@@ -65,17 +65,17 @@ impl Sides {
 
 /// Where the line sits on the outline.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Align {
+pub enum StrokeAlign {
     #[default]
     Inside,
     Center,
     Outside,
 }
 
-const ALIGNS: &[(&str, Align)] = &[
-    ("inside", Align::Inside),
-    ("center", Align::Center),
-    ("outside", Align::Outside),
+const STROKE_ALIGNS: &[(&str, StrokeAlign)] = &[
+    ("inside", StrokeAlign::Inside),
+    ("center", StrokeAlign::Center),
+    ("outside", StrokeAlign::Outside),
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,10 +99,6 @@ pub enum Cap {
 
 const CAPS: &[(&str, Cap)] = &[("none", Cap::None), ("round", Cap::Round), ("square", Cap::Square)];
 
-fn name_of<T: PartialEq + Copy>(options: &[(&'static str, T)], value: T) -> &'static str {
-    options.iter().find(|(_, v)| *v == value).map(|(name, _)| *name).unwrap_or_default()
-}
-
 impl StrokeStyle {
     fn to_value(&self) -> Value {
         let mut props = Map::new();
@@ -117,7 +113,7 @@ impl StrokeStyle {
                 }
             },
         );
-        props.insert("align".into(), json!(name_of(ALIGNS, self.align)));
+        props.insert("align".into(), json!(name_of(STROKE_ALIGNS, self.align)));
         if self.join != Join::default() {
             props.insert("join".into(), json!(name_of(JOINS, self.join)));
         }
@@ -166,14 +162,20 @@ impl StrokeStyle {
             Some(other) => return Err(format!("a dash pattern is a list of lengths, not {other}")),
         };
         let dashes = if dashes.iter().sum::<f32>() > 0. { dashes } else { Vec::new() };
-        if !dashes.is_empty() && thickness.uniform().is_none() {
-            warn("dashes need one thickness on every side; this stroke is drawn solid");
+        let join = choice(props, "join", "stroke join", JOINS)?.unwrap_or_default();
+        if thickness.uniform().is_none() {
+            if !dashes.is_empty() {
+                warn("dashes need one thickness on every side; this stroke is drawn solid");
+            }
+            if join != Join::Miter {
+                warn("a join needs one thickness on every side; this stroke's corners are mitered");
+            }
         }
         Ok(Self {
             fill: props.get("fill").map(paints_from).transpose()?.unwrap_or_default(),
             thickness,
-            align: choice(props, "align", "stroke align", ALIGNS)?.unwrap_or_default(),
-            join: choice(props, "join", "stroke join", JOINS)?.unwrap_or_default(),
+            align: choice(props, "align", "stroke align", STROKE_ALIGNS)?.unwrap_or_default(),
+            join,
             cap: choice(props, "cap", "stroke cap", CAPS)?.unwrap_or_default(),
             dashes,
         })

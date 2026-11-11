@@ -205,6 +205,8 @@ at({ type: "rectangle", x: 40, y: 160, width: 60, height: 60, fill: "#000000", e
 for (let i = 0; i < 20; i++) at({ type: "rectangle", x: 200 + 8 * i, y: 140, width: 4, height: 120, fill: "#000000" });
 at({ type: "rectangle", name: "Glass", x: 240, y: 160, width: 80, height: 80,
      effect: { type: "background_blur", radius: 12 } });
+at({ type: "rectangle", name: "Faded glass", x: 330, y: 160, width: 20, height: 80, opacity: 0.5,
+     effect: { type: "background_blur", radius: 12 } });
 "##,
     )
     .await;
@@ -229,7 +231,8 @@ at({ type: "rectangle", name: "Glass", x: 240, y: 160, width: 80, height: 80,
     // Stripes behind the glass blur to grey; beside it they stay sharp.
     near(&image, (202, 150), BLACK, 1);
     near(&image, (206, 150), WHITE, 1);
-    for x in [270, 274, 278, 282] {
+    // So they do behind a half-opaque one.
+    for x in [270, 274, 278, 282, 338, 342] {
         let grey = level(&image, x, 200);
         assert!((60..200).contains(&grey), "at {x}: {grey}");
     }
@@ -332,7 +335,8 @@ at({ type: "rectangle", name: "Odd", width: 100, height: 100, opacity: 2,
      stroke: { fill: "#0000FF", thickness: 10, align: "middle" },
      effect: [{ type: "glow" }, { type: "blur", radius: -3 }] });
 at({ type: "rectangle", name: "Odder", width: 1, height: 1, cornerRadius: -5,
-     fill: { type: "mesh_gradient" }, effect: { type: "glow" } });
+     fill: { type: "mesh_gradient" }, effect: { type: "glow" },
+     stroke: { fill: "#000000", thickness: { top: 1 }, join: "round" } });
 "##,
     )
     .await;
@@ -350,7 +354,7 @@ at({ type: "rectangle", name: "Odder", width: 1, height: 1, cornerRadius: -5,
     }
     // Each said once, as unsupported values of properties it knows.
     assert_eq!(warnings.iter().filter(|w| w.contains("plasma")).count(), 1, "{warnings:?}");
-    for said in ["corner radius", "mesh_gradient", "glow"] {
+    for said in ["corner radius", "mesh_gradient", "glow", "join"] {
         assert!(warnings.iter().any(|w| w.contains(said) && w.contains("\"Odder\"")), "{warnings:?}");
     }
     assert!(!warnings.iter().any(|w| w.contains("doesn't know")), "{warnings:?}");
@@ -359,7 +363,12 @@ at({ type: "rectangle", name: "Odder", width: 1, height: 1, cornerRadius: -5,
     near(&image, (5, 50), BLUE, 1);
     let file: Value = serde_json::from_str(&std::fs::read_to_string(called.path()).unwrap()).unwrap();
     let odd = &file["children"][0]["children"][0];
-    assert_eq!(odd["fill"], "#FF0000");
+    // What isn't supported stays in the file as written, for a Zeron that
+    // draws it.
+    assert_eq!(odd["fill"][0], "#FF0000");
+    assert_eq!(odd["fill"][1], serde_json::json!({ "type": "mesh_gradient" }));
+    assert_eq!(odd["fill"][2]["gradientType"], "diamond");
+    assert_eq!(odd["effect"][0], serde_json::json!({ "type": "glow" }));
     assert!(odd.get("opacity").is_none(), "{odd}");
 
     // A call with nothing unsupported has no warnings.

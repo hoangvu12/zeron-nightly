@@ -14,8 +14,8 @@ use skia_safe::{
 };
 
 use crate::model::{
-    Align, BlendMode, Cap, Color, Gradient, GradientShape, Join, Paint, PaintKind, Shadow,
-    Sides, StrokeStyle,
+    BlendMode, Cap, Color, Gradient, GradientShape, Join, Paint, PaintKind, Shadow,
+    Sides, StrokeAlign, StrokeStyle,
 };
 use crate::render::{Outline, Painter, Rect};
 
@@ -151,6 +151,7 @@ fn skia_paint(paint: &Paint, bounds: Rect) -> Option<skia_safe::Paint> {
         PaintKind::Gradient(gradient) => {
             out.set_shader(gradient_shader(gradient, bounds)?);
         }
+        PaintKind::Unsupported(_) => return None,
     }
     out.set_alpha_f(out.alpha_f() * paint.opacity);
     Some(out)
@@ -252,9 +253,9 @@ impl Painter for SkiaPainter<'_> {
             // A width per side: the ring between the outline moved out and
             // in by them, as the alignment splits them.
             let (outer, inner) = match stroke.align {
-                Align::Inside => (Sides::default(), thickness),
-                Align::Center => (thickness.scaled(-0.5), thickness.scaled(0.5)),
-                Align::Outside => (thickness.scaled(-1.), Sides::default()),
+                StrokeAlign::Inside => (Sides::default(), thickness),
+                StrokeAlign::Center => (thickness.scaled(-0.5), thickness.scaled(0.5)),
+                StrokeAlign::Outside => (thickness.scaled(-1.), Sides::default()),
             };
             let ring = ring(&inset(outline, outer), &inset(outline, inner));
             for paint in &stroke.fill {
@@ -272,12 +273,12 @@ impl Painter for SkiaPainter<'_> {
         // outline's one side.
         self.canvas.save();
         let width = match stroke.align {
-            Align::Center => width,
-            Align::Inside => {
+            StrokeAlign::Center => width,
+            StrokeAlign::Inside => {
                 self.canvas.clip_rrect(shape, ClipOp::Intersect, true);
                 width * 2.
             }
-            Align::Outside => {
+            StrokeAlign::Outside => {
                 self.canvas.clip_rrect(shape, ClipOp::Difference, true);
                 width * 2.
             }
@@ -318,7 +319,7 @@ impl Painter for SkiaPainter<'_> {
             .set_color(color(shadow.color))
             .set_blend_mode(blend_mode(shadow.blend));
         if shadow.blur > 0. {
-            paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, sigma(shadow.blur), false));
+            paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, sigma(shadow.blur), true));
         }
         let (dx, dy) = shadow.offset;
         if !shadow.inner {

@@ -1,12 +1,13 @@
 //! Paint: what fills a node's area. A `fill` is one paint or a list of them
 //! drawn in order, each a solid colour or a gradient, with a blend mode; a
-//! plain solid colour is written as its hex string.
+//! plain solid colour is written as its hex string. A paint of a type not
+//! supported is kept as written, but not drawn.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
-use super::warn::{self, choice, flag, number, pair, warn};
+use super::warn::{self, choice, flag, name_of, number, pair, warn};
 
 /// The fill property group, flattened into the types that have a fill.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -34,6 +35,8 @@ pub struct Paint {
 pub enum PaintKind {
     Solid(Color),
     Gradient(Gradient),
+    /// A paint type (or gradient type) not supported, as written.
+    Unsupported(Value),
 }
 
 /// A gradient over the node's bounds. Its geometry is relative to them:
@@ -115,10 +118,6 @@ impl BlendMode {
         ("luminosity", BlendMode::Luminosity),
     ];
 
-    fn name(self) -> &'static str {
-        Self::NAMES.iter().find(|(_, mode)| *mode == self).map(|(name, _)| *name).unwrap_or("normal")
-    }
-
     /// `blendMode` among `props`, normal when absent or unsupported.
     pub(crate) fn read(props: &Map<String, Value>) -> Result<Self, String> {
         Ok(choice(props, "blendMode", "blend mode", Self::NAMES)?.unwrap_or_default())
@@ -126,7 +125,7 @@ impl BlendMode {
 
     pub(crate) fn write(self, props: &mut Map<String, Value>) {
         if self != BlendMode::Normal {
-            props.insert("blendMode".into(), json!(self.name()));
+            props.insert("blendMode".into(), json!(name_of(Self::NAMES, self)));
         }
     }
 }
@@ -145,6 +144,7 @@ impl Paint {
     fn to_value(&self) -> Value {
         let mut props = Map::new();
         match &self.kind {
+            PaintKind::Unsupported(value) => return value.clone(),
             PaintKind::Solid(color) => {
                 if self.blend == BlendMode::Normal && self.opacity == 1. && self.enabled {
                     return json!(color.to_hex());
@@ -154,8 +154,7 @@ impl Paint {
             }
             PaintKind::Gradient(gradient) => {
                 props.insert("type".into(), json!("gradient"));
-                let shape = GRADIENT_SHAPES.iter().find(|(_, s)| *s == gradient.shape).map(|(n, _)| *n);
-                props.insert("gradientType".into(), json!(shape));
+                props.insert("gradientType".into(), json!(name_of(GRADIENT_SHAPES, gradient.shape)));
                 if gradient.center != (0.5, 0.5) {
                     props.insert("center".into(), json!({ "x": gradient.center.0, "y": gradient.center.1 }));
                 }
@@ -183,11 +182,11 @@ impl Paint {
         Value::Object(props)
     }
 
-    /// The paint `value` describes, or `None` (with a warning) for a paint
-    /// type that isn't supported.
-    fn from_value(value: &Value) -> Result<Option<Self>, String> {
+    /// The paint `value` describes; one of a type that isn't supported is
+    /// kept as written, with a warning.
+    fn from_value(value: &Value) -> Result<Self, String> {
         let paint = match value {
-            Value::String(hex) => return Color::parse(hex).map(|color| Some(Paint::solid(color))),
+            Value::String(hex) => return Color::parse(hex).map(Paint::solid),
             Value::Object(paint) => paint,
             _ => return Err(format!("a paint is a hex colour or a paint object, not {value}")),
         };
@@ -198,20 +197,23 @@ impl Paint {
             },
             Some("gradient") => match Gradient::from_props(paint)? {
                 Some(gradient) => PaintKind::Gradient(gradient),
-                None => return Ok(None),
+                None => PaintKind::Unsupported(value.clone()),
             },
             Some(other) => {
                 warn(warn::unsupported("paint type", other, ["color", "gradient"].into_iter()));
-                return Ok(None);
+                PaintKind::Unsupported(value.clone())
             }
             None => return Err("a paint needs a \"type\"".into()),
         };
-        Ok(Some(Paint {
+        if let PaintKind::Unsupported(_) = kind {
+            return Ok(Paint { kind, blend: BlendMode::Normal, opacity: 1., enabled: true });
+        }
+        Ok(Paint {
             kind,
             blend: BlendMode::read(paint)?,
             opacity: opacity(paint)?,
             enabled: flag(paint, "enabled", true)?,
-        }))
+        })
     }
 }
 
@@ -286,18 +288,12 @@ fn paints<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Paint>, D::E
     paints_from(&Value::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
-/// One paint or a list of them, leaving out unsupported ones.
+/// One paint or a list of them.
 pub(crate) fn paints_from(value: &Value) -> Result<Vec<Paint>, String> {
     match value {
-        Value::Array(paints) => Ok(paints
-            .iter()
-            .map(Paint::from_value)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect()),
+        Value::Array(paints) => paints.iter().map(Paint::from_value).collect(),
         Value::Null => Ok(Vec::new()),
-        paint => Ok(Paint::from_value(paint)?.into_iter().collect()),
+        paint => Ok(vec![Paint::from_value(paint)?]),
     }
 }
 

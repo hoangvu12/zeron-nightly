@@ -14,6 +14,7 @@ mod corners;
 mod effects;
 mod frame;
 mod kept;
+mod layout;
 mod paint;
 mod rectangle;
 mod stroke;
@@ -22,9 +23,10 @@ pub mod warn;
 pub use corners::Corners;
 pub use effects::{Effect, EffectKind, Effects, Shadow};
 pub use frame::Frame;
+pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
 pub use rectangle::Rectangle;
-pub use stroke::{Align, Cap, Join, Sides, Stroke, StrokeStyle};
+pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -146,6 +148,9 @@ pub struct Node {
     pub flip_y: bool,
     /// 0 to 1, for the node and its children as one.
     pub opacity: f32,
+    /// Placed at its x and y even in a parent that lays its children out,
+    /// and left out of that layout.
+    pub absolute: bool,
     pub kind: Kind,
     /// Properties the model doesn't know (all but its id, for an
     /// [`Opaque`] node), written back as they were read.
@@ -155,7 +160,13 @@ pub struct Node {
 /// What each node type answers, so walking, editing and drawing a Design
 /// needn't know the types.
 pub trait NodeKind {
-    fn size(&self) -> (f32, f32);
+    /// Its width and height as set, or its type's defaults.
+    fn size(&self) -> (Sizing, Sizing);
+
+    /// How it lays its children out, for the types that can.
+    fn layout(&self) -> Option<&Layout> {
+        None
+    }
 
     /// Its children, for the types that hold them.
     fn children(&self) -> &[Node] {
@@ -172,15 +183,16 @@ pub trait NodeKind {
         false
     }
 
-    /// Its outline and the fills, stroke and effects drawn on it, for the
-    /// types drawn that way.
-    fn look(&self) -> Option<Look<'_>> {
+    /// Its outline at its laid-out `size`, and the fills, stroke and
+    /// effects drawn on it, for the types drawn that way.
+    fn look(&self, _size: (f32, f32)) -> Option<Look<'_>> {
         None
     }
 
     /// Draws what the node draws itself beyond its [`look`](Self::look),
-    /// not its children, with its top-left at the painter's origin.
-    fn paint(&self, _painter: &mut dyn Painter) {}
+    /// not its children, at its laid-out `size` with its top-left at the
+    /// painter's origin.
+    fn paint(&self, _size: (f32, f32), _painter: &mut dyn Painter) {}
 }
 
 macro_rules! kinds {
@@ -244,18 +256,26 @@ pub struct Opaque {
 }
 
 impl NodeKind for Opaque {
-    fn size(&self) -> (f32, f32) {
-        (0., 0.)
+    fn size(&self) -> (Sizing, Sizing) {
+        (Sizing::Fixed(0.), Sizing::Fixed(0.))
     }
 
-    fn paint(&self, _painter: &mut dyn Painter) {}
+    fn paint(&self, _size: (f32, f32), _painter: &mut dyn Painter) {}
 }
 
-/// A fixed width and height, in pixels at 1x.
+/// A width and height, each fixed, fit content or fill container; unset,
+/// each is its type's default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Size {
-    #[serde(default)]
-    pub width: f32,
-    #[serde(default)]
-    pub height: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<Sizing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<Sizing>,
+}
+
+impl Size {
+    /// Each side as set, or `default`.
+    pub fn or(self, default: Sizing) -> (Sizing, Sizing) {
+        (self.width.unwrap_or(default), self.height.unwrap_or(default))
+    }
 }
