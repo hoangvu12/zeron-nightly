@@ -51,6 +51,8 @@ reqwest.workspace = true
 bytes = "1"
 # The rules plugins are held to (paths, programs, network), shared with apps/zgx.
 zeron-plugin-guard.workspace = true
+# Designs drawn by Skia (agents' screenshots and exports), with the zgx app.
+zeron-design.workspace = true
 ignore.workspace = true
 fff-search.workspace = true
 

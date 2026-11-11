@@ -1284,6 +1284,7 @@ impl Engine {
     pub async fn run(self) -> anyhow::Result<()> {
         let mut config = self.config;
         tracing::info!(data_dir = %config.data_dir.display(), "engine starting");
+        zeron_design::keep_linked();
 
         std::fs::create_dir_all(&config.data_dir)?;
         update_trial::boot(&config.data_dir)?;

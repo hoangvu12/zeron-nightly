@@ -141,6 +141,8 @@ zeron-visual = { path = "../../crates/visual" }
 # The rules plugins are held to (paths, programs, network), the engine's own.
 zeron-plugin-guard = { path = "../../crates/plugin-guard" }
 zeron-visual-gpu = { path = "../../crates/visual-gpu" }
+# Designs drawn by Skia for the Design tab, the engine's renderer.
+zeron-design = { path = "../../crates/design" }
 # Their frames' pixel loops, optimized in debug builds too (below).
 zeron-zgx-pixels = { path = "pixels" }
 

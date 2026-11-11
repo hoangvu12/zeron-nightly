@@ -1,0 +1,14 @@
+[package]
+name = "zeron-design"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Zeron Design's renderer: Designs drawn by Skia on the CPU, shared by Zeron's engine and its zgx app"
+
+[dependencies]
+# Pinned with `gl` to the feature set of a published prebuilt
+# (apps/zgx/docs/design/adr/0002): the build downloads Skia instead of
+# compiling it, so it needs no clang, Python or ninja. Only the raster
+# backend draws; GL is linked but unused.
+skia-safe = { version = "=0.157.0", features = ["gl", "textlayout", "svg"] }
