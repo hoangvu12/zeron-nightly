@@ -3130,11 +3130,26 @@
       "failed_save": "设计未能保存",
       "failed_new": "未能新建设计",
       "layers": "图层",
+      "failed_edit": "更改未能生效",
+      "properties": "属性",
+      "prop": {
+        "fill": "填充",
+        "width": "宽度",
+        "height": "高度",
+        "gap": "间距",
+        "padding": "内边距",
+        "radius": "圆角",
+        "font_size": "字号",
+        "font": "字体"
+      },
+      "select_one": "选择一个节点，即可更改其填充、尺寸、间距和文字。",
       "save": "保存",
       "remote": "设计只能为这台电脑上的对话打开。",
       "command": {
         "save": "保存设计",
-        "save_as": "设计另存为…"
+        "save_as": "设计另存为…",
+        "undo": "撤销设计更改",
+        "redo": "重做设计更改"
       },
       "recovered": {
         "title": "已恢复的更改",

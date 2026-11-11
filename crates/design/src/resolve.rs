@@ -43,8 +43,20 @@ pub fn drawn(design: &Design) -> Design {
     resolved(design, Resolve::DRAWN).0
 }
 
+/// The Design as drawn in `theme` (the Design tab's Theme switcher): its
+/// Tokens given their values there, each axis it doesn't name at its first
+/// value. A node's own Theme still wins inside it.
+pub fn drawn_in(design: &Design, theme: &Theme) -> Design {
+    resolved_in(design, Resolve::DRAWN, theme).0
+}
+
 /// `design` with what `how` asks resolved, and what couldn't be.
 pub fn resolved(design: &Design, how: Resolve) -> (Design, Vec<Problem>) {
+    resolved_in(design, how, &Theme::new())
+}
+
+/// [`resolved`] in `chosen`, over the Design's first value of each axis.
+fn resolved_in(design: &Design, how: Resolve, chosen: &Theme) -> (Design, Vec<Problem>) {
     if !asks(&design.children) {
         return (design.clone(), Vec::new());
     }
@@ -60,7 +72,8 @@ pub fn resolved(design: &Design, how: Resolve) -> (Design, Vec<Problem>) {
         .filter_map(|(name, token)| Some((name.clone(), Token::read(name, token).ok()?)))
         .collect();
     let mut resolver = Resolver { how, components, tokens, problems: Vec::new() };
-    let theme = token::default_theme(&design.themes);
+    let mut theme = token::default_theme(&design.themes);
+    theme.extend(chosen.clone());
     let children = design
         .children
         .iter()

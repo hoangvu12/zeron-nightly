@@ -5,6 +5,7 @@ mod editing;
 mod exports;
 mod failing;
 mod guide;
+mod hand;
 mod icons;
 mod images;
 mod kept;

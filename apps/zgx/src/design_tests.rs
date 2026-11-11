@@ -21,8 +21,9 @@ use crate::design::{FileState, CACHE_BYTES, DesignTabs, Heard, Listener, Source,
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
 const PATH: &str = "fixture.zdesign";
-/// The window: the layers list's 220 points, then a Canvas 960 by 700.
-const SIZE: (f32, f32) = (1180., 700.);
+/// The window: the layers list's 220 points, a Canvas 960 wide (under the
+/// toolbar), the properties panel's 220.
+const SIZE: (f32, f32) = (1400., 700.);
 
 const WHITE: [u8; 4] = [255, 255, 255, 255];
 const INDIGO: [u8; 4] = [79, 70, 229, 255];
@@ -182,6 +183,26 @@ impl Source for Engine {
                 Ok(serde_json::json!({ "name": name, "path": made }))
             }
             "RecentDesigns" => Ok(serde_json::json!({ "recent": *me.recent.borrow() })),
+            // The person's edits, applied as the engine applies them (the
+            // design crate's own), and told to the tab as theirs.
+            "EditDesign" => {
+                let design = me.designs.borrow().get(&path).cloned().unwrap_or_default();
+                let mut draft = zeron_design::edit::Draft::new(design);
+                let applied: Result<(), String> = params["edits"].as_array().into_iter().flatten().try_for_each(|edit| {
+                    let done = if let Some(id) = edit["update"].as_str() {
+                        draft.update(id, edit["props"].clone())
+                    } else {
+                        let id = edit["move"].as_str().unwrap_or_default();
+                        draft.move_to(id, edit["parent"].as_str(), edit["index"].as_u64().map(|i| i as usize))
+                    };
+                    done.map_err(|e| e.to_string())
+                });
+                applied.map(|()| {
+                    me.say(&path, draft.finish().design);
+                    serde_json::json!({ "path": path })
+                })
+            }
+            "UndoDesign" | "RedoDesign" => Ok(serde_json::json!({ "path": path, "done": true })),
             "DesignSaving" => {
                 let saving = me.saving.borrow().get(&path).cloned().unwrap_or_default();
                 Ok(serde_json::json!({ "path": path, "managed": path.starts_with("C:/designs/"), "unsaved": saving["unsaved"] }))
@@ -1266,4 +1287,138 @@ fn a_click_hits_a_turned_node_where_it_is_drawn_and_a_lone_node_on_the_canvas_wh
     assert_eq!(tab.said_selected(), ["screen"]);
     tab.click_canvas(750., 50., none);
     assert_eq!(tab.said_selected(), ["lone"]);
+}
+
+// ---------------------------------------------------------------------------
+// Hand edits (#33): each sent to the engine as a change.
+
+impl Tab {
+    fn edits(&self) -> Vec<serde_json::Value> {
+        self.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["edits"].clone()).collect()
+    }
+
+    /// A drag from Canvas point `from` by (`dx`, `dy`) Canvas units.
+    fn drag_canvas(&mut self, from: (f32, f32), (dx, dy): (f32, f32)) {
+        let (sx, sy) = self.on_screen(from.0, from.1);
+        let (_, _, zoom) = self.canvas.view(TAB).unwrap();
+        zgx_script::driver::drag_between(&mut self.app.ui, (sx as f32, sy as f32), (sx as f32 + dx * zoom, sy as f32 + dy * zoom));
+        self.app.frames(3);
+    }
+}
+
+#[test]
+fn moving_a_selected_node_sends_its_new_place_or_its_new_order_in_an_auto_layout() {
+    let mut tab = mount(landing("#EF4444", false));
+    let none = zgx::input::Modifiers::default();
+    // The badge, in a Screen that lays nothing out: its new x and y.
+    tab.click_canvas(780., 530., none);
+    tab.drag_canvas((780., 530.), (40., -30.));
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "badge", "props": { "x": 640, "y": 370 } }]));
+    // Shown where it went (the engine told the tab, as the person's).
+    tab.settle();
+    assert_eq!(tab.picture().rgba(tab.on_screen(100. + 640. + 10., 50. + 370. + 10.)), RED);
+    // The row's first chip, in an auto layout: dropped past the second,
+    // it's second in the order.
+    let deep = zgx::input::Modifiers { control: true, ..Default::default() };
+    let chip1 = (100. + 40. + 20. + 30., 50. + 300. + 20. + 30.);
+    tab.click_canvas(chip1.0, chip1.1, deep);
+    assert_eq!(tab.said_selected(), ["chip1"]);
+    tab.drag_canvas(chip1, (75., 0.));
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "move": "chip1", "parent": "chips", "index": 1 }]));
+}
+
+#[test]
+fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sent() {
+    let mut design = landing("#EF4444", false);
+    let zeron_design::model::Kind::Frame(screen) = &mut design.children[0].kind else { panic!("a frame") };
+    screen.children.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "title", "type": "text", "x": 300, "y": 40, "content": "Hello", "fontSize": 40, "fill": "#111827",
+        }))
+        .unwrap(),
+    );
+    let mut tab = mount(design);
+    let none = zgx::input::Modifiers::default();
+    // Selected, then pressed again at once: editing, the caret at its end.
+    // (In the Screen at (100, 50), the text at (300, 40): (400, 90) on the
+    // Canvas.)
+    tab.click_canvas(420., 110., none);
+    assert_eq!(tab.said_selected(), ["title"]);
+    tab.click_canvas(420., 110., none);
+    let caret = on_screen_of(&mut tab.app, &format!("#design-caret-{TAB}"));
+    // Where the drawn word ends: its last column of ink.
+    let shown = tab.picture();
+    let (_, top) = tab.on_screen(0., 110.);
+    let (left, _) = tab.on_screen(400., 110.);
+    let (right, _) = tab.on_screen(700., 110.);
+    let ink_right = (left..right).rev().find(|&x| {
+        let [r, _, _, a] = shown.rgba((x, top));
+        a > 200 && r < 100
+    });
+    let ink_right = ink_right.expect("the word drawn");
+    // (Just past it: the caret's at the last glyph's advance, which the
+    // "o"'s side bearing puts a few pixels beyond its ink.)
+    let past = caret.x - ink_right as f32;
+    assert!((-1. ..=7.).contains(&past), "the caret at {} against the ink's end at {ink_right}", caret.x);
+
+    // A character typed is sent as the text's new words.
+    tab.app.key(zgx::input::Key::Character("!".into()));
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "title", "props": { "content": "Hello!" } }]));
+    // Backspace, and the caret moved back one place.
+    tab.app.key(zgx::input::Key::Backspace);
+    tab.app.key(zgx::input::Key::ArrowLeft);
+    tab.app.key(zgx::input::Key::Backspace);
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "title", "props": { "content": "Helo" } }]));
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
+}
+
+#[test]
+fn the_properties_panel_sends_each_property_as_a_change_and_undo_and_redo_reach_the_engine() {
+    let mut tab = mount(landing("#EF4444", false));
+    tab.click_canvas(150., 100., zgx::input::Modifiers::default());
+    assert!(tab.app.wait_until(|app| app.find(&format!("#design-props-{TAB}")).is_some()), "{}", tab.app.tree());
+    tab.app.fill("role:textbox \"Fill\"", "#22C55E");
+    tab.app.key(zgx::input::Key::Enter);
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "hero", "props": { "fill": "#22C55E" } }]));
+    tab.app.fill("role:textbox \"Width\"", "240");
+    tab.app.key(zgx::input::Key::Enter);
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "hero", "props": { "width": 240 } }]));
+
+    // ⌘Z and ⌘⇧Z: the Design's one history (their shortcuts bound as the
+    // window binds commands' keys: src/shortcut_tests.rs presses them).
+    let keys: Vec<_> = tab.app.host.commands().get().into_iter().filter(|c| c.id.starts_with("panel.design.")).map(|c| (c.id, c.key)).collect();
+    assert!(keys.contains(&("panel.design.undo".into(), Some("cmd+z".into()))), "{keys:?}");
+    assert!(keys.contains(&("panel.design.redo".into(), Some("cmd+shift+z".into()))), "{keys:?}");
+    tab.app.host.run_command("panel.design.undo");
+    tab.app.host.run_command("panel.design.redo");
+    tab.app.frames(2);
+    let asked: Vec<String> = tab.engine.asked.borrow().iter().map(|(m, _)| m.clone()).filter(|m| m.ends_with("oDesign")).collect();
+    assert_eq!(asked, ["UndoDesign", "RedoDesign"]);
+}
+
+#[test]
+fn switching_theme_draws_the_design_in_that_themes_token_values() {
+    let design = design(serde_json::json!({
+        "version": "1.0",
+        "themes": { "mode": ["light", "dark"] },
+        "tokens": { "surface": { "type": "color", "value": [
+            { "value": "#FFFFFF", "theme": { "mode": "light" } },
+            { "value": "#000000", "theme": { "mode": "dark" } },
+        ] } },
+        "children": [{ "id": "screen", "type": "frame", "width": 600, "height": 400, "fill": "$surface" }],
+    }));
+    let mut tab = mount(design);
+    assert_eq!(tab.picture().rgba(tab.on_screen(300., 200.)), WHITE);
+    tab.app.click(&format!("#design-theme-{TAB}-mode >> \"dark\""));
+    tab.app.frames(4);
+    tab.settle();
+    assert_eq!(tab.picture().rgba(tab.on_screen(300., 200.)), [0, 0, 0, 255]);
+    // (The tab's alone: nothing was asked of the engine.)
+    assert!(tab.edits().is_empty());
 }

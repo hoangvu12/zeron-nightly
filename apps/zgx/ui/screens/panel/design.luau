@@ -44,6 +44,8 @@ local ZOOM_MIN, ZOOM_MAX = 0.25, 5
 local SETTLE_MS = 150
 -- How far a press may move and still be a click (selecting), not a drag.
 local CLICK_SLOP = 4
+-- How soon a second press on a selected text edits it.
+local DOUBLE_MS = 400
 -- How long what an agent just changed flashes (pen.dev's live touches).
 local FLASH_MS = 900
 
@@ -192,6 +194,46 @@ ui.command {
 	end,
 }
 
+-- The person's edits by hand on tab `id`'s Design (#33): one change, one
+-- undo step, told to every tab showing it.
+local function edit(id: string, edits: { any }, description: string)
+	api.call("design.edit", { tab = id, edits = edits, description = description }):after(function() end, said("panel.design.failed_edit"))
+end
+
+-- The Design's one history, whoever's change is latest (ADR-0003).
+local function step(call: string)
+	local t = front_tab()
+	if not t then
+		return false
+	end
+	api.call(call, { tab = t.id }):after(function() end, said("panel.design.failed_edit"))
+	return true
+end
+ui.command {
+	id = "panel.design.undo",
+	title = ui.t("panel.design.command.undo"):get(),
+	menu = "Edit",
+	key = "cmd+z",
+	run = function(): boolean
+		return step("design.undo")
+	end,
+}
+ui.command {
+	id = "panel.design.redo",
+	title = ui.t("panel.design.command.redo"):get(),
+	menu = "Edit",
+	key = "cmd+shift+z",
+	run = function(): boolean
+		return step("design.redo")
+	end,
+}
+
+-- `text`'s chars before place `at` and from it (places count chars).
+local function split(text: string, at: number): (string, string)
+	local byte = utf8.offset(text, at + 1) or (#text + 1)
+	return string.sub(text, 1, byte - 1), string.sub(text, byte)
+end
+
 function M.close(tab: Tab)
 	api.invoke("design.close", tab.id)
 	views:set_key(tab.id, nil)
@@ -321,6 +363,182 @@ local function layers(id: string): Node
 	}
 end
 
+-- The properties panel (#33): the one node selected, its common
+-- properties, each sent as an edit when committed (Enter, or leaving the
+-- field). Numbers stay numbers; a `$name` refers to a Token.
+local FIELDS: { { key: string, label: string, number: boolean } } = {
+	{ key = "fill", label = "panel.design.prop.fill", number = false },
+	{ key = "width", label = "panel.design.prop.width", number = true },
+	{ key = "height", label = "panel.design.prop.height", number = true },
+	{ key = "gap", label = "panel.design.prop.gap", number = true },
+	{ key = "padding", label = "panel.design.prop.padding", number = true },
+	{ key = "cornerRadius", label = "panel.design.prop.radius", number = true },
+	{ key = "fontSize", label = "panel.design.prop.font_size", number = true },
+	{ key = "fontFamily", label = "panel.design.prop.font", number = false },
+}
+local function properties(id: string): Node
+	local host = shown(id)
+	local function props(): any
+		local b = host:get()
+		return if b then b.props else nil
+	end
+	local function field(f: { key: string, label: string, number: boolean }, node: string, start: any): Node
+		local value = ui.use_state(if start == nil then "" elseif type(start) == "table" then "" else tostring(start))
+		-- (Following what the Design says as it changes, by anyone.)
+		ui.effect(function()
+			local now = props()
+			if now and now.id == node then
+				local v = now[f.key]
+				value:set(if v == nil or type(v) == "table" then "" else tostring(v))
+			end
+		end)
+		return ds.TextField {
+			label = ui.t(f.label),
+			value = value,
+			size = "sm",
+			w_full = true,
+			on_commit = function(text: string)
+				local v: any = text
+				if f.number and tonumber(text) then
+					v = tonumber(text)
+				end
+				edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property")
+			end,
+		}
+	end
+	-- (Always there, so the Canvas keeps its width as the selection changes.)
+	local function panel(rows: { Node }): Node
+		return ui.scroll {
+			id = `design-props-{id}`,
+			role = "group",
+			label = ui.t("panel.design.properties"),
+			w = ui.raw(220, "the properties panel's width, as the layers list's"),
+			h_full = true,
+			shrink = 0,
+			border = 1,
+			border_sides = { 0, 0, 0, 1 },
+			border_color = "$border.subtle",
+			p = "$space.3",
+			gap = "$space.2",
+			table.unpack(rows),
+		}
+	end
+	return ui.presence(function(): string
+		local p = props()
+		return if type(p) == "table" and p.id then p.id else ""
+	end, function(node: string): Node
+		if node == "" then
+			return panel({ ds.Text { ui.t("panel.design.select_one"), style = "caption", tone = "tertiary", wrap = true } })
+		end
+		local p = props()
+		local rows: { Node } = { ds.Text { p.name or p.type or "", style = "label" } }
+		for _, f in FIELDS do
+			-- (What its type has, and what's set.)
+			local has = p[f.key] ~= nil
+				or (f.key == "fill")
+				or ((f.key == "width" or f.key == "height") and p.type ~= "text")
+				or ((f.key == "gap" or f.key == "padding") and p.type == "frame")
+				or ((f.key == "fontSize" or f.key == "fontFamily") and p.type == "text")
+			if has then
+				table.insert(rows, field(f, node, p[f.key]))
+			end
+		end
+		return panel(rows)
+	end, { h_full = true })
+end
+
+-- Over the Canvas: the Theme it's shown in (an axis each, the Design's own
+-- Themes; the tab's alone, agents' screenshots keep the first values), and
+-- undo and redo.
+local function toolbar(id: string): Node
+	local host = shown(id)
+	local function axes(): { { axis: string, values: { string } } }
+		local b = host:get()
+		local out = {}
+		if b and type(b.themes) == "table" then
+			for axis, values in b.themes do
+				if type(values) == "table" then
+					table.insert(out, { axis = axis, values = values })
+				end
+			end
+		end
+		table.sort(out, function(a, c)
+			return a.axis < c.axis
+		end)
+		return out
+	end
+	local function choose(axis: string, value: string)
+		local b = host:peek()
+		local theme = table.clone(if b and type(b.theme) == "table" then b.theme else {})
+		theme[axis] = value
+		api.invoke("design.theme", { tab = id, theme = theme })
+	end
+	local function axis_row(a: any): Node
+		local function shown_in(): string
+			local b = host:peek()
+			local chosen = if b and type(b.theme) == "table" then b.theme[a.axis] else nil
+			return chosen or a.values[1]
+		end
+		local chosen = ui.use_state(shown_in())
+		ui.effect(function()
+			local value = chosen:get()
+			if value ~= shown_in() then
+				choose(a.axis, value)
+			end
+		end)
+		local options = {}
+		for _, value in a.values do
+			table.insert(options, { value = value, label = value })
+		end
+		return ds.Segmented {
+			id = `design-theme-{id}-{a.axis}`,
+			label = a.axis,
+			value = chosen,
+			options = options,
+		}
+	end
+	return ui.row {
+		id = `design-toolbar-{id}`,
+		w_full = true,
+		items = "center",
+		gap = "$space.2",
+		p = "$space.1",
+		border = 1,
+		border_sides = { 0, 0, 1, 0 },
+		border_color = "$border.subtle",
+		ui.each(ui.computed(axes), axis_row, {
+			key = function(a: any): string
+				return a.axis
+			end,
+		}),
+		ui.div { grow = 1 },
+		ds.IconButton {
+			label = ui.t("panel.design.command.undo"),
+			size = "sm",
+			tone = "quiet",
+			on_click = function()
+				local t = front_tab()
+				if t then
+					api.call("design.undo", { tab = t.id }):after(function() end, said("panel.design.failed_edit"))
+				end
+			end,
+			ds.Icon { name = "arrow-left", size = 14 },
+		},
+		ds.IconButton {
+			label = ui.t("panel.design.command.redo"),
+			size = "sm",
+			tone = "quiet",
+			on_click = function()
+				local t = front_tab()
+				if t then
+					api.call("design.redo", { tab = t.id }):after(function() end, said("panel.design.failed_edit"))
+				end
+			end,
+			ds.Icon { name = "arrow-right", size = 14 },
+		},
+	}
+end
+
 -- A tab's Design, once it has one, as the host draws it.
 local function canvas(id: string): Node
 	local host = shown(id)
@@ -333,7 +551,103 @@ local function canvas(id: string): Node
 	local size = ui.use_state({ w = 0, h = 0 })
 	local settled = ui.use_state(true)
 	local zooms = 0
-	local pointer: { x: number, y: number }? = nil
+	local pointer: { x: number, y: number, from_x: number, from_y: number, moving: { string }? }? = nil
+	-- Selected nodes being dragged, and how far (Canvas units): their
+	-- outlines follow; the move is sent as the drag ends (#33).
+	local dragging = ui.use_state(nil :: { ids: { string }, dx: number, dy: number }?)
+	-- A text being edited in place: its node, the words as typed, and the
+	-- caret (and the other end of what's selected), as char places.
+	local editing = ui.use_state(nil :: { node: string, content: string, at: number, anchor: number }?)
+	local last_press: { node: string?, at: number }? = nil
+	local box = ui.ref()
+	local function canvas_point(e: any): (number, number)
+		local v = views:peek()[id] :: View
+		return (e.local_x - v.x) / v.zoom, (e.local_y - v.y) / v.zoom
+	end
+	-- What tab `id` has selected that's a text, alone: its words.
+	local function single_text(node: string): string?
+		local b = host:peek()
+		local props = if b then b.props else nil
+		if type(props) == "table" and props.id == node and props.type == "text" then
+			return props.content or ""
+		end
+		return nil
+	end
+	local function start_editing(node: string)
+		local content = single_text(node)
+		if not content then
+			return
+		end
+		local count = utf8.len(content) or #content
+		editing:set({ node = node, content = content, at = count, anchor = count })
+		if box.focus then
+			box:focus()
+		end
+	end
+	-- Typed: the words sent as they change, the caret after them.
+	local function typed(content: string, at: number)
+		local e = editing:peek()
+		if not e then
+			return
+		end
+		editing:set({ node = e.node, content = content, at = at, anchor = at })
+		edit(id, { { update = e.node, props = { content = content } } }, "Edit text")
+	end
+	local function on_text_key(k: any): boolean
+		local e = editing:peek()
+		if not e then
+			return false
+		end
+		local count = utf8.len(e.content) or #e.content
+		local from, to = math.min(e.at, e.anchor), math.max(e.at, e.anchor)
+		local function cut(): (string, number)
+			local head = split(e.content, from)
+			local _, tail = split(e.content, to)
+			return head .. tail, from
+		end
+		local key = k.key
+		if key == "Escape" or (key == "Enter" and not k.shift) then
+			editing:set(nil)
+			return true
+		elseif key == "Backspace" or key == "Delete" then
+			if from ~= to then
+				local rest, at = cut()
+				typed(rest, at)
+			elseif key == "Backspace" and e.at > 0 then
+				local head, tail = split(e.content, e.at)
+				local shorter = split(head, e.at - 1)
+				typed(shorter .. tail, e.at - 1)
+			elseif key == "Delete" and e.at < count then
+				local head, tail = split(e.content, e.at)
+				local _, rest = split(tail, 1)
+				typed(head .. rest, e.at)
+			end
+			return true
+		elseif key == "ArrowLeft" or key == "ArrowRight" or key == "Home" or key == "End" then
+			local at = if key == "ArrowLeft" then math.max(e.at - 1, 0)
+				elseif key == "ArrowRight" then math.min(e.at + 1, count)
+				elseif key == "Home" then 0
+				else count
+			editing:set({ node = e.node, content = e.content, at = at, anchor = if k.shift then e.anchor else at })
+			return true
+		end
+		local char = if key == "Enter" then "\n" elseif key == "Space" or key == " " then " " else key
+		if type(char) == "string" and utf8.len(char) == 1 and not (k.cmd or k.ctrl or k.meta or k.alt) then
+			local rest, at = cut()
+			local head, tail = split(rest, at)
+			typed(head .. char .. tail, at + 1)
+			return true
+		end
+		return false
+	end
+	-- Where the caret and what's selected are, as the text is drawn.
+	local function caret(): any
+		local e = editing:get()
+		if not e then
+			return nil
+		end
+		return api.call_sync("design.caret", { tab = id, id = e.node, content = e.content, at = e.at, from = e.anchor, to = e.at })
+	end
 
 	-- The host told what shows, as it changes.
 	ui.effect(function()
@@ -489,7 +803,31 @@ local function canvas(id: string): Node
 	end
 	-- What the person selected: outlined.
 	local function selected(n: any): Node
-		local box = over(n)
+		-- (Where a drag is taking it.)
+		local function by(): (number, number)
+			local d = dragging:get()
+			if d and table.find(d.ids, n.id) then
+				return d.dx, d.dy
+			end
+			return 0, 0
+		end
+		local box = over({
+			id = n.id,
+			x = n.x,
+			y = n.y,
+			w = n.w,
+			h = n.h,
+		})
+		local at_left, at_top = box.left, box.top
+		box.left = function(): number
+			local v, dx = view(), by()
+			return at_left() + (if v then dx * v.zoom else 0)
+		end
+		box.top = function(): number
+			local v = view()
+			local _, dy = by()
+			return at_top() + (if v then dy * v.zoom else 0)
+		end
 		box.id = `design-selected-{id}-{n.id}`
 		box.class = "design-selected"
 		box.aria_hidden = true
@@ -533,6 +871,11 @@ local function canvas(id: string): Node
 		overflow = "hidden",
 		relative = true,
 		bg = "$surface.sunken",
+		ref = box,
+		focusable = true,
+		on_key = function(k: any): boolean?
+			return if on_text_key(k) then true else nil
+		end,
 		on_resize = function(s: { w: number, h: number })
 			local now = size:peek()
 			if now.w ~= s.w or now.h ~= s.h then
@@ -553,21 +896,80 @@ local function canvas(id: string): Node
 		end,
 		-- A drag pans; a press that doesn't move selects what's under it:
 		-- Shift adds (or takes away), ⌘/Ctrl picks the innermost node.
+		-- A press on a selected node and a drag moves the selection (#33);
+		-- a second press on a selected text, at once, edits it in place.
 		on_press = function(e: any)
-			pointer = { x = e.local_x, y = e.local_y, from_x = e.local_x, from_y = e.local_y }
+			if not views:peek()[id] then
+				return
+			end
+			local x, y = canvas_point(e)
+			local under = api.call_sync("design.hit", { tab = id, x = x, y = y })
+			local chosen = selections:peek()[id] or {}
+			local now = ui.now()
+			local again = last_press and last_press.node == under and now - last_press.at < DOUBLE_MS
+			last_press = { node = under, at = now }
+			local e_now = editing:peek()
+			if e_now then
+				-- (Editing: a press on its text places the caret; elsewhere
+				-- it ends.)
+				if under == e_now.node then
+					local place = api.call_sync("design.caret", { tab = id, id = e_now.node, content = e_now.content, x = x, y = y })
+					if type(place) == "number" then
+						editing:set({ node = e_now.node, content = e_now.content, at = place, anchor = place })
+					end
+					return
+				end
+				editing:set(nil)
+			end
+			if again and type(under) == "string" and table.find(chosen, under) and single_text(under) then
+				start_editing(under)
+				return
+			end
+			-- (On a selected node, however deep: a nested one selected with
+			-- ⌘/Ctrl is under the pointer too.)
+			local innermost = api.call_sync("design.hit", { tab = id, x = x, y = y, deep = true })
+			local on_selected = (type(under) == "string" and table.find(chosen, under) ~= nil)
+				or (type(innermost) == "string" and table.find(chosen, innermost) ~= nil)
+			local moving = if on_selected then table.clone(chosen) else nil
+			pointer = { x = e.local_x, y = e.local_y, from_x = e.local_x, from_y = e.local_y, moving = moving }
 		end,
 		on_pointer_move = function(e: any)
 			local p = pointer
-			if p then
-				pan(e.local_x - p.x, e.local_y - p.y)
-				p.x, p.y = e.local_x, e.local_y
+			if not p then
+				return
 			end
+			if p.moving then
+				local v = views:peek()[id] :: View
+				dragging:set({ ids = p.moving, dx = (e.local_x - p.from_x) / v.zoom, dy = (e.local_y - p.from_y) / v.zoom })
+			else
+				pan(e.local_x - p.x, e.local_y - p.y)
+			end
+			p.x, p.y = e.local_x, e.local_y
 		end,
 		on_release = function(e: any)
 			local p = pointer
 			pointer = nil
 			local v = views:peek()[id]
-			if not p or not v or math.abs(e.local_x - p.from_x) + math.abs(e.local_y - p.from_y) > CLICK_SLOP then
+			local far = p and math.abs(e.local_x - p.from_x) + math.abs(e.local_y - p.from_y) > CLICK_SLOP
+			if p and p.moving and far and v then
+				-- The moves, one change: each node's new place, as the
+				-- host works it out (an auto layout's order, or x and y).
+				local dx, dy = (e.local_x - p.from_x) / v.zoom, (e.local_y - p.from_y) / v.zoom
+				local edits: { any } = {}
+				for _, node in p.moving do
+					local moved = api.call_sync("design.moved", { tab = id, id = node, dx = dx, dy = dy })
+					if moved then
+						table.insert(edits, moved)
+					end
+				end
+				dragging:set(nil)
+				if #edits > 0 then
+					edit(id, edits, "Move")
+				end
+				return
+			end
+			dragging:set(nil)
+			if not p or not v or far then
 				return
 			end
 			local held = ui.modifiers
@@ -591,6 +993,40 @@ local function canvas(id: string): Node
 		ui.each(touches("selected"), selected, {
 			key = function(n: any): string
 				return n.id
+			end,
+		}),
+		-- Editing text: what's selected of it, and the caret, where the
+		-- drawn glyphs are.
+		ui.each(ui.computed(function(): { any }
+			local c = caret()
+			return if c and c.range then c.range else {}
+		end), function(r: any, i: number): Node
+			local o = over({ x = r.x, y = r.y, w = r.w, h = r.h })
+			o.class = "design-text-range"
+			o.aria_hidden = true
+			o.bg = "$selection.item"
+			return ui.div(o)
+		end),
+		ui.show(function(): boolean
+			return editing:get() ~= nil
+		end, ui.div {
+			id = `design-caret-{id}`,
+			class = "design-caret",
+			aria_hidden = true,
+			absolute = true,
+			w = 2,
+			bg = "$accent",
+			left = function(): number
+				local c, v = caret(), view()
+				return if c and v then v.x + c.caret.x * v.zoom - 1 else 0
+			end,
+			top = function(): number
+				local c, v = caret(), view()
+				return if c and v then v.y + c.caret.y * v.zoom else 0
+			end,
+			h = function(): number
+				local c, v = caret(), view()
+				return if c and v then c.caret.h * v.zoom else 0
 			end,
 		}),
 		ui.each(touches("working"), working, {
@@ -900,7 +1336,14 @@ M.Design = ui.component(function(props: Props): Node
 				grow = 1,
 				min_h = 0,
 				layers(id),
-				canvas(id),
+				ui.column {
+					grow = 1,
+					min_w = 0,
+					h_full = true,
+					toolbar(id),
+					canvas(id),
+				},
+				properties(id),
 			}
 		end, { w_full = true, grow = 1, min_h = 0 }),
 	}

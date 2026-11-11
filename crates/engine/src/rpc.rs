@@ -1052,6 +1052,21 @@ impl EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "recent": recent }))
             }
+            methods::EDIT_DESIGN => {
+                let p: crate::designs::EditParams = parse_params(params)?;
+                self.design_saving(move |designs| designs.edit(&p.path, p.edits, p.description.as_deref())).await
+            }
+            methods::UNDO_DESIGN | methods::REDO_DESIGN => {
+                let p: crate::designs::PathParams = parse_params(params)?;
+                let undo = method == methods::UNDO_DESIGN;
+                self.design_saving(move |designs| {
+                    let done = if undo { designs.undo(&p.path)? } else { designs.redo(&p.path)? };
+                    let mut saving = designs.saving(&p.path)?;
+                    saving["done"] = serde_json::json!(done);
+                    Ok(saving)
+                })
+                .await
+            }
             methods::SET_DESIGN_SELECTION => {
                 let designs = self.designs()?.clone();
                 let p: crate::designs::SelectionParams = parse_params(params)?;
@@ -5931,7 +5946,10 @@ impl RpcService for EngineRpc {
             | methods::DISCARD_DESIGN
             | methods::NEW_DESIGN
             | methods::RECENT_DESIGNS
-            | methods::SET_DESIGN_SELECTION => Box::pin(self.design_rpc(method, params)).await,
+            | methods::SET_DESIGN_SELECTION
+            | methods::EDIT_DESIGN
+            | methods::UNDO_DESIGN
+            | methods::REDO_DESIGN => Box::pin(self.design_rpc(method, params)).await,
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self

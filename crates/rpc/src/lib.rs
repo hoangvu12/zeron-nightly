@@ -413,6 +413,16 @@ pub mod methods {
     /// Design tab on the Design at `path` (none: nothing selected), which
     /// `design_state` reports to its agent. Local only.
     pub const SET_DESIGN_SELECTION: &str = "SetDesignSelection";
+    /// `{path, description?, edits: [{update, props} | {move, parent?,
+    /// index?}]}` → as `DesignSaving`: the person's edits by hand in a
+    /// Design tab, one change (one undo step), told to its tabs as the
+    /// person's. Local only.
+    pub const EDIT_DESIGN: &str = "EditDesign";
+    /// `{path}` → `{done, path, managed, unsaved, recovered}`: the latest
+    /// change to a Design undone (or, `RedoDesign`, the latest undone done
+    /// again), whoever made it. Local only.
+    pub const UNDO_DESIGN: &str = "UndoDesign";
+    pub const REDO_DESIGN: &str = "RedoDesign";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -786,6 +796,9 @@ pub fn local_only(method: &str) -> bool {
             | methods::NEW_DESIGN
             | methods::RECENT_DESIGNS
             | methods::SET_DESIGN_SELECTION
+            | methods::EDIT_DESIGN
+            | methods::UNDO_DESIGN
+            | methods::REDO_DESIGN
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME

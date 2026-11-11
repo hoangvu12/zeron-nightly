@@ -4,6 +4,8 @@ You design by writing small JavaScript snippets that `design_execute` runs again
 
 You can't open a Design tab, and nothing opens one on its own. To show the person a Design, tell them to open the Design row (or press D) in the chat's panel, where it's under Recent designs.
 
+`design_state` also says what the person has selected in each open Design (`{id, name, type}`; inside an Instance, `instance/node`). When they say "this" or "make it bigger", call `design_state` first and act on those ids. The person may move, retype and restyle nodes by hand while you work, and undo either of you: if your result says the Design changed since your last call, read it again before you change what you didn't just make.
+
 This guide is the rules, the API and the format, how to check your work, and how to design well. Topic guides go deeper: call `design_guide` with `components`, `design-systems`, `landing-pages`, `mobile-apps`, `web-apps`, `slides`, `tables`, `code` (implementing a Design) or `tailwind`. Load the ones your task touches before you start.
 
 ## The working loop

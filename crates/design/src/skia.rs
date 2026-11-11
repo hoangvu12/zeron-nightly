@@ -9,7 +9,8 @@ use skia_safe::canvas::SaveLayerRec;
 use skia_safe::matrix::ScaleToFit;
 use skia_safe::paint::{Cap as PaintCap, Join as PaintJoin, Style as PaintStyle};
 use skia_safe::textlayout::{
-    FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextAlign as SkiaAlign, TextDecoration, TextStyle,
+    FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, RectHeightStyle, RectWidthStyle, TextAlign as SkiaAlign,
+    TextDecoration, TextStyle,
     TypefaceFontProvider,
 };
 use skia_safe::{
@@ -99,6 +100,21 @@ impl Typesetter {
         }
     }
 
+    /// `text` laid out in a box of `size` as it's drawn ([`SkiaPainter`]'s
+    /// text), for placing a caret: the places between its characters
+    /// (`text.content`'s chars, 0 before the first) as boxes in the box's
+    /// space.
+    pub fn carets(&self, text: &Text, size: (f32, f32)) -> Carets {
+        let mut paragraph = self.paragraph(text, None);
+        paragraph.layout(size.0);
+        let top = match text.text_align_vertical {
+            VerticalAlign::Top => 0.,
+            VerticalAlign::Middle => (size.1 - paragraph.height()) / 2.,
+            VerticalAlign::Bottom => size.1 - paragraph.height(),
+        };
+        Carets { paragraph, offset: (-text.letter_spacing / 2., top), content: text.content.clone(), font_size: text.font_size(), align: text.text_align }
+    }
+
     /// `text` as a paragraph drawn with `foreground`, not yet laid out.
     fn paragraph(&self, text: &Text, foreground: Option<&skia_safe::Paint>) -> Paragraph {
         let mut style = TextStyle::new();
@@ -140,6 +156,85 @@ impl Typesetter {
         builder.push_style(&style);
         builder.add_text(&text.content);
         builder.build()
+    }
+}
+
+/// A text laid out as drawn ([`Typesetter::carets`]): where a caret goes
+/// at each place between its characters, what a range of them covers, and
+/// which place is nearest a point. Places count chars (not bytes, nor the
+/// UTF-16 units Skia counts in).
+pub struct Carets {
+    paragraph: Paragraph,
+    offset: (f32, f32),
+    content: String,
+    font_size: f32,
+    align: TextAlign,
+}
+
+impl Carets {
+    /// The UTF-16 offset of char place `at`.
+    fn utf16(&self, at: usize) -> usize {
+        self.content.chars().take(at).map(char::len_utf16).sum()
+    }
+
+    /// The char place at UTF-16 offset `at`.
+    fn place(&self, at: usize) -> usize {
+        let mut units = 0;
+        for (i, c) in self.content.chars().enumerate() {
+            if units >= at {
+                return i;
+            }
+            units += c.len_utf16();
+        }
+        self.content.chars().count()
+    }
+
+    fn boxes(&self, from: usize, to: usize) -> Vec<skia_safe::Rect> {
+        self.paragraph
+            .get_rects_for_range(self.utf16(from)..self.utf16(to), RectHeightStyle::Max, RectWidthStyle::Tight)
+            .into_iter()
+            .map(|b| b.rect.with_offset(self.offset))
+            .collect()
+    }
+
+    /// The caret at place `at`: a box no wider than a line's height is
+    /// tall, at its left edge.
+    pub fn caret(&self, at: usize) -> Rect {
+        let count = self.content.chars().count();
+        let at = at.min(count);
+        let edge = if at < count {
+            self.boxes(at, at + 1).first().map(|b| (b.left, b.top, b.height()))
+        } else if at > 0 {
+            self.boxes(at - 1, at).last().map(|b| (b.right, b.top, b.height()))
+        } else {
+            None
+        };
+        let (x, y, height) = edge.unwrap_or_else(|| {
+            // (No characters: where the first would stand.)
+            let width = self.paragraph.max_width();
+            let x = match self.align {
+                TextAlign::Center => width / 2.,
+                TextAlign::Right => width,
+                _ => 0.,
+            };
+            (x + self.offset.0, self.offset.1, self.font_size * 1.2)
+        });
+        Rect { x, y, width: 0., height }
+    }
+
+    /// What places `from` to `to` cover: a box a line.
+    pub fn range(&self, from: usize, to: usize) -> Vec<Rect> {
+        let (from, to) = (from.min(to), from.max(to));
+        self.boxes(from, to)
+            .into_iter()
+            .map(|b| Rect { x: b.left, y: b.top, width: b.width(), height: b.height() })
+            .collect()
+    }
+
+    /// The place nearest (`x`, `y`) in the box's space.
+    pub fn place_at(&self, x: f32, y: f32) -> usize {
+        let at = self.paragraph.get_glyph_position_at_coordinate((x - self.offset.0, y - self.offset.1));
+        self.place(at.position.max(0) as usize)
     }
 }
 

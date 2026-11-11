@@ -3130,11 +3130,26 @@
       "failed_save": "The Design wasn't saved",
       "failed_new": "No new Design was made",
       "layers": "Layers",
+      "failed_edit": "The change didn't go through",
+      "properties": "Properties",
+      "prop": {
+        "fill": "Fill",
+        "width": "Width",
+        "height": "Height",
+        "gap": "Gap",
+        "padding": "Padding",
+        "radius": "Corner radius",
+        "font_size": "Font size",
+        "font": "Font"
+      },
+      "select_one": "Select a node to change its fill, size, spacing and type.",
       "save": "Save",
       "remote": "Designs open only for chats on this computer.",
       "command": {
         "save": "Save Design",
-        "save_as": "Save Design As…"
+        "save_as": "Save Design As…",
+        "undo": "Undo Design Change",
+        "redo": "Redo Design Change"
       },
       "recovered": {
         "title": "Recovered changes",

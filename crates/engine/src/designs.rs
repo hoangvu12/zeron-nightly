@@ -162,6 +162,34 @@ pub struct SelectionParams {
     pub ids: Vec<String>,
 }
 
+/// One of the person's edits by hand (`EditDesign`): a node's properties
+/// changed (its place, size, words, fill…), or the node moved to another
+/// parent, or to another place among its siblings (`index`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum HandEdit {
+    Update {
+        update: String,
+        props: Value,
+    },
+    Move {
+        r#move: String,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+}
+
+/// `EditDesign`'s params.
+#[derive(Debug, Deserialize)]
+pub struct EditParams {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub edits: Vec<HandEdit>,
+}
+
 /// `NewDesign`'s params.
 #[derive(Debug, Deserialize)]
 pub struct NewParams {
@@ -358,6 +386,8 @@ const MAX_TOLD_CHANGES: usize = 32;
 pub enum Changer {
     /// An agent's `design_execute` call.
     Agent,
+    /// The person, by hand in a Design tab (`EditDesign`).
+    Person,
     /// An undo or redo of an earlier change.
     Undo,
     /// Its file: unsaved changes discarded for what the file holds, or
@@ -685,6 +715,26 @@ impl Designs {
             edit_id: None,
             edits: Vec::new(),
         })
+    }
+
+    /// The person's edits by hand in a Design tab (`EditDesign`), applied
+    /// together as one change (one undo step), told to its tabs as theirs:
+    /// says as [`Designs::saving`] does. An edit the Design refuses changes
+    /// nothing.
+    pub fn edit(&self, path: &Path, edits: Vec<HandEdit>, description: Option<&str>) -> Result<Value, DesignError> {
+        let live = self.open(path)?;
+        let mut live = lock(&live);
+        let mut draft = Draft::new(live.design.clone());
+        for edit in edits {
+            let done = match edit {
+                HandEdit::Update { update, props } => draft.update(&update, props),
+                HandEdit::Move { r#move, parent, index } => draft.move_to(&r#move, parent.as_deref(), index),
+            };
+            done.map_err(|e| DesignError::Refused(e.to_string()))?;
+        }
+        let edited = draft.finish();
+        live.commit(&edited, description.unwrap_or("Edit by hand"), Changer::Person)?;
+        Ok(live.saving())
     }
 
     /// Undoes the latest change to the Design at `path`, whoever made it,

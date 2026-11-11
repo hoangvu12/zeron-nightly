@@ -11,7 +11,9 @@
 //!                             flashes = { { id, version, x, y, w, h }… },  what an agent just changed
 //!                             working = { { id, name, x, y, w, h }… },  Screens in progress
 //!                             path, unsaved, recovered, stale,   its file, and whether it's current
-//!                             selected = { { id, x, y, w, h }… } }  the selection
+//!                             selected = { { id, x, y, w, h }… },  the selection
+//!                             props?,   the one node selected, as written (its properties)
+//!                             themes, theme }   the Design's Theme axes, and the tab's choice
 //! shared  design.tree.<tab>   { { id, name, type, depth }… }   its layers list, as the Design changes
 //!                             layers = { Layer… } }   the previous zoom's first
 //!         Layer             { level, tiles = { { id, src, x, y, size }… } }
@@ -20,6 +22,12 @@
 //! invoke  design.close      tab                      its watch and tiles let go
 //! invoke  design.tabs       { chat, paths }          a chat's Design tabs, front first
 //! function design.hit       { tab, x, y, deep? } → id?   what a click at a Canvas point selects
+//! function design.moved     { tab, id, dx, dy } → edit?  what dragging a node so changes
+//! function design.caret     { tab, id, content, at, from, to } → { caret, range }, or
+//!                           { tab, id, content, x, y } → place   a text's caret, as drawn
+//! invoke  design.theme      { tab, theme }           the Theme the tab shows (axis → value)
+//! call    design.edit       { tab, edits, description? }   the person's edits, one change
+//! call    design.undo / design.redo { tab }      the latest change taken back, done again
 //! invoke  design.select     { tab, chat, ids }       the person's selection, told to the engine
 //! invoke  design.flashed    { tab, version }         that flash is over
 //! call    design.new        { name? } → { name, path }   a new managed Design
@@ -49,6 +57,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use serde_json::{Value as Json, json};
 use zeron_design::Design;
+use zeron_design::model::Theme;
 use zeron_design::assets::{Files, Resolved};
 use zeron_design::fonts::{FontFile, Fonts};
 use zeron_design::layout::LaidOut;
@@ -239,17 +248,21 @@ struct Scene {
     tops: Vec<Rect>,
     /// How much more a tile draws round itself, for its blurs' sake.
     margin: f32,
+    /// Its assets as heard, and the Theme it's drawn in: what drawing it
+    /// in another Theme starts from.
+    heard: Vec<Resolved>,
+    theme: Theme,
 }
 
 impl Scene {
-    fn new(version: u64, design: Design, fonts: Fonts, assets: Vec<Resolved>) -> Self {
-        // As drawn: Instances expanded, Tokens resolved.
+    fn new(version: u64, design: Design, fonts: Fonts, assets: Vec<Resolved>, theme: Theme) -> Self {
+        // As drawn: Instances expanded, Tokens resolved, in the tab's Theme.
         let written = design;
-        let design = zeron_design::resolve::drawn(&written);
+        let design = zeron_design::resolve::drawn_in(&written, &theme);
         let laid_out = LaidOut::of(&design, &fonts.typesetter(&design));
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
         let margin = render::blur_reach(&design, &laid_out);
-        Self { version, written, design, fonts, laid_out, assets: Files::new(assets), tops, margin }
+        Self { version, written, design, fonts, laid_out, assets: Files::new(assets.clone()), tops, margin, heard: assets, theme }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -343,6 +356,69 @@ fn hit(scene: &Scene, x: f32, y: f32, deep: bool) -> Option<String> {
     let screen = under.first().is_some_and(|top| top.kind.name() == "frame");
     let at = if deep { under.last() } else if screen { under.get(1).or(under.first()) } else { under.first() };
     at.map(|node| if deep { node.id.clone() } else { node.id.split('/').next().unwrap_or(&node.id).to_string() })
+}
+
+/// What dragging node `id` by (`dx`, `dy`) Canvas units changes in
+/// `scene`: in a parent that lays its children out (and not placed apart
+/// from it), its place among its siblings, by where its middle lands;
+/// else its x and y. None for a node inside an Instance (its Component's
+/// to change) or one not there.
+fn moved(scene: &Scene, id: &str, dx: f32, dy: f32) -> Option<Json> {
+    use zeron_design::model::{Direction, Node};
+    fn parent_of<'a>(nodes: &'a [Node], id: &str) -> Option<Option<&'a Node>> {
+        for node in nodes {
+            if node.id == id {
+                return Some(None);
+            }
+            if let Some(found) = parent_of(node.kind.get().children(), id) {
+                return Some(found.or(Some(node)));
+            }
+        }
+        None
+    }
+    if id.contains('/') {
+        return None;
+    }
+    let node = scene.written.find(id)?;
+    let parent = parent_of(&scene.written.children, id)?;
+    let direction = parent.and_then(|p| p.kind.get().layout()).map(|l| l.layout);
+    match (parent, direction) {
+        (Some(parent), Some(direction @ (Direction::Horizontal | Direction::Vertical))) if !node.absolute => {
+            let middle = |b: Rect| if direction == Direction::Horizontal { b.x + b.width / 2. } else { b.y + b.height / 2. };
+            let at = middle(scene.laid_out.get(id)?.bounds) + if direction == Direction::Horizontal { dx } else { dy };
+            let index = parent
+                .kind
+                .get()
+                .children()
+                .iter()
+                .filter(|sibling| sibling.id != id)
+                .filter(|sibling| scene.laid_out.get(&sibling.id).is_some_and(|p| middle(p.bounds) < at))
+                .count();
+            Some(json!({ "move": id, "parent": parent.id, "index": index }))
+        }
+        _ => Some(json!({ "update": id, "props": { "x": node.x + dx, "y": node.y + dy } })),
+    }
+}
+
+/// Text node `id` of `scene` laid out as drawn with `content` in its
+/// place, and where its box is on the Canvas.
+fn carets_of(scene: &Scene, id: &str, content: &str) -> Option<(zeron_design::skia::Carets, Rect)> {
+    let node = scene.design.find(id)?;
+    let zeron_design::model::Kind::Text(text) = &node.kind else { return None };
+    let at = scene.laid_out.get(id)?.bounds;
+    let mut text = text.clone();
+    text.content = content.to_owned();
+    let typesetter = scene.fonts.typesetter(&scene.design);
+    Some((typesetter.carets(&text, (at.width, at.height)), at))
+}
+
+fn rect_value(r: Rect) -> Value {
+    Value::record([
+        ("x", Value::Num(r.x as f64)),
+        ("y", Value::Num(r.y as f64)),
+        ("w", Value::Num(r.width as f64)),
+        ("h", Value::Num(r.height as f64)),
+    ])
 }
 
 /// How finely tiles are drawn: device pixels a Canvas unit, in
@@ -583,6 +659,10 @@ struct TabCanvas {
     /// The layers list (`design.tree.<tab>`), set as the Design changes,
     /// not with every view.
     tree: Shared,
+    /// The Theme the tab shows its Design in (#33's switcher; agents'
+    /// screenshots keep the Design's first values): an axis each, those
+    /// not chosen at their first value.
+    theme: Theme,
     saving: FileState,
 }
 
@@ -687,6 +767,15 @@ impl TabCanvas {
             // The selection (#32), where each node is.
             let selected: Vec<Value> = self.selection.iter().filter_map(|id| placed(id, Vec::new())).collect();
             fields.push(("selected", Value::List(selected.into())));
+            // The properties panel's: the one node selected, as written.
+            if let [one] = self.selection.as_slice()
+                && let Some(node) = scene.written.find(one)
+                && let Ok(props) = serde_json::to_value(node)
+            {
+                fields.push(("props", crate::plugins::json_value(&props)));
+            }
+            fields.push(("themes", crate::plugins::json_value(&Json::Object(scene.written.themes.clone()))));
+            fields.push(("theme", crate::plugins::json_value(&Json::Object(self.theme.clone()))));
 
         }
         if let Some(why) = &self.failed {
@@ -807,6 +896,11 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         ("design.save", "SaveDesign", true),
         ("design.save_as", "SaveDesignAs", true),
         ("design.discard", "DiscardDesign", true),
+        // The person's edits by hand (#33), and stepping the Design's one
+        // history, whoever's change is latest.
+        ("design.edit", "EditDesign", true),
+        ("design.undo", "UndoDesign", true),
+        ("design.redo", "RedoDesign", true),
     ];
     for (action, method, of_tab) in calls {
         let me = Rc::downgrade(&tabs);
@@ -826,6 +920,46 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
     });
     // Selecting (#32): what a click on the Canvas hits, and the tab's
     // selection, told to the engine for the chat's agent.
+    // Hand edits (#33): what a drag of a node by (`dx`, `dy`) Canvas units
+    // changes, for the script to send (`design.edit`).
+    let me = Rc::downgrade(&tabs);
+    host.function("design.moved", move |arg| {
+        let Some(tabs) = me.upgrade() else { return Value::Nil };
+        let scene = tabs.tabs.borrow().get(&text(&arg, "tab")).and_then(|c| c.scene.clone());
+        scene
+            .and_then(|scene| moved(&scene, &text(&arg, "id"), num(&arg, "dx"), num(&arg, "dy")))
+            .map_or(Value::Nil, |edit| crate::plugins::json_value(&edit))
+    });
+    // Editing text in place: the caret, a range and the place at a point,
+    // in Canvas units, laid out as the text is drawn with `content` (what's
+    // being typed, before the engine has it).
+    let me = Rc::downgrade(&tabs);
+    host.function("design.caret", move |arg| {
+        let Some(tabs) = me.upgrade() else { return Value::Nil };
+        let scene = tabs.tabs.borrow().get(&text(&arg, "tab")).and_then(|c| c.scene.clone());
+        let Some(scene) = scene else { return Value::Nil };
+        let Some((carets, at)) = carets_of(&scene, &text(&arg, "id"), &text(&arg, "content")) else { return Value::Nil };
+        let shift = |r: Rect| rect_value(Rect { x: r.x + at.x, y: r.y + at.y, ..r });
+        let place = |k: &str| arg.field(k).and_then(Value::as_f64).unwrap_or(0.).max(0.) as usize;
+        match arg.field("x").and_then(Value::as_f64) {
+            // A point: the place nearest it.
+            Some(x) => Value::Num(carets.place_at(x as f32 - at.x, num(&arg, "y") - at.y) as f64),
+            None => Value::record([
+                ("caret", shift(carets.caret(place("at")))),
+                ("range", Value::List(carets.range(place("from"), place("to")).into_iter().map(shift).collect::<Vec<_>>().into())),
+            ]),
+        }
+    });
+    let me = Rc::downgrade(&tabs);
+    host.action("design.theme", move |arg| {
+        let Some(tabs) = me.upgrade() else { return };
+        let tab = text(&arg, "tab");
+        let theme = match crate::plugins::value_json(arg.field("theme").unwrap_or(&Value::Nil)) {
+            Json::Object(theme) => theme,
+            _ => Theme::new(),
+        };
+        tabs.show_in(&tab, theme);
+    });
     let me = Rc::downgrade(&tabs);
     host.function("design.hit", move |arg| {
         let Some(tabs) = me.upgrade() else { return Value::Nil };
@@ -893,10 +1027,13 @@ impl DesignTabs {
         }
         let tab = arg.field("tab").map(crate::auth::text).unwrap_or_default();
         let path = self.tabs.borrow().get(&tab).map(|c| c.path.clone()).ok_or("no Design in that tab")?;
-        let mut params = json!({ "path": path });
-        if let Some(to) = arg.field("to") {
-            params["to"] = json!(crate::auth::text(to));
+        // (What else the script gives: Save as's `to`, an edit's `edits`.)
+        let mut params = crate::plugins::value_json(arg);
+        if !params.is_object() {
+            params = json!({});
         }
+        params.as_object_mut().map(|p| p.remove("tab"));
+        params["path"] = json!(path);
         Ok(self.source.ask(method, params))
     }
 
@@ -923,6 +1060,7 @@ impl DesignTabs {
             selection: Vec::new(),
             selection_chat: String::new(),
             tree: self.host.shared(&format!("design.tree.{tab}"), Value::Nil),
+            theme: Theme::new(),
             saving: FileState::default(),
         };
         self.tabs.borrow_mut().insert(tab.to_owned(), canvas);
@@ -1009,7 +1147,7 @@ impl DesignTabs {
                     tree = Some((canvas.tree.clone(), Value::List(layers_of(&design).into())));
                     canvas.saving = saving;
                     self.versions.set(self.versions.get() + 1);
-                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, assets));
+                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, assets, canvas.theme.clone()));
                     canvas.flashes.retain(|f| f.at.elapsed() < FLASH_STALE);
                     if !flash.is_empty() {
                         canvas.flashes.push(Flash { version: scene.version, ids: flash, at: std::time::Instant::now() });
@@ -1041,6 +1179,37 @@ impl DesignTabs {
         }
         if let Some((shared, list)) = tree {
             shared.set(list);
+        }
+        self.update(tab);
+    }
+
+    /// `tab`'s Design shown in `theme` (the switcher's): drawn again from
+    /// what it last heard, every tile.
+    fn show_in(&self, tab: &str, theme: Theme) {
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(canvas) = tabs.get_mut(tab) else { return };
+            if canvas.theme == theme {
+                return;
+            }
+            canvas.theme = theme.clone();
+            let Some(old) = canvas.scene.clone() else { return };
+            self.versions.set(self.versions.get() + 1);
+            let scene = Arc::new(Scene::new(self.versions.get(), old.written.clone(), old.fonts.clone(), old.heard.clone(), theme));
+            let front = canvas.front;
+            let mut gone = Vec::new();
+            for (key, tile) in &mut canvas.tiles {
+                if Some(key.level) == front {
+                    tile.wanted = scene.version;
+                } else {
+                    gone.push(*key);
+                }
+            }
+            for key in gone {
+                canvas.tiles.remove(&key);
+                self.host.image(&key.image_name(tab), None);
+            }
+            canvas.scene = Some(scene);
         }
         self.update(tab);
     }
