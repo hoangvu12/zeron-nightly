@@ -1,18 +1,19 @@
-//! Assets: what a Design draws with beyond its own file, as icons and
-//! images are (and fonts will be). The engine resolves them, fetching, caching
+//! Assets: what a Design draws with beyond its own file, as icons, fonts
+//! and images are. The engine resolves them, fetching, caching
 //! and checking each ([`Cache`]); it tells the window which a Design uses
 //! and the file holding each ([`Resolved`]), and the window reads only
 //! those files, never the network ([`Files`]). A painter asks either for an
 //! asset's bytes through [`Assets`], so a Design tab draws what an agent's
 //! screenshot does. An image in the Design's folder is found through the
-//! Design's own view of the cache ([`Beside`]).
+//! Design's view of the cache ([`Beside`]) where no folder is given.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fonts::{FontFile, FontSource, Fonts};
 use crate::icons::{IconSource, Icons};
 use crate::images::{self, ImageSource, Images};
 use crate::model::{Design, ImageFill};
@@ -24,6 +25,9 @@ use crate::model::{Design, ImageFill};
 pub enum AssetKind {
     /// An Iconify icon's SVG, named `set:name` (its weight's variant).
     Icon,
+    /// A font file, named `family@weight` as text asks for it, or
+    /// `family@file` for one of a family beside the Design.
+    Font,
     /// An image fill's file, named by its url as written: a path relative
     /// to the Design's folder, or an http(s) URL.
     Image,
@@ -45,9 +49,34 @@ impl AssetKey {
         Self { kind: AssetKind::Image, name: url.into() }
     }
 
-    /// An image in the Design's folder, which only [`Beside`] finds.
+    /// An image in the Design's folder, rather than downloaded.
     fn is_beside(&self) -> bool {
         self.kind == AssetKind::Image && !ImageFill::is_remote(&self.name)
+    }
+
+    /// `family` at `weight` (100 to 900).
+    pub fn font(family: &str, weight: u16) -> Self {
+        Self { kind: AssetKind::Font, name: format!("{family}@{weight}") }
+    }
+
+    /// A font's family and what follows it (its weight, or its file):
+    /// split at the first `@`, which no family name holds.
+    fn font_parts(&self) -> Option<(&str, &str)> {
+        (self.kind == AssetKind::Font).then(|| self.name.split_once('@')).flatten()
+    }
+
+    /// A font's family and weight, as text asks for it.
+    fn font_weight(&self) -> Option<(&str, u16)> {
+        let (family, weight) = self.font_parts()?;
+        Some((family, weight.parse().ok()?))
+    }
+}
+
+impl Resolved {
+    /// The font file this is, for [`Fonts::of_files`].
+    pub fn font_file(&self) -> Option<FontFile> {
+        let (family, _) = self.key.font_parts()?;
+        Some(FontFile { family: family.to_owned(), path: self.path.clone() })
     }
 }
 
@@ -87,21 +116,23 @@ pub fn used(design: &Design) -> BTreeSet<AssetKey> {
 /// The engine's assets: fetched on first use and cached on this computer,
 /// in a folder per kind.
 pub struct Cache {
+    dir: PathBuf,
     icons: Icons,
+    fonts: RwLock<Fonts>,
     images: Images,
 }
 
 impl Cache {
-    /// Assets cached in `dir`, icons fetched from `icons`; images aren't
-    /// downloaded until [`with_images`](Self::with_images).
+    /// Assets cached in `dir`, icons fetched from `icons`; fonts and images
+    /// only from the cache until given a source ([`Cache::set_font_source`],
+    /// [`Cache::set_image_source`]).
     pub fn new(dir: &Path, icons: Arc<dyn IconSource>) -> Self {
-        Self { icons: Icons::new(dir.join("icons"), icons), images: Images::new(dir.join("images")) }
-    }
-
-    /// Images downloaded from `images`.
-    pub fn with_images(self, images: Arc<dyn ImageSource>) -> Self {
-        self.images.set_source(images);
-        self
+        Self {
+            dir: dir.to_owned(),
+            icons: Icons::new(dir.join("icons"), icons),
+            fonts: RwLock::new(Fonts::new(Some(dir.join("fonts")), None)),
+            images: Images::new(dir.join("images")),
+        }
     }
 
     pub fn icons(&self) -> &Icons {
@@ -112,20 +143,47 @@ impl Cache {
         &self.images
     }
 
-    /// The assets of a Design in `folder`: this cache's, and the images
-    /// beside it.
-    pub fn beside(self: &Arc<Self>, folder: impl Into<PathBuf>) -> Beside {
-        Beside { cache: self.clone(), folder: folder.into() }
+    /// Downloads images the cache hasn't got from `source` from now on.
+    pub fn set_image_source(&self, source: Arc<dyn ImageSource>) {
+        self.images.set_source(source);
     }
 
-    /// Fetches what `design` uses that isn't cached (a Design read from a
-    /// file made on another computer). One that can't be fetched draws
-    /// nothing, and isn't asked for again for a while.
-    pub fn fetch(&self, design: &Design) {
+    /// The assets of a Design in `folder`, for drawing it: this cache's,
+    /// and the images beside it.
+    pub fn beside(self: &Arc<Self>, folder: &Path) -> Beside {
+        Beside { cache: self.clone(), folder: folder.to_owned() }
+    }
+
+    /// This computer's fonts.
+    pub fn fonts(&self) -> Fonts {
+        self.fonts.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Fetches fonts the cache hasn't got from `source` from now on.
+    pub fn set_font_source(&self, source: Box<dyn FontSource>) {
+        self.set_fonts(Fonts::new(Some(self.dir.join("fonts")), Some(source)));
+    }
+
+    /// Sets text in `fonts` from now on, cache and all (for tests).
+    pub fn set_fonts(&self, fonts: Fonts) {
+        *self.fonts.write().unwrap_or_else(|e| e.into_inner()) = fonts;
+    }
+
+    /// Fetches what `design` (beside it, in `folder`) uses that isn't
+    /// cached (a Design read from a file made on another computer). One
+    /// that can't be fetched draws nothing, and isn't asked for again for a
+    /// while; a font family beside the Design isn't fetched.
+    pub fn fetch(&self, design: &Design, folder: Option<&Path>) {
+        let fonts = self.fonts_beside(folder);
         for key in used(design) {
             match key.kind {
                 AssetKind::Icon => {
                     let _ = self.icons.load(&key.name);
+                }
+                AssetKind::Font => {
+                    if let Some((family, weight)) = key.font_weight() {
+                        fonts.fetch(family, weight);
+                    }
                 }
                 AssetKind::Image if !key.is_beside() => {
                     let _ = self.images.load(&key.name);
@@ -135,28 +193,74 @@ impl Cache {
         }
     }
 
-    /// Each asset `design` uses that's cached, and its file; one that isn't
-    /// is left out, and draws nothing. Never fetches.
-    pub fn resolved(&self, design: &Design) -> Vec<Resolved> {
-        used(design)
+    /// Each asset `design` (beside it, in `folder`) uses that's cached, and
+    /// its file; one that isn't is left out, and draws nothing (text in
+    /// Geist). A family beside the Design is each of its files. Never
+    /// fetches.
+    pub fn resolved(&self, design: &Design, folder: Option<&Path>) -> Vec<Resolved> {
+        let fonts = self.fonts_beside(folder);
+        let mut resolved: Vec<Resolved> = used(design)
             .into_iter()
-            .filter_map(|key| {
-                let path = match key.kind {
-                    AssetKind::Icon => self.icons.file_of(&key.name).ok()?,
-                    AssetKind::Image if !key.is_beside() => self.images.file_of(&key.name),
-                    AssetKind::Image => return None,
-                };
-                path.is_file().then_some(Resolved { key, path })
+            .flat_map(|key| match key.kind {
+                AssetKind::Icon => self
+                    .icons
+                    .file_of(&key.name)
+                    .ok()
+                    .filter(|path| path.is_file())
+                    .map(|path| Resolved { key, path })
+                    .into_iter()
+                    .collect(),
+                AssetKind::Font => {
+                    let Some((family, weight)) = key.font_weight() else {
+                        return Vec::new();
+                    };
+                    fonts
+                        .found(family, weight)
+                        .into_iter()
+                        .map(|path| {
+                            let file = path.file_stem().unwrap_or_default().to_string_lossy();
+                            let key = AssetKey { kind: AssetKind::Font, name: format!("{family}@{file}") };
+                            Resolved { key, path }
+                        })
+                        .collect::<Vec<_>>()
+                }
+                AssetKind::Image => {
+                    let path = match folder {
+                        _ if !key.is_beside() => self.images.file_of(&key.name),
+                        Some(folder) => folder.join(key.name.replace('\\', "/")),
+                        None => return Vec::new(),
+                    };
+                    path.is_file().then_some(Resolved { key, path }).into_iter().collect()
+                }
             })
-            .collect()
+            .collect();
+        // (A family beside the Design is all of its files for each weight
+        // asked for: each once.)
+        let mut seen = BTreeSet::new();
+        resolved.retain(|resolved| seen.insert(resolved.key.clone()));
+        resolved
+    }
+
+    /// This computer's fonts, and those beside the Design in `folder`.
+    fn fonts_beside(&self, folder: Option<&Path>) -> Fonts {
+        match folder {
+            Some(folder) => self.fonts().beside(folder),
+            None => self.fonts(),
+        }
     }
 }
 
-/// What's cached only: drawing never fetches.
+/// What's cached only: drawing never fetches. (A font beside a Design,
+/// named by its file, isn't among them: text gets it from [`Fonts`].)
 impl Assets for Cache {
     fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
         match key.kind {
             AssetKind::Icon => self.icons.cached(&key.name).map(Arc::from),
+            AssetKind::Font => {
+                let (family, weight) = key.font_weight()?;
+                let path = self.fonts().found(family, weight).into_iter().next()?;
+                std::fs::read(path).ok().map(Arc::from)
+            }
             AssetKind::Image if !key.is_beside() => std::fs::read(self.images.file_of(&key.name)).ok().map(Arc::from),
             AssetKind::Image => None,
         }
@@ -170,28 +274,6 @@ pub struct Beside {
 }
 
 impl Beside {
-    pub fn cache(&self) -> &Arc<Cache> {
-        &self.cache
-    }
-
-    /// Fetches what `design` uses that isn't cached ([`Cache::fetch`]).
-    pub fn fetch(&self, design: &Design) {
-        self.cache.fetch(design);
-    }
-
-    /// Each asset `design` uses that's here, and its file
-    /// ([`Cache::resolved`]), with the images in its folder. Never fetches.
-    pub fn resolved(&self, design: &Design) -> Vec<Resolved> {
-        let mut resolved = self.cache.resolved(design);
-        for key in used(design).into_iter().filter(AssetKey::is_beside) {
-            let path = self.folder.join(key.name.replace('\\', "/"));
-            if path.is_file() {
-                resolved.push(Resolved { key, path });
-            }
-        }
-        resolved
-    }
-
     /// The file of the image at `url`, downloaded now if it's a URL not
     /// cached yet, or why it can't be drawn.
     pub fn image(&self, url: &str) -> Result<PathBuf, String> {

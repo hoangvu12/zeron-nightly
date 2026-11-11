@@ -13792,6 +13792,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "sha2",
  "skia-safe",
  "thiserror 2.0.20",
  "tracing",

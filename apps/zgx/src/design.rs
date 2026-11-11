@@ -63,13 +63,13 @@ pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
 
 /// A Design as it is now, and the nodes agents' changes to it made or
 /// changed since the tab last heard (none for anyone else's), which flash.
-/// And the files of the assets it uses (its icons and images) on this
-/// computer, as the engine found (and fetched) them: tiles draw them from
-/// those files only, and never fetch.
+/// And the files of the assets it uses (its icons, fonts and images) in
+/// the engine's cache, or beside the Design: tiles draw them from those
+/// files only, and never fetch.
 pub struct Heard {
     pub design: Design,
     pub flash: Vec<String>,
-    /// What its text draws in: the font files the engine says it uses.
+    /// What its text draws in: the font files among its assets.
     pub fonts: Fonts,
     pub assets: Vec<Resolved>,
 }
@@ -100,13 +100,13 @@ pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
             flash.push(id);
         }
     }
-    let files: Vec<FontFile> = serde_json::from_value(item["fonts"].clone()).unwrap_or_default();
+    // (An asset not named draws nothing, or an image's placeholder, as the
+    // engine does with one it couldn't fetch.)
+    let assets: Vec<Resolved> = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
+    let files: Vec<FontFile> = assets.iter().filter_map(Resolved::font_file).collect();
     if !fonts.is_of(&files) {
         *fonts = Fonts::of_files(&files);
     }
-    // (An asset not named draws nothing, or an image's placeholder, as the
-    // engine does with one it couldn't fetch.)
-    let assets = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
     Ok(Heard { design, flash, fonts: fonts.clone(), assets })
 }
 

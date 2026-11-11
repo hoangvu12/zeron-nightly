@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use zeron_design::Design;
 use zeron_design::assets::Resolved;
-use zeron_design::fonts::{FontFile, Fonts};
+use zeron_design::fonts::Fonts;
 use zgx::input::InputEvent;
 use zgx_script::{ScriptHost, testing::TestApp};
 
@@ -79,15 +79,12 @@ fn many_screens() -> Design {
     design(serde_json::json!({ "version": "1.0", "children": screens }))
 }
 
-/// The engine, stood in for: Designs by path (with the font files they
-/// use), and who follows each.
+/// The engine, stood in for: Designs by path, and who follows each.
 #[derive(Default)]
 struct StandIn {
     designs: RefCell<HashMap<String, Design>>,
-    /// The font files its Designs use, as the engine would say them.
-    fonts: RefCell<Vec<FontFile>>,
-    /// The files of the assets its Designs use (icons, images), as the
-    /// engine would say them.
+    /// The files of the assets its Designs use (icons, fonts, images), as
+    /// the engine would say them.
     assets: RefCell<Vec<Resolved>>,
     following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
     /// What each chat's Design tabs were said to be, in order.
@@ -113,7 +110,6 @@ impl StandIn {
         let item = serde_json::json!({
             "design": design,
             "changes": [{ "changed": changed, "by": by }],
-            "fonts": *self.fonts.borrow(),
             "assets": *self.assets.borrow(),
         });
         let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
@@ -130,8 +126,9 @@ impl Source for Engine {
         let listener = Rc::new(RefCell::new(listener));
         self.0.following.borrow_mut().push((path.into(), Rc::downgrade(&listener)));
         let now = self.0.designs.borrow().get(path).cloned();
-        let fonts = Fonts::of_files(&self.0.fonts.borrow());
-        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts, assets: self.0.assets.borrow().clone() }).ok_or_else(|| format!("can't open {path}")));
+        let assets = self.0.assets.borrow().clone();
+        let fonts = Fonts::of_files(&assets.iter().filter_map(Resolved::font_file).collect::<Vec<_>>());
+        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts, assets }).ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
     }
 
@@ -148,24 +145,12 @@ struct Tab {
 
 /// The fixture's Design tab on `design`, every tile in view drawn.
 fn mount(design: Design) -> Tab {
-    mount_on(design, Vec::new(), Vec::new())
-}
-
-/// The fixture's Design tab on `design` using the font files `fonts`.
-fn mount_with_fonts(design: Design, fonts: Vec<FontFile>) -> Tab {
-    mount_on(design, fonts, Vec::new())
+    mount_with(design, Vec::new())
 }
 
 /// As [`mount`], the engine naming the files of the Design's assets.
 fn mount_with(design: Design, assets: Vec<Resolved>) -> Tab {
-    mount_on(design, Vec::new(), assets)
-}
-
-/// The fixture's Design tab on `design`, the engine naming the files of
-/// its fonts and other assets.
-fn mount_on(design: Design, fonts: Vec<FontFile>, assets: Vec<Resolved>) -> Tab {
     let engine = Rc::new(StandIn::default());
-    *engine.fonts.borrow_mut() = fonts;
     *engine.assets.borrow_mut() = assets;
     engine.say(PATH, design);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/design_fixture.luau");
@@ -610,11 +595,11 @@ fn text_draws_in_tiles_as_it_does_whole_in_the_fonts_the_engine_names() {
               "fontSize": 18, "lineHeight": 1.6, "textAlign": "center", "fill": "#EF4444" },
         ] },
     ] }));
-    let serif = FontFile {
-        family: "Instrument Serif".into(),
+    let serif = Resolved {
+        key: zeron_design::assets::AssetKey::font("Instrument Serif", 400),
         path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/InstrumentSerif-Regular.ttf"),
     };
-    let tab = mount_with_fonts(design.clone(), vec![serif.clone()]);
+    let tab = mount_with(design.clone(), vec![serif.clone()]);
     assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
     let tiles: HashMap<(i32, i32), std::sync::Arc<zgx::image::ImageData>> = tab
         .canvas
@@ -639,7 +624,7 @@ fn text_draws_in_tiles_as_it_does_whole_in_the_fonts_the_engine_names() {
         let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
         zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::assets::NoAssets).expect("drawn")
     };
-    let one = whole(&Fonts::of_files(&[serif]));
+    let one = whole(&Fonts::of_files(&[serif.font_file().expect("a font")]));
     // As the engine draws it, fetching the font itself (from the same
     // files, standing in for Google Fonts).
     let fixture = zeron_design::fonts::FontFolder::new(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts"));
