@@ -4,6 +4,7 @@
 mod icons;
 mod kept;
 mod layout;
+mod looks;
 mod reading;
 mod seam;
 mod shapes;

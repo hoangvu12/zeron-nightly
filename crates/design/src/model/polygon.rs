@@ -1,9 +1,7 @@
-use std::f32::consts::{FRAC_PI_2, TAU};
-
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, NodeKind, Size, Sizing};
-use crate::render::{Painter, Shape};
+use super::{Effects, Fill, NodeKind, Size, Sizing, Stroke};
+use crate::render::{Look, Outline, Rect};
 
 /// The fewest and most sides a polygon draws with.
 const SIDES: std::ops::RangeInclusive<u32> = 3..=64;
@@ -17,6 +15,10 @@ pub struct Polygon {
     pub size: Size,
     #[serde(flatten)]
     pub fill: Fill,
+    #[serde(flatten)]
+    pub stroke: Stroke,
+    #[serde(flatten)]
+    pub effects: Effects,
     #[serde(default = "triangle")]
     pub polygon_count: u32,
 }
@@ -26,6 +28,8 @@ impl Default for Polygon {
         Self {
             size: Size::default(),
             fill: Fill::default(),
+            stroke: Stroke::default(),
+            effects: Effects::default(),
             polygon_count: triangle(),
         }
     }
@@ -47,30 +51,6 @@ impl Polygon {
             )
         })
     }
-
-    /// Its corners in a box of this size, clockwise from the top.
-    pub fn corners(&self, (width, height): (f32, f32)) -> Vec<(f32, f32)> {
-        let sides = self.polygon_count.clamp(*SIDES.start(), *SIDES.end());
-        let unit: Vec<(f32, f32)> = (0..sides)
-            .map(|i| {
-                let angle = i as f32 * TAU / sides as f32 - FRAC_PI_2;
-                (angle.cos(), angle.sin())
-            })
-            .collect();
-        // The corners' own bounds, mapped onto the box.
-        let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for &(x, y) in &unit {
-            (left, top, right, bottom) = (left.min(x), top.min(y), right.max(x), bottom.max(y));
-        }
-        unit.into_iter()
-            .map(|(x, y)| {
-                (
-                    (x - left) / (right - left) * width,
-                    (y - top) / (bottom - top) * height,
-                )
-            })
-            .collect()
-    }
 }
 
 impl NodeKind for Polygon {
@@ -78,7 +58,15 @@ impl NodeKind for Polygon {
         self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
-        painter.fill_shape(Shape::Polygon(&self.corners(size)), &self.fill.fill);
+    fn look(&self, size: (f32, f32)) -> Option<Look<'_>> {
+        Some(Look {
+            outline: Outline::Polygon {
+                rect: Rect::sized(size),
+                sides: self.polygon_count,
+            },
+            fill: &self.fill.fill,
+            stroke: self.stroke.stroke.as_ref(),
+            effects: &self.effects,
+        })
     }
 }

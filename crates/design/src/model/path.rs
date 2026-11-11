@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Fill, NodeKind, Size, Sizing};
-use crate::render::{Painter, Rect, Shape};
+use super::{Effects, Fill, NodeKind, Size, Sizing, Stroke};
+use crate::render::{Look, Outline, Rect};
 
 /// SVG path data (`geometry`) whose `viewBox` is stretched onto its box;
 /// without one, the geometry's own bounds are.
@@ -12,6 +12,10 @@ pub struct Path {
     pub size: Size,
     #[serde(flatten)]
     pub fill: Fill,
+    #[serde(flatten)]
+    pub stroke: Stroke,
+    #[serde(flatten)]
+    pub effects: Effects,
     #[serde(default)]
     pub geometry: String,
     /// `[x, y, width, height]`, as an SVG's `viewBox`.
@@ -59,13 +63,17 @@ impl NodeKind for Path {
         self.size.or(Sizing::Fixed(0.))
     }
 
-    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter) {
-        let shape = Shape::Path {
-            geometry: &self.geometry,
-            view_box: self.view_box.map(|[x, y, width, height]| Rect { x, y, width, height }),
-            rect: Rect::sized(size),
-            fill_rule: self.fill_rule,
-        };
-        painter.fill_shape(shape, &self.fill.fill);
+    fn look(&self, size: (f32, f32)) -> Option<Look<'_>> {
+        Some(Look {
+            outline: Outline::Path {
+                rect: Rect::sized(size),
+                geometry: &self.geometry,
+                view_box: self.view_box.map(|[x, y, width, height]| Rect { x, y, width, height }),
+                fill_rule: self.fill_rule,
+            },
+            fill: &self.fill.fill,
+            stroke: self.stroke.stroke.as_ref(),
+            effects: &self.effects,
+        })
     }
 }

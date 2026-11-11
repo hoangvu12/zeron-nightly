@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Color, Fill, NodeKind, Paint, Size, Sizing};
+use super::{Color, Fill, NodeKind, PaintKind, Size, Sizing};
 use crate::render::{Painter, Rect};
 
 /// An Iconify icon (`icon`, as `set:name`) drawn into its box in its fill's
@@ -19,13 +19,19 @@ pub struct Icon {
 }
 
 impl Icon {
-    /// The colour it draws in: its first solid fill, or black.
+    /// The colour it draws in: its first solid fill drawn, at that fill's
+    /// opacity, or black.
     pub fn color(&self) -> Color {
         self.fill
             .fill
-            .first()
-            .map(|paint| match *paint {
-                Paint::Solid(color) => color,
+            .iter()
+            .filter(|paint| paint.enabled)
+            .find_map(|paint| match paint.kind {
+                PaintKind::Solid(color) => Some(Color {
+                    a: (f32::from(color.a) * paint.opacity.clamp(0., 1.)).round() as u8,
+                    ..color
+                }),
+                _ => None,
             })
             .unwrap_or(Color { r: 0, g: 0, b: 0, a: 255 })
     }

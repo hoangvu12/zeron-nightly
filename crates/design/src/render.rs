@@ -5,7 +5,7 @@
 
 use crate::icons::Icons;
 use crate::layout::LaidOut;
-use crate::model::{Color, Design, FillRule, Node, Paint};
+use crate::model::{Color, Design, EffectKind, Effects, FillRule, Node, Paint, Shadow, StrokeStyle};
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -25,40 +25,66 @@ impl Rect {
     }
 }
 
-/// An outline other than a rectangle, as the shape node types describe it.
+/// The shape a node's fills, stroke and effects follow.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Shape<'a> {
+pub enum Outline<'a> {
+    /// A rectangle with a radius per corner: top left, top right, bottom
+    /// right, bottom left.
+    Rounded { rect: Rect, radii: [f32; 4] },
     /// The ellipse filling `rect`, or the part of it from `start` through
     /// `sweep` degrees (0 at 3 o'clock, clockwise), less a hole of `inner`
     /// times its radii.
     Ellipse { rect: Rect, start: f32, sweep: f32, inner: f32 },
-    /// The polygon through these corners.
-    Polygon(&'a [(f32, f32)]),
+    /// The regular polygon of `sides` filling `rect` ([`polygon`]).
+    Polygon { rect: Rect, sides: u32 },
     /// SVG path data whose `view_box` (or, without one, its own bounds) is
     /// stretched onto `rect`.
     Path {
+        rect: Rect,
         geometry: &'a str,
         view_box: Option<Rect>,
-        rect: Rect,
         fill_rule: FillRule,
     },
 }
 
-/// What node types draw with. Calls stack as on a canvas: `save` and
-/// `restore` bracket a `translate`, `scale` or `clip_rect`.
-pub trait Painter {
-    fn save(&mut self);
-    fn restore(&mut self);
-    fn translate(&mut self, x: f32, y: f32);
-    fn scale(&mut self, factor: f32);
-    fn clip_rect(&mut self, rect: Rect);
-    /// Fills `rect` with each paint in turn.
-    fn fill_rect(&mut self, rect: Rect, paints: &[Paint]);
-    /// Fills `shape` with each paint in turn.
-    fn fill_shape(&mut self, shape: Shape<'_>, paints: &[Paint]);
-    /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
-    /// the painter has no icons or not that one.
-    fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
+impl Outline<'_> {
+    pub fn rounded(rect: Rect, radii: [f32; 4]) -> Self {
+        Outline::Rounded { rect, radii }
+    }
+
+    pub fn bounds(&self) -> Rect {
+        match *self {
+            Outline::Rounded { rect, .. }
+            | Outline::Ellipse { rect, .. }
+            | Outline::Polygon { rect, .. }
+            | Outline::Path { rect, .. } => rect,
+        }
+    }
+}
+
+/// The corners of a regular polygon of `sides` (3 to 64), one at the top,
+/// clockwise, stretched to fill `rect`.
+pub fn polygon(rect: Rect, sides: u32) -> Vec<(f32, f32)> {
+    let sides = sides.clamp(3, 64);
+    let unit: Vec<(f32, f32)> = (0..sides)
+        .map(|i| {
+            let angle = i as f32 * std::f32::consts::TAU / sides as f32 - std::f32::consts::FRAC_PI_2;
+            (angle.cos(), angle.sin())
+        })
+        .collect();
+    // The corners' own bounds, mapped onto the rectangle.
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in &unit {
+        (left, top, right, bottom) = (left.min(x), top.min(y), right.max(x), bottom.max(y));
+    }
+    unit.into_iter()
+        .map(|(x, y)| {
+            (
+                rect.x + (x - left) / (right - left) * rect.width,
+                rect.y + (y - top) / (bottom - top) * rect.height,
+            )
+        })
+        .collect()
 }
 
 /// Whether `geometry` is SVG path data that draws something, as the
@@ -67,33 +93,143 @@ pub fn is_path_data(geometry: &str) -> bool {
     crate::skia::svg_path(geometry).is_some_and(|path| !path.is_empty())
 }
 
+/// How a node type is drawn from its properties ([`NodeKind::look`]).
+///
+/// [`NodeKind::look`]: crate::model::NodeKind::look
+pub struct Look<'a> {
+    pub outline: Outline<'a>,
+    pub fill: &'a [Paint],
+    pub stroke: Option<&'a StrokeStyle>,
+    pub effects: &'a Effects,
+}
+
+/// What node types draw with. Calls stack as on a canvas: `save` and
+/// `restore` bracket a `translate`, `scale`, `rotate`, `flip` or clip, and
+/// `restore` ends a `save_layer`.
+pub trait Painter {
+    fn save(&mut self);
+    fn restore(&mut self);
+    fn translate(&mut self, x: f32, y: f32);
+    fn scale(&mut self, factor: f32);
+    /// Turns what follows by `degrees` clockwise about the origin.
+    fn rotate(&mut self, degrees: f32);
+    /// Mirrors what follows across the origin's vertical axis
+    /// (`horizontal`) and its horizontal one (`vertical`).
+    fn flip(&mut self, horizontal: bool, vertical: bool);
+    /// Draws what follows, up to its `restore`, as one layer composited
+    /// at `opacity` and blurred by `blur` (a radius).
+    fn save_layer(&mut self, opacity: f32, blur: f32);
+    fn clip_rect(&mut self, rect: Rect);
+    fn clip(&mut self, outline: &Outline);
+    /// Fills `outline` with each paint in turn, gradients laid over its
+    /// bounds.
+    fn fill(&mut self, outline: &Outline, paints: &[Paint]);
+    /// Fills `rect` with each paint in turn.
+    fn fill_rect(&mut self, rect: Rect, paints: &[Paint]) {
+        self.fill(&Outline::rounded(rect, [0.; 4]), paints);
+    }
+    fn stroke(&mut self, outline: &Outline, stroke: &StrokeStyle);
+    /// A drop shadow behind `outline`, or an inner one within it.
+    fn shadow(&mut self, outline: &Outline, shadow: &Shadow);
+    /// Blurs what's already drawn within `outline` by `radius`.
+    fn background_blur(&mut self, outline: &Outline, radius: f32);
+    /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
+    /// the painter has no icons or not that one.
+    fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
+}
+
 /// Draws `node` and its descendants where `laid_out` puts them, with its
-/// top-left at the painter's origin wherever it sits in its parent.
+/// top-left at the painter's origin wherever it sits in its parent, turned
+/// and flipped as it is.
 pub fn paint_node(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter) {
+    let Some(placed) = laid_out.get(&node.id) else {
+        return;
+    };
+    let turned = node.rotation != 0. || node.flip_x || node.flip_y;
+    if turned {
+        painter.save();
+        painter.rotate(-node.rotation);
+        if node.flip_x || node.flip_y {
+            let (width, height) = (placed.bounds.width, placed.bounds.height);
+            painter.translate(width / 2., height / 2.);
+            painter.flip(node.flip_x, node.flip_y);
+            painter.translate(-width / 2., -height / 2.);
+        }
+    }
+    paint_upright(node, laid_out, painter);
+    if turned {
+        painter.restore();
+    }
+}
+
+/// Draws `node` and its descendants as [`paint_node`] does, without the
+/// node's own rotation and flip: a node seen on its own.
+pub fn paint_upright(node: &Node, laid_out: &LaidOut, painter: &mut dyn Painter) {
     let Some(placed) = laid_out.get(&node.id) else {
         return;
     };
     let bounds = placed.bounds;
     let size = (bounds.width, bounds.height);
     let kind = node.kind.get();
-    kind.paint(size, painter);
-    if kind.children().is_empty() {
-        return;
+    let look = kind.look(size);
+    if let Some(look) = &look {
+        // Before any layer of the node's own, which would hide what's
+        // behind it from the blur.
+        for effect in look.effects.enabled() {
+            if let EffectKind::BackgroundBlur(radius) = effect {
+                painter.background_blur(&look.outline, *radius);
+            }
+        }
     }
-    painter.save();
-    if kind.clips() {
-        painter.clip_rect(Rect::sized(size));
+    let blur = look.as_ref().map_or(0., |look| look.effects.layer_blur());
+    let layered = node.opacity < 1. || blur > 0.;
+    if layered {
+        painter.save_layer(node.opacity, blur);
     }
-    for child in kind.children() {
-        let Some(at) = laid_out.get(&child.id) else {
-            continue;
+    if let Some(look) = &look {
+        let shadows = |inner: bool| {
+            look.effects.enabled().filter_map(move |effect| match effect {
+                EffectKind::Shadow(shadow) if shadow.inner == inner => Some(shadow),
+                _ => None,
+            })
         };
+        for shadow in shadows(false) {
+            painter.shadow(&look.outline, shadow);
+        }
+        painter.fill(&look.outline, look.fill);
+        for shadow in shadows(true) {
+            painter.shadow(&look.outline, shadow);
+        }
+    }
+    kind.paint(size, painter);
+    if !kind.children().is_empty() {
         painter.save();
-        painter.translate(at.bounds.x - bounds.x, at.bounds.y - bounds.y);
-        paint_node(child, laid_out, painter);
+        if kind.clips() {
+            match &look {
+                Some(look) => painter.clip(&look.outline),
+                None => painter.clip_rect(Rect::sized(size)),
+            }
+        }
+        for child in kind.children() {
+            let Some(at) = laid_out.get(&child.id) else {
+                continue;
+            };
+            painter.save();
+            painter.translate(at.bounds.x - bounds.x, at.bounds.y - bounds.y);
+            paint_node(child, laid_out, painter);
+            painter.restore();
+        }
         painter.restore();
     }
-    painter.restore();
+    // Over the children, as a Frame's border is.
+    if let Some(look) = &look
+        && let Some(stroke) = look.stroke
+    {
+        painter.stroke(&look.outline, stroke);
+    }
+    if layered {
+        painter.restore();
+    }
 }
 
 /// A node drawn on its own at 1x, scaled down to fit `max_side`, as PNG.
@@ -142,7 +278,7 @@ pub fn screenshot(
     {
         let mut painter = crate::skia::SkiaPainter::new(surface.canvas()).with_icons(icons);
         painter.scale(scale);
-        paint_node(node, &laid_out, &mut painter);
+        paint_upright(node, &laid_out, &mut painter);
     }
     let png = crate::skia::png(&mut surface).ok_or_else(failed)?;
     Ok(Screenshot {

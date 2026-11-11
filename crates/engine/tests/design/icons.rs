@@ -47,6 +47,32 @@ async fn an_icon_draws_at_its_size_in_its_colour() {
 }
 
 #[tokio::test]
+async fn icons_turn_fade_and_clip_as_any_node_does() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Turned",
+            r##"const board = Insert({ type: "frame", width: 220, height: 100 });
+// Cut off at the frame's bottom, halfway down the icon.
+const half = Insert(board, { type: "frame", width: 48, height: 24, clip: true });
+Insert(half, { type: "icon", icon: "mdi:square", width: 48, height: 48, fill: "#EF4444" });
+Insert(board, { type: "icon", icon: "mdi:square", x: 60, width: 48, height: 48, fill: "#EF4444", opacity: 0.5 });
+// A level line, turned upright about its top-left corner.
+Insert(board, { type: "icon", icon: "lucide:minus", x: 150, y: 60, width: 48, height: 48, fill: "#EF4444", rotation: 90 });
+TakeScreenshot(board);"##,
+        )
+        .await;
+    let image = &made.images[0];
+    assert_eq!(image.rgba(24, 20), RED);
+    assert_eq!(image.rgba(24, 30)[3], 0);
+    let [r, g, b, a] = image.rgba(84, 24);
+    assert!((r, g, b) == (239, 68, 68) && (120..=136).contains(&a), "{:?}", [r, g, b, a]);
+    assert_eq!(image.rgba(174, 36), RED);
+    assert_eq!((image.rgba(160, 36)[3], image.rgba(174, 84)[3]), (0, 0));
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn icons_are_fetched_once_and_cached_on_the_computer() {
     let seam = Seam::new().await;
     let made = seam

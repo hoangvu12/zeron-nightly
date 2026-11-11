@@ -192,6 +192,32 @@ async fn paths_honour_their_fill_rule() {
 }
 
 #[tokio::test]
+async fn shapes_take_strokes_and_effects() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Looks",
+            r##"const board = Insert({ type: "frame", width: 240, height: 120 });
+Insert(board, { type: "ellipse", width: 100, height: 100,
+  stroke: { fill: "#000000", thickness: 10, align: "inside" } });
+Insert(board, { type: "ellipse", x: 120, width: 100, height: 100, fill: "#EF4444",
+  effect: { type: "shadow", color: "#000000", offset: { x: 10, y: 10 }, blur: 0 } });
+TakeScreenshot(board);"##,
+        )
+        .await;
+    let image = &made.images[0];
+    // A ring of stroke inside the first ellipse's edge, nothing within it.
+    assert_eq!(image.rgba(50, 4), [0, 0, 0, 255]);
+    assert_eq!(image.rgba(4, 50), [0, 0, 0, 255]);
+    assert!(clear(image, 50, 50) && clear(image, 50, 16) && clear(image, 3, 3));
+    // The second ellipse, and its shadow following its shape, not its box.
+    assert_eq!(image.rgba(170, 50), RED);
+    assert_eq!(image.rgba(225, 60), [0, 0, 0, 255]);
+    assert!(clear(image, 228, 18), "{:?}", image.rgba(228, 18));
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_path_that_isnt_path_data_is_refused() {
     let seam = Seam::new().await;
     for (node, says) in [
