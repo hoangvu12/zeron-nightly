@@ -12,6 +12,7 @@ mod reading;
 mod saving;
 mod seam;
 mod shapes;
+mod system;
 mod targeting;
 mod text;
 mod tracer;

@@ -186,6 +186,8 @@ impl Images for ImageFiles {
 
 /// Every image url `design` draws.
 pub fn image_urls(design: &Design) -> BTreeSet<String> {
+    // As drawn: images inside Instances, and those Tokens name, count.
+    let design = &crate::resolve::drawn(design);
     let mut found = Vec::new();
     for node in &design.children {
         images_in(node, &mut found);
@@ -507,6 +509,7 @@ pub fn screenshot(
     images: &dyn Images,
     assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
+    let design = &crate::resolve::drawn(design);
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let typesetter = fonts.typesetter(design);
     let laid_out = LaidOut::of(design, &typesetter);

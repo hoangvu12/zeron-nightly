@@ -20,8 +20,10 @@ use crate::printed::Printed;
 
 mod copy;
 mod delete;
+mod inside;
 mod moved;
 mod replace;
+mod tokens;
 mod update;
 mod warning;
 
@@ -133,6 +135,7 @@ impl Draft {
     /// none. A property the model doesn't know is kept, with a warning.
     /// Returns the new node's id.
     pub fn insert(&mut self, parent: Option<&str>, node: Value) -> Result<String, EditError> {
+        self.outside(parent, "Insert")?;
         let depth = self.depth_inside(parent)?;
         self.children_of(parent)?;
         let built = self.build(node, depth, "Insert")?;
@@ -141,8 +144,9 @@ impl Draft {
 
     /// Asks for screenshots of these nodes with the call's result.
     pub fn screenshot(&mut self, ids: Vec<String>) -> Result<(), EditError> {
+        let expanded = ids.iter().any(|id| inside::is_inside(id)).then(|| inside::expanded(&self.design));
         for id in ids {
-            if self.design.find(&id).is_none() {
+            if expanded.as_ref().unwrap_or(&self.design).find(&id).is_none() {
                 return Err(EditError::NotFound(id));
             }
             self.screenshots.push(id);
@@ -162,6 +166,22 @@ impl Draft {
     }
 
     pub fn finish(mut self) -> Edited {
+        // What can't be drawn as asked, about the nodes this call changed,
+        // the Instances they're in, or Instances of Components it changed.
+        let (_, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
+        for problem in problems {
+            let top = problem.node.split('/').next().unwrap_or_default();
+            let follows_changed = match self.design.find(top).map(|node| &node.kind) {
+                Some(Kind::Instance(instance)) => self
+                    .design
+                    .find(&instance.component)
+                    .is_some_and(|component| touches(component, &self.changed)),
+                _ => false,
+            };
+            if self.changed.contains(&problem.node) || self.changed.contains(top) || follows_changed {
+                self.warn(&problem.node, None, problem.message);
+            }
+        }
         // However it came to be: inserted so, or its fill taken away.
         for id in &self.changed {
             if let Some(node) = self.design.find(id)
@@ -173,7 +193,9 @@ impl Draft {
         }
         let mut names = Map::new();
         // A node made and deleted in one call was never there.
-        let created = self.created.into_iter().filter(|(_, id)| self.design.find(id).is_some());
+        let expanded = self.created.iter().any(|(_, id)| inside::is_inside(id)).then(|| inside::expanded(&self.design));
+        let there = |id: &str| self.design.find(id).is_some() || expanded.as_ref().is_some_and(|e| e.find(id).is_some());
+        let created: Vec<_> = self.created.iter().filter(|(_, id)| there(id)).cloned().collect();
         for (name, id) in created {
             let mut key = name.clone();
             let mut n = 1;
@@ -266,7 +288,8 @@ impl Draft {
     /// properties checks it here (Update and Copy only the nodes they set).
     fn check_one(&self, node: &Node, warnings: &mut Vec<Warning>) -> Result<(), String> {
         match &node.kind {
-            Kind::Icon(icon) => {
+            // One a Token names is fetched once it's resolved, to draw.
+            Kind::Icon(icon) if !node.refs.contains_key("icon") => {
                 if let Some(assets) = &self.assets {
                     let svg = assets.icons().svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
                     if icon.weight.is_some() && !crate::icons::takes_weight(&icon.icon, &svg) {
@@ -423,6 +446,11 @@ fn capitalised(word: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// Whether `node` or any node inside it is among `ids`.
+fn touches(node: &Node, ids: &BTreeSet<String>) -> bool {
+    ids.contains(&node.id) || node.kind.get().children().iter().any(|child| touches(child, ids))
 }
 
 /// Whether the node `id` is among `node`'s descendants.

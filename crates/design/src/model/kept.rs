@@ -7,12 +7,26 @@
 //! reads a different value of it differently (a default it doesn't write,
 //! like `x: 0`). No list of property names to keep up to date: a property a
 //! type gains is known as soon as its type reads it.
+//!
+//! A property that refers to a Token (`$name`, anywhere in its value) is
+//! kept as written in [`Node::refs`], for the model to read once resolved.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
-use super::{Kind, Node, Opaque, paint, warn};
+use super::{Kind, Node, Opaque, paint, token, warn};
+
+/// The properties every node has, by name: what an Instance takes as its
+/// own rather than an override of its Component's ([`super::Instance`]).
+/// (Kept beside [`Common`], which reads them.)
+pub(super) const COMMON: &[&str] = &[
+    "id", "name", "x", "y", "absolute", "rotation", "flipX", "flipY", "opacity", "inProgress", "enabled", "theme",
+];
+
+/// Properties never taken as referring to Tokens: what a node is, and
+/// what's resolved along with what it holds.
+const NOT_REFS: &[&str] = &["id", "type", "name", "children", "descendants", "ref"];
 
 /// The properties every node has.
 #[derive(Deserialize, PartialEq)]
@@ -36,6 +50,14 @@ struct Common {
     opacity: f32,
     #[serde(default, rename = "inProgress")]
     in_progress: bool,
+    #[serde(default = "enabled")]
+    enabled: bool,
+    #[serde(default)]
+    theme: Map<String, Value>,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 fn opaque() -> f32 {
@@ -70,8 +92,14 @@ struct Written<'a> {
     absolute: bool,
     #[serde(rename = "inProgress", skip_serializing_if = "std::ops::Not::not")]
     in_progress: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<&'a Map<String, Value>>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     kind: Option<&'a Kind>,
+    #[serde(flatten)]
+    refs: &'a Map<String, Value>,
     #[serde(flatten)]
     extra: &'a Map<String, Value>,
 }
@@ -96,13 +124,16 @@ impl Node {
             opacity: (known && self.opacity != 1.).then_some(self.opacity),
             absolute: known && self.absolute,
             in_progress: known && self.in_progress,
+            enabled: (known && !self.enabled).then_some(false),
+            theme: (known && !self.theme.is_empty()).then_some(&self.theme),
             kind: known.then_some(&self.kind),
+            refs: &self.refs,
             extra: &self.extra,
         }
     }
 
     /// A node from its JSON object, keeping what the model doesn't know.
-    pub fn from_props(props: Map<String, Value>) -> Result<Self, String> {
+    pub fn from_props(mut props: Map<String, Value>) -> Result<Self, String> {
         let type_name = match props.get("type") {
             Some(Value::String(name)) => name.clone(),
             _ => return Err("a node needs a \"type\"".into()),
@@ -129,10 +160,19 @@ impl Node {
                 opacity: 1.,
                 absolute: false,
                 in_progress: false,
+                enabled: true,
+                theme: Map::new(),
                 kind: Kind::Opaque(Opaque { type_name }),
+                refs: Map::new(),
                 extra,
             });
         }
+        let refs: Map<String, Value> = props
+            .iter()
+            .filter(|(key, value)| !NOT_REFS.contains(&key.as_str()) && token::refers(value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        props.retain(|key, _| !refs.contains_key(key));
         let read = |props: &Map<String, Value>| -> Result<(Common, Kind), String> {
             let value = Value::Object(props.clone());
             let common = Common::deserialize(&value).map_err(|e| e.to_string())?;
@@ -151,7 +191,10 @@ impl Node {
             opacity: common.opacity,
             absolute: common.absolute,
             in_progress: common.in_progress,
+            enabled: common.enabled,
+            theme: common.theme,
             kind,
+            refs,
             extra: Map::new(),
         };
         let Value::Object(written) = serde_json::to_value(node.written()).map_err(|e| e.to_string())?
@@ -187,6 +230,38 @@ impl Node {
             }
         }
         Ok(node)
+    }
+
+    /// Sets `props` on the node as written (`null` unsets one), its
+    /// children kept, so a property it kept unknown or referring to a Token
+    /// is replaced, not written twice. Returns the model's warnings about
+    /// values it doesn't support; on an error, the node is as it was.
+    pub fn set_props(&mut self, props: &Map<String, Value>) -> Result<Vec<String>, String> {
+        // Written without its children, so a node's whole subtree isn't.
+        let children = self.kind.get_mut().children_mut().map(std::mem::take);
+        let set = self.with_props(props).map(|(node, warnings)| {
+            *self = node;
+            warnings
+        });
+        if let (Some(children), Some(slot)) = (children, self.kind.get_mut().children_mut()) {
+            *slot = children;
+        }
+        set
+    }
+
+    fn with_props(&self, props: &Map<String, Value>) -> Result<(Node, Vec<String>), String> {
+        let Value::Object(mut written) = serde_json::to_value(self).map_err(|e| e.to_string())? else {
+            unreachable!("a node is written as an object");
+        };
+        for (key, value) in props {
+            if value.is_null() {
+                written.remove(key);
+            } else {
+                written.insert(key.clone(), value.clone());
+            }
+        }
+        let (node, warnings) = warn::collect(|| Node::from_props(written));
+        Ok((node?, warnings))
     }
 
     /// The keys of [`Node::extra`] the model doesn't read: unknown

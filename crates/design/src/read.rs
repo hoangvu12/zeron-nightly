@@ -1,12 +1,46 @@
 //! Reading a Design back, as the snippet API's `Get` does: nodes as the
 //! file holds them, to a depth, so what's read inserts as the same nodes;
-//! or each node of a subtree with where the layout put it.
+//! or each node of a subtree with where the layout put it. On request,
+//! with Tokens resolved and Instances expanded ([`Options`]); a node inside
+//! an Instance (`card/title`) is read expanded either way.
 
+use std::borrow::Cow;
+
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::edit::EditError;
 use crate::layout::LaidOut;
 use crate::model::{Design, Node};
+use crate::resolve::{self, Resolve};
+
+/// What `Get` resolves, as the snippet asks.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Options {
+    /// Each property that refers to a Token as the Token's value in the
+    /// node's Theme.
+    #[serde(default)]
+    pub resolve_tokens: bool,
+    /// Each Instance as its Component's nodes, with its overrides.
+    #[serde(default)]
+    pub expand_instances: bool,
+}
+
+/// The Design as `Get` reads the node `id` (or the Canvas) with `options`.
+pub fn view<'a>(design: &'a Design, id: Option<&str>, options: &Options) -> Cow<'a, Design> {
+    // A slash path names a node inside an Instance.
+    let inside_instance = id.is_some_and(|id| id.contains('/'));
+    if !(options.resolve_tokens || options.expand_instances || inside_instance) {
+        return Cow::Borrowed(design);
+    }
+    let how = Resolve {
+        instances: options.expand_instances || inside_instance,
+        tokens: options.resolve_tokens,
+        enabled_only: false,
+    };
+    Cow::Owned(resolve::resolved(design, how).0)
+}
 
 /// `Get`'s depth as the snippet gives it: a whole number of levels, or
 /// `Infinity` for all of them.

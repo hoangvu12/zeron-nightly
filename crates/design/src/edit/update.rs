@@ -3,7 +3,7 @@
 use serde_json::{Map, Value};
 
 use super::{Draft, EditError, Warning, unsupported_warnings};
-use crate::model::{Node, warn};
+use crate::model::{Kind, Node};
 
 /// What Update can't change: a node's identity.
 const FIXED: &[&str] = &["id", "type", "ref"];
@@ -13,9 +13,13 @@ impl Draft {
     /// unsets one. Its id, type and ref can't change, nor can its children
     /// (Insert, Move, Delete and Replace change those), but a node as `Get`
     /// read it updates as it is, so what Get reads can be changed and sent
-    /// back.
+    /// back. A node inside an Instance (`card/title`) takes them as that
+    /// Instance's override.
     pub fn update(&mut self, id: &str, props: Value) -> Result<(), EditError> {
         let props = properties(props, "Update")?;
+        if super::inside::is_inside(id) {
+            return self.update_inside(id, props);
+        }
         let node = self.design.find_mut(id).ok_or_else(|| EditError::NotFound(id.into()))?;
         let before = node.clone();
         let unsupported = set(node, &props, "Update")?;
@@ -46,9 +50,8 @@ pub(super) fn properties(props: Value, verb: &str) -> Result<Map<String, Value>,
     }
 }
 
-/// Sets `props` on `node`, its children kept; on an error, `node` is as it
-/// was. Each property is set in the node as written, so one the model
-/// doesn't know is replaced, not written twice. Returns the model's
+/// Sets `props` on `node`, as [`Node::set_props`] does, once it's checked
+/// they leave what Update can't change as it is. Returns the model's
 /// warnings about values it doesn't support.
 pub(super) fn set(node: &mut Node, props: &Map<String, Value>, verb: &str) -> Result<Vec<String>, EditError> {
     if !node.kind.is_known() {
@@ -58,54 +61,34 @@ pub(super) fn set(node: &mut Node, props: &Map<String, Value>, verb: &str) -> Re
             node.kind.name()
         )));
     }
-    // Written without its children, so a node's whole subtree isn't.
-    let children = node.kind.get_mut().children_mut().map(std::mem::take);
-    let set = with_props(node, props, children.as_deref().unwrap_or_default(), verb)
-        .map(|(updated, unsupported)| {
-            *node = updated;
-            unsupported
-        });
-    // Its type is as it was, so it holds children as it did.
-    if let (Some(children), Some(slot)) = (children, node.kind.get_mut().children_mut()) {
-        *slot = children;
-    }
-    set
-}
-
-/// `node` (its children taken out, `children` being them) with `props` set.
-fn with_props(
-    node: &Node,
-    props: &Map<String, Value>,
-    children: &[Node],
-    verb: &str,
-) -> Result<(Node, Vec<String>), EditError> {
-    let Value::Object(mut written) = serde_json::to_value(node).expect("a node serializes") else {
-        unreachable!("a node is written as an object");
-    };
-    written.remove("children");
+    let mut settable = Map::new();
     for (key, value) in props {
         if FIXED.contains(&key.as_str()) {
-            if written.get(key) != Some(value) {
+            let current = match key.as_str() {
+                "id" => Some(Value::String(node.id.clone())),
+                "type" => Some(Value::String(node.kind.name().to_owned())),
+                _ => match &node.kind {
+                    Kind::Instance(instance) => Some(Value::String(instance.component.clone())),
+                    _ => node.extra.get(key).cloned(),
+                },
+            };
+            if current.as_ref() != Some(value) {
                 return Err(EditError::Invalid(format!(
                     "{verb} can't change a node's \"{key}\" (Replace puts a new node in its place)"
                 )));
             }
         } else if key == "children" {
-            let current = serde_json::to_value(children).expect("nodes serialize");
+            let current = serde_json::to_value(node.kind.get().children()).expect("nodes serialize");
             if !read_from(value, &current) {
                 return Err(EditError::Invalid(format!(
                     "{verb} doesn't change children: Insert, Move, Delete or Replace them"
                 )));
             }
-        } else if value.is_null() {
-            written.remove(key);
         } else {
-            written.insert(key.clone(), value.clone());
+            settable.insert(key.clone(), value.clone());
         }
     }
-    let (node, unsupported) = warn::collect(|| Node::from_props(written));
-    let node = node.map_err(|e| EditError::Invalid(format!("{verb}: {e}")))?;
-    Ok((node, unsupported))
+    node.set_props(&settable).map_err(|e| EditError::Invalid(format!("{verb}: {e}")))
 }
 
 /// Whether `given` is `current` as `Get` reads it: the same, but that
