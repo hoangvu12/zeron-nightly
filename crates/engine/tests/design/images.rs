@@ -135,10 +135,11 @@ fn near(image: &Image, (x, y): (u32, u32), expected: [u8; 4], tolerance: u8) {
 }
 
 fn warnings(called: &Called) -> Vec<String> {
-    match called.json().get("warnings") {
-        Some(warnings) => serde_json::from_value(warnings.clone()).unwrap(),
-        None => Vec::new(),
-    }
+    let json = called.json();
+    let Some(Value::Array(warnings)) = json.get("warnings") else {
+        return Vec::new();
+    };
+    warnings.iter().map(|w| w["message"].as_str().unwrap().to_owned()).collect()
 }
 
 #[tokio::test]

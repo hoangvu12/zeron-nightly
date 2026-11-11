@@ -344,7 +344,7 @@ at({ type: "rectangle", name: "Odder", width: 1, height: 1, cornerRadius: -5,
         .as_array()
         .expect("warnings")
         .iter()
-        .map(|w| w.as_str().unwrap().to_owned())
+        .map(|w| w["message"].as_str().unwrap().to_owned())
         .collect();
     for said in ["plasma", "mesh_gradient", "diamond", "middle", "glow", "radius", "opacity"] {
         assert!(

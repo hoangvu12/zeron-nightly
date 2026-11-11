@@ -14,7 +14,7 @@ use zeron_design::Design;
 use zgx::input::InputEvent;
 use zgx_script::{ScriptHost, testing::TestApp};
 
-use crate::design::{CACHE_BYTES, DesignTabs, Heard, Listener, Source};
+use crate::design::{CACHE_BYTES, DesignTabs, Heard, Listener, Source, heard_of};
 
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
@@ -90,11 +90,24 @@ struct StandIn {
 
 impl StandIn {
     /// A new version of the Design at `path`, said to whoever follows it.
+    /// A new version the person made (in a Design tab, as #33's edits will
+    /// be told): it doesn't flash.
     fn say(&self, path: &str, design: Design) {
+        self.tell(path, design, &[], "person");
+    }
+
+    /// A new version an agent's call made, changing `changed`.
+    fn say_by_agent(&self, path: &str, design: Design, changed: &[&str]) {
+        self.tell(path, design, changed, "agent");
+    }
+
+    /// As the engine's `WatchDesign` says it, read as the window reads it.
+    fn tell(&self, path: &str, design: Design, changed: &[&str], by: &str) {
         self.designs.borrow_mut().insert(path.into(), design.clone());
+        let item = serde_json::json!({ "design": design, "changes": [{ "changed": changed, "by": by }], "images": *self.images.borrow() });
         let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
         for listener in listeners {
-            (listener.borrow_mut())(Ok(Heard { design: design.clone(), images: self.images.borrow().clone() }));
+            (listener.borrow_mut())(heard_of(&item));
         }
     }
 }
@@ -106,8 +119,7 @@ impl Source for Engine {
         let listener = Rc::new(RefCell::new(listener));
         self.0.following.borrow_mut().push((path.into(), Rc::downgrade(&listener)));
         let now = self.0.designs.borrow().get(path).cloned();
-        let images = self.0.images.borrow().clone();
-        (listener.borrow_mut())(now.map(|design| Heard { design, images }).ok_or_else(|| format!("can't open {path}")));
+        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), images: self.0.images.borrow().clone() }).ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
     }
 
@@ -478,6 +490,70 @@ fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
     // softening the stripes, the turned square.)
     assert_ne!(tiled(580, 150), tiled(300, 150));
     assert_ne!(tiled(514, 360), one(514, 280));
+}
+
+/// Where node `target` shows in the tab, through its transforms.
+fn on_screen_of(app: &mut TestApp, target: &str) -> zgx::scene::Rect {
+    let node = app.target(target).unwrap_or_else(|e| panic!("{e}
+{}", app.tree()));
+    app.ui.scene.borrow().transformed_bounds(node)
+}
+
+fn near(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 1.5
+}
+
+#[test]
+fn an_agents_change_flashes_what_it_changed_and_no_one_elses_does() {
+    let mut tab = mount(landing("#EF4444", false));
+    assert!(tab.app.find(".design-flash").is_none(), "nothing flashes as it opens");
+
+    // An agent turns the badge green: it flashes over the badge, then goes.
+    tab.engine.say_by_agent(PATH, landing("#22C55E", false), &["badge"]);
+    tab.app.frames(2);
+    let flash = on_screen_of(&mut tab.app, &format!("#design-flash-{TAB}-badge"));
+    let (left, top) = tab.on_screen(700., 450.);
+    let (_, _, zoom) = tab.canvas.view(TAB).unwrap();
+    assert!(near(flash.x, left as f32) && near(flash.y, top as f32), "{flash:?} against ({left}, {top})");
+    assert!(near(flash.width, 160. * zoom) && near(flash.height, 160. * zoom), "{flash:?}");
+    assert!(tab.app.find(&format!("#design-flash-{TAB}-hero")).is_none(), "only what changed flashes");
+    let gone = tab.app.wait_until(|app| app.find(".design-flash").is_none());
+    assert!(gone, "the flash stays:
+{}", tab.app.tree());
+
+    // Two calls one after the other, each changing its node: both flash.
+    tab.engine.say_by_agent(PATH, landing("#EF4444", false), &["badge"]);
+    let mut moved = landing("#EF4444", false);
+    moved.children[0].name = "Landing".into();
+    tab.engine.say_by_agent(PATH, moved, &["hero"]);
+    tab.app.frames(2);
+    assert!(tab.app.find(&format!("#design-flash-{TAB}-badge")).is_some(), "{}", tab.app.tree());
+    assert!(tab.app.find(&format!("#design-flash-{TAB}-hero")).is_some(), "{}", tab.app.tree());
+    assert!(tab.app.wait_until(|app| app.find(".design-flash").is_none()));
+
+    // A change that isn't an agent's (the person's own) doesn't flash.
+    tab.engine.say(PATH, landing("#EF4444", false));
+    tab.app.frames(2);
+    assert!(tab.app.find(".design-flash").is_none(), "{}", tab.app.tree());
+}
+
+#[test]
+fn in_progress_screens_look_in_progress_until_the_mark_is_cleared() {
+    let mut working = landing("#EF4444", true);
+    working.children[0].in_progress = true;
+    let mut tab = mount(working);
+    let mark = on_screen_of(&mut tab.app, &format!("#design-working-{TAB}-screen"));
+    let (left, top) = tab.on_screen(100., 50.);
+    let (_, _, zoom) = tab.canvas.view(TAB).unwrap();
+    assert!(near(mark.x, left as f32) && near(mark.y, top as f32), "{mark:?} against ({left}, {top})");
+    assert!(near(mark.width, 800. * zoom), "{mark:?}");
+    assert!(tab.app.find(&format!("#design-working-{TAB}-screen >> \"In progress\"")).is_some(), "{}", tab.app.tree());
+    assert!(tab.app.find(&format!("#design-working-{TAB}-other")).is_none(), "the finished Screen looks as ever");
+
+    // The agent clears the mark: the Screen looks finished.
+    tab.engine.say_by_agent(PATH, landing("#EF4444", true), &["screen"]);
+    tab.app.frames(4);
+    assert!(tab.app.wait_until(|app| app.find(".design-working").is_none()), "{}", tab.app.tree());
 }
 
 /// A 40 × 20 PNG of four upright stripes: red, green, blue and black.

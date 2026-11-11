@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use zeron_design::Design;
+use zeron_design::edit::Warning;
 use zeron_design::model::{ImageFill, Node};
 use zeron_design::render::{self, Images};
 
@@ -83,13 +84,13 @@ impl ImageCache {
 }
 
 /// The images one Design's paints refer to.
-pub struct DesignImages<'a> {
+pub struct DesignImages {
     /// The folder the Design's file is in.
     pub folder: PathBuf,
-    pub cache: &'a ImageCache,
+    pub cache: Arc<ImageCache>,
 }
 
-impl DesignImages<'_> {
+impl DesignImages {
     /// The file the image at `url` is in: in the Design's folder, or the
     /// cache's, downloaded now if it's a URL not had yet.
     fn file(&self, url: &str) -> Result<PathBuf, String> {
@@ -112,7 +113,7 @@ impl DesignImages<'_> {
     }
 }
 
-impl Images for DesignImages<'_> {
+impl Images for DesignImages {
     fn get(&self, url: &str) -> Result<Arc<[u8]>, String> {
         let path = self.file(url)?;
         let bytes = std::fs::read(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
@@ -125,7 +126,7 @@ impl Images for DesignImages<'_> {
 
 /// A warning for each image the `nodes` (and their descendants) draw that
 /// can't be had, once per node and image.
-pub fn warnings<'a>(nodes: impl Iterator<Item = &'a Node>, images: &dyn Images) -> Vec<String> {
+pub fn warnings<'a>(nodes: impl Iterator<Item = &'a Node>, images: &dyn Images) -> Vec<Warning> {
     let mut found = Vec::new();
     for node in nodes {
         render::images_in(node, &mut found);
@@ -136,12 +137,16 @@ pub fn warnings<'a>(nodes: impl Iterator<Item = &'a Node>, images: &dyn Images) 
         .filter(|(node, image)| seen.insert((node.id.as_str(), image.url.as_str())))
         .filter_map(|(node, image)| {
             let why = images.get(&image.url).err()?;
-            Some(format!(
-                "\"{}\" ({}): can't draw the image {}: {why}; a placeholder is drawn in its place",
-                node.name,
-                node.kind.name(),
-                image.url
-            ))
+            Some(Warning {
+                node: Some(node.id.clone()),
+                property: None,
+                message: format!(
+                    "\"{}\" ({}): can't draw the image {}: {why}; a placeholder is drawn in its place",
+                    node.name,
+                    node.kind.name(),
+                    image.url
+                ),
+            })
         })
         .collect()
 }
