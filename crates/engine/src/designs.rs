@@ -13,8 +13,8 @@
 //!
 //! New Designs are made in the managed folder, `designs/` in the
 //! engine's data dir, one folder each with an `images/` folder beside the
-//! `.zdesign` file. Assets (icons) are fetched as a call places them and
-//! cached in `design-cache/` beside it ([`zeron_design::assets::Cache`]);
+//! `.zdesign` file. Assets (icons, fonts) are fetched as a call places them
+//! and cached in `design-cache/` beside it ([`zeron_design::assets::Cache`]);
 //! a Design's tabs hear the files of those it uses.
 //!
 //! Several chats may change one Design: they share its one live copy, and
@@ -25,11 +25,9 @@
 //! follow a Design ([`Designs::watch`]): it whole, then again after each
 //! change.
 //!
-//! Text is set in Google Fonts fetched on first use into `design-fonts/`
-//! in the engine's data dir, or in font files beside its Design
-//! ([`zeron_design::fonts`]); tabs following a Design are told the font
-//! files it uses, and draw with those. Image paints draw files from the
-//! Design's folder, and downloads cached for every Design ([`images`]);
+//! Text is set in Google Fonts, fetched on first use as assets, or in font
+//! files beside its Design ([`zeron_design::fonts`]). Image paints draw
+//! files from the Design's folder, and downloads cached for every Design ([`images`]);
 //! tabs are told the image files too.
 
 mod iconify;
@@ -47,7 +45,7 @@ use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::assets::{Cache, Resolved};
 use zeron_design::edit::{Draft, Edited, Warning};
-use zeron_design::fonts::{FontFile, Fonts, GoogleFonts};
+use zeron_design::fonts::{Fonts, GoogleFonts};
 use zeron_design::history::History;
 use zeron_design::icons::Icons;
 use zeron_design::model::Kind;
@@ -170,8 +168,6 @@ struct Inner {
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
     recent_file: PathBuf,
-    /// This computer's fonts, for every Design's text.
-    fonts: Mutex<Fonts>,
     /// Images downloaded, for every Design.
     images: Arc<ImageCache>,
 }
@@ -197,15 +193,14 @@ struct Live {
 
 /// A Design as the tabs following it hear it: its version, the changes
 /// that made the latest versions (a tab that falls behind hears each
-/// change it missed, up to [`MAX_TOLD_CHANGES`]), the font files its text
-/// uses and the files of the other assets it uses (none yet for a Design no
-/// change was told of).
+/// change it missed, up to [`MAX_TOLD_CHANGES`]), and the files of the
+/// assets it uses, its icons and fonts (none yet for a Design no change
+/// was told of).
 #[derive(Clone)]
 struct Told {
     version: u64,
     design: Arc<Design>,
     changes: Vec<Change>,
-    fonts: Option<Arc<Vec<FontFile>>>,
     /// The file each image it draws is in, for the tabs to read (they
     /// never download): those it has, by url.
     images: BTreeMap<String, PathBuf>,
@@ -253,17 +248,17 @@ impl Designs {
             inner: Arc::new(Inner {
                 root,
                 limits: Limits::default(),
-                assets: Arc::new(Cache::new(&data_dir.join("design-cache"), Arc::new(Iconify))),
+                assets: {
+                    let assets = Cache::new(&data_dir.join("design-cache"), Arc::new(Iconify));
+                    assets.set_font_source(Box::new(GoogleFonts::default()));
+                    Arc::new(assets)
+                },
                 live: Mutex::new(HashMap::new()),
                 globals: Mutex::new(HashMap::new()),
                 failed: Mutex::new(Failed::default()),
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
-                fonts: Mutex::new(Fonts::new(
-                    Some(data_dir.join("design-fonts")),
-                    Some(Box::new(GoogleFonts::default())),
-                )),
                 images: Arc::new(ImageCache::new(data_dir.join("image-cache"))),
             }),
         }
@@ -377,35 +372,31 @@ impl Designs {
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
     /// design, changes: [{version, changed, by}]}`: the changes since the
-    /// item before (none in the first), `by` "agent"; and `fonts`, the font
-    /// files its text uses (`{family, path}`), for the tab to draw it with.
-    /// A tab that falls behind hears the latest only. Blocking (it may read
-    /// the file, or fetch fonts): run it off the async runtime.
+    /// item before (none in the first), `by` "agent". A tab that falls
+    /// behind hears the latest only. Blocking (it may read the file): run it
+    /// off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
         let told = loop {
-            let (version, design, fonts, images) = {
+            let (version, design, images) = {
                 let live = lock(&live);
                 let told = live.followers.borrow();
-                if told.version == live.version && told.fonts.is_some() && told.assets.is_some() {
+                if told.version == live.version && told.assets.is_some() {
                     drop(told);
                     break live.followers.subscribe();
                 }
-                (live.version, live.design.clone(), self.fonts_for(&live.path), live.images.files(&live.design))
+                (live.version, live.design.clone(), live.images.files(&live.design))
             };
-            // Its fonts found (fetched, maybe) without holding the Design up.
-            let files = Arc::new(fonts.files(&design));
             let live = lock(&live);
             // (Changes with nobody following weren't copied for them; one
             // made meanwhile is looked at again.)
             if live.version == version {
                 // (Only what's cached: no fetch under its lock.)
-                let assets = live.assets.resolved(&design);
+                let assets = live.assets.resolved(&design, live.path.parent());
                 live.followers.send_replace(Told {
                     version,
                     design: Arc::new(design),
                     changes: Vec::new(),
-                    fonts: Some(files),
                     images,
                     assets: Some(assets),
                 });
@@ -426,7 +417,6 @@ impl Designs {
                 "version": now.version,
                 "design": &*now.design,
                 "changes": since,
-                "fonts": now.fonts.as_deref(),
                 "images": now.images,
                 "assets": now.assets.as_deref().unwrap_or_default(),
             });
@@ -437,7 +427,7 @@ impl Designs {
     /// The fonts for the Design at `path`: this computer's, and those
     /// beside it.
     fn fonts_for(&self, path: &Path) -> Fonts {
-        let fonts = lock(&self.inner.fonts).clone();
+        let fonts = self.inner.assets.fonts();
         match path.parent() {
             Some(folder) => fonts.beside(folder),
             None => fonts,
@@ -447,7 +437,7 @@ impl Designs {
     /// Sets text in `fonts` from now on, in place of the font cache and
     /// Google Fonts (for tests, which run offline).
     pub fn use_fonts(&self, fonts: Fonts) {
-        *lock(&self.inner.fonts) = fonts;
+        self.inner.assets.set_fonts(fonts);
     }
 
     /// Runs `code` with the calling chat's globals, keeping the globals it
@@ -466,6 +456,9 @@ impl Designs {
             .with_assets(self.inner.assets.clone());
         let (draft, globals) = snippet::run(draft, globals, code, self.inner.limits).map_err(Ran::Snippet)?;
         let mut edited = draft.finish();
+        // What it draws with that no edit's check fetched: icons and fonts
+        // inside Instances, or named by Tokens (`assets::used` resolves).
+        self.inner.assets.fetch(&edited.design, live.path.parent());
         // Fonts the call's text couldn't get, and images it can't have, as
         // drawn (inside Instances, named by Tokens).
         let drawn = zeron_design::resolve::drawn(&edited.design);
@@ -680,7 +673,7 @@ impl Designs {
         })?;
         // Fetched now, outside its lock: telling its tabs and drawing it
         // only read what's cached.
-        self.inner.assets.fetch(&design);
+        self.inner.assets.fetch(&design, path.parent());
         let design = Arc::new(Mutex::new(Live::new(
             path.clone(),
             design,
@@ -746,7 +739,6 @@ impl Live {
             version: 0,
             design: Arc::new(design.clone()),
             changes: Vec::new(),
-            fonts: None,
             images: BTreeMap::new(),
             assets: None,
         };
@@ -805,16 +797,13 @@ impl Live {
             by,
         };
         let design = Arc::new(self.design.clone());
-        // (Loaded as the change set its text, so found without a fetch.)
-        let fonts = Arc::new(self.fonts.files(&self.design));
         // (Downloaded already, by the call that placed them.)
         let images = self.images.files(&self.design);
         // (Only what's cached: no fetch under its lock.)
-        let assets = self.assets.resolved(&self.design);
+        let assets = self.assets.resolved(&self.design, self.path.parent());
         self.followers.send_modify(|told| {
             told.version = change.version;
             told.design = design;
-            told.fonts = Some(fonts);
             told.images = images;
             told.assets = Some(assets);
             told.changes.push(change);

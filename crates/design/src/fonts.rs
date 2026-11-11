@@ -8,8 +8,10 @@
 //! - from a [`FontSource`], once, into that cache: Google Fonts
 //!   ([`GoogleFonts`]), or a folder of font files in tests ([`FontFolder`]).
 //!
-//! The window doesn't fetch: the engine tells it the font files a Design
-//! uses ([`Fonts::files`]) and it draws with those ([`Fonts::of_files`]).
+//! Fonts are assets ([`crate::assets`], kind `font`): the engine fetches
+//! and caches them, a fetch's wait kept off the snippet's time
+//! ([`crate::waits`]), and tells the window the font files a Design uses;
+//! the window draws with those ([`Fonts::of_files`]) and never fetches.
 //!
 //! Never the computer's own fonts, so text draws the same everywhere. A
 //! family that can't be had draws in Geist, with a warning ([`Fonts::warnings`]).
@@ -189,21 +191,29 @@ impl Fonts {
         Typesetter::new(provider)
     }
 
-    /// The font files `design`'s text uses (fetched first when needed), for
-    /// the window to draw it with ([`Fonts::of_files`]): as drawn, so
-    /// text inside Instances and fonts named by Tokens count.
-    pub fn files(&self, design: &Design) -> Vec<FontFile> {
-        let design = &crate::resolve::drawn(design);
-        let mut files = Vec::new();
-        self.each_face(design, &mut |family, (_, path)| {
-            if let Some(path) = path {
-                let file = FontFile { family: family.to_owned(), path };
-                if !files.contains(&file) {
-                    files.push(file);
-                }
-            }
-        });
-        files
+    /// Fetches `family` at `weight` if it isn't had yet ([`crate::assets`]).
+    pub(crate) fn fetch(&self, family: &str, weight: u16) {
+        let _ = self.load(family, snapped(weight));
+    }
+
+    /// The files of `family` at `weight` these fonts have, without
+    /// fetching: none for the bundled family, which needs no file.
+    pub(crate) fn found(&self, family: &str, weight: u16) -> Vec<PathBuf> {
+        let weight = snapped(weight);
+        let mut faces = faces(&self.library.given, family);
+        if faces.is_empty()
+            && let Some(folder) = &self.beside
+        {
+            faces = self.beside_design(folder, family);
+        }
+        if !faces.is_empty() || family.eq_ignore_ascii_case(BUNDLED_FAMILY) {
+            return faces.into_iter().filter_map(|(_, path)| path).collect();
+        }
+        if let Some((_, path)) = lock(&self.library.state).loaded.get(&(family.to_owned(), weight)) {
+            return path.iter().cloned().collect();
+        }
+        let cached = self.library.cache.as_ref().map(|cache| cached_file(cache, family, weight));
+        cached.filter(|file| file.is_file()).into_iter().collect()
     }
 
     /// Calls `visit` with each typeface `design`'s text uses, and the
@@ -289,12 +299,26 @@ impl Fonts {
             return Err(Missing::Unknown);
         };
         // Fetched without holding the fonts up for other Designs' text, but
-        // one fetch at a time: one waiting may find its font fetched.
-        let _fetching = lock(&self.library.fetching);
-        if let Some(known) = self.known(&key) {
-            return known;
-        }
-        let fetched = source.fetch(family, weight);
+        // one fetch at a time: one waiting may find its font fetched. The
+        // wait, for its turn too, isn't counted against the snippet's time
+        // ([`crate::waits`]).
+        let waited = crate::waits::network(|| {
+            let fetching = lock(&self.library.fetching);
+            match self.known(&key) {
+                Some(known) => Err(known),
+                None => Ok((fetching, source.fetch(family, weight))),
+            }
+        });
+        let (_fetching, fetched) = match waited {
+            Ok(Ok(fetched)) => fetched,
+            Ok(Err(known)) => return known,
+            Err(cap) => {
+                return Err(Missing::Failed(format!(
+                    "this call has waited {}s on the network already",
+                    cap.as_secs()
+                )));
+            }
+        };
         let mut state = lock(&self.library.state);
         match fetched {
             Ok(Some(bytes)) => match decode(&bytes) {
@@ -558,7 +582,7 @@ fn decode(bytes: &[u8]) -> Option<Typeface> {
 }
 
 /// `weight` to the nearest hundred Google Fonts serves, 100 to 900.
-fn snapped(weight: u16) -> u16 {
+pub(crate) fn snapped(weight: u16) -> u16 {
     ((weight + 50) / 100 * 100).clamp(100, 900)
 }
 

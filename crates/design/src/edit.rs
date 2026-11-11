@@ -168,11 +168,7 @@ impl Draft {
     pub fn finish(mut self) -> Edited {
         // What can't be drawn as asked, about the nodes this call changed,
         // the Instances they're in, or Instances of Components it changed.
-        let (drawn, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
-        // What it draws with that no edit fetched: icons a Token names.
-        if let Some(assets) = &self.assets {
-            assets.fetch(&drawn);
-        }
+        let (_, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
         for problem in problems {
             let top = problem.node.split('/').next().unwrap_or_default();
             let follows_changed = match self.design.find(top).map(|node| &node.kind) {
