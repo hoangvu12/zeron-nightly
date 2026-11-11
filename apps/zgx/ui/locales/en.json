@@ -3058,6 +3058,7 @@
       "browser": "Browser",
       "files": "Files",
       "terminal": "Terminal {n}",
+      "design": "Design",
       "actions": "Tab actions",
       "close": "Close Tab",
       "close_tooltip": "Close Tab  {key}",
@@ -3076,6 +3077,7 @@
       "browser": "Browser",
       "files": "File viewer",
       "terminal": "Terminal",
+      "design": "Design",
       "title": "Open a tab",
       "side_chat": "Side chat",
       "fork": "Fork chat"
@@ -3085,6 +3087,10 @@
       "browser": {
         "title": "The browser didn't load",
         "body": "Save the file again once it's fixed, and it comes back here."
+      },
+      "design": {
+        "title": "Designs didn't load",
+        "body": "Save the file again once it's fixed, and they come back here."
       },
       "terminals": {
         "title": "Terminals didn't load",
@@ -3104,6 +3110,16 @@
       "title": "Close this tab?",
       "running": "Something is still running in “{title}”. Closing the tab ends it.",
       "unsaved": "“{title}” has unsaved changes. Closing the tab lets them go."
+    },
+    "design": {
+      "label": "Canvas",
+      "empty": {
+        "title": "No Design open",
+        "body": "Open a .zdesign file to see its Canvas here."
+      },
+      "open": "Open design",
+      "filter": "Designs",
+      "failed": "The Design didn't open"
     },
     "terminal": {
       "no_session": "This tab has no session to run in.",

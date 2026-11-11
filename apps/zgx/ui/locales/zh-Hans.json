@@ -3058,6 +3058,7 @@
       "browser": "浏览器",
       "files": "文件",
       "terminal": "终端 {n}",
+      "design": "设计",
       "actions": "标签页操作",
       "close": "关闭标签页",
       "close_tooltip": "关闭标签页  {key}",
@@ -3076,6 +3077,7 @@
       "browser": "浏览器",
       "files": "文件查看器",
       "terminal": "终端",
+      "design": "设计",
       "title": "打开标签页",
       "side_chat": "侧边对话",
       "fork": "分叉对话"
@@ -3084,6 +3086,10 @@
     "broken": {
       "browser": {
         "title": "浏览器未能载入",
+        "body": "修复后再次保存文件，即可在此恢复。"
+      },
+      "design": {
+        "title": "设计未能载入",
         "body": "修复后再次保存文件，即可在此恢复。"
       },
       "terminals": {
@@ -3104,6 +3110,16 @@
       "title": "关闭此标签页？",
       "running": "“{title}”中仍有内容在运行。关闭标签页会结束运行。",
       "unsaved": "“{title}”有未保存的更改。关闭标签页会舍弃这些更改。"
+    },
+    "design": {
+      "label": "画布",
+      "empty": {
+        "title": "没有打开的设计",
+        "body": "打开一个 .zdesign 文件，在此查看其画布。"
+      },
+      "open": "打开设计",
+      "filter": "设计",
+      "failed": "设计未能打开"
     },
     "terminal": {
       "no_session": "此标签页没有可供运行的会话。",
