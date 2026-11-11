@@ -26,8 +26,8 @@
 //! change.
 //!
 //! Text is set in Google Fonts, fetched on first use as assets, or in font
-//! files beside its Design ([`zeron_design::fonts`]). Image paints draw files from the
-//! Design's folder, and downloads cached for every Design ([`images`]);
+//! files beside its Design ([`zeron_design::fonts`]). Image paints draw
+//! files from the Design's folder, and downloads cached for every Design ([`images`]);
 //! tabs are told the image files too.
 
 mod iconify;
@@ -667,7 +667,7 @@ impl Designs {
         })?;
         // Fetched now, outside its lock: telling its tabs and drawing it
         // only read what's cached.
-        self.inner.assets.fetch(&design);
+        self.inner.assets.fetch(&design, path.parent());
         let design = Arc::new(Mutex::new(Live::new(
             path.clone(),
             design,

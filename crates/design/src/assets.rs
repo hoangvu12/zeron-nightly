@@ -45,9 +45,10 @@ impl AssetKey {
         Self { kind: AssetKind::Font, name: format!("{family}@{weight}") }
     }
 
-    /// A font's family and what follows it (its weight, or its file).
+    /// A font's family and what follows it (its weight, or its file):
+    /// split at the first `@`, which no family name holds.
     fn font_parts(&self) -> Option<(&str, &str)> {
-        (self.kind == AssetKind::Font).then(|| self.name.rsplit_once('@')).flatten()
+        (self.kind == AssetKind::Font).then(|| self.name.split_once('@')).flatten()
     }
 
     /// A font's family and weight, as text asks for it.
@@ -136,11 +137,12 @@ impl Cache {
         *self.fonts.write().unwrap_or_else(|e| e.into_inner()) = fonts;
     }
 
-    /// Fetches what `design` uses that isn't cached (a Design read from a
-    /// file made on another computer). One that can't be fetched draws
-    /// nothing, and isn't asked for again for a while.
-    pub fn fetch(&self, design: &Design) {
-        let fonts = self.fonts();
+    /// Fetches what `design` (beside it, in `folder`) uses that isn't
+    /// cached (a Design read from a file made on another computer). One
+    /// that can't be fetched draws nothing, and isn't asked for again for a
+    /// while; a font family beside the Design isn't fetched.
+    pub fn fetch(&self, design: &Design, folder: Option<&Path>) {
+        let fonts = self.fonts_beside(folder);
         for key in used(design) {
             match key.kind {
                 AssetKind::Icon => {
@@ -160,11 +162,8 @@ impl Cache {
     /// Geist). A family beside the Design is each of its files. Never
     /// fetches.
     pub fn resolved(&self, design: &Design, folder: Option<&Path>) -> Vec<Resolved> {
-        let fonts = match folder {
-            Some(folder) => self.fonts().beside(folder),
-            None => self.fonts(),
-        };
-        used(design)
+        let fonts = self.fonts_beside(folder);
+        let mut resolved: Vec<Resolved> = used(design)
             .into_iter()
             .flat_map(|key| match key.kind {
                 AssetKind::Icon => self
@@ -190,11 +189,25 @@ impl Cache {
                         .collect::<Vec<_>>()
                 }
             })
-            .collect()
+            .collect();
+        // (A family beside the Design is all of its files for each weight
+        // asked for: each once.)
+        let mut seen = BTreeSet::new();
+        resolved.retain(|resolved| seen.insert(resolved.key.clone()));
+        resolved
+    }
+
+    /// This computer's fonts, and those beside the Design in `folder`.
+    fn fonts_beside(&self, folder: Option<&Path>) -> Fonts {
+        match folder {
+            Some(folder) => self.fonts().beside(folder),
+            None => self.fonts(),
+        }
     }
 }
 
-/// What's cached only: drawing never fetches.
+/// What's cached only: drawing never fetches. (A font beside a Design,
+/// named by its file, isn't among them: text gets it from [`Fonts`].)
 impl Assets for Cache {
     fn get(&self, key: &AssetKey) -> Option<Arc<[u8]>> {
         match key.kind {

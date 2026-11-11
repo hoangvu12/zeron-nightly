@@ -63,15 +63,18 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
 }
 
-/// How a text node's box follows its text.
+/// How a text node's box follows its text. (Read in pen's kebab-case
+/// too, as the first Designs with text wrote it.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextGrowth {
     /// As wide and tall as its text, each paragraph on one line.
     Auto,
     /// Wraps at its width and grows in height.
+    #[serde(alias = "fixed-width")]
     FixedWidth,
     /// Wraps at its width; text past its height overflows it.
+    #[serde(alias = "fixed-width-height")]
     FixedWidthHeight,
 }
 

@@ -358,6 +358,47 @@ Insert({{ type: "text", name: "Sans", content: "Hamburgefonstiv", fontSize: 40, 
     let nodes = seen(&used);
     assert!(nodes["Serif"].width() < nodes["Sans"].width() - 20., "{nodes:?}");
     assert_eq!(warnings(&used), Vec::<String>::new());
+
+    // Its tabs are told the file beside it, by its name.
+    let window = zeron_rpc::memory_client(seam.core.rpc_service());
+    let mut seen = window
+        .subscribe("WatchDesign", serde_json::json!({ "path": made.path() }))
+        .await
+        .expect("the window may watch a Design");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv())
+        .await
+        .expect("the watch said nothing")
+        .expect("the watch ended");
+    let fonts: Vec<(&str, &str)> = first["assets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{first}"))
+        .iter()
+        .filter(|asset| asset["kind"] == "font")
+        .map(|asset| (asset["name"].as_str().unwrap(), asset["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(fonts.len(), 1, "{first}");
+    assert_eq!(fonts[0].0, "Instrument Serif@InstrumentSerif-Regular");
+    assert!(PathBuf::from(fonts[0].1).starts_with(made.path().parent().unwrap()), "{fonts:?}");
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn text_growth_is_written_in_snake_case_and_read_in_pens_spelling_too() {
+    let seam = Seam::new().await;
+    let (made, nodes) = laid_out(
+        &seam,
+        &format!(
+            r##"
+Insert({{ type: "text", name: "Box", content: "{WORDS}", width: 120, height: 30, textGrowth: "fixed_width_height", fill: "#000000" }});
+Insert({{ type: "text", name: "Old", y: 100, content: "{WORDS}", width: 120, textGrowth: "fixed-width", fill: "#000000" }});"##
+        ),
+    )
+    .await;
+    assert_eq!(nodes["Box"].bounds[2..], [120., 30.]);
+    assert!(nodes["Old"].height() > 30., "{:?}", nodes["Old"]);
+    let file = std::fs::read_to_string(made.path()).unwrap();
+    assert!(file.contains("\"fixed_width_height\"") && file.contains("\"fixed_width\""), "{file}");
+    assert!(!file.contains("fixed-width"), "{file}");
     seam.shutdown().await;
 }
 
