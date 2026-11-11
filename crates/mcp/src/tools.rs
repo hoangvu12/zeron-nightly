@@ -284,7 +284,7 @@ fn catalog() -> Vec<ToolDef> {
             "properties": {
                 "snippet": {
                     "type": "string",
-                    "description": "JavaScript run in a sandbox. `Insert(parent, node)` adds a node as the last child of the node with id `parent` (or on the Canvas with `Insert(node)`) and returns its id; a node is {type: \"frame\" | \"rectangle\", name, x, y, width, height, fill: \"#RRGGBB\"}, and a frame takes `children` inline. `TakeScreenshot([ids])` attaches a PNG of each node once the call succeeds, at most 400 px on its longest side. A snippet that throws changes nothing."
+                    "description": "JavaScript run in a sandbox. `Insert(parent, node)` adds a node as the last child of the node with id `parent` (or on the Canvas with `Insert(node)`) and returns its id; a node is {type: \"frame\" | \"rectangle\", name, x, y, width, height, fill: \"#RRGGBB\"}, and a frame takes `children` inline. `TakeScreenshot([ids])` attaches a PNG of each node once the call succeeds, at most 400 px on its longest side. A snippet that throws changes nothing; a property Zeron doesn't know is kept, with a warning in the result."
                 },
                 "description": { "type": "string", "description": "What this call does, in a few words." },
                 "name": { "type": "string", "description": "A name for a new Design, made in Zeron's designs folder." },

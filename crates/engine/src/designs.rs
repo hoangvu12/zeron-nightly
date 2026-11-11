@@ -151,7 +151,8 @@ impl Designs {
 
     /// Runs one `design_execute` call to its end (blocking: run it off the
     /// async runtime). Returns the Design's name and path, the name-to-id
-    /// map of the nodes the call made, and its screenshots as base64 PNG.
+    /// map of the nodes the call made, its screenshots as base64 PNG, and
+    /// any warnings about its edits.
     pub fn execute(&self, params: ExecuteParams) -> Result<Value, DesignError> {
         if params.snippet.trim().is_empty() {
             return Err(DesignError::Refused("the snippet is empty".into()));
@@ -184,6 +185,9 @@ impl Designs {
             "ids": edited.names,
             "screenshots": screenshots,
         });
+        if !edited.warnings.is_empty() {
+            result["warnings"] = json!(edited.warnings);
+        }
         if changed {
             result["notice"] = json!(CHANGED_NOTICE);
         }
