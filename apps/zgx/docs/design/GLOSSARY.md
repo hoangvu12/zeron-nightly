@@ -42,5 +42,5 @@ A Design's Themes belong to that Design and colour only its nodes; Zeron's own l
 _Avoid_: Mode, skin
 
 **Asset**:
-What a Design draws with beyond its own file: an icon, a font, and later an image. The engine fetches and caches each (a font may sit beside the Design instead); a Design tab draws from the files the engine names.
+What a Design draws with beyond its own file: an icon, a font, an image. The engine fetches and caches each (a font or an image may sit beside the Design instead); a Design tab draws from the files the engine names.
 _Avoid_: Resource, attachment

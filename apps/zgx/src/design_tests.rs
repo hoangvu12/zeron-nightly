@@ -83,9 +83,7 @@ fn many_screens() -> Design {
 #[derive(Default)]
 struct StandIn {
     designs: RefCell<HashMap<String, Design>>,
-    /// The file each image is in, by url, as the engine says them.
-    images: RefCell<HashMap<String, std::path::PathBuf>>,
-    /// The files of the other assets its Designs use (icons, fonts), as
+    /// The files of the assets its Designs use (icons, fonts, images), as
     /// the engine would say them.
     assets: RefCell<Vec<Resolved>>,
     following: RefCell<Vec<(String, Weak<RefCell<Listener>>)>>,
@@ -112,7 +110,6 @@ impl StandIn {
         let item = serde_json::json!({
             "design": design,
             "changes": [{ "changed": changed, "by": by }],
-            "images": *self.images.borrow(),
             "assets": *self.assets.borrow(),
         });
         let listeners: Vec<_> = self.following.borrow().iter().filter(|(p, _)| p == path).filter_map(|(_, l)| l.upgrade()).collect();
@@ -131,8 +128,7 @@ impl Source for Engine {
         let now = self.0.designs.borrow().get(path).cloned();
         let assets = self.0.assets.borrow().clone();
         let fonts = Fonts::of_files(&assets.iter().filter_map(Resolved::font_file).collect::<Vec<_>>());
-        let images = self.0.images.borrow().clone();
-        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts, images, assets }).ok_or_else(|| format!("can't open {path}")));
+        (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts, assets }).ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
     }
 
@@ -262,7 +258,7 @@ fn the_tab_draws_its_design_as_the_engines_screenshot_does() {
     // The engine's screenshot of the Screen (crates/engine designs.rs),
     // against where the Screen shows in the tab.
     let design = landing("#EF4444", false);
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::render::NoImages, &zeron_design::assets::NoAssets).expect("a screenshot");
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::assets::NoAssets).expect("a screenshot");
     let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
     let mut reader = decoder.read_info().expect("a PNG");
     let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
@@ -489,7 +485,7 @@ fn shadows_blurs_and_turns_across_tile_edges_draw_without_seams() {
     let typesetter = Fonts::default().typesetter(&design);
     let laid_out = zeron_design::layout::LaidOut::of(&design, &typesetter);
     let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
-    let whole = zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::render::NoImages, &zeron_design::assets::NoAssets).expect("drawn");
+    let whole = zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::assets::NoAssets).expect("drawn");
     let one = |x: i32, y: i32| -> [u8; 4] {
         let at = ((y * 860 + x) * 4) as usize;
         whole[at..at + 4].try_into().unwrap()
@@ -551,7 +547,7 @@ fn icons_and_paths_across_tile_edges_draw_as_the_engines_screenshot_does() {
     // The engine's screenshot of the Screen (at the Canvas's origin), its
     // icon drawn from the same file.
     let files = zeron_design::assets::Files::new(assets);
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::render::NoImages, &files).expect("a screenshot");
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &files).expect("a screenshot");
     assert_eq!((shot.width, shot.height), (860, 600));
     let mut reader = png::Decoder::new(std::io::Cursor::new(shot.png)).read_info().expect("a PNG");
     let mut whole = vec![0; reader.output_buffer_size().expect("its size")];
@@ -626,7 +622,7 @@ fn text_draws_in_tiles_as_it_does_whole_in_the_fonts_the_engine_names() {
         let typesetter = fonts.typesetter(&design);
         let laid_out = zeron_design::layout::LaidOut::of(&design, &typesetter);
         let area = zeron_design::render::Rect { x: 0., y: 0., width: 860., height: 600. };
-        zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::render::NoImages, &zeron_design::assets::NoAssets).expect("drawn")
+        zeron_design::render::region(&design, &laid_out, &typesetter, &[0], area, 1., 0., (860, 600), &zeron_design::assets::NoAssets).expect("drawn")
     };
     let one = whole(&Fonts::of_files(&[serif.font_file().expect("a font")]));
     // As the engine draws it, fetching the font itself (from the same
@@ -741,8 +737,9 @@ fn stripes() -> Vec<u8> {
 
 #[test]
 fn image_fills_draw_from_the_files_the_engine_names_across_tile_edges() {
-    // The engine names each image's file; one it hasn't (a download that
-    // failed) draws as a placeholder, as the window never downloads.
+    // The engine names each image's file, as an asset; one it hasn't (a
+    // download that failed) draws as a placeholder: the window never
+    // downloads.
     let folder = tempfile::tempdir().expect("a folder");
     let file = folder.path().join("stripes.png");
     std::fs::write(&file, stripes()).expect("the image written");
@@ -754,10 +751,8 @@ fn image_fills_draw_from_the_files_the_engine_names_across_tile_edges() {
               "fill": { "type": "image", "url": "https://example.com/gone.png" } },
         ] },
     ] }));
-    let mut tab = mount(design.clone());
-    tab.engine.images.borrow_mut().insert("images/stripes.png".into(), file.clone());
-    tab.engine.say(PATH, design.clone());
-    tab.settle();
+    let assets = vec![Resolved { key: zeron_design::assets::AssetKey::image("images/stripes.png"), path: file }];
+    let mut tab = mount_with(design.clone(), assets.clone());
     assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
     let shown = tab.picture();
     // Stretched, a stripe 60 wide each, across the tiles' edges at 512.
@@ -771,8 +766,8 @@ fn image_fills_draw_from_the_files_the_engine_names_across_tile_edges() {
     assert!(placeholder.iter().zip([228, 228, 231, 255]).all(|(a, b)| a.abs_diff(b) <= 2), "{placeholder:?}");
 
     // As the engine's screenshot draws it, with the same files.
-    let images = zeron_design::render::ImageFiles::new([("images/stripes.png".to_string(), file)].into());
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &images, &zeron_design::assets::NoAssets).expect("a screenshot");
+    let files = zeron_design::assets::Files::new(assets);
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &files).expect("a screenshot");
     let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
     let mut reader = decoder.read_info().expect("a PNG");
     let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
@@ -818,7 +813,7 @@ fn instances_and_themed_tokens_draw_in_tiles_as_in_the_engines_screenshot() {
     assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
     let shown = tab.picture();
 
-    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::render::ImageFiles::default(), &zeron_design::assets::NoAssets).expect("a screenshot");
+    let shot = zeron_design::render::screenshot(&design, "screen", 10_000., &Fonts::default(), &zeron_design::assets::NoAssets).expect("a screenshot");
     let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
     let mut reader = decoder.read_info().expect("a PNG");
     let mut expected = vec![0; reader.output_buffer_size().expect("its size")];
@@ -865,16 +860,14 @@ fn an_image_and_a_font_set_only_in_an_instances_overrides_draw_in_tiles() {
         key: zeron_design::assets::AssetKey::font("Instrument Serif", 400),
         path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/InstrumentSerif-Regular.ttf"),
     };
-    let mut tab = mount_with(design.clone(), vec![serif.clone()]);
-    tab.engine.images.borrow_mut().insert("images/stripes.png".into(), file.clone());
-    tab.engine.say(PATH, design.clone());
-    tab.settle();
+    let image = Resolved { key: zeron_design::assets::AssetKey::image("images/stripes.png"), path: file };
+    let mut tab = mount_with(design.clone(), vec![serif.clone(), image.clone()]);
     assert_eq!(tab.canvas.view(TAB).unwrap().2, 1.);
     let shown = tab.picture();
 
-    let images = zeron_design::render::ImageFiles::new([("images/stripes.png".to_string(), file)].into());
+    let images = zeron_design::assets::Files::new([image]);
     let shot = |fonts: &Fonts| {
-        let shot = zeron_design::render::screenshot(&design, "screen", 10_000., fonts, &images, &zeron_design::assets::NoAssets)
+        let shot = zeron_design::render::screenshot(&design, "screen", 10_000., fonts, &images)
             .expect("a screenshot");
         let decoder = png::Decoder::new(std::io::Cursor::new(shot.png));
         let mut reader = decoder.read_info().expect("a PNG");

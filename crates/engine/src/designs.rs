@@ -30,20 +30,20 @@
 //! anywhere else changes on disk only when it's saved ([`Designs::save`]);
 //! until then each change goes to a backup in `design-backups/` in the
 //! engine's data dir, which is the Design again, marked recovered, when
-//! it's next opened after Zeron stopped without saving it. Save as
+//! it's next opened after Zeron stopped without saving it (and stale when
+//! its file changed on disk since). Save as
 //! ([`Designs::save_as`]) writes the Design anywhere with the images and
 //! fonts beside it, and the Design is that file from then on.
 //!
 //! Text is set in Google Fonts, fetched on first use as assets, or in font
-//! files beside its Design ([`zeron_design::fonts`]). Image paints draw
-//! files from the Design's folder, and downloads cached for every Design ([`images`]);
-//! tabs are told the image files too.
+//! files beside its Design ([`zeron_design::fonts`]). An image fill's file
+//! is in the Design's folder, or downloaded ([`images`]) as an asset.
 
 mod iconify;
 mod images;
 mod retry;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -66,7 +66,7 @@ pub use retry::{Edit, Failure};
 use retry::{Failed, Kept, Retarget};
 
 use self::iconify::Iconify;
-use self::images::{DesignImages, ImageCache};
+use self::images::Download;
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -85,7 +85,7 @@ const MAX_RECENT: usize = 50;
 pub const AUTOSAVE_AFTER: Duration = Duration::from_secs(3);
 
 /// What an agent's call on a Design that isn't managed is told.
-const UNSAVED_NOTICE: &str = "This Design's file changes only when the person saves it in its Design tab; until then your changes are kept in a backup, and other calls and its tabs see them.";
+const UNSAVED_NOTICE: &str = "Kept in a backup: the file changes when the person saves the Design.";
 
 /// The undo step of discarding a Design's unsaved changes.
 const DISCARD_DESCRIPTION: &str = "Discard unsaved changes";
@@ -218,8 +218,6 @@ struct Inner {
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
     recent_file: PathBuf,
-    /// Images downloaded, for every Design.
-    images: Arc<ImageCache>,
     /// Where Designs that aren't managed keep their unsaved changes.
     backups: PathBuf,
     /// How long after a change managed Designs save themselves.
@@ -239,8 +237,6 @@ struct Live {
     seen: HashMap<String, u64>,
     /// What the Design tabs following it hear: it after each change.
     followers: tokio::sync::watch::Sender<Told>,
-    /// The images its paints refer to.
-    images: DesignImages,
     /// Where its tabs are told the files of its assets.
     assets: Arc<Cache>,
     /// How its changes reach its file.
@@ -252,6 +248,12 @@ struct Live {
     /// Zeron stopped without saving them; until it's saved or they're
     /// discarded.
     recovered: bool,
+    /// Its file changed on disk since the recovered changes were made to
+    /// it (or that can't be told); as long as it's recovered.
+    stale: bool,
+    /// The digest of its file as its changes began from: as it was read or
+    /// last saved (none for a recovered Design whose backup didn't say).
+    base: Option<String>,
     /// Itself, for its autosave to come back to.
     me: Weak<Mutex<Live>>,
 }
@@ -276,14 +278,13 @@ struct Told {
     version: u64,
     design: Arc<Design>,
     changes: Vec<Change>,
-    /// The file each image it draws is in, for the tabs to read (they
-    /// never download): those it has, by url.
-    images: BTreeMap<String, PathBuf>,
     assets: Option<Vec<Resolved>>,
-    /// Its file, unsaved and recovered: as [`Designs::saving`] says.
+    /// Its file, unsaved, recovered and stale: as [`Designs::saving`]
+    /// says.
     path: PathBuf,
     unsaved: bool,
     recovered: bool,
+    stale: bool,
 }
 
 /// One change to a Design, as its tabs hear of it.
@@ -333,6 +334,7 @@ impl Designs {
                 assets: {
                     let assets = Cache::new(&data_dir.join("design-cache"), Arc::new(Iconify));
                     assets.set_font_source(Box::new(GoogleFonts::default()));
+                    assets.set_image_source(Arc::new(Download));
                     Arc::new(assets)
                 },
                 live: Mutex::new(HashMap::new()),
@@ -341,7 +343,6 @@ impl Designs {
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
-                images: Arc::new(ImageCache::new(data_dir.join("image-cache"))),
                 backups: data_dir.join("design-backups"),
                 autosave: Mutex::new(AUTOSAVE_AFTER),
             }),
@@ -362,7 +363,9 @@ impl Designs {
 
     /// Whether the Design at `path` is managed, has unsaved changes, and
     /// recovered them (`DesignSaving`): `{path, managed, unsaved,
-    /// recovered}`. Blocking, like every call here that may read a file.
+    /// recovered, stale}`, `stale` when its file changed on disk since the
+    /// recovered changes were made to it. Blocking, like every call here
+    /// that may read a file.
     pub fn saving(&self, path: &Path) -> Result<Value, DesignError> {
         Ok(lock(&*self.open(path)?).saving())
     }
@@ -459,7 +462,8 @@ impl Designs {
             }
             by_path.insert(to.clone(), held.clone());
         }
-        if let Err(e) = write_whole(&to, design.to_json().as_bytes()) {
+        let json = design.to_json();
+        if let Err(e) = write_whole(&to, json.as_bytes()) {
             lock(&self.inner.live).remove(&to);
             return Err(io(e));
         }
@@ -473,10 +477,8 @@ impl Designs {
         if let Saving::Backup(backup) = &live.saving {
             remove_backup(backup);
         }
-        live.images = DesignImages::new(&to, self.inner.images.clone());
         live.fonts = self.fonts_for(&to);
-        live.unsaved = false;
-        live.recovered = false;
+        live.on_file(digest(json.as_bytes()));
         if renamed {
             // One undo step: undone, it draws its images by their old names.
             let before = std::mem::replace(&mut live.design, design);
@@ -516,21 +518,23 @@ impl Designs {
                 pending: false,
             }
         } else {
-            let key = format!("{:x}", sha2::Sha256::digest(path.to_string_lossy().as_bytes()));
+            let key = digest(path.to_string_lossy().as_bytes());
             Saving::Backup(self.inner.backups.join(format!("{}.{EXTENSION}", &key[..32])))
         }
     }
 
-    /// The Design at `path` held live, as `design`; `recovered` when that
-    /// came from its backup.
-    fn hold(&self, path: PathBuf, design: Design, recovered: bool) -> Arc<Mutex<Live>> {
+    /// The Design at `path` held live, as `design`, its file as [`Opened`]
+    /// says.
+    fn hold(&self, path: PathBuf, design: Design, opened: Opened) -> Arc<Mutex<Live>> {
         let fonts = self.fonts_for(&path);
         let saving = self.saving_for(&path);
         Arc::new_cyclic(|me| {
-            let (images, assets) = (self.inner.images.clone(), self.inner.assets.clone());
-            let mut live = Live::new(path, design, fonts, images, assets, saving, me.clone());
-            live.unsaved = recovered;
-            live.recovered = recovered;
+            let assets = self.inner.assets.clone();
+            let mut live = Live::new(path, design, fonts, assets, saving, me.clone());
+            live.unsaved = opened.recovered;
+            live.recovered = opened.recovered;
+            live.stale = opened.stale;
+            live.base = opened.base;
             Mutex::new(live)
         })
     }
@@ -640,21 +644,21 @@ impl Designs {
     /// design, changes: [{version, changed, by}]}`: the changes since the
     /// item before (none in the first), `by` "agent", "undo" or "file"
     /// (unsaved changes discarded, or Save as renaming images); and `path`,
-    /// `unsaved` and `recovered`, as [`Designs::saving`] says (heard again,
+    /// `unsaved`, `recovered` and `stale`, as [`Designs::saving`] says (heard again,
     /// with no changes, when only they change). A tab that falls behind
     /// hears the latest only. Blocking (it may read the file): run it off
     /// the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
         let told = loop {
-            let (version, design, images) = {
+            let (version, design) = {
                 let live = lock(&live);
                 let told = live.followers.borrow();
                 if told.version == live.version && told.assets.is_some() {
                     drop(told);
                     break live.followers.subscribe();
                 }
-                (live.version, live.design.clone(), live.images.files(&live.design))
+                (live.version, live.design.clone())
             };
             let live = lock(&live);
             // (Changes with nobody following weren't copied for them; one
@@ -666,11 +670,11 @@ impl Designs {
                     version,
                     design: Arc::new(design),
                     changes: Vec::new(),
-                    images,
                     assets: Some(assets),
                     path: live.path.clone(),
                     unsaved: live.unsaved,
                     recovered: live.recovered,
+                    stale: live.stale,
                 });
                 break live.followers.subscribe();
             }
@@ -689,11 +693,11 @@ impl Designs {
                 "version": now.version,
                 "design": &*now.design,
                 "changes": since,
-                "images": now.images,
                 "assets": now.assets.as_deref().unwrap_or_default(),
                 "path": now.path,
                 "unsaved": now.unsaved,
                 "recovered": now.recovered,
+                "stale": now.stale,
             });
             Some((item, (told, Some(now.version))))
         }))
@@ -750,7 +754,8 @@ impl Designs {
         // Images the call placed or looked at that can't be had (those it
         // can, downloaded now, for its screenshots and the tabs).
         let looked_at = edited.changed.iter().chain(&edited.screenshots);
-        let missing = images::warnings(looked_at.filter_map(|id| drawn.find(id)), &live.images);
+        let assets = live.assets.beside(&live.folder());
+        let missing = images::warnings(looked_at.filter_map(|id| drawn.find(id)), &assets);
         edited.warnings.extend(missing);
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
@@ -949,21 +954,40 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        // Changes Zeron stopped without saving, from its backup.
+        let file = digest(text.as_bytes());
+        // Changes Zeron stopped without saving, from its backup: stale when
+        // the file isn't as they began from (or that can't be told).
         let backup = match self.saving_for(&path) {
             Saving::Backup(backup) => std::fs::read_to_string(&backup).ok().and_then(|text| {
-                Design::from_json(&text)
+                let design = Design::from_json(&text)
                     .inspect_err(|e| tracing::warn!("can't recover {} from {}: {e}", path.display(), backup.display()))
-                    .ok()
+                    .ok()?;
+                let base = std::fs::read_to_string(base_of(&backup)).ok().map(|base| base.trim().to_owned());
+                Some((design, base))
             }),
             Saving::Autosave { .. } => None,
         };
-        let recovered = backup.is_some();
-        let design = backup.unwrap_or(design);
+        let (design, opened) = match backup {
+            Some((recovered, base)) => (
+                recovered,
+                Opened {
+                    recovered: true,
+                    stale: base.as_ref() != Some(&file),
+                    base,
+                },
+            ),
+            None => (
+                design,
+                Opened {
+                    base: Some(file),
+                    ..Opened::default()
+                },
+            ),
+        };
         // Fetched now, outside its lock: telling its tabs and drawing it
         // only read what's cached.
         self.inner.assets.fetch(&design, path.parent());
-        let design = self.hold(path.clone(), design, recovered);
+        let design = self.hold(path.clone(), design, opened);
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -989,7 +1013,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = self.hold(path.clone(), Design::default(), false);
+        let design = self.hold(path.clone(), Design::default(), Opened::default());
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -1010,12 +1034,20 @@ struct Target {
     new: bool,
 }
 
+/// What a Design held from its file starts with: as [`Live`]'s `base`,
+/// `recovered` and `stale` say.
+#[derive(Default)]
+struct Opened {
+    base: Option<String>,
+    recovered: bool,
+    stale: bool,
+}
+
 impl Live {
     fn new(
         path: PathBuf,
         design: Design,
         fonts: Fonts,
-        cache: Arc<ImageCache>,
         assets: Arc<Cache>,
         saving: Saving,
         me: Weak<Mutex<Live>>,
@@ -1024,13 +1056,12 @@ impl Live {
             version: 0,
             design: Arc::new(design.clone()),
             changes: Vec::new(),
-            images: BTreeMap::new(),
             assets: None,
             path: path.clone(),
             unsaved: false,
             recovered: false,
+            stale: false,
         };
-        let images = DesignImages::new(&path, cache);
         Self {
             path,
             design,
@@ -1039,13 +1070,19 @@ impl Live {
             version: 0,
             seen: HashMap::new(),
             followers: tokio::sync::watch::channel(told).0,
-            images,
             assets,
             saving,
             unsaved: false,
             recovered: false,
+            stale: false,
+            base: None,
             me,
         }
+    }
+
+    /// The folder its file is in.
+    fn folder(&self) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).to_owned()
     }
 
     /// Makes `design` the Design, as every change does: puts it on disk as
@@ -1075,6 +1112,16 @@ impl Live {
             Saving::Backup(backup) => {
                 let io = |e: std::io::Error| DesignError::Io(format!("can't back up {}: {e}", backup.display()));
                 std::fs::create_dir_all(backup.parent().unwrap_or(Path::new("."))).map_err(io)?;
+                // As a backup begins, the file its changes begin from, to
+                // tell later whether it changed on disk since.
+                if !backup.exists() {
+                    let base = base_of(backup);
+                    match &self.base {
+                        Some(digest) => write_whole(&base, digest.as_bytes()).map_err(io)?,
+                        // (Can't be told: so it's stale if recovered.)
+                        None => _ = std::fs::remove_file(&base),
+                    }
+                }
                 write_whole(backup, design.to_json().as_bytes()).map_err(io)?;
                 self.unsaved = true;
             }
@@ -1115,14 +1162,23 @@ impl Live {
 
     /// Saves the Design to its file, its backup gone.
     fn save_file(&mut self) -> Result<(), DesignError> {
-        save(&self.path, &self.design)?;
+        let json = self.design.to_json();
+        save_json(&self.path, &json)?;
         if let Saving::Backup(backup) = &self.saving {
             remove_backup(backup);
         }
-        self.unsaved = false;
-        self.recovered = false;
+        self.on_file(digest(json.as_bytes()));
         self.tell_saving();
         Ok(())
+    }
+
+    /// Its changes are all in its file, whose digest is `base`: it's no
+    /// longer unsaved, recovered or stale.
+    fn on_file(&mut self, base: String) {
+        self.base = Some(base);
+        self.unsaved = false;
+        self.recovered = false;
+        self.stale = false;
     }
 
     /// Puts the Design back as its file holds it, as one undo step, its
@@ -1141,8 +1197,7 @@ impl Live {
         let design = Design::from_json(&text)
             .map_err(|e| DesignError::Refused(format!("{} is not a Design: {e}", self.path.display())))?;
         remove_backup(&backup);
-        self.unsaved = false;
-        self.recovered = false;
+        self.on_file(digest(text.as_bytes()));
         let before = self.put(design, Vec::new(), Changer::File);
         self.history.record(DISCARD_DESCRIPTION, &before, &self.design);
         Ok(())
@@ -1155,18 +1210,23 @@ impl Live {
             "managed": matches!(self.saving, Saving::Autosave { .. }),
             "unsaved": self.unsaved,
             "recovered": self.recovered,
+            "stale": self.stale,
         })
     }
 
-    /// Tells the Design's tabs its file, and whether it's unsaved or
-    /// recovered, when that changed.
+    /// Tells the Design's tabs its file, and whether it's unsaved,
+    /// recovered or stale, when that changed.
     fn tell_saving(&self) {
-        let (path, unsaved, recovered) = (&self.path, self.unsaved, self.recovered);
+        let (path, unsaved, recovered, stale) = (&self.path, self.unsaved, self.recovered, self.stale);
         self.followers.send_if_modified(|told| {
-            let changed = told.path != *path || told.unsaved != unsaved || told.recovered != recovered;
+            let changed = told.path != *path
+                || told.unsaved != unsaved
+                || told.recovered != recovered
+                || told.stale != stale;
             told.path.clone_from(path);
             told.unsaved = unsaved;
             told.recovered = recovered;
+            told.stale = stale;
             changed
         });
     }
@@ -1201,14 +1261,11 @@ impl Live {
             by,
         };
         let design = Arc::new(self.design.clone());
-        // (Downloaded already, by the call that placed them.)
-        let images = self.images.files(&self.design);
         // (Only what's cached: no fetch under its lock.)
         let assets = self.assets.resolved(&self.design, self.path.parent());
         self.followers.send_modify(|told| {
             told.version = change.version;
             told.design = design;
-            told.images = images;
             told.assets = Some(assets);
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
@@ -1218,10 +1275,11 @@ impl Live {
 
     /// Keeps a successful change's draft (`by` whom) as one undo step,
     /// described as `description`: saves the file, then draws the
-    /// screenshots it asked for.
+    /// screenshots it asked for with its assets.
     fn commit(&mut self, edited: &Edited, description: &str, by: Changer) -> Result<Vec<Value>, DesignError> {
         let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect(), by)?;
         self.history.record(description, &before, &self.design);
+        let assets = self.assets.beside(&self.folder());
         Ok(edited
             .screenshots
             .iter()
@@ -1231,8 +1289,7 @@ impl Live {
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
                     &self.fonts,
-                    &self.images,
-                    &*self.assets,
+                    &assets,
                 );
                 match shot {
                     Ok(shot) => json!({
@@ -1252,12 +1309,17 @@ impl Live {
 /// Writes the file whole or not at all, making a new managed Design's
 /// folder (with its `images/`) on its first save.
 fn save(path: &Path, design: &Design) -> Result<(), DesignError> {
+    save_json(path, &design.to_json())
+}
+
+/// Saves a Design's JSON as [`save`] does.
+fn save_json(path: &Path, json: &str) -> Result<(), DesignError> {
     let io = |e: std::io::Error| DesignError::Io(format!("can't save {}: {e}", path.display()));
     let folder = path.parent().ok_or_else(|| DesignError::Io("a Design's path has no folder".into()))?;
     if !path.exists() {
         std::fs::create_dir_all(folder.join("images")).map_err(io)?;
     }
-    write_whole(path, design.to_json().as_bytes()).map_err(io)
+    write_whole(path, json.as_bytes()).map_err(io)
 }
 
 /// Writes `path` whole or not at all.
@@ -1284,13 +1346,27 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// How many times a save tries again to replace its file.
 const PERSIST_TRIES: u64 = 8;
 
-/// Removes a Design's backup, once its changes are saved or discarded.
+/// Removes a Design's backup (and the digest beside it), once its changes
+/// are saved or discarded.
 fn remove_backup(backup: &Path) {
-    if let Err(e) = std::fs::remove_file(backup)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("can't remove the backup {}: {e}", backup.display());
+    for file in [backup.to_owned(), base_of(backup)] {
+        if let Err(e) = std::fs::remove_file(&file)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("can't remove the backup {}: {e}", file.display());
+        }
     }
+}
+
+/// Beside a Design's backup: the digest of its file as its changes began
+/// from.
+fn base_of(backup: &Path) -> PathBuf {
+    backup.with_extension("base")
+}
+
+/// A file's contents' SHA-256, in hex.
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 /// `design` as saved in the folder `to` from the folder `from`: the image

@@ -7391,6 +7391,7 @@ version = "0.2.139"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "skia-safe",
  "thiserror 2.0.21",
  "tracing",

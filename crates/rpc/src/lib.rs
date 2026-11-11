@@ -365,7 +365,7 @@ pub mod methods {
     /// guide}`. Local only, like `DesignExecute`.
     pub const DESIGN_STATE: &str = "DesignState";
     /// `{path}` → stream (the app's Design tab) of `{version, design,
-    /// changes, path, unsaved, recovered}`: the Design whole as it is, then
+    /// changes, path, unsaved, recovered, stale}`: the Design whole as it is, then
     /// after each change, with each change since the item before as
     /// `{version, changed, by}` (the ids it made or changed; `by` "agent",
     /// "undo" or "file"), and again when only its file or saving state
@@ -376,9 +376,10 @@ pub mod methods {
     /// and come to the front; what `design_state` and a call naming no
     /// Design go by. Local only.
     pub const SET_DESIGN_TABS: &str = "SetDesignTabs";
-    /// `{path}` → `{path, managed, unsaved, recovered}`: whether a Design
+    /// `{path}` → `{path, managed, unsaved, recovered, stale}`: whether a Design
     /// is in Zeron's designs folder (it saves itself), has changes its file
-    /// doesn't, and found them in its backup when it opened. Local only.
+    /// doesn't, and found them in its backup when it opened (stale: its
+    /// file changed on disk since they were made). Local only.
     pub const DESIGN_SAVING: &str = "DesignSaving";
     /// `{path}` → as `DesignSaving`: saves a Design to its file now (Ctrl+S).
     /// Local only.

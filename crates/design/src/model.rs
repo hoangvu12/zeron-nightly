@@ -240,9 +240,20 @@ pub trait NodeKind {
         None
     }
 
-    /// The assets it draws with ([`crate::assets`]).
+    /// The assets it draws with ([`crate::assets`]): by default, the images
+    /// its enabled fills draw.
     fn assets(&self) -> Vec<AssetKey> {
-        Vec::new()
+        let Some(look) = self.look((0., 0.)) else {
+            return Vec::new();
+        };
+        look.fill
+            .iter()
+            .filter(|paint| paint.enabled)
+            .filter_map(|paint| match &paint.kind {
+                PaintKind::Image(image) => Some(AssetKey::image(&image.url)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether its children are cut off at its bounds.
