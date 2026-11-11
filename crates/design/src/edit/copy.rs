@@ -11,7 +11,7 @@ use crate::model::Node;
 impl Draft {
     /// Copies the node `id` with its descendants as the last child of
     /// `parent`, or onto the Canvas without one. The copy and every node
-    /// in it get new ids. `props` are set on the copy as Update sets them,
+    /// in it get new ids, listed by name in the call's map as Insert's are. `props` are set on the copy as Update sets them,
     /// but for its `descendants`: an object from the id of a node inside
     /// `id` to properties set on that node's copy. Returns the copy's id.
     pub fn copy(&mut self, id: &str, parent: Option<&str>, props: Value) -> Result<String, EditError> {
@@ -47,28 +47,24 @@ impl Draft {
         warnings.extend(unsupported_warnings(&copy, "Copy", unsupported));
         warnings.extend(set_warnings(&copy, &props));
 
-        let mut renamed = HashMap::new();
-        self.renew_ids(&mut copy, &mut renamed);
+        let (mut renamed, mut made) = (HashMap::new(), Vec::new());
+        self.renew_ids(&mut copy, &mut renamed, &mut made);
         for warning in &mut warnings {
             warning.node = warning.node.as_ref().map(|old| renamed[old].clone());
         }
-        let built = Built {
-            made: vec![(copy.name.clone(), copy.id.clone())],
-            node: copy,
-            warnings,
-        };
-        let id = self.attach(parent, None, built);
-        self.changed.extend(renamed.into_values());
-        Ok(id)
+        let built = Built { node: copy, made, warnings };
+        Ok(self.attach(parent, None, built))
     }
 
-    /// Gives `node` and its descendants new ids, noting each old id's new one.
-    fn renew_ids(&mut self, node: &mut Node, renamed: &mut HashMap<String, String>) {
+    /// Gives `node` and its descendants new ids, noting each old id's new
+    /// one, and each node as (name, new id) as Insert notes the nodes it makes.
+    fn renew_ids(&mut self, node: &mut Node, renamed: &mut HashMap<String, String>, made: &mut Vec<(String, String)>) {
         let id = self.new_id();
-        renamed.insert(std::mem::replace(&mut node.id, id.clone()), id);
+        renamed.insert(std::mem::replace(&mut node.id, id.clone()), id.clone());
+        made.push((node.name.clone(), id));
         if let Some(children) = node.kind.get_mut().children_mut() {
             for child in children {
-                self.renew_ids(child, renamed);
+                self.renew_ids(child, renamed, made);
             }
         }
     }

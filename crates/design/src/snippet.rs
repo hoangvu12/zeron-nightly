@@ -86,7 +86,7 @@ const PRELUDE: &str = r#"(function (native) {
     native.move(String(node), id(parent), index == null ? null : Number(index));
   };
   globalThis.Delete = function (nodes) {
-    for (const node of Array.isArray(nodes) ? nodes : [nodes]) native.delete(String(node));
+    native.delete(json((Array.isArray(nodes) ? nodes : [nodes]).map(String)));
   };
   globalThis.FindEmptySpace = function (wanted) {
     return JSON.parse(native.emptySpace(json(wanted)));
@@ -263,8 +263,9 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
         let draft = draft.clone();
         native.set(
             "delete",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String| {
-                draft.borrow_mut().delete(&id).map_err(|e| thrown(&ctx, e))
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, ids: String| {
+                let ids: Vec<String> = serde_json::from_str(&ids).map_err(|e| thrown(&ctx, e))?;
+                draft.borrow_mut().delete(&ids).map_err(|e| thrown(&ctx, e))
             })?,
         )?;
     }

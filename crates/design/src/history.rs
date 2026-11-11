@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use crate::model::{Design, Node};
 
 /// Most steps kept to undo; the oldest go first.
-pub const MAX_STEPS: usize = 100;
+const MAX_STEPS: usize = 100;
 
 #[derive(Debug, Default)]
 pub struct History {

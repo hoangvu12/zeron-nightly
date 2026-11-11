@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Most failed calls kept to retry; the oldest go first.
+/// Most failed calls kept to retry per chat; its oldest go first.
 const MAX_KEPT: usize = 32;
 
 /// Longest line of the snippet a failure quotes.
@@ -84,10 +84,17 @@ impl Failed {
     pub fn keep(&mut self, edit_id: Option<String>, kept: Kept) -> String {
         let edit_id = edit_id.unwrap_or_else(new_edit_id);
         self.remove(&edit_id);
+        let chat = kept.chat.clone();
         self.kept.push_back((edit_id.clone(), kept));
-        if self.kept.len() > MAX_KEPT {
-            self.kept.pop_front();
-        }
+        let mut of_chat = self.kept.iter().filter(|(_, kept)| kept.chat == chat).count();
+        // So one busy chat can't push out another's.
+        self.kept.retain(|(_, kept)| {
+            let oldest = kept.chat == chat && of_chat > MAX_KEPT;
+            if oldest {
+                of_chat -= 1;
+            }
+            !oldest
+        });
         edit_id
     }
 

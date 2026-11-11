@@ -10,7 +10,7 @@ use crate::render::Rect;
 
 /// Space kept between the room found and the nodes around it, unless
 /// asked otherwise.
-pub const DEFAULT_PADDING: f32 = 100.;
+const DEFAULT_PADDING: f32 = 100.;
 
 /// What `FindEmptySpace` is asked for.
 #[derive(Debug, Deserialize)]

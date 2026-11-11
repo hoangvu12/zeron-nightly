@@ -294,37 +294,12 @@ impl Designs {
     /// Undoes the latest change to the Design at `path`, whoever made it,
     /// and saves it. False with nothing to undo.
     pub fn undo(&self, path: &Path) -> Result<bool, DesignError> {
-        self.step(path, History::undo, History::redo)
+        lock(&*self.open(path)?).step(History::undo, History::redo)
     }
 
     /// Does the latest undone change to the Design at `path` again.
     pub fn redo(&self, path: &Path) -> Result<bool, DesignError> {
-        self.step(path, History::redo, History::undo)
-    }
-
-    /// Takes one step through the Design's history with `step`, or back
-    /// with `back` when the Design can't be saved.
-    fn step(
-        &self,
-        path: &Path,
-        step: fn(&mut History, &Design) -> Option<(Design, String)>,
-        back: fn(&mut History, &Design) -> Option<(Design, String)>,
-    ) -> Result<bool, DesignError> {
-        let live = self.open(path)?;
-        let mut live = lock(&live);
-        let live = &mut *live;
-        let Some((design, _)) = step(&mut live.history, &live.design) else {
-            return Ok(false);
-        };
-        if let Err(e) = save(&live.path, &design) {
-            back(&mut live.history, &design);
-            return Err(e);
-        }
-        live.design = design;
-        // A change, as other chats' next calls and the Design's tabs are told.
-        live.version += 1;
-        live.tell(Vec::new());
-        Ok(true)
+        lock(&*self.open(path)?).step(History::redo, History::undo)
     }
 
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
@@ -624,6 +599,35 @@ impl Live {
         }
     }
 
+    /// Makes `design` the Design, as every change does: saves it, then
+    /// tells other chats' next calls and the Design's tabs, with the nodes
+    /// `changed`. Returns the Design as it was.
+    fn keep(&mut self, design: Design, changed: Vec<String>) -> Result<Design, DesignError> {
+        save(&self.path, &design)?;
+        let before = std::mem::replace(&mut self.design, design);
+        self.version += 1;
+        self.tell(changed);
+        Ok(before)
+    }
+
+    /// Takes one step through the Design's history with `step` (undo or
+    /// redo), or back with `back` when the Design can't be saved. False
+    /// with no step to take.
+    fn step(
+        &mut self,
+        step: fn(&mut History, &Design) -> Option<(Design, String)>,
+        back: fn(&mut History, &Design) -> Option<(Design, String)>,
+    ) -> Result<bool, DesignError> {
+        let Some((design, _)) = step(&mut self.history, &self.design) else {
+            return Ok(false);
+        };
+        if let Err(e) = self.keep(design.clone(), Vec::new()) {
+            back(&mut self.history, &design);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
     /// Tells the Design's tabs what a change made of it, and the nodes it
     /// changed (copied for them only while some follow it).
     fn tell(&self, changed: Vec<String>) {
@@ -641,11 +645,8 @@ impl Live {
     /// `description`: saves the file, then draws the screenshots the call
     /// asked for.
     fn commit(&mut self, edited: &Edited, description: &str) -> Result<Vec<Value>, DesignError> {
-        save(&self.path, &edited.design)?;
-        self.history.record(description, &self.design, &edited.design);
-        self.design = edited.design.clone();
-        self.version += 1;
-        self.tell(edited.changed.iter().cloned().collect());
+        let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect())?;
+        self.history.record(description, &before, &self.design);
         Ok(edited
             .screenshots
             .iter()

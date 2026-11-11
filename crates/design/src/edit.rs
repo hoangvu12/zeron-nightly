@@ -48,8 +48,6 @@ pub struct Draft {
     created: Vec<(String, String)>,
     /// Nodes this call made or changed.
     changed: BTreeSet<String>,
-    /// Nodes the Design had that this call deleted.
-    deleted: BTreeSet<String>,
     /// Nodes whose screenshots the call asked for, in order.
     screenshots: Vec<String>,
     /// What the snippet printed, for the call's result.
@@ -65,7 +63,6 @@ pub struct Edited {
     /// listed as `Name 2`, `Name 3` and so on.
     pub names: Map<String, Value>,
     pub changed: BTreeSet<String>,
-    pub deleted: BTreeSet<String>,
     pub screenshots: Vec<String>,
     /// The lines the call printed.
     pub printed: Vec<String>,
@@ -87,7 +84,6 @@ impl Draft {
             ids,
             created: Vec::new(),
             changed: BTreeSet::new(),
-            deleted: BTreeSet::new(),
             screenshots: Vec::new(),
             printed: Printed::default(),
             warnings: Vec::new(),
@@ -155,7 +151,6 @@ impl Draft {
             design: self.design,
             names,
             changed: self.changed,
-            deleted: self.deleted,
             screenshots: self.screenshots,
             printed: self.printed.into_lines(),
             warnings: warning::finished(self.warnings),

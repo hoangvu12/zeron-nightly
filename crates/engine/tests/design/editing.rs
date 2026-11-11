@@ -63,6 +63,8 @@ Print(Get(onCanvas, {{ depth: Infinity }}));"##
     assert_eq!(copy["children"][0]["name"], "Label");
     assert_eq!(copy["children"][0]["fill"], "#000000");
     assert_ne!(copy["children"][0]["id"], label);
+    // Listed by name with the rest, as Insert lists inline children.
+    assert_eq!(copied.id("Label"), copy["children"][0]["id"].as_str().unwrap());
 
     // The whole Screen, copied onto the Canvas: every id in it is new.
     let whole = line(&printed, 1);
@@ -288,6 +290,17 @@ Delete([gone, "{title}"]);"#
 
     let missing = seam.execute(&made.path(), &format!(r#"Delete("{button}");"#)).await;
     assert!(missing.is_error && missing.text.contains(&button), "{}", missing.text);
+
+    // All or nothing: a list with a node that isn't there deletes none.
+    let kept = seam
+        .execute(
+            &made.path(),
+            r#"const id = Get()[1].id;
+try { Delete([id, "nope"]); } catch (e) { Print(String(e.message)); }
+Print(Get().length);"#,
+        )
+        .await;
+    assert_eq!(kept.printed()[1], "2", "{:?}", kept.printed());
     seam.shutdown().await;
 }
 
