@@ -16,8 +16,10 @@ impl Live {
     pub(super) fn export(&self, exports: &[Export]) -> (Vec<String>, Vec<Warning>) {
         let (mut written, mut warnings) = (Vec::new(), Vec::new());
         let assets = self.assets.beside(&self.folder());
-        let mut wrote = |path: &Path, bytes: Result<Vec<u8>, String>| match bytes
-            .and_then(|bytes| write_whole(path, &bytes).map_err(|e| e.to_string()))
+        let mut wrote = |path: &Path, bytes: Result<Vec<u8>, String>| match bytes.and_then(|bytes| {
+            let folder = path.parent().unwrap_or(Path::new("."));
+            std::fs::create_dir_all(folder).and_then(|()| write_whole(path, &bytes)).map_err(|e| e.to_string())
+        })
         {
             Ok(()) => written.push(path.display().to_string()),
             Err(e) => warnings.push(Warning::export(format!("Export couldn't write {}: {e}", path.display()))),

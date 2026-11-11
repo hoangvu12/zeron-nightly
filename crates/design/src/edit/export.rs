@@ -1,7 +1,8 @@
 //! `Export`: nodes as PNG files into a folder, or Screens as one HTML file.
-//! The call checks now that it can write where the export goes, so a path
-//! it can't write fails the call with why; the files are written once the
-//! call is kept, from the Design as it left it.
+//! The call checks now that it could write where the export goes, so a
+//! path it can't write fails the call with why (and leaves nothing
+//! behind); the folders and files are made once the call is kept, from the
+//! Design as it left it.
 
 use std::path::{Path, PathBuf};
 
@@ -121,8 +122,19 @@ impl Draft {
             (Some(folder), false) => folder.join(path),
             (None, false) => return Err(format!("{} isn't absolute, and the Design has no folder yet", path.display())),
         };
-        // Its separators this system's, however written.
-        let path: PathBuf = path.components().collect();
+        // Its separators this system's and its `..` taken, however written,
+        // so the paths from it (to its images) are right.
+        let mut normal = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                std::path::Component::CurDir => {}
+                part => normal.push(part.as_os_str()),
+            }
+        }
+        let path = normal;
         if path.extension().is_some_and(|e| e == "zdesign") {
             return Err(format!("{} is a Design's file, which an export doesn't write over", path.display()));
         }
@@ -130,11 +142,21 @@ impl Draft {
     }
 }
 
-/// Makes `folder` if it isn't there, and checks a file can be written in it.
+/// Whether `folder` could be written in: the nearest part of it that's
+/// there is a folder, and a file can be written (then removed) in it.
 fn writable(folder: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(folder).map_err(|e| format!("can't make the folder {}: {e}", folder.display()))?;
-    let probe = folder.join(format!(".zeron-export-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&probe, b"").map_err(|e| format!("can't write in {}: {e}", folder.display()))?;
+    let there = folder.ancestors().find(|ancestor| ancestor.exists()).ok_or_else(|| {
+        format!("can't write in {}: none of its folders is there", folder.display())
+    })?;
+    if !there.is_dir() {
+        return Err(format!(
+            "can't make the folder {}: {} is a file, not a folder",
+            folder.display(),
+            there.display()
+        ));
+    }
+    let probe = there.join(format!(".zeron-export-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&probe, b"").map_err(|e| format!("can't write in {}: {e}", there.display()))?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
 }

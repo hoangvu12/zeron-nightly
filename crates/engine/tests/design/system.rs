@@ -363,5 +363,12 @@ Insert({ type: "icon", name: "Glyph", icon: "$glyph", width: 24, height: 24 });"
         .await;
     let warnings = made.json()["warnings"].to_string();
     assert!(warnings.contains("mdi:no-such-icon") && warnings.contains("can't be had"), "{warnings}");
+
+    // Pointing the Token at another icon that can't be had warns too,
+    // though no node changed.
+    let token = seam
+        .execute(&made.path(), r##"SetTokens({ glyph: { type: "string", value: "mdi:also-missing" } });"##)
+        .await;
+    assert!(token.json()["warnings"].to_string().contains("mdi:also-missing"), "{}", token.text);
     seam.shutdown().await;
 }

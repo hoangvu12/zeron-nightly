@@ -73,19 +73,14 @@ pub fn node(
     // Where it sits.
     match parent {
         Parent::Page => set("position", "relative".into()),
-        Parent::Free => {
-            set("position", "absolute".into());
-            set("left", px(node.x));
-            set("top", px(node.y));
-        }
-        Parent::Flex { .. } if node.absolute => {
+        _ if parent == Parent::Free || node.absolute => {
             set("position", "absolute".into());
             set("left", px(node.x));
             set("top", px(node.y));
         }
         // A Frame, so what's absolute inside it is placed from it.
         Parent::Flex { .. } if kind.layout().is_some() => set("position", "relative".into()),
-        Parent::Flex { .. } => {}
+        _ => {}
     }
 
     // How big it is.
@@ -112,7 +107,11 @@ pub fn node(
             }
             Sizing::FillContainer if in_flex.is_some() => set("align-self", "stretch".into()),
             Sizing::FillContainer if parent == Parent::Page => set(property, px(laid)),
-            Sizing::FillContainer => set(property, "100%".into()),
+            // What's left of the parent past where it starts, as the layout gives it.
+            Sizing::FillContainer => {
+                let from = if property == "width" { node.x } else { node.y };
+                set(property, if from == 0. { "100%".into() } else { format!("calc(100% - {})", px(from)) });
+            }
             Sizing::FitContent if shrinks && parent != Parent::Page => {}
             Sizing::FitContent => set(property, px(laid)),
         }
@@ -142,7 +141,7 @@ pub fn node(
 
     // How it looks.
     if let Kind::Text(text) = &node.kind {
-        text_style(d, text, refs);
+        text_style(d, text, refs, image_href);
         if let Some(look) = &look {
             shadows(d, look, true);
         }
@@ -173,15 +172,24 @@ pub fn node(
         }
     }
     let d = &mut out.declarations;
+    let mut filters: Vec<String> = d
+        .iter()
+        .position(|(property, _)| property == "filter")
+        .map(|at| d.remove(at).1)
+        .into_iter()
+        .collect();
     let blur = look.as_ref().map(|look| look.effects.effect.iter().filter(|e| e.enabled));
     for effect in blur.into_iter().flatten() {
         match effect.kind {
-            EffectKind::LayerBlur(radius) => d.push(("filter".into(), format!("blur({})", px(radius / 2.)))),
+            EffectKind::LayerBlur(radius) => filters.push(format!("blur({})", px(radius / 2.))),
             EffectKind::BackgroundBlur(radius) => {
                 d.push(("backdrop-filter".into(), format!("blur({})", px(radius / 2.))));
             }
             _ => {}
         }
+    }
+    if !filters.is_empty() {
+        d.push(("filter".into(), filters.join(" ")));
     }
     if node.opacity < 1. {
         d.push(("opacity".into(), number(node.opacity)));
@@ -201,16 +209,33 @@ pub fn node(
     out
 }
 
-fn text_style(d: &mut Vec<(String, String)>, text: &crate::model::Text, refs: &Map<String, Value>) {
+fn text_style(
+    d: &mut Vec<(String, String)>,
+    text: &crate::model::Text,
+    refs: &Map<String, Value>,
+    image_href: &dyn Fn(&str) -> String,
+) {
+    // One solid colour is the text's colour; anything more is painted
+    // behind it and cut to the letters.
+    let paints: Vec<&Paint> = text.fill.fill.iter().filter(|paint| paint.enabled).collect();
+    match paints.as_slice() {
+        [paint] if matches!(paint.kind, PaintKind::Solid(_)) => {
+            d.push(("color".into(), solid(paint, refs)));
+        }
+        [] => d.push(("color".into(), "transparent".into())),
+        _ => {
+            if let Some(background) = background(&text.fill.fill, refs, image_href) {
+                d.extend(background.into_iter().map(|(_, value)| ("background".to_owned(), value)));
+            }
+            d.push(("-webkit-background-clip".into(), "text".into()));
+            d.push(("background-clip".into(), "text".into()));
+            d.push(("color".into(), "transparent".into()));
+        }
+    }
     let mut set = |property: &str, value: String| d.push((property.to_owned(), value));
-    let color_value = match whole_ref(refs, "fill") {
-        Some(name) => format!("var(--{})", tokens::ident(name)),
-        None => first_solid(&text.fill.fill).map_or("transparent".into(), |(c, o)| color(c, o)),
-    };
-    set("color", color_value);
     let family = match whole_ref(refs, "fontFamily") {
-        Some(name) => format!("var(--{})", tokens::ident(name)),
-        None => format!("\"{}\"", text.family()),
+        Some(name) => token_var(name),
+        None => string(text.family()),
     };
     set("font-family", format!("{family}, sans-serif"));
     set("font-size", sized(refs, "fontSize", text.font_size()));
@@ -259,13 +284,9 @@ fn background(
         return None;
     }
     if let [paint] = paints.as_slice()
-        && let PaintKind::Solid(c) = paint.kind
+        && let PaintKind::Solid(_) = paint.kind
     {
-        let value = match whole_ref(refs, "fill") {
-            Some(name) => format!("var(--{})", tokens::ident(name)),
-            None => color(c, paint.opacity),
-        };
-        return Some(vec![("background-color".into(), value)]);
+        return Some(vec![("background-color".into(), solid(paint, refs))]);
     }
     let layers: Vec<String> = paints
         .iter()
@@ -306,7 +327,7 @@ fn background(
                     ImageMode::Contain => "contain",
                     ImageMode::Stretch => "100% 100%",
                 };
-                Some(format!("url(\"{}\") center / {size} no-repeat", image_href(&image.url)))
+                Some(format!("url({}) center / {size} no-repeat", string(&image_href(&image.url))))
             }
             PaintKind::Unsupported(_) => None,
         })
@@ -327,7 +348,18 @@ fn stroke(d: &mut Vec<(String, String)>, look: &Look) {
     let c = color(c, opacity);
     let t = stroke.thickness;
     let uniform = t.top == t.right && t.top == t.bottom && t.top == t.left;
-    if uniform && stroke.dashes.is_empty() {
+    // None of these take room from the layout, as a border would.
+    if uniform && !stroke.dashes.is_empty() {
+        // Dashed: an outline, inside, outside or across the edge.
+        let width = t.top;
+        let offset = match stroke.align {
+            StrokeAlign::Inside => -width,
+            StrokeAlign::Outside => 0.,
+            StrokeAlign::Center => -width / 2.,
+        };
+        d.push(("outline".into(), format!("{} dashed {c}", px(width))));
+        d.push(("outline-offset".into(), px(offset)));
+    } else if uniform {
         let width = t.top;
         let rings = match stroke.align {
             StrokeAlign::Inside => vec![format!("inset 0 0 0 {} {c}", px(width))],
@@ -338,10 +370,15 @@ fn stroke(d: &mut Vec<(String, String)>, look: &Look) {
         };
         add_shadows(d, rings);
     } else {
-        let style = if stroke.dashes.is_empty() { "solid" } else { "dashed" };
-        d.push(("border-style".into(), style.into()));
-        d.push(("border-color".into(), c));
-        d.push(("border-width".into(), format!("{} {} {} {}", px(t.top), px(t.right), px(t.bottom), px(t.left))));
+        // A width per side: an inner shadow per side (dashes aren't kept).
+        let sides = [(0., t.top), (-t.right, 0.), (0., -t.bottom), (t.left, 0.)];
+        let rings = sides
+            .iter()
+            .zip([t.top, t.right, t.bottom, t.left])
+            .filter(|(_, width)| *width > 0.)
+            .map(|((x, y), _)| format!("inset {} {} 0 0 {c}", px(*x), px(*y)))
+            .collect();
+        add_shadows(d, rings);
     }
 }
 
@@ -394,14 +431,33 @@ fn svg_shape(out: &mut Styled, look: &Look, (width, height): (f32, f32)) {
         && let Some((c, opacity)) = first_solid(&stroke.fill)
     {
         attributes.push_str(&format!(" stroke=\"{}\" stroke-width=\"{}\"", color(c, opacity), number(stroke.thickness.top)));
+        if !stroke.dashes.is_empty() {
+            let dashes: Vec<String> = stroke.dashes.iter().map(|dash| number(*dash)).collect();
+            attributes.push_str(&format!(" stroke-dasharray=\"{}\"", dashes.join(" ")));
+        }
     }
     out.svg_attributes = format!(" viewBox=\"0 0 {} {}\" overflow=\"visible\"", number(width), number(height));
     out.inner = format!("<path{attributes}/>");
-    shadows(&mut out.declarations, look, false);
-    // An SVG draws its shadows around its box, not its shape.
-    if let Some(at) = out.declarations.iter().position(|(property, _)| property == "box-shadow") {
-        let (_, value) = out.declarations.remove(at);
-        out.declarations.push(("filter".into(), format!("drop-shadow({value})")));
+    // A shape's drop shadows follow its outline; drop-shadow takes no
+    // spread, and an inner shadow isn't kept.
+    let drops: Vec<String> = look
+        .effects
+        .effect
+        .iter()
+        .filter(|effect| effect.enabled)
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Shadow(shadow) if !shadow.inner => Some(format!(
+                "drop-shadow({} {} {} {})",
+                px(shadow.offset.0),
+                px(shadow.offset.1),
+                px(shadow.blur / 2.),
+                color(shadow.color, 1.)
+            )),
+            _ => None,
+        })
+        .collect();
+    if !drops.is_empty() {
+        out.declarations.push(("filter".into(), drops.join(" ")));
     }
 }
 
@@ -413,6 +469,31 @@ fn first_solid(paints: &[Paint]) -> Option<(Color, f32)> {
     })
 }
 
+/// A solid paint's colour, through the Token its fill names if it does
+/// (mixed toward transparent for the paint's opacity).
+fn solid(paint: &Paint, refs: &Map<String, Value>) -> String {
+    let PaintKind::Solid(c) = paint.kind else {
+        return "transparent".into();
+    };
+    match whole_ref(refs, "fill") {
+        Some(name) if paint.opacity < 1. => {
+            format!("color-mix(in srgb, {} {}%, transparent)", token_var(name), number(paint.opacity * 100.))
+        }
+        Some(name) => token_var(name),
+        None => color(c, paint.opacity),
+    }
+}
+
+/// The custom property of the Token `name`.
+fn token_var(name: &str) -> String {
+    format!("var(--{})", tokens::ident(name))
+}
+
+/// `text` as a CSS string, safe inside a style element.
+pub(super) fn string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"").replace('<', "\\3C "))
+}
+
 /// The Token `key` names, when the whole property is one reference.
 fn whole_ref<'a>(refs: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     refs.get(key).and_then(Value::as_str).and_then(crate::model::token::reference)
@@ -421,7 +502,7 @@ fn whole_ref<'a>(refs: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 /// A length, through the number Token the property names if it does.
 fn sized(refs: &Map<String, Value>, key: &str, length: f32) -> String {
     match whole_ref(refs, key) {
-        Some(name) => format!("calc(var(--{}) * 1px)", tokens::ident(name)),
+        Some(name) => format!("calc({} * 1px)", token_var(name)),
         None => px(length),
     }
 }

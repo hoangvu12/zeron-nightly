@@ -147,8 +147,8 @@ async fn tokens_read_as_css_custom_properties_per_theme() {
     assert_eq!(
         called.printed()[0],
         ":root {\n  --accent: #4F46E5;\n  --gap: 12;\n  --surface: #FFFFFF;\n}\n\
-         [data-mode=\"light\"] {\n  --accent: #4F46E5;\n  --gap: 12;\n  --surface: #FFFFFF;\n}\n\
-         [data-mode=\"dark\"] {\n  --accent: #4F46E5;\n  --gap: 12;\n  --surface: #111827;\n}\n"
+         [data-mode=\"light\"] {\n  --surface: #FFFFFF;\n}\n\
+         [data-mode=\"dark\"] {\n  --surface: #111827;\n}\n"
     );
     seam.shutdown().await;
 }
@@ -167,6 +167,19 @@ async fn exports_where_nothing_can_be_written_fail_the_call_clearly() {
     let error = blocked.failure()["error"].as_str().unwrap().to_owned();
     assert!(error.contains("can't make the folder") && error.contains("taken"), "{error}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "the call's edits went with it");
+    // A call that fails after its Export leaves no folder behind.
+    let later = seam
+        .execute(&path, r#"Export([screen], { format: "png", path: "later/pngs" }); throw new Error("no");"#)
+        .await;
+    assert!(later.is_error && !folder.join("later").exists(), "{}", later.text);
+    // A path through `..` finds the Design's images from where it lands.
+    let up = seam
+        .execute(&path, r#"Export([screen], { format: "html", path: "../elsewhere/up.html" });"#)
+        .await;
+    let page = folder.parent().unwrap().join("elsewhere").join("up.html");
+    assert_eq!(exported(&up), [page.display().to_string()]);
+    let html = std::fs::read_to_string(&page).unwrap();
+    assert!(html.contains("url(\"../Shop/images/stripes.png\")"), "{html}");
 
     for (snippet, says) in [
         (r#"Export({ format: "html", path: "page.txt" });"#, ".html file"),

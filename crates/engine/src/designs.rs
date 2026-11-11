@@ -710,12 +710,15 @@ impl Designs {
         });
         edited.warnings.extend(live.fonts.warnings(&texts).into_iter().map(Warning::fonts));
         // Icons the call's nodes draw (named by a Token, say) that couldn't
-        // be fetched, which draw nothing.
+        // be fetched, which draw nothing: every icon's, when it changed the
+        // Tokens or a Component.
         let icons = self.inner.assets.icons();
+        let everywhere = live.design.tokens != edited.design.tokens
+            || edited.changed.iter().any(|id| edited.design.find(id).is_some_and(|node| node.is_component()));
         drawn.walk(&mut |node| {
             let top = node.id.split('/').next().unwrap_or_default();
             if let Kind::Icon(icon) = &node.kind
-                && (edited.changed.contains(&node.id) || edited.changed.contains(top))
+                && (everywhere || edited.changed.contains(&node.id) || edited.changed.contains(top))
                 && let Ok(name) = zeron_design::icons::name(&icon.icon, icon.weight)
                 && icons.cached(&name).is_none()
             {

@@ -22,7 +22,7 @@ pub fn css(design: &Design) -> String {
     let default = token::default_theme(&design.themes);
     let mut css = String::from(":root {\n");
     for (name, token) in &tokens {
-        let _ = writeln!(css, "  --{}: {};", ident(name), super::token_value(token.value_in(&default)));
+        let _ = writeln!(css, "  --{}: {};", ident(name), value_css(token.value_in(&default)));
     }
     css.push_str("}\n");
     // Each other Theme a value is for, in the order first named.
@@ -37,19 +37,32 @@ pub fn css(design: &Design) -> String {
     for theme in themes {
         let selector: String = theme
             .iter()
-            .map(|(axis, value)| format!("[data-{}=\"{}\"]", ident(axis), value.as_str().unwrap_or_default()))
+            .map(|(axis, value)| {
+                let value = value.as_str().unwrap_or_default();
+                format!("[data-{}={}]", ident(axis), super::css::string(value))
+            })
             .collect();
         let _ = writeln!(css, "{selector} {{");
+        // Only the Tokens with a value for this Theme, so an element that
+        // sets one axis keeps what its parent set of the others.
         for (name, token) in &tokens {
-            // The value it has there, over what the Theme doesn't name.
-            let mut shown = default.clone();
-            shown.extend(theme.iter().map(|(axis, value)| (axis.clone(), value.clone())));
-            let value: &Value = token.value_in(&shown);
-            let _ = writeln!(css, "  --{}: {};", ident(name), super::token_value(value));
+            if let Some((value, _)) = token.values.iter().rev().find(|(_, for_theme)| for_theme == theme) {
+                let _ = writeln!(css, "  --{}: {};", ident(name), value_css(value));
+            }
         }
         css.push_str("}\n");
     }
     css
+}
+
+/// A Token value as CSS: a colour as written, a number as is, a string quoted.
+fn value_css(value: &Value) -> String {
+    match value {
+        Value::String(text) if text.starts_with('#') => text.clone(),
+        Value::String(text) => super::css::string(text),
+        Value::Number(number) => number.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// `name` as a CSS identifier: what one can't hold as `-`.

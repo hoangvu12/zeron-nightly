@@ -14,8 +14,6 @@
 
 use std::fmt::Write as _;
 
-use serde_json::Value;
-
 use crate::assets::Assets;
 use crate::fonts::Fonts;
 use crate::layout::LaidOut;
@@ -71,6 +69,7 @@ pub fn html(design: &Design, ids: &[String], options: HtmlOptions, sources: &Sou
         rules: String::new(),
         body: String::new(),
         families: Vec::new(),
+        classes: std::collections::HashSet::new(),
     };
     for root in &roots {
         page.element(root, css::Parent::Page, 2);
@@ -88,6 +87,7 @@ struct Page<'a> {
     body: String,
     /// The font families and weights the text uses, for Google Fonts.
     families: Vec<(String, u16)>,
+    classes: std::collections::HashSet<String>,
 }
 
 impl Page<'_> {
@@ -100,7 +100,7 @@ impl Page<'_> {
         if self.options.tailwind {
             let _ = write!(attributes, " class=\"{}\"", attribute(&tailwind::classes(&styled.declarations)));
         } else {
-            let class = class_of(&node.id);
+            let class = class_of(&node.id, &mut self.classes);
             let _ = write!(attributes, " class=\"{class}\"");
             let _ = writeln!(self.rules, ".{class} {{");
             for (property, value) in &styled.declarations {
@@ -204,7 +204,7 @@ fn google_fonts(families: &[(String, u16)]) -> Option<String> {
 }
 
 /// An icon's SVG filling its box: the root's own size (in em, Iconify's)
-/// replaced.
+/// left out.
 fn sized_svg(svg: &str) -> String {
     let Some(start) = svg.find("<svg") else {
         return String::new();
@@ -212,33 +212,75 @@ fn sized_svg(svg: &str) -> String {
     let Some(end) = svg[start..].find('>').map(|end| start + end) else {
         return String::new();
     };
-    let mut tag = String::new();
-    let mut rest = &svg[start + 4..end];
-    // Drop the root's width and height attributes.
-    while let Some(at) = rest.find(|c: char| !c.is_whitespace()) {
-        rest = &rest[at..];
-        let name_end = rest.find(['=', ' ', '/']).unwrap_or(rest.len());
-        let name = &rest[..name_end];
-        let attribute_end = match rest[name_end..].strip_prefix('=') {
-            Some(value) => {
-                let quote = value.chars().next().unwrap_or('"');
-                let close = value[1..].find(quote).map_or(value.len(), |at| at + 2);
-                name_end + 1 + close
-            }
-            None => name_end.max(1),
-        };
-        if name != "width" && name != "height" {
-            tag.push(' ');
-            tag.push_str(&rest[..attribute_end]);
-        }
-        rest = &rest[attribute_end..];
-    }
-    format!("<svg width=\"100%\" height=\"100%\"{}>{}", tag.trim_end_matches(" /"), &svg[end + 1..])
+    let closed = svg[..end].ends_with('/');
+    let inside = &svg[start + 4..if closed { end - 1 } else { end }];
+    let kept: Vec<&str> = attributes(inside)
+        .into_iter()
+        .filter(|attribute| {
+            let name = attribute.split('=').next().unwrap_or_default().trim();
+            name != "width" && name != "height"
+        })
+        .collect();
+    let rest = if closed { "</svg>" } else { &svg[end + 1..] };
+    format!("<svg width=\"100%\" height=\"100%\" {}>{rest}", kept.join(" "))
 }
 
-/// The class a node's rule is for.
-fn class_of(id: &str) -> String {
-    format!("n-{}", id.replace(|c: char| !c.is_ascii_alphanumeric(), "-"))
+/// Each attribute in a tag's inside, as written (`name`, `name=value`,
+/// `name="value"`).
+fn attributes(inside: &str) -> Vec<&str> {
+    let bytes = inside.as_bytes();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'=' {
+            at += 1;
+        }
+        let mut look = at;
+        while look < bytes.len() && bytes[look].is_ascii_whitespace() {
+            look += 1;
+        }
+        if look < bytes.len() && bytes[look] == b'=' {
+            at = look + 1;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            match bytes.get(at) {
+                Some(&quote @ (b'"' | b'\'')) => {
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != quote {
+                        at += 1;
+                    }
+                    at = (at + 1).min(bytes.len());
+                }
+                _ => {
+                    while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+                        at += 1;
+                    }
+                }
+            }
+        }
+        if at > start {
+            found.push(&inside[start..at]);
+        }
+    }
+    found
+}
+
+/// The class a node's rule is for: from its id, numbered past one
+/// another node's id already gave.
+fn class_of(id: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let base = format!("n-{}", id.replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+    let mut class = base.clone();
+    let mut n = 1;
+    while !taken.insert(class.clone()) {
+        n += 1;
+        class = format!("{base}-{n}");
+    }
+    class
 }
 
 fn escape(text: &str) -> String {
@@ -252,14 +294,4 @@ fn attribute(text: &str) -> String {
 fn indented(text: &str, spaces: usize) -> String {
     let pad = " ".repeat(spaces);
     text.lines().map(|line| format!("{pad}{line}\n")).collect()
-}
-
-/// A Token value as CSS: a colour as written, a number as is, a string quoted.
-pub(crate) fn token_value(value: &Value) -> String {
-    match value {
-        Value::String(text) if text.starts_with('#') => text.clone(),
-        Value::String(text) => format!("\"{}\"", text.replace('"', "\\\"")),
-        Value::Number(number) => number.to_string(),
-        other => other.to_string(),
-    }
 }
