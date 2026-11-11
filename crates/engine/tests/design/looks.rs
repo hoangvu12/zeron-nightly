@@ -331,6 +331,8 @@ at({ type: "rectangle", name: "Odd", width: 100, height: 100, opacity: 2,
             { type: "gradient", gradientType: "diamond", colors: ["#000000", "#FFFFFF"] }],
      stroke: { fill: "#0000FF", thickness: 10, align: "middle" },
      effect: [{ type: "glow" }, { type: "blur", radius: -3 }] });
+at({ type: "rectangle", name: "Odder", width: 1, height: 1, cornerRadius: -5,
+     fill: { type: "mesh_gradient" }, effect: { type: "glow" } });
 "##,
     )
     .await;
@@ -346,6 +348,12 @@ at({ type: "rectangle", name: "Odd", width: 100, height: 100, opacity: 2,
             "no warning about {said}: {warnings:?}"
         );
     }
+    // Each said once, as unsupported values of properties it knows.
+    assert_eq!(warnings.iter().filter(|w| w.contains("plasma")).count(), 1, "{warnings:?}");
+    for said in ["corner radius", "mesh_gradient", "glow"] {
+        assert!(warnings.iter().any(|w| w.contains(said) && w.contains("\"Odder\"")), "{warnings:?}");
+    }
+    assert!(!warnings.iter().any(|w| w.contains("doesn't know")), "{warnings:?}");
     // Red at full opacity, with the default (inside) blue stroke.
     near(&image, (50, 50), RED, 1);
     near(&image, (5, 50), BLUE, 1);

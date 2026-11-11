@@ -5,10 +5,15 @@
 //! ([`Kind`]). Each type lives in a file of its own under `model/`, made of
 //! property groups shared by the types that have them ([`Size`], [`Fill`]),
 //! and joins [`Kind`] with one line in its `kinds!` list.
+//!
+//! What the model doesn't know is kept, not dropped ([`kept`]): a node's
+//! unknown properties, a node of an unknown type ([`Opaque`]) and the
+//! Design's unknown keys are written back as they were read.
 
 mod corners;
 mod effects;
 mod frame;
+mod kept;
 mod paint;
 mod rectangle;
 mod stroke;
@@ -21,7 +26,7 @@ pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKin
 pub use rectangle::Rectangle;
 pub use stroke::{Align, Cap, Join, Sides, Stroke, StrokeStyle};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::render::{Look, Painter};
@@ -42,6 +47,9 @@ pub struct Design {
     /// Tokens by name, kept as written until Tokens are modelled.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub tokens: Map<String, Value>,
+    /// Keys the model doesn't know, written back as they were read.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Default for Design {
@@ -51,6 +59,7 @@ impl Default for Design {
             children: Vec::new(),
             themes: Map::new(),
             tokens: Map::new(),
+            extra: Map::new(),
         }
     }
 }
@@ -119,50 +128,28 @@ fn find_in_mut<'a>(nodes: &'a mut [Node], id: &str) -> Option<&'a mut Node> {
     None
 }
 
-/// One node: what every type has, and its type's own properties.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One node: what every type has, its type's own properties, and what the
+/// model doesn't know of it. Read and written as one JSON object ([`kept`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Its top-left corner, from its parent's (or the Canvas's origin).
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub x: f32,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub y: f32,
     /// Degrees counter-clockwise, about its top-left corner; it turns its
     /// children with it.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub rotation: f32,
     /// Mirrored left to right (and top to bottom) within its box, with its
     /// children.
-    #[serde(default, rename = "flipX", skip_serializing_if = "std::ops::Not::not")]
     pub flip_x: bool,
-    #[serde(default, rename = "flipY", skip_serializing_if = "std::ops::Not::not")]
     pub flip_y: bool,
     /// 0 to 1, for the node and its children as one.
-    #[serde(default = "opaque", skip_serializing_if = "is_opaque", deserialize_with = "opacity")]
     pub opacity: f32,
-    #[serde(flatten)]
     pub kind: Kind,
-}
-
-fn is_zero(value: &f32) -> bool {
-    *value == 0.
-}
-
-fn opaque() -> f32 {
-    1.
-}
-
-fn is_opaque(value: &f32) -> bool {
-    *value == 1.
-}
-
-fn opacity<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
-    let mut props = Map::new();
-    props.insert("opacity".into(), Value::deserialize(deserializer)?);
-    paint::opacity(&props).map_err(serde::de::Error::custom)
+    /// Properties the model doesn't know (all but its id, for an
+    /// [`Opaque`] node), written back as they were read.
+    pub extra: Map<String, Value>,
 }
 
 /// What each node type answers, so walking, editing and drawing a Design
@@ -203,27 +190,39 @@ macro_rules! kinds {
         #[serde(tag = "type")]
         pub enum Kind {
             $($(#[$doc])* #[serde(rename = $tag)] $variant($variant),)*
+            /// A type the model doesn't know, kept as it was read.
+            #[serde(skip)]
+            Opaque(Opaque),
         }
 
         impl Kind {
-            /// The `type` names, for messages.
+            /// The `type` names the model knows, for messages.
             pub const NAMES: &[&str] = &[$($tag),*];
 
             pub fn get(&self) -> &dyn NodeKind {
                 match self {
                     $(Kind::$variant(kind) => kind,)*
+                    Kind::Opaque(kind) => kind,
                 }
             }
 
             pub fn get_mut(&mut self) -> &mut dyn NodeKind {
                 match self {
                     $(Kind::$variant(kind) => kind,)*
+                    Kind::Opaque(kind) => kind,
                 }
             }
 
-            pub fn name(&self) -> &'static str {
+            /// Whether it's a type the model knows (not [`Opaque`]).
+            pub fn is_known(&self) -> bool {
+                !matches!(self, Kind::Opaque(_))
+            }
+
+            /// Its `type`.
+            pub fn name(&self) -> &str {
                 match self {
                     $(Kind::$variant(_) => $tag,)*
+                    Kind::Opaque(kind) => &kind.type_name,
                 }
             }
         }
@@ -234,6 +233,22 @@ kinds! {
     /// A container. On the Canvas itself, a Screen or a Component.
     Frame = "frame",
     Rectangle = "rectangle",
+}
+
+/// A node of a type the model doesn't know (one a newer Zeron wrote, say):
+/// its properties stay in [`Node::extra`], it draws nothing and holds no
+/// children an edit can reach.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Opaque {
+    pub type_name: String,
+}
+
+impl NodeKind for Opaque {
+    fn size(&self) -> (f32, f32) {
+        (0., 0.)
+    }
+
+    fn paint(&self, _painter: &mut dyn Painter) {}
 }
 
 /// A fixed width and height, in pixels at 1x.

@@ -38,8 +38,7 @@ pub struct Draft {
     changed: BTreeSet<String>,
     /// Nodes whose screenshots the call asked for, in order.
     screenshots: Vec<String>,
-    /// What the call should know about its changes, such as values the
-    /// Design doesn't support and left out.
+    /// What the agent should know about its edits that didn't fail them.
     warnings: Vec<String>,
 }
 
@@ -59,6 +58,10 @@ impl Draft {
         let mut ids = HashSet::new();
         design.walk(&mut |node| {
             ids.insert(node.id.clone());
+            // Nodes kept inside a node of an unknown type have ids too.
+            if !node.kind.is_known() {
+                kept_ids(&Value::Object(node.extra.clone()), &mut ids);
+            }
         });
         Self {
             design,
@@ -73,7 +76,8 @@ impl Draft {
     /// Adds `node` (a node's properties, with any `children` inline) as the
     /// last child of `parent`, or on the Canvas without one. Every node it
     /// makes gets a new id, and a name (its type's, capitalised) when it has
-    /// none. Returns the new node's id.
+    /// none. A property the model doesn't know is kept, with a warning.
+    /// Returns the new node's id.
     pub fn insert(&mut self, parent: Option<&str>, mut node: Value) -> Result<String, EditError> {
         let depth = match parent {
             None => 0,
@@ -89,12 +93,14 @@ impl Draft {
         }
         let mut made = Vec::new();
         self.prepare(&mut node, &mut made)?;
-        let (node, warnings) = warn::collect(|| serde_json::from_value::<Node>(node));
+        // Unsupported values, as the model read them; then unknown properties.
+        let (node, unsupported) = warn::collect(|| serde_json::from_value::<Node>(node));
         let node = node.map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
-        let warnings = warnings
+        let mut warnings: Vec<_> = unsupported
             .into_iter()
             .map(|warning| format!("Insert \"{}\": {warning}", node.name))
-            .collect::<Vec<_>>();
+            .collect();
+        warn_unknown(&node, &mut warnings);
         let siblings = match parent {
             None => &mut self.design.children,
             Some(parent) => {
@@ -102,7 +108,7 @@ impl Draft {
                     .design
                     .find_mut(parent)
                     .ok_or_else(|| EditError::NotFound(parent.into()))?;
-                let kind = parent_node.kind.name();
+                let kind = parent_node.kind.name().to_owned();
                 parent_node.kind.get_mut().children_mut().ok_or_else(|| {
                     EditError::Invalid(format!("\"{parent}\" is a {kind}, which holds no children"))
                 })?
@@ -155,11 +161,15 @@ impl Draft {
         let Value::Object(props) = node else {
             return Err(EditError::Invalid(format!("Insert takes a node object, not {node}")));
         };
-        let Some(kind) = props.get("type").and_then(Value::as_str) else {
-            return Err(EditError::Invalid(format!(
-                "Insert needs a node with a \"type\" ({})",
-                Kind::NAMES.join(", ")
-            )));
+        let kind = match props.get("type").and_then(Value::as_str) {
+            Some(kind) if Kind::NAMES.contains(&kind) => kind,
+            kind => {
+                return Err(EditError::Invalid(format!(
+                    "Insert needs a node whose \"type\" is one of {}{}",
+                    Kind::NAMES.join(", "),
+                    kind.map(|kind| format!(" (not \"{kind}\")")).unwrap_or_default(),
+                )));
+            }
         };
         let name = match props.get("name").and_then(Value::as_str).map(str::trim) {
             Some(name) if !name.is_empty() => name.to_owned(),
@@ -188,6 +198,35 @@ impl Draft {
                 return id;
             }
         }
+    }
+}
+
+/// A warning for each property `node` and its children have that the model
+/// doesn't know (kept, but doing nothing): most often a typo.
+fn warn_unknown(node: &Node, warnings: &mut Vec<String>) {
+    for property in node.unknown_properties() {
+        warnings.push(format!(
+            "\"{}\" ({}) has a property \"{property}\" Zeron doesn't know; it's kept, but does nothing",
+            node.name,
+            node.kind.name()
+        ));
+    }
+    for child in node.kind.get().children() {
+        warn_unknown(child, warnings);
+    }
+}
+
+/// Every `id` string in `value`, however deep.
+fn kept_ids(value: &Value, ids: &mut HashSet<String>) {
+    match value {
+        Value::Object(props) => {
+            if let Some(Value::String(id)) = props.get("id") {
+                ids.insert(id.clone());
+            }
+            props.values().for_each(|value| kept_ids(value, ids));
+        }
+        Value::Array(items) => items.iter().for_each(|value| kept_ids(value, ids)),
+        _ => {}
     }
 }
 
