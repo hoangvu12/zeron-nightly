@@ -1,0 +1,63 @@
+From a4f7ec11644e54e4d8aa1d34f2a3f2e3efe2705d Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 11 Nov 2026 15:50:23 +0700
+Subject: [PATCH] zgx: a long page in a reply shows its top, not a blown-up
+ middle
+
+A reply's picture taller than 2:1 sits in a 1:2 frame showing its top. Its
+`ui.image` set a width and `aspect`, but as a flex item its height was its
+pixels' own (the automatic minimum), and `cover` filled that box: a phone
+screenshot drew several times too big, its middle cropped. Its height is now
+said from the frame's width, so it spans the frame at its own shape.
+---
+ apps/zgx/ui/ds/reply_picture.luau          |  8 ++++++--
+ apps/zgx/ui/tests/reply_pictures.test.luau | 12 ++++++++++++
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/apps/zgx/ui/ds/reply_picture.luau b/apps/zgx/ui/ds/reply_picture.luau
+index 003addf8be6b8383575328f88e0a43c5d3f71054..849bab5ec4164969ee498e546991aabb470a35d3 100644
+--- a/apps/zgx/ui/ds/reply_picture.luau
++++ b/apps/zgx/ui/ds/reply_picture.luau
+@@ -444,10 +444,14 @@ local Frame = ui.component(function(props: FrameProps): Node
+ 					on_error = broke,
+ 					on_load = landed,
+ 					w_full = true,
+-					aspect = function(): number
++					-- (Its height said, from the frame's width: by `aspect`
++					-- alone it took its pixels' own, and `cover`, filling
++					-- that, blew the picture up.)
++					h = function(): number
+ 						local w, h = size_of(file())
+-						return if w and h then w / h else 1
++						return if w and h then box:get().w * h / w else box:get().h
+ 					end,
++					shrink = 0,
+ 					-- (Covered, never stretched, should its box and its
+ 					-- pixels ever disagree.)
+ 					fit = "cover",
+diff --git a/apps/zgx/ui/tests/reply_pictures.test.luau b/apps/zgx/ui/tests/reply_pictures.test.luau
+index 9fec07b3ae08672a32bada3a76b55b35551e0a9e..3bdb31f30a1c3d23e9d9cec0dc7c0411fd37e61f 100644
+--- a/apps/zgx/ui/tests/reply_pictures.test.luau
++++ b/apps/zgx/ui/tests/reply_pictures.test.luau
+@@ -89,6 +89,18 @@ test("a long strip shows its middle, a long page its top, an icon its own size",
+ 	local tall = box(app, 'button "Open The whole page"')
+ 	expect(near(tall.w, 210)).to_be(true)
+ 	expect(near(tall.h, 420)).to_be(true)
++	-- Its picture spans the frame from its top at its own shape (210 by
++	-- 727), never at its pixels' own height, which `cover` blew up.
++	local page = boxes(app, "img")
++	local drawn: any = nil
++	for _, b in page do
++		if near(b.x, tall.x) and near(b.y, tall.y) and b.w > 100 then
++			drawn = b
++		end
++	end
++	expect(drawn ~= nil).to_be(true)
++	expect(near(drawn.w, 210)).to_be(true)
++	expect(near(drawn.h, 210 * 1800 / 520)).to_be(true)
+ 	-- 24 by 24: a 64-point tile.
+ 	local icon = box(app, 'button "Open The icon"')
+ 	expect(near(icon.w, 64) and near(icon.h, 64)).to_be(true)
+-- 
+2.52.0.windows.1
+

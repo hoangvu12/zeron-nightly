@@ -73,3 +73,8 @@ note = "What real use of child-chats-report-back found: a turn a child starts on
 name = "child-reports-held-stop"
 file = "patches/0010-child-reports-held-stop.patch"
 note = "The person's Stop on a child is held for two minutes: what they write to it meanwhile corrects the parent's task, so the parent hears nothing until the child's normal finished report, and the child stays on its wait. A Stop left standing reports once the hold is out; an agent's Stop or a Zeron restart still reports at once. Once the person writes to a child otherwise, it is theirs and its ends no longer report. Applies on top of child-reports-follow-ups."
+
+[[patch]]
+name = "reply-long-page-picture"
+file = "patches/0011-reply-long-page-picture.patch"
+note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its top across its frame at its own shape, not blown up with its middle cropped: its `ui.image` took its pixels' own height as a flex item, and `cover` filled that. Not yet a PR upstream."
