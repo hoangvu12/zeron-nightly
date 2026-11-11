@@ -395,8 +395,15 @@ async fn unsaved_state_is_reported_per_design() {
     let mut seen = window.subscribe("WatchDesign", json!({ "path": theirs })).await.unwrap();
     let first = next(&mut seen).await;
     assert_eq!((first["unsaved"].clone(), first["path"].clone()), (json!(false), json!(theirs)));
-    seam.execute(&theirs, &card("Card")).await.json();
-    assert_eq!(next(&mut seen).await["unsaved"], true);
+    // The change is heard once, already unsaved.
+    let added = seam.execute(&theirs, &card("Card")).await.id("Card");
+    let changed = next(&mut seen).await;
+    assert_eq!(changed["unsaved"], true, "{changed}");
+    assert_eq!(changed["changes"][0]["changed"], json!([added]), "{changed}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), seen.recv()).await.is_err(),
+        "a change was heard twice"
+    );
     seam.window("SaveDesign", json!({ "path": theirs })).await.unwrap();
     let saved = next(&mut seen).await;
     assert_eq!(saved["unsaved"], false);
