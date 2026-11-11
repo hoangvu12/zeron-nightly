@@ -1,5 +1,6 @@
 //! Paint: what fills a node's area. A `fill` is one paint or a list of them
-//! drawn in order, each a solid colour or a gradient, with a blend mode; a
+//! drawn in order, each a solid colour, a gradient or an image
+//! ([`super::image`]), with a blend mode; a
 //! plain solid colour is written as its hex string. A paint of a type not
 //! supported is kept as written, but not drawn.
 
@@ -7,6 +8,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
+use super::image::ImageFill;
 use super::warn::{self, choice, flag, name_of, number, pair, warn};
 
 /// The fill property group, flattened into the types that have a fill.
@@ -35,6 +37,7 @@ pub struct Paint {
 pub enum PaintKind {
     Solid(Color),
     Gradient(Gradient),
+    Image(ImageFill),
     /// A paint type (or gradient type) not supported, as written.
     Unsupported(Value),
 }
@@ -171,6 +174,7 @@ impl Paint {
                     .collect();
                 props.insert("colors".into(), Value::Array(stops));
             }
+            PaintKind::Image(image) => image.write(&mut props),
         }
         if self.opacity != 1. {
             props.insert("opacity".into(), json!(self.opacity));
@@ -199,8 +203,9 @@ impl Paint {
                 Some(gradient) => PaintKind::Gradient(gradient),
                 None => PaintKind::Unsupported(value.clone()),
             },
+            Some("image") => PaintKind::Image(ImageFill::from_props(paint)?),
             Some(other) => {
-                warn(warn::unsupported("paint type", other, ["color", "gradient"].into_iter()));
+                warn(warn::unsupported("paint type", other, ["color", "gradient", "image"].into_iter()));
                 PaintKind::Unsupported(value.clone())
             }
             None => return Err("a paint needs a \"type\"".into()),

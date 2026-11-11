@@ -13,6 +13,7 @@
 mod corners;
 mod effects;
 mod frame;
+mod image;
 mod kept;
 mod layout;
 mod paint;
@@ -23,6 +24,7 @@ pub mod warn;
 pub use corners::Corners;
 pub use effects::{Effect, EffectKind, Effects, Shadow};
 pub use frame::Frame;
+pub use image::{ImageFill, ImageMode};
 pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
 pub use rectangle::Rectangle;

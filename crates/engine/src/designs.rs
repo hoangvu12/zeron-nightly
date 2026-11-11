@@ -14,6 +14,11 @@
 //! engine also keeps which Designs each chat's Design tabs show
 //! ([`Designs::set_tabs`]), and the Designs touched most recently on this
 //! computer ([`Designs::recent`]), in `recent-designs.json`.
+//!
+//! Image paints draw files from the Design's folder, and downloads cached
+//! for every Design ([`images`]).
+
+mod images;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
+use zeron_design::render::Images;
 use zeron_design::snippet::{self, Globals, Limits};
+
+use self::images::{DesignImages, ImageCache};
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -109,6 +117,7 @@ struct Inner {
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
     recent_file: PathBuf,
+    images: ImageCache,
 }
 
 /// One Design as the engine holds it.
@@ -144,6 +153,7 @@ impl Designs {
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
+                images: ImageCache::new(data_dir.join("image-cache")),
             }),
         }
     }
@@ -186,7 +196,13 @@ impl Designs {
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
-        let screenshots = live.commit(&edited)?;
+        let folder = live.path.parent().unwrap_or(Path::new(".")).to_owned();
+        let images = DesignImages { folder: &folder, cache: &self.inner.images };
+        let screenshots = live.commit(&edited, &images)?;
+        // And images the call placed or looked at that can't be drawn.
+        let mut warnings = edited.warnings.clone();
+        let looked_at = edited.changed.iter().chain(&edited.screenshots);
+        warnings.extend(images::warnings(looked_at.filter_map(|id| live.design.find(id)), &images));
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -200,8 +216,8 @@ impl Designs {
         if !edited.printed.is_empty() {
             result["printed"] = json!(edited.printed);
         }
-        if !edited.warnings.is_empty() {
-            result["warnings"] = json!(edited.warnings);
+        if !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
         }
         if changed {
             result["notice"] = json!(CHANGED_NOTICE);
@@ -419,8 +435,8 @@ impl Live {
     }
 
     /// Keeps a successful call's draft: saves the file, then draws the
-    /// screenshots the call asked for.
-    fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
+    /// screenshots the call asked for with `images`.
+    fn commit(&mut self, edited: &Edited, images: &dyn Images) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
         self.version += 1;
@@ -432,6 +448,7 @@ impl Live {
                     &self.design,
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
+                    images,
                 );
                 match shot {
                     Ok(shot) => json!({

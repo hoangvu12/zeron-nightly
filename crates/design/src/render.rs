@@ -3,8 +3,12 @@
 //! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
 //! would replace that and a painter of its own.
 
+use std::sync::Arc;
+
 use crate::layout::LaidOut;
-use crate::model::{Design, EffectKind, Effects, Node, Paint, Shadow, StrokeStyle};
+use crate::model::{
+    Design, EffectKind, Effects, ImageFill, Node, Paint, PaintKind, Shadow, StrokeStyle,
+};
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -52,6 +56,41 @@ pub struct Look<'a> {
     pub fill: &'a [Paint],
     pub stroke: Option<&'a StrokeStyle>,
     pub effects: &'a Effects,
+}
+
+/// Where a drawing gets the images its image paints refer to
+/// ([`ImageFill`]): files from the Design's folder, and downloads.
+pub trait Images {
+    /// The encoded image `url` refers to, or why it can't be had (an image
+    /// that can't be had draws as a placeholder).
+    fn get(&self, url: &str) -> Result<Arc<[u8]>, String>;
+}
+
+/// No images to be had: every image paint draws as a placeholder.
+pub struct NoImages;
+
+impl Images for NoImages {
+    fn get(&self, _url: &str) -> Result<Arc<[u8]>, String> {
+        Err("no images are given to this drawing".into())
+    }
+}
+
+/// The image paints `node` and its descendants draw (fills and strokes),
+/// each with the node it's on.
+pub fn images_in<'a>(node: &'a Node, found: &mut Vec<(&'a Node, &'a ImageFill)>) {
+    let kind = node.kind.get();
+    // A paint doesn't depend on the size it's drawn at.
+    if let Some(look) = kind.look((0., 0.)) {
+        let stroke = look.stroke.map_or(&[][..], |stroke| &stroke.fill[..]);
+        for paint in look.fill.iter().chain(stroke) {
+            if let PaintKind::Image(image) = &paint.kind {
+                found.push((node, image));
+            }
+        }
+    }
+    for child in kind.children() {
+        images_in(child, found);
+    }
 }
 
 /// What node types draw with. Calls stack as on a canvas: `save` and
@@ -200,8 +239,14 @@ pub enum RenderError {
 }
 
 /// Draws one node of `design` on a transparent background at 1x, or
-/// smaller when its longest side is over `max_side`, and encodes it.
-pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot, RenderError> {
+/// smaller when its longest side is over `max_side`, with the images
+/// `images` has, and encodes it.
+pub fn screenshot(
+    design: &Design,
+    id: &str,
+    max_side: f32,
+    images: &dyn Images,
+) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let laid_out = LaidOut::of(design);
     let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
@@ -218,7 +263,7 @@ pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas());
+        let mut painter = crate::skia::SkiaPainter::with_images(surface.canvas(), images);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }
