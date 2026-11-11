@@ -84,7 +84,7 @@ const text = {{ type: "text", content: "{WORDS}", fontSize: 20, lineHeight: 1.5,
 const screen = Insert({{ type: "frame", name: "Screen", width: 800, height: 400, fill: "#FFFFFF" }});
 Insert(screen, {{ ...text, name: "Auto" }});
 Insert(screen, {{ ...text, name: "Wide", y: 50, width: 120 }});
-Insert(screen, {{ ...text, name: "Set wide", y: 50, x: 200, width: 120, textGrowth: "fixed-width" }});
+Insert(screen, {{ ...text, name: "Set wide", y: 50, x: 200, width: 120, textGrowth: "fixed_width" }});
 Insert(screen, {{ ...text, name: "Box", y: 50, x: 400, width: 120, height: 30 }});
 Insert(screen, {{ ...text, name: "Set auto", y: 300, width: 120, textGrowth: "auto" }});"##
         ),
@@ -298,7 +298,7 @@ async fn letters_geist_has_need_no_other_font() {
 }
 
 #[tokio::test]
-async fn design_tabs_hear_the_font_files_a_design_uses() {
+async fn design_tabs_hear_the_font_files_a_design_uses_as_assets() {
     let seam = Seam::new().await;
     let made = seam
         .create(
@@ -315,13 +315,19 @@ async fn design_tabs_hear_the_font_files_a_design_uses() {
         .await
         .expect("the watch said nothing")
         .expect("the watch ended");
-    // Instrument Serif from the cache, where the engine fetched it; the
-    // bundled Geist needs no file.
-    let fonts = first["fonts"].as_array().unwrap_or_else(|| panic!("{first}"));
+    // Instrument Serif from the cache, where the engine fetched it, as a
+    // font asset; the bundled Geist needs no file.
+    let fonts: Vec<&Value> = first["assets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{first}"))
+        .iter()
+        .filter(|asset| asset["kind"] == "font")
+        .collect();
     assert_eq!(fonts.len(), 1, "{first}");
-    assert_eq!(fonts[0]["family"], "Instrument Serif");
+    assert_eq!(fonts[0]["name"], "Instrument Serif@400");
     let path = PathBuf::from(fonts[0]["path"].as_str().unwrap());
     assert!(path.is_file() && path.ends_with("Instrument Serif/400.ttf"), "{path:?}");
+    assert!(first.get("fonts").is_none(), "{first}");
     seam.shutdown().await;
 }
 

@@ -67,12 +67,13 @@ pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
 /// With it, the file each image it draws is in on this computer, by url,
 /// as the engine found (and downloaded) them: the window reads images from
 /// those files only, and never downloads.
-/// And the files of the other assets it uses (its icons) in the engine's
-/// cache: tiles draw them from those files only.
+/// And the files of the other assets it uses (its icons and fonts) in the
+/// engine's cache, or beside the Design: tiles draw them from those files
+/// only.
 pub struct Heard {
     pub design: Design,
     pub flash: Vec<String>,
-    /// What its text draws in: the font files the engine says it uses.
+    /// What its text draws in: the font files among its assets.
     pub fonts: Fonts,
     pub images: HashMap<String, PathBuf>,
     pub assets: Vec<Resolved>,
@@ -104,15 +105,15 @@ pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
             flash.push(id);
         }
     }
-    let files: Vec<FontFile> = serde_json::from_value(item["fonts"].clone()).unwrap_or_default();
-    if !fonts.is_of(&files) {
-        *fonts = Fonts::of_files(&files);
-    }
     // (An older engine says no images: they draw as placeholders.)
     let images = serde_json::from_value(item["images"].clone()).unwrap_or_default();
     // (An asset not named draws nothing, as the engine does with one it
     // couldn't fetch.)
-    let assets = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
+    let assets: Vec<Resolved> = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
+    let files: Vec<FontFile> = assets.iter().filter_map(Resolved::font_file).collect();
+    if !fonts.is_of(&files) {
+        *fonts = Fonts::of_files(&files);
+    }
     Ok(Heard { design, flash, fonts: fonts.clone(), images, assets })
 }
 

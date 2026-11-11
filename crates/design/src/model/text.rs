@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::{Fill, NodeKind, Size, Sizing};
+use crate::assets::AssetKey;
 use crate::render::Painter;
 use crate::skia::Typesetter;
 
@@ -64,7 +65,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 
 /// How a text node's box follows its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum TextGrowth {
     /// As wide and tall as its text, each paragraph on one line.
     Auto,
@@ -175,6 +176,17 @@ impl NodeKind for Text {
                 height.unwrap_or(Sizing::FitContent),
             ),
         }
+    }
+
+    /// Its families, but the bundled one, at its weight: those its
+    /// characters may draw in.
+    fn assets(&self) -> Vec<AssetKey> {
+        let weight = crate::fonts::snapped(self.weight().0);
+        crate::fonts::families(self)
+            .iter()
+            .filter(|family| !family.eq_ignore_ascii_case(crate::fonts::BUNDLED_FAMILY))
+            .map(|family| AssetKey::font(family, weight))
+            .collect()
     }
 
     fn measure(&self, typesetter: &Typesetter, width: Option<f32>) -> Option<[f32; 2]> {
