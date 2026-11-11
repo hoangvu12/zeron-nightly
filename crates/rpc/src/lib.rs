@@ -939,6 +939,12 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
     serde_json::from_value(params).map_err(|e| RpcError::BadParams(e.to_string()))
 }
 
+/// [`memory_client`] as an agent's `zeron mcp` server connects: reaching
+/// only [`agent_allowed`] methods, served as [`Caller::Agent`] for `chat`.
+pub fn agent_memory_client(service: Arc<dyn RpcService>, chat: Option<String>) -> RpcClient {
+    memory_client(Arc::new(server::AgentGuard { inner: service, chat }))
+}
+
 /// Spawn an in-memory server for `service` and return a connected client.
 /// Same envelopes, same dispatch loop as the WebSocket path — the in-process UI
 /// transport (ARCHITECTURE §1 "zero serialization shortcuts").

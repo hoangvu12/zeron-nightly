@@ -174,3 +174,34 @@ async fn runaway_snippets_fail_without_hanging_the_engine() {
     assert!(!made.is_error, "{}", made.text);
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_screenshot_that_cant_be_drawn_says_why_and_keeps_the_edit() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create("Blank", r#"TakeScreenshot([Insert({ type: "frame", name: "Empty" })]);"#)
+        .await;
+    assert!(made.images.is_empty());
+    let shot = &made.json()["screenshots"][0];
+    assert_eq!(shot["id"], made.id("Empty"));
+    assert!(shot["error"].as_str().unwrap().contains("no area"), "{shot}");
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(made.path()).unwrap()).unwrap();
+    assert_eq!(file["children"][0]["id"], made.id("Empty"));
+    seam.shutdown().await;
+}
+
+#[tokio::test]
+async fn nodes_nest_at_most_48_deep() {
+    const NEST: &str = r#"let parent = null;
+for (let i = 0; i < DEPTH; i++) parent = Insert(parent, { type: "frame", width: 10, height: 10 });"#;
+    let seam = Seam::new().await;
+    let deep = seam.create("Deep", &NEST.replace("DEPTH", "49")).await;
+    assert!(deep.is_error && deep.text.contains("48"), "{}", deep.text);
+    assert!(!seam.designs_folder().join("Deep").exists());
+
+    // As deep as it goes, and the file still reads back.
+    let made = seam.create("Deep", &NEST.replace("DEPTH", "48")).await;
+    let again = seam.execute(&made.path(), r#"Insert({ type: "frame", width: 1, height: 1 });"#).await;
+    assert!(!again.is_error, "{}", again.text);
+    seam.shutdown().await;
+}

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rquickjs::{CatchResultExt, Context, Ctx, Exception, Function, Object, Runtime};
 
-use crate::edit::{Draft, EditError};
+use crate::edit::Draft;
 
 /// What one snippet may use.
 #[derive(Debug, Clone, Copy)]
@@ -129,7 +129,7 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
                 draft
                     .borrow_mut()
                     .insert(parent.as_deref(), node)
-                    .map_err(|e| edit_thrown(&ctx, e))
+                    .map_err(|e| thrown(&ctx, e))
             })?,
         )?;
     }
@@ -140,7 +140,7 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, ids: String| {
                 let ids: Vec<String> = serde_json::from_str(&ids)
                     .map_err(|_| thrown(&ctx, "TakeScreenshot takes a list of node ids"))?;
-                draft.borrow_mut().screenshot(ids).map_err(|e| edit_thrown(&ctx, e))
+                draft.borrow_mut().screenshot(ids).map_err(|e| thrown(&ctx, e))
             })?,
         )?;
     }
@@ -149,8 +149,4 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
 
 fn thrown(ctx: &Ctx<'_>, message: impl std::fmt::Display) -> rquickjs::Error {
     Exception::throw_message(ctx, &message.to_string())
-}
-
-fn edit_thrown(ctx: &Ctx<'_>, error: EditError) -> rquickjs::Error {
-    thrown(ctx, error)
 }

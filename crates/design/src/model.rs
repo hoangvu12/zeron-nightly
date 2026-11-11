@@ -64,6 +64,18 @@ impl Design {
         find_in(&self.children, id)
     }
 
+    /// How deep the node is: 1 on the Canvas, 2 in a Screen, and so on.
+    pub fn depth_of(&self, id: &str) -> Option<usize> {
+        fn depth_in(nodes: &[Node], id: &str, depth: usize) -> Option<usize> {
+            nodes.iter().find_map(|node| {
+                (node.id == id)
+                    .then_some(depth)
+                    .or_else(|| depth_in(node.kind.get().children(), id, depth + 1))
+            })
+        }
+        depth_in(&self.children, id, 1)
+    }
+
     pub fn find_mut(&mut self, id: &str) -> Option<&mut Node> {
         find_in_mut(&mut self.children, id)
     }
@@ -179,7 +191,7 @@ macro_rules! kinds {
 }
 
 kinds! {
-    /// A container; a Screen when it's on the Canvas itself.
+    /// A container. On the Canvas itself, a Screen or a Component.
     Frame = "frame",
     Rectangle = "rectangle",
 }

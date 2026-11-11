@@ -1,7 +1,7 @@
 //! Seam 1: the design tools as an agent calls them. An engine assembled
 //! with the mock harness in a temp folder, and Zeron's MCP server for one
-//! of its chats, called with `tools/call` the way an agent's client calls
-//! it; tests read what the agent would: the result's text and images, and
+//! of its chats, connected as an agent's is (the agent token's guard), and
+//! called with `tools/call` the way an agent's client calls it; tests read what the agent would: the result's text and images, and
 //! the files on disk.
 
 use std::path::{Path, PathBuf};
@@ -79,7 +79,7 @@ impl Seam {
             .create_chat(CHAT, None, Some(&core.device_id), None, None)
             .unwrap();
         let tools = Tools::new(Arc::new(Zeron::with_client(
-            zeron_rpc::memory_client(core.rpc_service()),
+            zeron_rpc::agent_memory_client(core.rpc_service(), Some(CHAT.into())),
             Origin {
                 chat_id: Some(CHAT.into()),
                 device_id: Some(core.device_id.clone()),

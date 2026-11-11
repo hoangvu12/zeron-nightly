@@ -5809,8 +5809,12 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| match e {
-                        crate::designs::DesignError::Io(e) => RpcError::Failed(e),
-                        e => RpcError::BadParams(e.to_string()),
+                        crate::designs::DesignError::Refused(_)
+                        | crate::designs::DesignError::Snippet(
+                            zeron_design::snippet::SnippetError::Failed(_)
+                            | zeron_design::snippet::SnippetError::TimedOut(_),
+                        ) => RpcError::BadParams(e.to_string()),
+                        e => RpcError::Failed(e.to_string()),
                     })?;
                 RpcReply::value(&executed)
             }

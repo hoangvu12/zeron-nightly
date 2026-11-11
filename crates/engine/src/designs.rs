@@ -3,9 +3,9 @@
 //!
 //! A call ([`Designs::execute`]) finds its Design ([`Designs::target`]),
 //! runs its snippet against a draft of it in the QuickJS sandbox, and on
-//! success keeps the draft ([`Live::commit`]): the file is saved and the
-//! call's screenshots drawn. A failed call changes nothing, on disk or in
-//! memory. New Designs are made in the managed folder, `designs/` in the
+//! success keeps the draft ([`Live::commit`]): the file is saved, then the
+//! call's screenshots drawn (one that can't be drawn says why in its
+//! place). A failed call changes nothing, on disk or in memory. New Designs are made in the managed folder, `designs/` in the
 //! engine's data dir, one folder each with an `images/` folder beside the
 //! `.zdesign` file.
 
@@ -156,10 +156,10 @@ impl Designs {
         }
         let path = canonical(path)
             .map_err(|e| DesignError::Refused(format!("can't open {}: {e}", path.display())))?;
-        let mut live = lock(&self.inner.live);
-        if let Some(design) = live.get(&path) {
+        if let Some(design) = lock(&self.inner.live).get(&path) {
             return Ok(design.clone());
         }
+        // Read without holding every Design up; the first read held wins.
         let text = std::fs::read_to_string(&path)
             .map_err(|e| DesignError::Refused(format!("can't read {}: {e}", path.display())))?;
         let design = Design::from_json(&text).map_err(|e| {
@@ -169,8 +169,7 @@ impl Designs {
             path: path.clone(),
             design,
         }));
-        live.insert(path, design.clone());
-        Ok(design)
+        Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
     /// A new managed Design named `name`, held from now on, in a folder of
@@ -179,12 +178,18 @@ impl Designs {
     fn create(&self, name: &str) -> Result<Arc<Mutex<Live>>, DesignError> {
         let base = folder_name(name)?;
         let mut live = lock(&self.inner.live);
-        let taken = |folder: &Path| {
-            folder.exists() || live.keys().any(|path| path.parent() == Some(folder))
+        // Without regard to case, as Windows and macOS file systems compare.
+        let taken = |folder: &str| {
+            self.inner.root.join(folder).exists()
+                || live.keys().any(|path| {
+                    path.parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|held| held.to_string_lossy().eq_ignore_ascii_case(folder))
+                })
         };
         let mut folder = base.clone();
         let mut n = 1;
-        while taken(&self.inner.root.join(&folder)) {
+        while taken(&folder) {
             n += 1;
             folder = format!("{base} {n}");
         }
@@ -208,30 +213,27 @@ impl Live {
     /// Keeps a successful call's draft: saves the file, then draws the
     /// screenshots the call asked for.
     fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
-        let screenshots = edited
+        save(&self.path, &edited.design)?;
+        self.design = edited.design.clone();
+        Ok(edited
             .screenshots
             .iter()
             .map(|id| {
-                zeron_design::render::screenshot(
-                    &edited.design,
+                let shot = zeron_design::render::screenshot(
+                    &self.design,
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
-                )
-                .map_err(|e| DesignError::Refused(format!("TakeScreenshot: {e}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        save(&self.path, &edited.design)?;
-        self.design = edited.design.clone();
-        Ok(screenshots
-            .into_iter()
-            .map(|shot| {
-                json!({
-                    "id": shot.id,
-                    "width": shot.width,
-                    "height": shot.height,
-                    "mimeType": "image/png",
-                    "data": base64::engine::general_purpose::STANDARD.encode(&shot.png),
-                })
+                );
+                match shot {
+                    Ok(shot) => json!({
+                        "id": shot.id,
+                        "width": shot.width,
+                        "height": shot.height,
+                        "mimeType": "image/png",
+                        "data": base64::engine::general_purpose::STANDARD.encode(&shot.png),
+                    }),
+                    Err(e) => json!({ "id": id, "error": e.to_string() }),
+                }
             })
             .collect())
     }
@@ -259,7 +261,8 @@ fn design_name(path: &Path) -> String {
 }
 
 /// `name` as a folder name every file system takes: characters Windows
-/// refuses become `-`, and it's cut to [`MAX_NAME_CHARS`].
+/// refuses become `-`, a name Windows keeps for a device (`CON`, `COM1`)
+/// gets a `-` after it, and it's cut to [`MAX_NAME_CHARS`].
 fn folder_name(name: &str) -> Result<String, DesignError> {
     let cleaned: String = name
         .trim()
@@ -277,7 +280,12 @@ fn folder_name(name: &str) -> Result<String, DesignError> {
             "\"{name}\" can't name a Design: use letters or digits"
         )));
     }
-    Ok(cleaned)
+    let stem = cleaned.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    Ok(if device { format!("{cleaned}-") } else { cleaned })
 }
 
 fn canonical(path: &Path) -> std::io::Result<PathBuf> {

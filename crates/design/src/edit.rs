@@ -16,6 +16,10 @@ use crate::model::{Design, Kind, Node};
 const ID_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const ID_LEN: usize = 5;
 
+/// How deep nodes nest at most. Walking and drawing recurse per level, and
+/// a file nested past about 60 levels is past serde_json's limit to read.
+pub const MAX_DEPTH: usize = 48;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
     #[error("no node has the id \"{0}\"")]
@@ -61,15 +65,23 @@ impl Draft {
         }
     }
 
-    pub fn design(&self) -> &Design {
-        &self.design
-    }
-
     /// Adds `node` (a node's properties, with any `children` inline) as the
     /// last child of `parent`, or on the Canvas without one. Every node it
     /// makes gets a new id, and a name (its type's, capitalised) when it has
     /// none. Returns the new node's id.
     pub fn insert(&mut self, parent: Option<&str>, mut node: Value) -> Result<String, EditError> {
+        let depth = match parent {
+            None => 0,
+            Some(parent) => self
+                .design
+                .depth_of(parent)
+                .ok_or_else(|| EditError::NotFound(parent.into()))?,
+        };
+        if depth + nesting(&node) > MAX_DEPTH {
+            return Err(EditError::Invalid(format!(
+                "Insert: nodes nest at most {MAX_DEPTH} deep"
+            )));
+        }
         let mut made = Vec::new();
         self.prepare(&mut node, &mut made)?;
         let node: Node = serde_json::from_value(node)
@@ -165,6 +177,14 @@ impl Draft {
                 return id;
             }
         }
+    }
+}
+
+/// How many levels `node` and its inline children take.
+fn nesting(node: &Value) -> usize {
+    1 + match node.get("children") {
+        Some(Value::Array(children)) => children.iter().map(nesting).max().unwrap_or(0),
+        _ => 0,
     }
 }
 
