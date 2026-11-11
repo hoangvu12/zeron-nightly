@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::model::{Design, Kind, Node};
+use crate::model::{Design, Kind, Node, warn};
 use crate::printed::Printed;
 
 mod copy;
@@ -207,9 +207,10 @@ impl Draft {
         }
         let mut made = Vec::new();
         self.prepare(&mut node, &mut made, verb)?;
-        let node: Node = serde_json::from_value(node)
-            .map_err(|e| EditError::Invalid(format!("{verb}: {e}")))?;
-        let mut warnings = Vec::new();
+        // Unsupported values, as the model read them; then unknown properties.
+        let (node, unsupported) = warn::collect(|| serde_json::from_value::<Node>(node));
+        let node = node.map_err(|e| EditError::Invalid(format!("{verb}: {e}")))?;
+        let mut warnings = unsupported_warnings(&node, verb, unsupported);
         warn_unknown(&node, &mut warnings);
         Ok(Built { node, made, warnings })
     }
@@ -293,6 +294,19 @@ struct Built {
     /// Its nodes, as (name, id), for the call's map of new ids.
     made: Vec<(String, String)>,
     warnings: Vec<Warning>,
+}
+
+/// The model's warnings about `node`'s values it doesn't support, as an
+/// edit `verb` made them.
+pub(super) fn unsupported_warnings(node: &Node, verb: &str, messages: Vec<String>) -> Vec<Warning> {
+    messages
+        .into_iter()
+        .map(|message| Warning {
+            node: Some(node.id.clone()),
+            property: None,
+            message: format!("{verb} \"{}\": {message}", node.name),
+        })
+        .collect()
 }
 
 /// A warning for each property `node` and its children have that the model

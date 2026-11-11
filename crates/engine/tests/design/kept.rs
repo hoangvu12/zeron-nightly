@@ -17,7 +17,7 @@ fn newer_design() -> Value {
             "width": 200,
             "height": 100,
             "fill": "#FFFFFF",
-            "cornerRadius": 12,
+            "cornerSmoothing": 12,
             "children": [
                 {
                     "id": "blob1", "name": "Blob", "type": "blob", "x": "50%", "points": [1, 2, 3],
@@ -52,7 +52,7 @@ TakeScreenshot(["scr01"]);"##,
     let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(file["generator"], original["generator"]);
     let screen = &file["children"][0];
-    assert_eq!(screen["cornerRadius"], 12);
+    assert_eq!(screen["cornerSmoothing"], 12);
     assert_eq!(screen["children"][0], original["children"][0]["children"][0]);
     assert_eq!(screen["children"][1]["id"], changed.id("Bar"));
 

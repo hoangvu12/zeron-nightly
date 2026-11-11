@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::update::{properties, set, set_warnings};
-use super::{Built, Draft, EditError, MAX_DEPTH, height};
+use super::{Built, Draft, EditError, MAX_DEPTH, height, unsupported_warnings};
 use crate::model::Node;
 
 impl Draft {
@@ -39,10 +39,12 @@ impl Draft {
             let inside = find_below(&mut copy, &descendant).ok_or_else(|| {
                 EditError::Invalid(format!("Copy: no node inside \"{id}\" has the id \"{descendant}\""))
             })?;
-            set(inside, &props, "Copy")?;
+            let unsupported = set(inside, &props, "Copy")?;
+            warnings.extend(unsupported_warnings(inside, "Copy", unsupported));
             warnings.extend(set_warnings(inside, &props));
         }
-        set(&mut copy, &props, "Copy")?;
+        let unsupported = set(&mut copy, &props, "Copy")?;
+        warnings.extend(unsupported_warnings(&copy, "Copy", unsupported));
         warnings.extend(set_warnings(&copy, &props));
 
         let mut renamed = HashMap::new();

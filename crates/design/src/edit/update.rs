@@ -2,8 +2,8 @@
 
 use serde_json::{Map, Value};
 
-use super::{Draft, EditError, Warning};
-use crate::model::Node;
+use super::{Draft, EditError, Warning, unsupported_warnings};
+use crate::model::{Node, warn};
 
 /// What Update can't change: a node's identity.
 const FIXED: &[&str] = &["id", "type", "ref"];
@@ -17,9 +17,10 @@ impl Draft {
     pub fn update(&mut self, id: &str, props: Value) -> Result<(), EditError> {
         let props = properties(props, "Update")?;
         let node = self.design.find_mut(id).ok_or_else(|| EditError::NotFound(id.into()))?;
-        set(node, &props, "Update")?;
+        let unsupported = set(node, &props, "Update")?;
         let node = self.design.find(id).expect("the node was just updated");
-        let warnings = set_warnings(node, &props);
+        let mut warnings = unsupported_warnings(node, "Update", unsupported);
+        warnings.extend(set_warnings(node, &props));
         for key in props.keys() {
             self.unwarn(id, key);
         }
@@ -42,8 +43,9 @@ pub(super) fn properties(props: Value, verb: &str) -> Result<Map<String, Value>,
 
 /// Sets `props` on `node`, its children kept; on an error, `node` is as it
 /// was. Each property is set in the node as written, so one the model
-/// doesn't know is replaced, not written twice.
-pub(super) fn set(node: &mut Node, props: &Map<String, Value>, verb: &str) -> Result<(), EditError> {
+/// doesn't know is replaced, not written twice. Returns the model's
+/// warnings about values it doesn't support.
+pub(super) fn set(node: &mut Node, props: &Map<String, Value>, verb: &str) -> Result<Vec<String>, EditError> {
     if !node.kind.is_known() {
         return Err(EditError::Invalid(format!(
             "\"{}\" is a {} node, which Zeron doesn't know: it takes no edits",
@@ -54,7 +56,10 @@ pub(super) fn set(node: &mut Node, props: &Map<String, Value>, verb: &str) -> Re
     // Written without its children, so a node's whole subtree isn't.
     let children = node.kind.get_mut().children_mut().map(std::mem::take);
     let set = with_props(node, props, children.as_deref().unwrap_or_default(), verb)
-        .map(|updated| *node = updated);
+        .map(|(updated, unsupported)| {
+            *node = updated;
+            unsupported
+        });
     // Its type is as it was, so it holds children as it did.
     if let (Some(children), Some(slot)) = (children, node.kind.get_mut().children_mut()) {
         *slot = children;
@@ -63,7 +68,12 @@ pub(super) fn set(node: &mut Node, props: &Map<String, Value>, verb: &str) -> Re
 }
 
 /// `node` (its children taken out, `children` being them) with `props` set.
-fn with_props(node: &Node, props: &Map<String, Value>, children: &[Node], verb: &str) -> Result<Node, EditError> {
+fn with_props(
+    node: &Node,
+    props: &Map<String, Value>,
+    children: &[Node],
+    verb: &str,
+) -> Result<(Node, Vec<String>), EditError> {
     let Value::Object(mut written) = serde_json::to_value(node).expect("a node serializes") else {
         unreachable!("a node is written as an object");
     };
@@ -88,7 +98,9 @@ fn with_props(node: &Node, props: &Map<String, Value>, children: &[Node], verb: 
             written.insert(key.clone(), value.clone());
         }
     }
-    Node::from_props(written).map_err(|e| EditError::Invalid(format!("{verb}: {e}")))
+    let (node, unsupported) = warn::collect(|| Node::from_props(written));
+    let node = node.map_err(|e| EditError::Invalid(format!("{verb}: {e}")))?;
+    Ok((node, unsupported))
 }
 
 /// Whether `given` is `current` as `Get` reads it: the same, but that

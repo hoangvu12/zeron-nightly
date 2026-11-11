@@ -962,6 +962,12 @@ impl EngineRpc {
         self
     }
 
+    fn designs(&self) -> Result<&crate::designs::Designs, RpcError> {
+        self.designs
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))
+    }
+
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
         self
@@ -5800,10 +5806,7 @@ impl RpcService for EngineRpc {
                 }))
             }
             methods::DESIGN_EXECUTE => {
-                let designs = self
-                    .designs
-                    .clone()
-                    .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))?;
+                let designs = self.designs()?.clone();
                 let p: crate::designs::ExecuteParams = parse_params(params)?;
                 let executed = tokio::task::spawn_blocking(move || designs.execute(p))
                     .await
@@ -5818,6 +5821,11 @@ impl RpcService for EngineRpc {
                     Err(e @ crate::designs::DesignError::Refused(_)) => Err(RpcError::BadParams(e.to_string())),
                     Err(e) => Err(RpcError::Failed(e.to_string())),
                 }
+            }
+            methods::DESIGN_STATE => {
+                let designs = self.designs()?;
+                let p: crate::designs::StateParams = parse_params(params)?;
+                RpcReply::value(&designs.state(p.chat_id.as_deref()))
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;

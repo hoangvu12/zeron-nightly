@@ -10,21 +10,28 @@
 //! unknown properties, a node of an unknown type ([`Opaque`]) and the
 //! Design's unknown keys are written back as they were read.
 
+mod corners;
+mod effects;
 mod frame;
 mod kept;
 mod layout;
 mod paint;
 mod rectangle;
+mod stroke;
+pub mod warn;
 
+pub use corners::Corners;
+pub use effects::{Effect, EffectKind, Effects, Shadow};
 pub use frame::Frame;
 pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
-pub use paint::{Color, Fill, Paint};
+pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
 pub use rectangle::Rectangle;
+pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::render::Painter;
+use crate::render::{Look, Painter};
 
 /// The format version new Designs are written with.
 pub const VERSION: &str = "1.0";
@@ -145,6 +152,15 @@ pub struct Node {
     /// Its top-left corner, from its parent's (or the Canvas's origin).
     pub x: f32,
     pub y: f32,
+    /// Degrees counter-clockwise, about its top-left corner; it turns its
+    /// children with it.
+    pub rotation: f32,
+    /// Mirrored left to right (and top to bottom) within its box, with its
+    /// children.
+    pub flip_x: bool,
+    pub flip_y: bool,
+    /// 0 to 1, for the node and its children as one.
+    pub opacity: f32,
     /// Placed at its x and y even in a parent that lays its children out,
     /// and left out of that layout.
     pub absolute: bool,
@@ -180,9 +196,16 @@ pub trait NodeKind {
         false
     }
 
-    /// Draws the node itself, not its children, at its laid-out `size`
-    /// with its top-left at the painter's origin.
-    fn paint(&self, size: (f32, f32), painter: &mut dyn Painter);
+    /// Its outline at its laid-out `size`, and the fills, stroke and
+    /// effects drawn on it, for the types drawn that way.
+    fn look(&self, _size: (f32, f32)) -> Option<Look<'_>> {
+        None
+    }
+
+    /// Draws what the node draws itself beyond its [`look`](Self::look),
+    /// not its children, at its laid-out `size` with its top-left at the
+    /// painter's origin.
+    fn paint(&self, _size: (f32, f32), _painter: &mut dyn Painter) {}
 }
 
 macro_rules! kinds {

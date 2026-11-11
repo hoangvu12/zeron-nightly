@@ -12,7 +12,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
-use super::{Kind, Node, Opaque};
+use super::{Kind, Node, Opaque, paint, warn};
 
 /// The properties every node has.
 #[derive(Deserialize, PartialEq)]
@@ -26,6 +26,25 @@ struct Common {
     y: f32,
     #[serde(default)]
     absolute: bool,
+    #[serde(default)]
+    rotation: f32,
+    #[serde(default, rename = "flipX")]
+    flip_x: bool,
+    #[serde(default, rename = "flipY")]
+    flip_y: bool,
+    #[serde(default = "opaque", deserialize_with = "opacity")]
+    opacity: f32,
+}
+
+fn opaque() -> f32 {
+    1.
+}
+
+/// Kept within 0 to 1, with a warning past them.
+fn opacity<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let mut props = Map::new();
+    props.insert("opacity".into(), Value::deserialize(deserializer)?);
+    paint::opacity(&props).map_err(D::Error::custom)
 }
 
 #[derive(Serialize)]
@@ -37,6 +56,14 @@ struct Written<'a> {
     x: Option<f32>,
     #[serde(skip_serializing_if = "is_none_or_zero")]
     y: Option<f32>,
+    #[serde(skip_serializing_if = "is_none_or_zero")]
+    rotation: Option<f32>,
+    #[serde(rename = "flipX", skip_serializing_if = "std::ops::Not::not")]
+    flip_x: bool,
+    #[serde(rename = "flipY", skip_serializing_if = "std::ops::Not::not")]
+    flip_y: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opacity: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     absolute: bool,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -59,6 +86,10 @@ impl Node {
             name: if known { &self.name } else { "" },
             x: known.then_some(self.x),
             y: known.then_some(self.y),
+            rotation: known.then_some(self.rotation),
+            flip_x: known && self.flip_x,
+            flip_y: known && self.flip_y,
+            opacity: (known && self.opacity != 1.).then_some(self.opacity),
             absolute: known && self.absolute,
             kind: known.then_some(&self.kind),
             extra: &self.extra,
@@ -87,6 +118,10 @@ impl Node {
                 name,
                 x,
                 y,
+                rotation: 0.,
+                flip_x: false,
+                flip_y: false,
+                opacity: 1.,
                 absolute: false,
                 kind: Kind::Opaque(Opaque { type_name }),
                 extra,
@@ -104,6 +139,10 @@ impl Node {
             name: common.name,
             x: common.x,
             y: common.y,
+            rotation: common.rotation,
+            flip_x: common.flip_x,
+            flip_y: common.flip_y,
+            opacity: common.opacity,
             absolute: common.absolute,
             kind,
             extra: Map::new(),
@@ -124,13 +163,17 @@ impl Node {
             let unknown = if key == "children" {
                 node.kind.get_mut().children_mut().is_none()
             } else {
+                // Quietly: the node's warnings came with its first read.
+                let quiet = |props: &Map<String, Value>| warn::collect(|| read(props)).0;
                 let reference = match &reference {
                     Some(reference) => reference,
-                    None => reference.insert(read(&shallow)?),
+                    None => reference.insert(quiet(&shallow)?),
                 };
-                let mut probe = shallow.clone();
-                probe.insert(key.clone(), other_than(value));
-                read(&probe).is_ok_and(|read| read == *reference)
+                others_than(value).into_iter().all(|other| {
+                    let mut probe = shallow.clone();
+                    probe.insert(key.clone(), other);
+                    quiet(&probe).is_ok_and(|read| read == *reference)
+                })
             };
             if unknown {
                 node.extra.insert(key.clone(), value.clone());
@@ -147,20 +190,25 @@ impl Node {
     }
 }
 
-/// A value of the same shape as `value` that a model reading `value` would
-/// read differently.
-fn other_than(value: &Value) -> Value {
+/// Values of about the same shape as `value`, one of which a model reading
+/// `value` would read differently. Several for a number, as a model may
+/// keep a number within bounds (an opacity of 2 and of 3 both read as 1, a
+/// radius of -5 and of -4 as 0), and for an object, which a model may drop.
+fn others_than(value: &Value) -> Vec<Value> {
     match value {
-        Value::Null => json!(1),
-        Value::Bool(b) => json!(!b),
-        Value::Number(n) => json!(n.as_f64().unwrap_or_default() + 1.),
-        Value::String(s) => json!(format!("{s}~")),
+        Value::Null => vec![json!(1)],
+        Value::Bool(b) => vec![json!(!b)],
+        Value::Number(n) => {
+            let n = n.as_f64().unwrap_or_default();
+            vec![json!(n.abs() + 1.), json!(if n == 0. { 1. } else { 0. })]
+        }
+        Value::String(s) => vec![json!(format!("{s}~"))],
         Value::Array(items) => {
             let mut items = items.clone();
             items.push(Value::Null);
-            Value::Array(items)
+            vec![Value::Array(items)]
         }
-        Value::Object(_) => Value::Null,
+        Value::Object(_) => vec![Value::Null, json!(1)],
     }
 }
 

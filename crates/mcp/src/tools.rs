@@ -288,7 +288,7 @@ fn catalog() -> Vec<ToolDef> {
                 },
                 "description": { "type": "string", "description": "What this call does, in a few words." },
                 "name": { "type": "string", "description": "A name for a new Design, made in Zeron's designs folder." },
-                "path": { "type": "string", "description": "The .zdesign file to change (a previous call's `design.path`)." },
+                "path": { "type": "string", "description": "The .zdesign file to change, anywhere on this computer (a previous call's `design.path`). With neither path nor name, the call changes the Design in your chat's front Design tab." },
                 "editId": { "type": "string", "description": "Retries the failed call with this edit id, its snippet changed by `edits`; send no snippet, path or name with it." },
                 "edits": {
                     "type": "array",
@@ -301,6 +301,11 @@ fn catalog() -> Vec<ToolDef> {
                 }
             }
         }),
+    });
+    tools.push(ToolDef {
+        name: DESIGN_STATE,
+        description: "Lists the Designs open in your chat's Design tabs (the front one first) and the ones touched recently on this computer, with a reminder to load the design guide.",
+        input_schema: json!({ "type": "object", "properties": {} }),
     });
     tools.push(ToolDef {
         name: WAIT_ON_BACKGROUND,
@@ -337,6 +342,9 @@ const SHOW_IMAGE: &str = "show_image";
 
 /// Runs a snippet against a Design in this computer's engine.
 const DESIGN_EXECUTE: &str = "design_execute";
+
+/// Says which Designs the calling chat has open.
+const DESIGN_STATE: &str = "design_state";
 
 /// Where a tool's result carries images for the client, as MCP image
 /// content (`{type: "image", data, mimeType}`); the transport moves them
@@ -924,6 +932,7 @@ impl Tools {
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             SHOW_IMAGE => self.show_image(parse(args)?).await,
             DESIGN_EXECUTE => self.design_execute(parse(args)?).await,
+            DESIGN_STATE => self.design_state().await,
             WAIT_ON_BACKGROUND => self.wait_on_background(parse(args)?).await,
             plugins::CREATE_PLUGIN => return self.create_plugin(args).await,
             plugins::LIST_PLUGINS => return self.list_plugins().await,
@@ -1709,6 +1718,15 @@ impl Tools {
         }
         executed[IMAGE_CONTENT] = Value::Array(images);
         Ok(executed)
+    }
+
+    async fn design_state(&self) -> anyhow::Result<Value> {
+        self.zeron
+            .call(
+                zeron_rpc::methods::DESIGN_STATE,
+                json!({ "chatId": self.zeron.origin().chat_id }),
+            )
+            .await
     }
 
     async fn wait_on_background(&self, args: WaitOnBackgroundArgs) -> anyhow::Result<Value> {
