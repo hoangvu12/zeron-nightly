@@ -16,10 +16,15 @@ use zeron_proto::HarnessId;
 /// The chat the agent calls from.
 pub const CHAT: &str = "designer";
 
+/// A second chat, for Designs shared between chats.
+pub const OTHER: &str = "implementer";
+
 pub struct Seam {
     pub core: EngineCore,
     tools: Tools,
-    _dir: tempfile::TempDir,
+    /// [`OTHER`]'s agent.
+    other: Tools,
+    dir: tempfile::TempDir,
 }
 
 /// One tool call's result, as the agent's client gets it.
@@ -75,22 +80,31 @@ impl Seam {
             None,
         )
         .unwrap();
-        core.workspace
-            .create_chat(CHAT, None, Some(&core.device_id), None, None)
-            .unwrap();
-        let tools = Tools::new(Arc::new(Zeron::with_client(
-            zeron_rpc::agent_memory_client(core.rpc_service(), Some(CHAT.into())),
-            Origin {
-                chat_id: Some(CHAT.into()),
-                device_id: Some(core.device_id.clone()),
-                ..Default::default()
-            },
-        )));
+        let agent = |chat: &str| {
+            core.workspace
+                .create_chat(chat, None, Some(&core.device_id), None, None)
+                .unwrap();
+            Tools::new(Arc::new(Zeron::with_client(
+                zeron_rpc::agent_memory_client(core.rpc_service(), Some(chat.into())),
+                Origin {
+                    chat_id: Some(chat.into()),
+                    device_id: Some(core.device_id.clone()),
+                    ..Default::default()
+                },
+            )))
+        };
+        let (tools, other) = (agent(CHAT), agent(OTHER));
         Self {
             core,
             tools,
-            _dir: dir,
+            other,
+            dir,
         }
+    }
+
+    /// The engine's data folder.
+    pub fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("engine")
     }
 
     /// Zeron's MCP tool list, as `tools/list` gives it.
@@ -100,42 +114,12 @@ impl Seam {
     }
 
     pub async fn call(&self, tool: &str, arguments: Value) -> Called {
-        let reply = zeron_mcp::handle_request(
-            &self.tools,
-            json!(1),
-            "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
-        )
-        .await;
-        let result = &reply["result"];
-        let content = result["content"].as_array().expect("content");
-        let text = content
-            .iter()
-            .filter(|c| c["type"] == "text")
-            .map(|c| c["text"].as_str().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let images = content
-            .iter()
-            .filter(|c| c["type"] == "image")
-            .map(|c| {
-                let png = base64::engine::general_purpose::STANDARD
-                    .decode(c["data"].as_str().expect("image data"))
-                    .expect("base64");
-                let rgba = image::load_from_memory(&png).expect("a PNG").to_rgba8();
-                Image {
-                    mime_type: c["mimeType"].as_str().unwrap_or_default().to_owned(),
-                    width: rgba.width(),
-                    height: rgba.height(),
-                    rgba,
-                }
-            })
-            .collect();
-        Called {
-            is_error: result["isError"] == true,
-            text,
-            images,
-        }
+        call(&self.tools, tool, arguments).await
+    }
+
+    /// A tool call from [`OTHER`]'s agent.
+    pub async fn call_other(&self, tool: &str, arguments: Value) -> Called {
+        call(&self.other, tool, arguments).await
     }
 
     /// `design_execute` on a new Design named `name`.
@@ -157,5 +141,44 @@ impl Seam {
 
     pub async fn shutdown(self) {
         self.core.shutdown().await;
+    }
+}
+
+async fn call(tools: &Tools, tool: &str, arguments: Value) -> Called {
+    let reply = zeron_mcp::handle_request(
+        tools,
+        json!(1),
+        "tools/call",
+        json!({ "name": tool, "arguments": arguments }),
+    )
+    .await;
+    let result = &reply["result"];
+    let content = result["content"].as_array().expect("content");
+    let text = content
+        .iter()
+        .filter(|c| c["type"] == "text")
+        .map(|c| c["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = content
+        .iter()
+        .filter(|c| c["type"] == "image")
+        .map(|c| {
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(c["data"].as_str().expect("image data"))
+                .expect("base64");
+            let rgba = image::load_from_memory(&png).expect("a PNG").to_rgba8();
+            Image {
+                mime_type: c["mimeType"].as_str().unwrap_or_default().to_owned(),
+                width: rgba.width(),
+                height: rgba.height(),
+                rgba,
+            }
+        })
+        .collect();
+    Called {
+        is_error: result["isError"] == true,
+        text,
+        images,
     }
 }

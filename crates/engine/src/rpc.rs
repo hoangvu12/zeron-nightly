@@ -5818,6 +5818,14 @@ impl RpcService for EngineRpc {
                     })?;
                 RpcReply::value(&executed)
             }
+            methods::DESIGN_STATE => {
+                let designs = self
+                    .designs
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))?;
+                let p: crate::designs::StateParams = parse_params(params)?;
+                RpcReply::value(&designs.state(p.chat_id.as_deref()))
+            }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
                 let text = self

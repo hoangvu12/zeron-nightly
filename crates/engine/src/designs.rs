@@ -8,13 +8,19 @@
 //! place). A failed call changes nothing, on disk or in memory. New Designs are made in the managed folder, `designs/` in the
 //! engine's data dir, one folder each with an `images/` folder beside the
 //! `.zdesign` file.
+//!
+//! Several chats may change one Design: they share its one live copy, and
+//! a call is told when someone else changed it since that chat's last. The
+//! engine also keeps which Designs each chat's Design tabs show
+//! ([`Designs::set_tabs`]), and the Designs touched most recently on this
+//! computer ([`Designs::recent`]), in `recent-designs.json`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
@@ -25,6 +31,15 @@ pub const EXTENSION: &str = "zdesign";
 
 /// Longest name a managed Design's folder takes from its Design's name.
 const MAX_NAME_CHARS: usize = 64;
+
+/// How many recent Designs are kept.
+const MAX_RECENT: usize = 50;
+
+/// What `design_state` reminds an agent of.
+pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide comes with your first design call in a chat; call design_guide for it again (after your context was compacted, say) or for a topic guide.";
+
+/// What a call is told when its Design changed since that chat's last call.
+const CHANGED_NOTICE: &str = "This Design changed since your last call (another chat or the person changed it): read nodes again before changing what you didn't just make.";
 
 /// `DesignExecute`'s params, as Zeron's `design_execute` tool sends them.
 #[derive(Debug, Deserialize)]
@@ -43,6 +58,25 @@ pub struct ExecuteParams {
     /// The name of a new managed Design to make.
     #[serde(default)]
     pub name: Option<String>,
+}
+
+/// `DesignState`'s params, as Zeron's `design_state` tool sends them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateParams {
+    /// The calling chat (the agent's, set by the engine for an agent).
+    #[serde(default)]
+    pub chat_id: Option<String>,
+}
+
+/// A Design touched recently on this computer, by an agent or the person.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recent {
+    pub name: String,
+    pub path: PathBuf,
+    /// When, in ms since the Unix epoch.
+    pub touched_at: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,12 +100,22 @@ struct Inner {
     limits: Limits,
     /// Designs held live, by file: one owner each, so calls apply in order.
     live: Mutex<HashMap<PathBuf, Arc<Mutex<Live>>>>,
+    /// The Designs each chat's Design tabs show, front first.
+    tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
+    /// The Designs touched most recently, newest first, as kept in
+    /// `recent_file`.
+    recent: Mutex<Vec<Recent>>,
+    recent_file: PathBuf,
 }
 
 /// One Design as the engine holds it.
 struct Live {
     path: PathBuf,
     design: Design,
+    /// Counts the changes kept, whoever made them.
+    version: u64,
+    /// The version each chat's last successful call left.
+    seen: HashMap<String, u64>,
 }
 
 impl Designs {
@@ -83,11 +127,19 @@ impl Designs {
         let root = std::fs::create_dir_all(&root)
             .and_then(|()| canonical(&root))
             .unwrap_or(root);
+        let recent_file = data_dir.join("recent-designs.json");
+        let recent = std::fs::read_to_string(&recent_file)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
         Self {
             inner: Arc::new(Inner {
                 root,
                 limits: Limits::default(),
                 live: Mutex::new(HashMap::new()),
+                tabs: Mutex::new(HashMap::new()),
+                recent: Mutex::new(recent),
+                recent_file,
             }),
         }
     }
@@ -105,7 +157,7 @@ impl Designs {
             return Err(DesignError::Refused("the snippet is empty".into()));
         }
         let target = self.target(&params)?;
-        let ran = self.run(&target.live, &params.snippet);
+        let ran = self.run(&target.live, &params);
         if ran.is_err() && target.new {
             // Nothing was made: the name is free again.
             lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
@@ -113,16 +165,97 @@ impl Designs {
         ran
     }
 
-    fn run(&self, live: &Mutex<Live>, code: &str) -> Result<Value, DesignError> {
+    fn run(&self, live: &Mutex<Live>, params: &ExecuteParams) -> Result<Value, DesignError> {
         let mut live = lock(live);
-        let draft = snippet::run(Draft::new(live.design.clone()), code, self.inner.limits)?;
+        let draft = snippet::run(Draft::new(live.design.clone()), &params.snippet, self.inner.limits)?;
         let edited = draft.finish();
+        let chat = params.chat_id.as_deref();
+        let changed = chat
+            .and_then(|chat| live.seen.get(chat))
+            .is_some_and(|&seen| seen != live.version);
         let screenshots = live.commit(&edited)?;
-        Ok(json!({
+        if let Some(chat) = chat {
+            let version = live.version;
+            live.seen.insert(chat.to_owned(), version);
+        }
+        self.touch(&live.path);
+        let mut result = json!({
             "design": { "name": design_name(&live.path), "path": live.path },
             "ids": edited.names,
             "screenshots": screenshots,
-        }))
+        });
+        if changed {
+            result["notice"] = json!(CHANGED_NOTICE);
+        }
+        Ok(result)
+    }
+
+    /// `design_state` for `chat_id`: the Designs its Design tabs show,
+    /// front first, the recent ones, and the guide reminder.
+    pub fn state(&self, chat_id: Option<&str>) -> Value {
+        let tabs = chat_id
+            .and_then(|chat| lock(&self.inner.tabs).get(chat).cloned())
+            .unwrap_or_default();
+        let designs: Vec<Value> = tabs
+            .iter()
+            .enumerate()
+            .map(|(i, path)| json!({ "name": design_name(path), "path": path, "front": i == 0 }))
+            .collect();
+        json!({ "designs": designs, "recent": self.recent(), "guide": GUIDE_REMINDER })
+    }
+
+    /// Sets the Designs `chat_id`'s Design tabs show, the one in front
+    /// first (none when it has no Design tab). The Design tab calls it as
+    /// its tabs open, close and come to the front; a call that names no
+    /// Design changes the front one. A Design newly open is touched.
+    pub fn set_tabs(&self, chat_id: &str, paths: Vec<PathBuf>) {
+        let paths: Vec<PathBuf> = paths.into_iter().map(|p| canonical(&p).unwrap_or(p)).collect();
+        let mut tabs = lock(&self.inner.tabs);
+        let before = tabs.get(chat_id).cloned().unwrap_or_default();
+        let opened: Vec<PathBuf> = paths.iter().filter(|p| !before.contains(p)).cloned().collect();
+        if paths.is_empty() {
+            tabs.remove(chat_id);
+        } else {
+            tabs.insert(chat_id.to_owned(), paths);
+        }
+        drop(tabs);
+        // The front one last, so it's the newest.
+        for path in opened.iter().rev() {
+            self.touch(path);
+        }
+    }
+
+    /// The Designs touched most recently on this computer, newest first,
+    /// leaving out any whose file is gone.
+    pub fn recent(&self) -> Vec<Recent> {
+        lock(&self.inner.recent)
+            .iter()
+            .filter(|recent| recent.path.is_file())
+            .cloned()
+            .collect()
+    }
+
+    /// Makes the Design at `path` the most recent, and keeps the list.
+    fn touch(&self, path: &Path) {
+        let mut recent = lock(&self.inner.recent);
+        recent.retain(|recent| recent.path != path);
+        let touched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        recent.insert(
+            0,
+            Recent {
+                name: design_name(path),
+                path: path.to_owned(),
+                touched_at,
+            },
+        );
+        recent.truncate(MAX_RECENT);
+        let text = serde_json::to_string_pretty(&*recent).unwrap_or_default();
+        // A list that can't be kept still serves this run.
+        if let Err(e) = write_whole(&self.inner.recent_file, text.as_bytes()) {
+            tracing::warn!("can't keep the recent Designs: {e}");
+        }
     }
 
     /// The Design a call is for: the file it names, or a new managed
@@ -140,10 +273,49 @@ impl Designs {
             (Some(_), Some(_)) => Err(DesignError::Refused(
                 "give either the path of a Design or the name of a new one, not both".into(),
             )),
-            (None, None) => Err(DesignError::Refused(
-                "name a Design: the path of a .zdesign file, or a name for a new one".into(),
-            )),
+            (None, None) => {
+                let front = params
+                    .chat_id
+                    .as_deref()
+                    .and_then(|chat| lock(&self.inner.tabs).get(chat)?.first().cloned());
+                match front {
+                    Some(path) => Ok(Target {
+                        live: self.open(&path)?,
+                        new: false,
+                    }),
+                    None => Err(self.untargeted()),
+                }
+            }
         }
+    }
+
+    /// Why a call that names no Design, from a chat with no Design tab,
+    /// can't run, with the Designs it could name.
+    fn untargeted(&self) -> DesignError {
+        let mut open: Vec<PathBuf> = lock(&self.inner.tabs).values().flatten().cloned().collect();
+        open.sort();
+        open.dedup();
+        let recent: Vec<PathBuf> = self
+            .recent()
+            .into_iter()
+            .map(|recent| recent.path)
+            .filter(|path| !open.contains(path))
+            .collect();
+        let mut text = String::from(
+            "name a Design: this chat has no Design tab open, so give the `path` of a .zdesign file, or a `name` for a new Design.",
+        );
+        if open.is_empty() && recent.is_empty() {
+            text.push_str(" There are no Designs yet on this computer.");
+        }
+        for (title, paths) in [("Open in Design tabs", open), ("Recent", recent)] {
+            if !paths.is_empty() {
+                text.push_str(&format!("\n{title}:"));
+                for path in paths {
+                    text.push_str(&format!("\n- {}: {}", design_name(&path), path.display()));
+                }
+            }
+        }
+        DesignError::Refused(text)
     }
 
     /// The live Design of the `.zdesign` file at `path`, read on first use.
@@ -154,8 +326,15 @@ impl Designs {
                 path.display()
             )));
         }
-        let path = canonical(path)
-            .map_err(|e| DesignError::Refused(format!("can't open {}: {e}", path.display())))?;
+        let path = canonical(path).map_err(|e| {
+            DesignError::Refused(match e.kind() {
+                std::io::ErrorKind::NotFound => format!(
+                    "there's no file at {}: give the path of a .{EXTENSION} file on this computer, or a name for a new Design",
+                    path.display()
+                ),
+                _ => format!("can't open {}: {e}", path.display()),
+            })
+        })?;
         if let Some(design) = lock(&self.inner.live).get(&path) {
             return Ok(design.clone());
         }
@@ -165,10 +344,7 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        let design = Arc::new(Mutex::new(Live {
-            path: path.clone(),
-            design,
-        }));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), design)));
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -194,10 +370,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = Arc::new(Mutex::new(Live {
-            path: path.clone(),
-            design: Design::default(),
-        }));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default())));
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -210,11 +383,21 @@ struct Target {
 }
 
 impl Live {
+    fn new(path: PathBuf, design: Design) -> Self {
+        Self {
+            path,
+            design,
+            version: 0,
+            seen: HashMap::new(),
+        }
+    }
+
     /// Keeps a successful call's draft: saves the file, then draws the
     /// screenshots the call asked for.
     fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
+        self.version += 1;
         Ok(edited
             .screenshots
             .iter()
@@ -247,9 +430,15 @@ fn save(path: &Path, design: &Design) -> Result<(), DesignError> {
     if !path.exists() {
         std::fs::create_dir_all(folder.join("images")).map_err(io)?;
     }
-    let mut file = tempfile::NamedTempFile::new_in(folder).map_err(io)?;
-    std::io::Write::write_all(&mut file, design.to_json().as_bytes()).map_err(io)?;
-    file.persist(path).map_err(|e| io(e.error))?;
+    write_whole(path, design.to_json().as_bytes()).map_err(io)
+}
+
+/// Writes `path` whole or not at all.
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let folder = path.parent().unwrap_or(Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(folder)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 

@@ -71,7 +71,7 @@ The reader sees the visual above that reply, so don't announce or restate it. To
 reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
 draw images through `show_visual`.\n\
 \n\
-To make or change a visual design (Screens, Components, a design system), use `design_execute`.";
+To make or change a visual design (Screens, Components, a design system), use `design_execute`; `design_state` says which Designs your chat has open.";
 
 /// Appended to [`INSTRUCTIONS`] where the agent is offered
 /// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
