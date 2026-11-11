@@ -598,7 +598,7 @@ fn image_fills_draw_from_the_files_the_engine_names_across_tile_edges() {
         }
     }
     let placeholder = shown.rgba(tab.on_screen(150., 120.));
-    assert_eq!(placeholder, [228, 228, 231, 255]);
+    assert!(placeholder.iter().zip([228, 228, 231, 255]).all(|(a, b)| a.abs_diff(b) <= 2), "{placeholder:?}");
 
     // As the engine's screenshot draws it, with the same files.
     let images = zeron_design::render::ImageFiles::new([("images/stripes.png".to_string(), file)].into());

@@ -405,6 +405,8 @@ impl Designs {
         let mut warnings = edited.warnings.clone();
         let looked_at = edited.changed.iter().chain(&edited.screenshots);
         warnings.extend(images::warnings(looked_at.filter_map(|id| live.design.find(id)), &live.images));
+        // Downloaded just now, so the tabs draw them too.
+        live.tell_images();
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -644,7 +646,7 @@ impl Live {
             changes: Vec::new(),
             images: BTreeMap::new(),
         };
-        let images = DesignImages { folder: path.parent().unwrap_or(Path::new(".")).to_owned(), cache };
+        let images = DesignImages::new(&path, cache);
         Self {
             path,
             design,
@@ -705,6 +707,19 @@ impl Live {
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
             told.changes.drain(..over);
+        });
+    }
+
+    /// Tells the Design's tabs the image files it has now, if that's more
+    /// than they were told.
+    fn tell_images(&self) {
+        let images = self.images.files(&self.design);
+        self.followers.send_if_modified(|told| {
+            let more = told.version == self.version && told.images != images;
+            if more {
+                told.images = images;
+            }
+            more
         });
     }
 

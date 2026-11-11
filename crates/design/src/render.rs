@@ -141,14 +141,13 @@ pub fn image_urls(design: &Design) -> BTreeSet<String> {
     found.into_iter().map(|(_, image)| image.url.clone()).collect()
 }
 
-/// The image paints `node` and its descendants draw (fills and strokes),
-/// each with the node it's on.
+/// The image paints `node` and its descendants draw, each with the node
+/// it's on: their enabled fills (a stroke draws no image).
 pub fn images_in<'a>(node: &'a Node, found: &mut Vec<(&'a Node, &'a ImageFill)>) {
     let kind = node.kind.get();
     // A paint doesn't depend on the size it's drawn at.
     if let Some(look) = kind.look((0., 0.)) {
-        let stroke = look.stroke.map_or(&[][..], |stroke| &stroke.fill[..]);
-        for paint in look.fill.iter().chain(stroke) {
+        for paint in look.fill.iter().filter(|paint| paint.enabled) {
             if let PaintKind::Image(image) = &paint.kind {
                 found.push((node, image));
             }

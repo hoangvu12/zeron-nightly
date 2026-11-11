@@ -71,7 +71,7 @@ fn remote(url: &str) -> bool {
 /// breaks when the Design moves, and an image's data is never kept in the
 /// file.
 fn check(url: &str) -> Result<(), String> {
-    let relative = "an image's url is a path relative to the Design's folder (such as images/photo.png: copy the file into the images folder beside the .zdesign file) or an http(s) URL";
+    let relative = "an image's url is a path relative to the Design's folder and within it (such as images/photo.png: copy the file into the images folder beside the .zdesign file) or an http(s) URL";
     if url.is_empty() {
         return Err(relative.into());
     }
@@ -79,7 +79,10 @@ fn check(url: &str) -> Result<(), String> {
         return Ok(());
     }
     // A drive (`C:`) or another scheme (`data:`, `file:`) has a colon.
-    if url.contains(':') || url.starts_with(['/', '\\']) {
+    // Nor out of the folder, which goes with the Design when it's saved
+    // elsewhere.
+    let outside = url.split(['/', '\\']).any(|part| part == "..");
+    if outside || url.contains(':') || url.starts_with(['/', '\\']) {
         return Err(format!("{relative}, not \"{}\"", shortened(url)));
     }
     Ok(())

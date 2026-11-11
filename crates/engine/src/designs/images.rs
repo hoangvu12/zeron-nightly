@@ -7,7 +7,7 @@
 //! ([`DesignImages::files`]) and read it there: only the engine downloads.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,10 +46,15 @@ impl ImageCache {
         }
     }
 
+    /// Where the image at `url` is kept once downloaded.
+    fn path(&self, url: &str) -> PathBuf {
+        self.dir.join(format!("{:x}", Sha256::digest(url.as_bytes())))
+    }
+
     /// The cache file holding the image at `url`, downloaded now if it
     /// isn't yet.
     fn file(&self, url: &str) -> Result<PathBuf, String> {
-        let file = self.dir.join(format!("{:x}", Sha256::digest(url.as_bytes())));
+        let file = self.path(url);
         if file.is_file() {
             return Ok(file);
         }
@@ -86,11 +91,19 @@ impl ImageCache {
 /// The images one Design's paints refer to.
 pub struct DesignImages {
     /// The folder the Design's file is in.
-    pub folder: PathBuf,
-    pub cache: Arc<ImageCache>,
+    folder: PathBuf,
+    cache: Arc<ImageCache>,
 }
 
 impl DesignImages {
+    /// The images of the Design whose file is at `path`.
+    pub fn new(path: &Path, cache: Arc<ImageCache>) -> Self {
+        Self {
+            folder: path.parent().unwrap_or(Path::new(".")).to_owned(),
+            cache,
+        }
+    }
+
     /// The file the image at `url` is in: in the Design's folder, or the
     /// cache's, downloaded now if it's a URL not had yet.
     fn file(&self, url: &str) -> Result<PathBuf, String> {
@@ -104,11 +117,20 @@ impl DesignImages {
         Ok(path)
     }
 
-    /// The file each image `design` draws is in, for those it has.
+    /// The file each image `design` draws is in, for those it has now:
+    /// nothing is downloaded (so a Design isn't held up telling its tabs);
+    /// an agent's call downloads the images it uses.
     pub fn files(&self, design: &Design) -> BTreeMap<String, PathBuf> {
         render::image_urls(design)
             .into_iter()
-            .filter_map(|url| Some((url.clone(), self.file(&url).ok()?)))
+            .filter_map(|url| {
+                let file = if ImageFill::is_remote(&url) {
+                    Some(self.cache.path(&url)).filter(|file| file.is_file())
+                } else {
+                    self.file(&url).ok()
+                };
+                Some((url, file?))
+            })
             .collect()
     }
 }

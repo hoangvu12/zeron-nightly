@@ -263,6 +263,7 @@ async fn an_image_must_be_a_relative_path_or_an_http_url() {
         absolute.to_string_lossy().into_owned(),
         "data:image/png;base64,iVBORw0KGgo=".to_owned(),
         "ftp://example.com/photo.png".to_owned(),
+        "images/../../elsewhere/photo.png".to_owned(),
         String::new(),
     ] {
         let snippet = format!(
