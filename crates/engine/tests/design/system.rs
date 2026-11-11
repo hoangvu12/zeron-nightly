@@ -391,3 +391,20 @@ TakeScreenshot(screen);"##,
     assert!(inked, "the text draws in its Token's colour");
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn text_that_only_looks_like_a_token_draws_as_written() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Prices",
+            r##"screen = Insert({ type: "frame", name: "Screen", width: 200, height: 100, fill: "#FFFFFF", layout: "vertical",
+  children: [{ type: "text", name: "Price", content: "$880", fontSize: 60, fontWeight: 700, fill: "#000000" }] });
+TakeScreenshot(screen);"##,
+        )
+        .await;
+    let shot = &made.images[0];
+    let inked = (0..shot.width).any(|x| (0..shot.height).any(|y| shot.rgba(x, y) == BLACK));
+    assert!(inked, "\"$880\" draws");
+    seam.shutdown().await;
+}
