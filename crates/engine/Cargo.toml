@@ -53,7 +53,7 @@ bytes = "1"
 zeron-plugin-guard.workspace = true
 # Designs: agents' snippets (QuickJS) and their screenshots, drawn by Skia
 # as the zgx app draws them.
-zeron-design = { workspace = true, features = ["snippet"] }
+zeron-design = { workspace = true, features = ["snippet", "google-fonts"] }
 ignore.workspace = true
 fff-search.workspace = true
 

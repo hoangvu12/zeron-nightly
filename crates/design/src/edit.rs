@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::assets::Cache;
+use crate::fonts::Fonts;
 use crate::model::{Design, Kind, Node, warn};
 use crate::printed::Printed;
 
@@ -45,6 +46,8 @@ pub enum EditError {
 /// One call's working copy of a Design.
 pub struct Draft {
     design: Design,
+    /// What the Design's text is set in, for reading its layout back.
+    fonts: Fonts,
     ids: HashSet<String>,
     /// Nodes made by this call, as (name, id), in order.
     created: Vec<(String, String)>,
@@ -85,6 +88,7 @@ impl Draft {
         });
         Self {
             design,
+            fonts: Fonts::default(),
             ids,
             created: Vec::new(),
             changed: BTreeSet::new(),
@@ -100,6 +104,17 @@ impl Draft {
     pub fn with_assets(mut self, assets: Arc<Cache>) -> Self {
         self.assets = Some(assets);
         self
+    }
+
+    /// The draft with its text set in `fonts` (else in the bundled font
+    /// only).
+    pub fn with_fonts(mut self, fonts: Fonts) -> Self {
+        self.fonts = fonts;
+        self
+    }
+
+    pub fn fonts(&self) -> &Fonts {
+        &self.fonts
     }
 
     /// The Design as this call has it so far.
@@ -146,7 +161,16 @@ impl Draft {
         });
     }
 
-    pub fn finish(self) -> Edited {
+    pub fn finish(mut self) -> Edited {
+        // However it came to be: inserted so, or its fill taken away.
+        for id in &self.changed {
+            if let Some(node) = self.design.find(id)
+                && let Kind::Text(text) = &node.kind
+                && text.fill.fill.is_empty()
+            {
+                self.warnings.push(Warning::invisible(node));
+            }
+        }
         let mut names = Map::new();
         // A node made and deleted in one call was never there.
         let created = self.created.into_iter().filter(|(_, id)| self.design.find(id).is_some());

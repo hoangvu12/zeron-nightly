@@ -2,13 +2,15 @@
 //! with the mock harness in a temp folder, and Zeron's MCP server for one
 //! of its chats, connected as an agent's is (the agent token's guard), and
 //! called with `tools/call` the way an agent's client calls it; tests read what the agent would: the result's text and images, and
-//! the files on disk.
+//! the files on disk. Fonts come from a fixture folder ([`FONTS`]) in place
+//! of Google Fonts, so tests run offline.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
+use zeron_design::fonts::{FontFolder, Fonts};
 use zeron_design::icons::IconSource;
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_mcp::{Origin, Tools, Zeron};
@@ -19,6 +21,10 @@ pub const CHAT: &str = "designer";
 
 /// A second chat, for Designs shared between chats.
 pub const OTHER: &str = "implementer";
+
+/// The fixture standing in for Google Fonts: the Zeron app's own font
+/// files (Geist, Geist Mono and Instrument Serif).
+pub const FONTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/zgx/fonts");
 
 pub struct Seam {
     pub core: EngineCore,
@@ -116,6 +122,10 @@ impl Seam {
             None,
         )
         .unwrap();
+        core.designs.use_fonts(Fonts::new(
+            Some(dir.path().join("font-cache")),
+            Some(Box::new(FontFolder::new(FONTS))),
+        ));
         let tools = agent_tools(&core, CHAT);
         let iconify = Arc::new(FixtureIcons::default());
         core.designs.icons().set_source(iconify.clone());

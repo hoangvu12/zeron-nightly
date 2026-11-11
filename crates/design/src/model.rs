@@ -22,6 +22,7 @@ mod path;
 mod polygon;
 mod rectangle;
 mod stroke;
+mod text;
 pub mod warn;
 
 pub use ellipse::Ellipse;
@@ -35,12 +36,14 @@ pub use path::{FillRule, Path};
 pub use polygon::Polygon;
 pub use rectangle::Rectangle;
 pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
+pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::assets::AssetKey;
 use crate::render::{Look, Painter};
+use crate::skia::Typesetter;
 
 /// The format version new Designs are written with.
 pub const VERSION: &str = "1.0";
@@ -223,6 +226,12 @@ pub trait NodeKind {
     /// not its children, at its laid-out `size` with its top-left at the
     /// painter's origin.
     fn paint(&self, _size: (f32, f32), _painter: &mut dyn Painter) {}
+
+    /// The size of its own content, for a type whose content isn't its
+    /// children (text), at `width` when its parent decides that.
+    fn measure(&self, _typesetter: &Typesetter, _width: Option<f32>) -> Option<[f32; 2]> {
+        None
+    }
 }
 
 macro_rules! kinds {
@@ -275,6 +284,7 @@ kinds! {
     /// A container. On the Canvas itself, a Screen or a Component.
     Frame = "frame",
     Rectangle = "rectangle",
+    Text = "text",
     Ellipse = "ellipse",
     Polygon = "polygon",
     Path = "path",

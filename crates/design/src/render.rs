@@ -7,8 +7,10 @@
 //! the agent's screenshot does.
 
 use crate::assets::Assets;
+use crate::fonts::Fonts;
 use crate::layout::LaidOut;
-use crate::model::{Color, Design, EffectKind, Effects, FillRule, Node, Paint, Shadow, StrokeStyle};
+use crate::model::{Color, Design, EffectKind, Effects, FillRule, Node, Paint, Shadow, StrokeStyle, Text};
+use crate::skia::Typesetter;
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -157,6 +159,9 @@ pub trait Painter {
     /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
     /// the painter's assets haven't that one.
     fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
+    /// Draws `text` in a box of `size` at the origin, in each of its fill's
+    /// paints in turn.
+    fn text(&mut self, text: &Text, size: (f32, f32));
 }
 
 /// Draws `node` and its descendants where `laid_out` puts them, with its
@@ -338,13 +343,15 @@ pub fn blur_reach(design: &Design, laid_out: &LaidOut) -> f32 {
 /// transparent `width` × `height` image (RGBA, premultiplied): the
 /// Canvas's top-level nodes at `nodes` (indices into its children, the
 /// ones meeting `area` grown by `margin`, in order) drawn where `laid_out`
-/// puts them. It's drawn `margin` (Canvas units, [`blur_reach`]) wider all
-/// round and cut to `area`, so blurs at its edges read what they would
-/// with the whole Canvas drawn. Its icons and other assets come from
-/// `assets`. `None` for an empty or oversized image.
+/// puts them, their text set by `typesetter` (as it was laid out) and
+/// their icons and other assets from `assets`. It's drawn `margin` (Canvas
+/// units, [`blur_reach`]) wider all round and cut to `area`, so blurs at
+/// its edges read what they would with the whole Canvas drawn. `None` for
+/// an empty or oversized image.
 pub fn region(
     design: &Design,
     laid_out: &LaidOut,
+    typesetter: &Typesetter,
     nodes: &[usize],
     area: Rect,
     scale: f32,
@@ -357,7 +364,7 @@ pub fn region(
     let (wide, high) = (width + 2 * pad, height + 2 * pad);
     let mut drawn = vec![0; wide as usize * high as usize * 4];
     crate::skia::draw_into(&mut drawn, wide, high, |canvas| {
-        let mut painter = crate::skia::SkiaPainter::new(canvas).with_assets(assets);
+        let mut painter = crate::skia::SkiaPainter::new(canvas, typesetter).with_assets(assets);
         painter.translate(pad as f32, pad as f32);
         painter.scale(scale);
         painter.translate(-area.x, -area.y);
@@ -404,15 +411,17 @@ pub enum RenderError {
 
 /// Draws one node of `design` on a transparent background at 1x, or
 /// smaller when its longest side is over `max_side`, and encodes it. Its
-/// icons and other assets come from `assets`.
+/// text is set in `fonts`, its icons and other assets come from `assets`.
 pub fn screenshot(
     design: &Design,
     id: &str,
     max_side: f32,
+    fonts: &Fonts,
     assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
-    let laid_out = LaidOut::of(design);
+    let typesetter = fonts.typesetter(design);
+    let laid_out = LaidOut::of(design, &typesetter);
     let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
     let (width, height) = (bounds.width, bounds.height);
     if !(width > 0. && height > 0.) {
@@ -427,7 +436,7 @@ pub fn screenshot(
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas()).with_assets(assets);
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter).with_assets(assets);
         painter.scale(scale);
         paint_upright(node, &laid_out, &mut painter);
     }
