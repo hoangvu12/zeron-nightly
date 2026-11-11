@@ -38,7 +38,8 @@ const MAX_RECENT: usize = 50;
 /// What `design_state` reminds an agent of.
 pub const GUIDE_REMINDER: &str = "Design with the design guide loaded: the core guide comes with your first design call in a chat; call design_guide for it again (after your context was compacted, say) or for a topic guide.";
 
-/// What a call is told when its Design changed since that chat's last call.
+/// What a call is told when its Design changed since that chat's last call
+/// (a chat's first call on a Design has nothing to compare, so isn't).
 const CHANGED_NOTICE: &str = "This Design changed since your last call (another chat or the person changed it): read nodes again before changing what you didn't just make.";
 
 /// `DesignExecute`'s params, as Zeron's `design_execute` tool sends them.
@@ -179,7 +180,6 @@ impl Designs {
             let version = live.version;
             live.seen.insert(chat.to_owned(), version);
         }
-        self.touch(&live.path);
         let mut result = json!({
             "design": { "name": design_name(&live.path), "path": live.path },
             "ids": edited.names,
@@ -191,6 +191,10 @@ impl Designs {
         if changed {
             result["notice"] = json!(CHANGED_NOTICE);
         }
+        // Not holding the Design up for the recent list's write.
+        let path = live.path.clone();
+        drop(live);
+        self.touch(&path);
         Ok(result)
     }
 
@@ -209,9 +213,10 @@ impl Designs {
     }
 
     /// Sets the Designs `chat_id`'s Design tabs show, the one in front
-    /// first (none when it has no Design tab). The Design tab calls it as
-    /// its tabs open, close and come to the front; a call that names no
-    /// Design changes the front one. A Design newly open is touched.
+    /// first (none when it has no Design tab). For the Design tab (#30,
+    /// #31) to call as its tabs open, close and come to the front; until it
+    /// does, only seam 1 calls it. A call that names no Design changes the
+    /// front one. A Design newly open is touched.
     pub fn set_tabs(&self, chat_id: &str, paths: Vec<PathBuf>) {
         let paths: Vec<PathBuf> = paths.into_iter().map(|p| canonical(&p).unwrap_or(p)).collect();
         let mut tabs = lock(&self.inner.tabs);
@@ -232,11 +237,8 @@ impl Designs {
     /// The Designs touched most recently on this computer, newest first,
     /// leaving out any whose file is gone.
     pub fn recent(&self) -> Vec<Recent> {
-        lock(&self.inner.recent)
-            .iter()
-            .filter(|recent| recent.path.is_file())
-            .cloned()
-            .collect()
+        let recent = lock(&self.inner.recent).clone();
+        recent.into_iter().filter(|recent| recent.path.is_file()).collect()
     }
 
     /// Makes the Design at `path` the most recent, and keeps the list.
@@ -262,8 +264,9 @@ impl Designs {
         }
     }
 
-    /// The Design a call is for: the file it names, or a new managed
-    /// Design by the name it gives (made on disk when the call succeeds).
+    /// The Design a call is for: the file it names, a new managed Design by
+    /// the name it gives (made on disk when the call succeeds), or else the
+    /// one in the calling chat's front Design tab.
     fn target(&self, params: &ExecuteParams) -> Result<Target, DesignError> {
         match (params.path.as_deref(), params.name.as_deref()) {
             (Some(path), None) => Ok(Target {
@@ -283,6 +286,10 @@ impl Designs {
                     .as_deref()
                     .and_then(|chat| lock(&self.inner.tabs).get(chat)?.first().cloned());
                 match front {
+                    Some(path) if !path.is_file() => Err(DesignError::Refused(format!(
+                        "your front Design tab shows {}, which is no longer on disk: give the `path` of a .{EXTENSION} file, or a `name` for a new Design",
+                        path.display()
+                    ))),
                     Some(path) => Ok(Target {
                         live: self.open(&path)?,
                         new: false,

@@ -142,7 +142,13 @@ async fn a_call_with_no_path_targets_the_chats_front_design_tab() {
 
     // A path or a name still wins over the tab.
     assert_eq!(seam.execute(&beta, SCREEN).await.path(), beta);
-    assert_eq!(seam.create("Gamma", SCREEN).await.json()["design"]["name"], "Gamma");
+    let gamma = seam.create("Gamma", SCREEN).await.path();
+
+    // A front tab whose file went away says so.
+    seam.core.designs.set_tabs(CHAT, vec![gamma.clone()]);
+    std::fs::remove_file(&gamma).unwrap();
+    let gone = untargeted(&seam).await;
+    assert!(gone.is_error && gone.text.contains("front Design tab"), "{}", gone.text);
 
     // Another chat's tabs aren't this chat's.
     seam.core.designs.set_tabs(CHAT, vec![]);
