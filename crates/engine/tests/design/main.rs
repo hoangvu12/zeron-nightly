@@ -9,6 +9,7 @@ mod kept;
 mod layout;
 mod looks;
 mod reading;
+mod saving;
 mod seam;
 mod shapes;
 mod system;

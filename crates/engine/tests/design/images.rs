@@ -355,3 +355,27 @@ TakeScreenshot([screen]);"##,
     assert_eq!(server.hits("/stripes.png"), 1);
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn save_as_keeps_a_url_image_as_written_and_draws_it_from_the_cache() {
+    let server = Server::start(vec![("/stripes.png", stripes())]);
+    let seam = Seam::new().await;
+    let path = design(&seam, "Moved").await;
+    let (called, _) = three_modes(&seam, &path, &server.url("/stripes.png")).await;
+    let screen = called.id("Modes");
+
+    let project = tempfile::tempdir().unwrap();
+    let to = project.path().join("Moved.zdesign");
+    let saved = seam.window("SaveDesignAs", json!({ "path": path, "to": to })).await.unwrap();
+    let to = std::path::PathBuf::from(saved["path"].as_str().unwrap());
+    // Nothing downloaded is copied beside it; the url is kept as written.
+    let copied = std::fs::read_dir(to.parent().unwrap().join("images"));
+    assert!(copied.map_or(true, |mut files| files.next().is_none()));
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(&to).unwrap()).unwrap();
+    assert_eq!(file["children"][1]["children"][0]["fill"]["url"], json!(server.url("/stripes.png")));
+    let again = seam.execute(&to, &format!("TakeScreenshot({});", json!(screen))).await;
+    assert_eq!(again.images.len(), 1, "{}", again.text);
+    drawn_in_three_modes(&again.images[0]);
+    assert_eq!(server.hits("/stripes.png"), 1);
+    seam.shutdown().await;
+}

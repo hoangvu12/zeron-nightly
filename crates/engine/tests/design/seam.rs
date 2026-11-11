@@ -3,7 +3,9 @@
 //! of its chats, connected as an agent's is (the agent token's guard), and
 //! called with `tools/call` the way an agent's client calls it; tests read what the agent would: the result's text and images, and
 //! the files on disk. Fonts come from a fixture folder ([`FONTS`]) in place
-//! of Google Fonts, so tests run offline.
+//! of Google Fonts, so tests run offline. Managed Designs save at once
+//! after each change, so tests read their files as each call left them
+//! (`saving.rs` sets an autosave delay of its own).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -114,7 +116,21 @@ impl Image {
 
 impl Seam {
     pub async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::in_dir(tempfile::tempdir().unwrap())
+    }
+
+    /// The engine stopped, and another started on its data folder, as when
+    /// Zeron restarts (or crashes: a stop saves no Design that isn't
+    /// managed).
+    pub async fn restart(self) -> Self {
+        let Self { core, tools, dir, .. } = self;
+        core.shutdown().await;
+        // (Its data folder's lock goes with it.)
+        drop((core, tools));
+        Self::in_dir(dir)
+    }
+
+    fn in_dir(dir: tempfile::TempDir) -> Self {
         let core = EngineCore::assemble(
             &dir.path().join("engine"),
             Arc::new(HarnessRegistry::new()),
@@ -126,6 +142,7 @@ impl Seam {
             Some(dir.path().join("font-cache")),
             Some(Box::new(FontFolder::new(FONTS))),
         ));
+        core.designs.autosave_after(std::time::Duration::ZERO);
         let tools = agent_tools(&core, CHAT);
         let iconify = Arc::new(FixtureIcons::default());
         core.designs.icons().set_source(iconify.clone());
@@ -155,6 +172,20 @@ impl Seam {
     /// A call from another chat's agent, made on first use.
     pub async fn call_from(&self, chat: &str, tool: &str, arguments: Value) -> Called {
         call(&agent_tools(&self.core, chat), tool, arguments).await
+    }
+
+    /// An RPC from the app's window (a Design tab's), as JSON.
+    pub async fn window(&self, method: &str, params: Value) -> Result<Value, String> {
+        zeron_rpc::memory_client(self.core.rpc_service())
+            .call(method, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Saves the Design at `path`, as the person does with Ctrl+S: a
+    /// Design that isn't managed changes on disk only then.
+    pub async fn save(&self, path: &Path) {
+        self.window("SaveDesign", json!({ "path": path })).await.expect("saved");
     }
 
     /// `design_execute` on a new Design named `name`.
