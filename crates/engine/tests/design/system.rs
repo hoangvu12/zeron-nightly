@@ -350,3 +350,18 @@ async fn bad_token_names_and_bare_values_are_refused() {
     assert!(warnings.contains("$nope") && warnings.contains(&missing.id("Odd")), "{warnings}");
     seam.shutdown().await;
 }
+
+#[tokio::test]
+async fn an_icon_a_token_names_that_cant_be_had_warns() {
+    let seam = Seam::new().await;
+    let made = seam
+        .create(
+            "Missing glyph",
+            r##"SetTokens({ glyph: { type: "string", value: "mdi:no-such-icon" } });
+Insert({ type: "icon", name: "Glyph", icon: "$glyph", width: 24, height: 24 });"##,
+        )
+        .await;
+    let warnings = made.json()["warnings"].to_string();
+    assert!(warnings.contains("mdi:no-such-icon") && warnings.contains("can't be had"), "{warnings}");
+    seam.shutdown().await;
+}

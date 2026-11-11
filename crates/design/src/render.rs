@@ -509,6 +509,32 @@ pub fn screenshot(
     images: &dyn Images,
     assets: &dyn Assets,
 ) -> Result<Screenshot, RenderError> {
+    let scale = |width: f32, height: f32| (max_side / width.max(height)).min(1.);
+    picture(design, id, &scale, fonts, images, assets)
+}
+
+/// Draws one node of `design` as [`screenshot`] does, at `scale` (2 for
+/// twice its size), as an export's PNG.
+pub fn png(
+    design: &Design,
+    id: &str,
+    scale: f32,
+    fonts: &Fonts,
+    images: &dyn Images,
+    assets: &dyn Assets,
+) -> Result<Screenshot, RenderError> {
+    picture(design, id, &|_, _| scale, fonts, images, assets)
+}
+
+/// One node of `design` drawn at the scale `scale` gives for its size.
+fn picture(
+    design: &Design,
+    id: &str,
+    scale: &dyn Fn(f32, f32) -> f32,
+    fonts: &Fonts,
+    images: &dyn Images,
+    assets: &dyn Assets,
+) -> Result<Screenshot, RenderError> {
     let design = &crate::resolve::drawn(design);
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let typesetter = fonts.typesetter(design);
@@ -518,7 +544,7 @@ pub fn screenshot(
     if !(width > 0. && height > 0.) {
         return Err(RenderError::Empty(id.into()));
     }
-    let scale = (max_side / width.max(height)).min(1.);
+    let scale = scale(width, height);
     let (pixels_wide, pixels_high) = (
         (width * scale).round().max(1.) as u32,
         (height * scale).round().max(1.) as u32,

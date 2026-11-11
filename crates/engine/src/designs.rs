@@ -31,6 +31,7 @@
 //! tabs are told the image files too.
 
 mod iconify;
+mod export;
 mod images;
 mod retry;
 
@@ -451,9 +452,12 @@ impl Designs {
             .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
             .unwrap_or_default();
         live.fonts = self.fonts_for(&live.path);
-        let draft = Draft::new(live.design.clone())
+        let mut draft = Draft::new(live.design.clone())
             .with_fonts(live.fonts.clone())
             .with_assets(self.inner.assets.clone());
+        if let Some(folder) = live.path.parent() {
+            draft = draft.with_folder(folder.to_owned());
+        }
         let (draft, globals) = snippet::run(draft, globals, code, self.inner.limits).map_err(Ran::Snippet)?;
         let mut edited = draft.finish();
         // What it draws with that no edit's check fetched: icons and fonts
@@ -472,6 +476,20 @@ impl Designs {
             }
         });
         edited.warnings.extend(live.fonts.warnings(&texts).into_iter().map(Warning::fonts));
+        // Icons the call's nodes draw (named by a Token, say) that couldn't
+        // be fetched, which draw nothing.
+        let icons = self.inner.assets.icons();
+        drawn.walk(&mut |node| {
+            let top = node.id.split('/').next().unwrap_or_default();
+            if let Kind::Icon(icon) = &node.kind
+                && (edited.changed.contains(&node.id) || edited.changed.contains(top))
+                && let Ok(name) = zeron_design::icons::name(&icon.icon, icon.weight)
+                && icons.cached(&name).is_none()
+            {
+                let message = format!("\"{}\" draws the icon \"{}\", which can't be had; it draws nothing", node.name, icon.icon);
+                edited.warnings.push(Warning { node: Some(node.id.clone()), property: Some("icon".into()), message });
+            }
+        });
         // Images the call placed or looked at that can't be had (those it
         // can, downloaded now, for its screenshots and the tabs).
         let looked_at = edited.changed.iter().chain(&edited.screenshots);
@@ -482,6 +500,8 @@ impl Designs {
             .is_some_and(|&seen| seen != live.version);
         let description = params.description.as_deref().unwrap_or(DEFAULT_DESCRIPTION);
         let screenshots = live.commit(&edited, description, Changer::Agent).map_err(Ran::Design)?;
+        let (exported, unwritten) = live.export(&edited.exports);
+        edited.warnings.extend(unwritten);
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -494,6 +514,9 @@ impl Designs {
         });
         if !edited.printed.is_empty() {
             result["printed"] = json!(edited.printed);
+        }
+        if !exported.is_empty() {
+            result["exported"] = json!(exported);
         }
         if !edited.warnings.is_empty() {
             result["warnings"] = json!(edited.warnings);

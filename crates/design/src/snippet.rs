@@ -97,8 +97,14 @@ const PRELUDE: &str = r#"(function (native) {
   globalThis.SetTokens = function (tokens, options) {
     native.setTokens(json(tokens), Boolean(options && options.replace));
   };
-  globalThis.GetTokens = function () {
+  globalThis.GetTokens = function (options) {
+    if (options && options.css) return native.tokensCss();
     return JSON.parse(native.getTokens());
+  };
+  globalThis.Export = function (ids, options) {
+    if (options === undefined && ids !== null && typeof ids === "object" && !Array.isArray(ids)) { options = ids; ids = []; }
+    ids = ids == null ? [] : (Array.isArray(ids) ? ids : [ids]).map(String);
+    return JSON.parse(native.export(json(ids), json(options)));
   };
   globalThis.FindEmptySpace = function (wanted) {
     return JSON.parse(native.emptySpace(json(wanted)));
@@ -289,6 +295,25 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, tokens: String, replace: bool| {
                 let tokens = serde_json::from_str(&tokens).map_err(|e| thrown(&ctx, e))?;
                 draft.borrow_mut().set_tokens(tokens, replace).map_err(|e| thrown(&ctx, e))
+            })?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "tokensCss",
+            Function::new(ctx.clone(), move || draft.borrow().tokens_css())?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "export",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, ids: String, options: String| {
+                let ids: Vec<String> = serde_json::from_str(&ids).map_err(|e| thrown(&ctx, e))?;
+                let options = serde_json::from_str(&options).map_err(|e| thrown(&ctx, e))?;
+                let paths = draft.borrow_mut().export(ids, options).map_err(|e| thrown(&ctx, e))?;
+                Ok::<_, rquickjs::Error>(serde_json::json!(paths).to_string())
             })?,
         )?;
     }
