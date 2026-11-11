@@ -13,17 +13,20 @@ use skia_safe::textlayout::{
     TypefaceFontProvider,
 };
 use skia_safe::{
-    AlphaType, BlurStyle, ClipOp, Color4f, ColorType, Data, EncodedImageFormat, FontMgr, FontStyle,
-    ImageInfo, MaskFilter, Matrix, PathBuilder, PathFillType, Point, RRect, Surface, TileMode,
-    Vector, dash_path_effect, font_style, gradient, image_filters, surfaces, svg,
+    AlphaType, BlurStyle, ClipOp, Color4f, ColorType, Data, EncodedImageFormat, FilterMode, FontMgr,
+    FontStyle, ImageInfo, MaskFilter, Matrix, MipmapMode, PathBuilder, PathFillType, Point, RRect,
+    SamplingOptions, Surface, TileMode, Vector, dash_path_effect, font_style, gradient, image_filters,
+    surfaces, svg,
 };
+
+use std::collections::HashMap;
 
 use crate::assets::{AssetKey, Assets};
 use crate::model::{
-    BlendMode, Cap, Color, FillRule, Gradient, GradientShape, Join, Paint, PaintKind, Shadow,
-    Sides, StrokeAlign, StrokeStyle, Text, TextAlign, VerticalAlign,
+    BlendMode, Cap, Color, FillRule, Gradient, GradientShape, ImageFill, ImageMode, Join, Paint, PaintKind,
+    Shadow, Sides, StrokeAlign, StrokeStyle, Text, TextAlign, VerticalAlign,
 };
-use crate::render::{Outline, Painter, Rect};
+use crate::render::{Images, NoImages, Outline, Painter, Rect};
 
 /// A transparent raster surface of `width` × `height` pixels (RGBA,
 /// premultiplied), or `None` for an empty or oversized one.
@@ -151,17 +154,27 @@ pub fn svg_path(geometry: &str) -> Option<skia_safe::Path> {
     skia_safe::utils::parse_path::from_svg(geometry)
 }
 
+/// Whether `encoded` is an image Skia can draw (PNG, JPEG, WebP, GIF, BMP
+/// or ICO), going by its header.
+pub fn is_image(encoded: &[u8]) -> bool {
+    skia_safe::images::deferred_from_encoded_data(Data::new_copy(encoded), None).is_some()
+}
+
 /// The [`Painter`] node types draw with, on a Skia canvas, setting text
 /// with a [`Typesetter`].
 pub struct SkiaPainter<'a> {
     canvas: &'a skia_safe::Canvas,
     typesetter: &'a Typesetter,
+    images: &'a dyn Images,
+    /// Images decoded so far, by url; `None` for one that can't be had.
+    decoded: HashMap<String, Option<skia_safe::Image>>,
     assets: Option<&'a dyn Assets>,
 }
 
 impl<'a> SkiaPainter<'a> {
+    /// A painter with no images: image paints draw as placeholders.
     pub fn new(canvas: &'a skia_safe::Canvas, typesetter: &'a Typesetter) -> Self {
-        Self { canvas, typesetter, assets: None }
+        Self { canvas, typesetter, images: &NoImages, decoded: HashMap::new(), assets: None }
     }
 
     /// Draws icons and other assets from `assets` (without, they draw
@@ -170,7 +183,80 @@ impl<'a> SkiaPainter<'a> {
         self.assets = Some(assets);
         self
     }
+
+    /// The painter drawing image paints with the images `images` has.
+    pub fn with_images(self, images: &'a dyn Images) -> Self {
+        Self { images, ..self }
+    }
+
+    fn image(&mut self, url: &str) -> Option<skia_safe::Image> {
+        let images = self.images;
+        self.decoded
+            .entry(url.to_owned())
+            .or_insert_with(|| {
+                let encoded = images.get(url).ok()?;
+                let image = skia_safe::images::deferred_from_encoded_data(Data::new_copy(&encoded), None)?;
+                // Decoded now, once, rather than each time it's drawn.
+                image.make_raster_image(None, None)
+            })
+            .clone()
+    }
+
+    /// Fills `shape` with `image` laid over `bounds` as `fill` says, or a
+    /// placeholder when the image can't be had.
+    fn fill_image(&mut self, shape: &Shape, bounds: Rect, paint: &Paint, fill: &ImageFill) {
+        match self.image(&fill.url).and_then(|image| image_paint(paint, fill, &image, bounds)) {
+            Some(image) => {
+                shape.draw(self.canvas, &image);
+            }
+            None => placeholder(self.canvas, shape),
+        }
+    }
 }
+
+/// A grey shape crossed corner to corner: where an image that can't be had
+/// would be.
+fn placeholder(canvas: &skia_safe::Canvas, shape: &Shape) {
+    let mut paint = skia_safe::Paint::default();
+    paint.set_anti_alias(true).set_color(skia_safe::Color::from_rgb(228, 228, 231));
+    shape.draw(canvas, &paint);
+    let r = shape.bounds();
+    paint
+        .set_color(skia_safe::Color::from_rgb(161, 161, 170))
+        .set_style(PaintStyle::Stroke)
+        .set_stroke_width(1.5);
+    canvas.save();
+    shape.clip(canvas, ClipOp::Intersect);
+    canvas.draw_line((r.left, r.top), (r.right, r.bottom), &paint);
+    canvas.draw_line((r.right, r.top), (r.left, r.bottom), &paint);
+    canvas.restore();
+}
+
+/// Skia's paint for an image paint over `bounds`, scaled and placed as its
+/// mode says; outside the image (in contain mode) it paints nothing.
+fn image_paint(paint: &Paint, fill: &ImageFill, image: &skia_safe::Image, bounds: Rect) -> Option<skia_safe::Paint> {
+    let mut out = base_paint(paint)?;
+    let (width, height) = (image.width() as f32, image.height() as f32);
+    let (wide, high) = (bounds.width / width, bounds.height / height);
+    let (sx, sy) = match fill.mode {
+        ImageMode::Stretch => (wide, high),
+        ImageMode::Cover => (wide.max(high), wide.max(high)),
+        ImageMode::Contain => (wide.min(high), wide.min(high)),
+    };
+    if !(sx.is_finite() && sy.is_finite() && sx > 0. && sy > 0.) {
+        return None;
+    }
+    let mut matrix = Matrix::translate((
+        bounds.x + (bounds.width - width * sx) / 2.,
+        bounds.y + (bounds.height - height * sy) / 2.,
+    ));
+    matrix.pre_scale((sx, sy), None);
+    let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear);
+    out.set_shader(image.to_shader((TileMode::Decal, TileMode::Decal), sampling, &matrix)?);
+    out.set_alpha_f(paint.opacity);
+    Some(out)
+}
+
 
 fn rect(rect: Rect) -> skia_safe::Rect {
     skia_safe::Rect::from_xywh(rect.x, rect.y, rect.width, rect.height)
@@ -281,6 +367,13 @@ fn shape(outline: &Outline) -> Shape {
 }
 
 impl Shape {
+    fn bounds(&self) -> skia_safe::Rect {
+        match self {
+            Shape::Rounded(rrect) => *rrect.rect(),
+            Shape::Path(path) => *path.bounds(),
+        }
+    }
+
     fn clip(&self, canvas: &skia_safe::Canvas, op: ClipOp) {
         match self {
             Shape::Rounded(rrect) => canvas.clip_rrect(rrect, op, true),
@@ -330,14 +423,10 @@ fn blend_mode(mode: BlendMode) -> skia_safe::BlendMode {
     }
 }
 
-/// Skia's paint for one of ours over `bounds`, or `None` for one not drawn.
+/// Skia's paint for one of ours over `bounds`, or `None` for one not drawn
+/// (an image paint is drawn by [`SkiaPainter::fill_image`]).
 fn skia_paint(paint: &Paint, bounds: Rect) -> Option<skia_safe::Paint> {
-    if !paint.enabled {
-        return None;
-    }
-    let mut out = skia_safe::Paint::default();
-    out.set_anti_alias(true);
-    out.set_blend_mode(blend_mode(paint.blend));
+    let mut out = base_paint(paint)?;
     match &paint.kind {
         PaintKind::Solid(solid) => {
             out.set_color(color(*solid));
@@ -345,9 +434,21 @@ fn skia_paint(paint: &Paint, bounds: Rect) -> Option<skia_safe::Paint> {
         PaintKind::Gradient(gradient) => {
             out.set_shader(gradient_shader(gradient, bounds)?);
         }
-        PaintKind::Unsupported(_) => return None,
+        PaintKind::Image(_) | PaintKind::Unsupported(_) => return None,
     }
     out.set_alpha_f(out.alpha_f() * paint.opacity);
+    Some(out)
+}
+
+/// What every drawn paint starts as: anti-aliased, with its blend mode.
+/// `None` for one disabled.
+fn base_paint(paint: &Paint) -> Option<skia_safe::Paint> {
+    if !paint.enabled {
+        return None;
+    }
+    let mut out = skia_safe::Paint::default();
+    out.set_anti_alias(true);
+    out.set_blend_mode(blend_mode(paint.blend));
     Some(out)
 }
 
@@ -435,7 +536,11 @@ impl Painter for SkiaPainter<'_> {
     fn fill(&mut self, outline: &Outline, paints: &[Paint]) {
         let shape = shape(outline);
         for paint in paints {
-            if let Some(fill) = skia_paint(paint, outline.bounds()) {
+            if let PaintKind::Image(image) = &paint.kind {
+                if paint.enabled {
+                    self.fill_image(&shape, outline.bounds(), paint, image);
+                }
+            } else if let Some(fill) = skia_paint(paint, outline.bounds()) {
                 shape.draw(self.canvas, &fill);
             }
         }

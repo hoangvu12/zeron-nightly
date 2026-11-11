@@ -32,6 +32,7 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -41,7 +42,7 @@ use zeron_design::Design;
 use zeron_design::assets::{Files, Resolved};
 use zeron_design::fonts::{FontFile, Fonts};
 use zeron_design::layout::LaidOut;
-use zeron_design::render::{self, Rect};
+use zeron_design::render::{self, ImageFiles, Rect};
 use zgx::image::ImageData;
 use zgx_script::{ScriptHost, Shared, Value};
 
@@ -61,15 +62,19 @@ pub const ZOOM: (f32, f32) = (0.25, 5.);
 /// change, or why it can't be followed.
 pub type Listener = Box<dyn FnMut(Result<Heard, String>)>;
 
-/// A Design as it is now, the nodes agents' changes to it made or changed
-/// since the tab last heard (none for anyone else's), which flash, and the
-/// files of the assets it uses (its icons) in the engine's cache: tiles
-/// draw them from those files only.
+/// A Design as it is now, and the nodes agents' changes to it made or
+/// changed since the tab last heard (none for anyone else's), which flash.
+/// With it, the file each image it draws is in on this computer, by url,
+/// as the engine found (and downloaded) them: the window reads images from
+/// those files only, and never downloads.
+/// And the files of the other assets it uses (its icons) in the engine's
+/// cache: tiles draw them from those files only.
 pub struct Heard {
     pub design: Design,
     pub flash: Vec<String>,
     /// What its text draws in: the font files the engine says it uses.
     pub fonts: Fonts,
+    pub images: HashMap<String, PathBuf>,
     pub assets: Vec<Resolved>,
 }
 
@@ -103,10 +108,12 @@ pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
     if !fonts.is_of(&files) {
         *fonts = Fonts::of_files(&files);
     }
+    // (An older engine says no images: they draw as placeholders.)
+    let images = serde_json::from_value(item["images"].clone()).unwrap_or_default();
     // (An asset not named draws nothing, as the engine does with one it
     // couldn't fetch.)
     let assets = serde_json::from_value(item["assets"].clone()).unwrap_or_default();
-    Ok(Heard { design, flash, fonts: fonts.clone(), assets })
+    Ok(Heard { design, flash, fonts: fonts.clone(), images, assets })
 }
 
 /// Where tabs follow their Designs: the engine, or a test's stand-in.
@@ -166,14 +173,15 @@ struct Scene {
     tops: Vec<Rect>,
     /// How much more a tile draws round itself, for its blurs' sake.
     margin: f32,
+    images: ImageFiles,
 }
 
 impl Scene {
-    fn new(version: u64, design: Design, fonts: Fonts, assets: Vec<Resolved>) -> Self {
+    fn new(version: u64, design: Design, fonts: Fonts, images: HashMap<String, PathBuf>, assets: Vec<Resolved>) -> Self {
         let laid_out = LaidOut::of(&design, &fonts.typesetter(&design));
         let tops = design.children.iter().map(|node| render::bounds(node, &laid_out)).collect();
         let margin = render::blur_reach(&design, &laid_out);
-        Self { version, design, fonts, laid_out, assets: Files::new(assets), tops, margin }
+        Self { version, design, fonts, laid_out, assets: Files::new(assets), tops, margin, images: ImageFiles::new(images) }
     }
 
     /// Where `newer` draws differently: each top-level node changed, made,
@@ -182,7 +190,9 @@ impl Scene {
     /// what the model keeps without knowing).
     fn damage(&self, newer: &Scene) -> Vec<Rect> {
         let (old, new) = (&self.design, &newer.design);
-        if old.tokens != new.tokens || old.themes != new.themes || old.extra != new.extra {
+        // (An image newly had draws in place of its placeholder.)
+        let images = self.images.paths() != newer.images.paths();
+        if images || old.tokens != new.tokens || old.themes != new.themes || old.extra != new.extra {
             return vec![Rect { x: f32::MIN / 4., y: f32::MIN / 4., width: f32::MAX / 2., height: f32::MAX / 2. }];
         }
         let was: HashMap<&str, usize> = old.children.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
@@ -294,7 +304,7 @@ fn draw(scene: &Scene, key: TileKey) -> Option<Arc<ImageData>> {
     let nodes: Vec<usize> = (0..scene.tops.len()).filter(|&i| scene.tops[i].meets(&around)).collect();
     // (Made per tile: Skia's text layout isn't shared across threads.)
     let typesetter = scene.fonts.typesetter(&scene.design);
-    let pixels = render::region(&scene.design, &scene.laid_out, &typesetter, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.assets)?;
+    let pixels = render::region(&scene.design, &scene.laid_out, &typesetter, &nodes, area, key.level.scale(), m, (TILE, TILE), &scene.images, &scene.assets)?;
     ImageData::new_premultiplied(TILE, TILE, pixels).ok().map(Arc::new)
 }
 
@@ -754,10 +764,10 @@ impl DesignTabs {
             let Some(canvas) = tabs.get_mut(tab) else { return };
             match heard {
                 Err(why) => canvas.failed = Some(why),
-                Ok(Heard { design, flash, fonts, assets }) => {
+                Ok(Heard { design, flash, fonts, images, assets }) => {
                     canvas.failed = None;
                     self.versions.set(self.versions.get() + 1);
-                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, assets));
+                    let scene = Arc::new(Scene::new(self.versions.get(), design, fonts, images, assets));
                     canvas.flashes.retain(|f| f.at.elapsed() < FLASH_STALE);
                     if !flash.is_empty() {
                         canvas.flashes.push(Flash { version: scene.version, ids: flash, at: std::time::Instant::now() });
