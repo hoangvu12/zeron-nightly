@@ -16,7 +16,7 @@ use zeron_design::fonts::Fonts;
 use zgx::input::InputEvent;
 use zgx_script::{ScriptHost, testing::TestApp};
 
-use crate::design::{Saving, CACHE_BYTES, DesignTabs, Heard, Listener, Source, heard_of};
+use crate::design::{FileState, CACHE_BYTES, DesignTabs, Heard, Listener, Source, heard_of};
 
 /// The fixture's Design tab, on `fixture.zdesign`.
 const TAB: &str = "tab1";
@@ -149,7 +149,7 @@ impl Source for Engine {
         let now = self.0.designs.borrow().get(path).cloned();
         let assets = self.0.assets.borrow().clone();
         let fonts = Fonts::of_files(&assets.iter().filter_map(Resolved::font_file).collect::<Vec<_>>());
-        let saving = Saving { path: Some(path.into()), ..Default::default() };
+        let saving = FileState { path: Some(path.into()), ..Default::default() };
         (listener.borrow_mut())(now.map(|design| Heard { design, flash: Vec::new(), fonts, assets, saving }).ok_or_else(|| format!("can't open {path}")));
         Some(Box::new(listener))
     }
@@ -160,7 +160,7 @@ impl Source for Engine {
 
     /// As the engine answers (#27, #28, #31's calls), its Designs changed
     /// so and told to whoever follows them.
-    fn ask(&self, method: &str, params: serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>>>> {
+    fn ask(&self, method: &str, params: serde_json::Value) -> crate::design::Asked {
         let me = &self.0;
         me.asked.borrow_mut().push((method.into(), params.clone()));
         let path = params["path"].as_str().unwrap_or_default().to_owned();
@@ -175,6 +175,10 @@ impl Source for Engine {
                 Ok(serde_json::json!({ "name": name, "path": made }))
             }
             "RecentDesigns" => Ok(serde_json::json!({ "recent": *me.recent.borrow() })),
+            "DesignSaving" => {
+                let saving = me.saving.borrow().get(&path).cloned().unwrap_or_default();
+                Ok(serde_json::json!({ "path": path, "managed": path.starts_with("C:/designs/"), "unsaved": saving["unsaved"] }))
+            }
             "SaveDesign" | "DiscardDesign" => {
                 me.say_saving(&path, false, false, false);
                 Ok(serde_json::json!({ "path": path, "unsaved": false }))
@@ -1018,10 +1022,8 @@ fn the_design_row_opens_a_tab_that_offers_new_recent_and_open_and_nothing_opens_
 
     // Open design: a .zdesign picked anywhere, in another tab.
     p.engine.say("C:/work/app/checkout.zdesign", landing("#22C55E", false));
+    // (A Design tab's + opens another Design tab.)
     p.app.click("role:button \"New Tab\"");
-    p.app.frames(10);
-    // (Its key, D, is the shell's to route: ui/tests/panel_home.test.luau.)
-    p.app.click("#panel-open-design");
     assert!(p.app.wait_until(|app| app.find("role:button \"Open design\"").is_some()), "{}", p.app.tree());
     p.app.desktop.as_ref().unwrap().pick(["C:/work/app/checkout.zdesign"]);
     p.app.click("role:button \"Open design\"");
@@ -1031,8 +1033,6 @@ fn the_design_row_opens_a_tab_that_offers_new_recent_and_open_and_nothing_opens_
 
     // Recent designs: one an agent made with no tab open.
     p.app.click("role:button \"New Tab\"");
-    p.app.frames(10);
-    p.app.click("#panel-open-design");
     assert!(p.app.wait_until(|app| app.find("role:button \"Landing\"").is_some()), "{}", p.app.tree());
     p.app.click("role:button \"Landing\"");
     assert!(p.app.wait_until(|app| app.find("~\"Landing\"").is_some() && app.find(".design-canvas").is_some()), "{}", p.app.tree());
@@ -1066,6 +1066,28 @@ fn the_tab_follows_the_engines_saving_ctrl_s_saves_and_closing_asks_save_or_disc
     assert!(p.app.wait_until(|app| app.find("~\"Recovered changes\"").is_none()), "{}", p.app.tree());
     assert_eq!(p.asked("DiscardDesign").len(), 1);
 
+    // Recovered again: Keep puts the notice away, and it stays away when
+    // the tab comes back.
+    p.engine.say_saving("C:/work/mine.zdesign", true, true, false);
+    assert!(p.app.wait_until(|app| app.find("~\"Recovered changes\"").is_some()), "{}", p.app.tree());
+    p.app.click("role:button \"Keep\"");
+    assert!(p.app.wait_until(|app| app.find("~\"Recovered changes\"").is_none()));
+    // (The + of a Design tab opens another Design tab; ⌘S has nothing to
+    // save in it yet.)
+    p.app.click("role:button \"New Tab\"");
+    assert!(p.app.wait_until(|app| app.find("~\"Start a Design\"").is_some()), "{}", p.app.tree());
+    let saves = p.asked("SaveDesign").len();
+    p.app.host.run_command("panel.design.save");
+    p.app.frames(5);
+    assert_eq!(p.asked("SaveDesign").len(), saves);
+    p.app.click("role:tab \"mine\"");
+    assert!(p.app.wait_until(|app| app.find(".design-canvas").is_some()), "{}", p.app.tree());
+    p.app.frames(5);
+    assert!(p.app.find("~\"Recovered changes\"").is_none(), "kept stays kept:
+{}", p.app.tree());
+    // (Off the tab, whose × stands in its dot under the pointer.)
+    p.app.hover("#outside");
+
     // Closing with unsaved changes asks Save or Discard; Save writes it,
     // then the tab closes.
     p.engine.say_saving("C:/work/mine.zdesign", true, false, false);
@@ -1077,4 +1099,30 @@ fn the_tab_follows_the_engines_saving_ctrl_s_saves_and_closing_asks_save_or_disc
     p.app.click("#panel-design-close-question >> role:button \"Save\"");
     assert!(p.app.wait_until(|app| app.find(".design-canvas").is_none()), "{}", p.app.tree());
     assert_eq!(p.asked("SaveDesign").len(), 2);
+}
+
+#[test]
+fn closing_asks_only_for_a_design_of_your_own_and_discard_closes_too() {
+    let mut p = panel();
+    let unsaved = "role:img \"Unsaved changes\"";
+    // One of Zeron's own, a moment before it saves itself: closed at once.
+    p.open_recent("Landing", "C:/designs/Landing/Landing.zdesign", landing("#EF4444", false));
+    p.engine.say_saving("C:/designs/Landing/Landing.zdesign", true, false, false);
+    assert!(p.app.wait_until(|app| app.find(unsaved).is_some()));
+    assert!(p.app.host.run_command("test.close_active_tab"));
+    assert!(p.app.wait_until(|app| app.find(".design-canvas").is_none()), "{}", p.app.tree());
+    assert!(p.app.find("~\"Save changes to this Design?\"").is_none());
+
+    // One of your own: asked; Discard puts it back as its file holds it,
+    // then closes.
+    p.open_recent("Mine", "C:/work/mine.zdesign", landing("#EF4444", false));
+    p.engine.say_saving("C:/work/mine.zdesign", true, false, false);
+    assert!(p.app.wait_until(|app| app.find(unsaved).is_some()));
+    assert!(p.app.host.run_command("test.close_active_tab"));
+    assert!(p.app.wait_until(|app| app.find("~\"Save changes to this Design?\"").is_some()), "{}", p.app.tree());
+    p.app.frames(20);
+    p.app.click("#panel-design-close-question >> role:button \"Discard\"");
+    assert!(p.app.wait_until(|app| app.find(".design-canvas").is_none()), "{}", p.app.tree());
+    assert_eq!(p.asked("DiscardDesign"), [serde_json::json!({ "path": "C:/work/mine.zdesign" })]);
+    assert!(p.asked("SaveDesign").is_empty());
 }

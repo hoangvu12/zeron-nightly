@@ -389,8 +389,12 @@ impl Designs {
             let mut held = lock(&live);
             let made = held.save_file();
             if let Err(e) = made {
+                // Nothing was made: the name is free again (its folder, new
+                // with it, gone too).
+                if let Some(folder) = held.path.parent() {
+                    let _ = std::fs::remove_dir_all(folder);
+                }
                 drop(held);
-                // Nothing was made: the name is free again.
                 lock(&self.inner.live).retain(|_, other| !Arc::ptr_eq(other, &live));
                 return Err(e);
             }

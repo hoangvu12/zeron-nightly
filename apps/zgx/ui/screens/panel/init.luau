@@ -165,6 +165,8 @@ end
 type DesignModule = {
 	title: (tab: state.Tab) -> string?,
 	dirty: (tab: state.Tab) -> boolean,
+	closing: (tab: state.Tab, done: (ask: boolean) -> ()) -> (),
+	shown: () -> boolean,
 	save: (tab: state.Tab, done: (() -> ())?) -> (),
 	discard: (tab: state.Tab, done: (() -> ())?) -> (),
 	close: (tab: state.Tab) -> (),
@@ -289,6 +291,17 @@ end
 local function panel_open(): boolean
 	local files = if shell_view then shell_view.files else nil
 	return files ~= nil and files:peek() == true
+end
+
+-- ⌘S is a Design tab's while its panel shows: as the shell says, or a
+-- panel standing alone (a fixture's).
+if Design then
+	Design.shown = function(): boolean
+		if is_shown then
+			return is_shown()
+		end
+		return shell_view == nil or panel_open()
+	end
 end
 
 local function set_panel(on: boolean)
@@ -742,7 +755,12 @@ M.Panel = ui.component(function(props: Props): Node
 	local asking = ui.use_state(false)
 	-- A Design with unsaved changes asks Save or Discard as it closes.
 	local saving_asking = ui.use_state(false)
-	local saving_asked = ui.use_state(nil :: { key: string, id: string, title: string, why: string }?)
+	local saving_asked = ui.use_state(nil :: { key: string, id: string, title: string }?)
+	ui.effect(function()
+		if not saving_asking:get() and saving_asked:peek() then
+			saving_asked:set(nil)
+		end
+	end)
 	local asked = ui.use_state(nil :: { key: string, id: string, title: string, why: string }?)
 	ui.effect(function()
 		if not asking:get() and asked:peek() then
@@ -807,10 +825,17 @@ M.Panel = ui.component(function(props: Props): Node
 			return
 		end
 		local title, dirty = title_of(tab)
-		if dirty and tab.kind == "design" then
-			-- (A Design asks Save or Discard: the engine keeps its changes.)
-			saving_asked:set({ key = k, id = id, title = title, why = "design" })
-			saving_asking:set(true)
+		if dirty and tab.kind == "design" and Design then
+			-- (A Design of your own asks Save or Discard; Zeron's own save
+			-- themselves.)
+			Design.closing(tab, function(ask: boolean)
+				if ask then
+					saving_asked:set({ key = k, id = id, title = title })
+					saving_asking:set(true)
+				else
+					close_now(k, id)
+				end
+			end)
 		elseif dirty then
 			asked:set({ key = k, id = id, title = title, why = "unsaved" })
 			asking:set(true)
@@ -1257,7 +1282,14 @@ M.Panel = ui.component(function(props: Props): Node
 			rounded = "$radius.lg",
 			on_click = function()
 				local k = key:peek()
-				if k then
+				if not k then
+					return
+				end
+				-- (From a Design tab, another Design tab; else the home.)
+				local front = state.find(k, state.of(k).active or "")
+				if front and front.kind == "design" then
+					state.open(k, "design")
+				else
 					state.activate(k, nil)
 				end
 			end,
@@ -1615,7 +1647,7 @@ M.Panel = ui.component(function(props: Props): Node
 				end,
 			},
 			aside = {
-				label = ui.t("panel.design.recovered.discard") :: any,
+				label = ui.t("panel.design.discard") :: any,
 				on_click = function()
 					close_design("discard")
 				end,

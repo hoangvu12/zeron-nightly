@@ -20,6 +20,7 @@
 //! invoke  design.flashed    { tab, version }         that flash is over
 //! call    design.new        { name? } → { name, path }   a new managed Design
 //! call    design.recent     → { recent = { { name, path, touchedAt }… } }
+//! call    design.saving     { tab } → saving          { path, managed, unsaved, recovered, stale }
 //! call    design.save       { tab } → saving          its file written now (⌘S)
 //! call    design.save_as    { tab, to } → saving      written to `to`, the tab's from then
 //! call    design.discard    { tab } → saving          back as its file holds it
@@ -79,13 +80,13 @@ pub struct Heard {
     pub fonts: Fonts,
     pub assets: Vec<Resolved>,
     /// Its file and whether that's current (#28).
-    pub saving: Saving,
+    pub saving: FileState,
 }
 
 /// A Design's file and whether it's current, as the engine says (#28).
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(default)]
-pub struct Saving {
+pub struct FileState {
     /// Its file now (another after Save as).
     pub path: Option<String>,
     /// It has changes its file doesn't.
@@ -129,7 +130,7 @@ pub fn heard_of(item: &Json, fonts: &mut Fonts) -> Result<Heard, String> {
     if !fonts.is_of(&files) {
         *fonts = Fonts::of_files(&files);
     }
-    let saving = serde_json::from_value(item.clone()).unwrap_or_default();
+    let saving = <FileState as serde::Deserialize>::deserialize(item).unwrap_or_default();
     Ok(Heard { design, flash, fonts: fonts.clone(), assets, saving })
 }
 
@@ -147,14 +148,17 @@ pub trait Source {
     /// One of the engine's Design calls (`NewDesign`, `RecentDesigns`,
     /// `SaveDesign`, `SaveDesignAs`, `DiscardDesign`): its answer, or why
     /// not.
-    fn ask(&self, method: &str, params: Json) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json, String>>>>;
+    fn ask(&self, method: &str, params: Json) -> Asked;
 }
+
+/// An engine call's answer, to come.
+pub type Asked = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json, String>>>>;
 
 /// The engine of this computer (ADR-0003), over its local connection.
 struct EngineSource;
 
 impl Source for EngineSource {
-    fn ask(&self, method: &str, params: Json) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json, String>>>> {
+    fn ask(&self, method: &str, params: Json) -> Asked {
         let method = method.to_owned();
         Box::pin(async move { engine::get().call_soon(&method, params).await })
     }
@@ -476,7 +480,7 @@ struct TabCanvas {
     tiles: HashMap<TileKey, Tile>,
     /// What flashes now, a flash for each version agents changed.
     flashes: Vec<Flash>,
-    saving: Saving,
+    saving: FileState,
 }
 
 /// The nodes agents changed in one version of a Design, lit for a moment.
@@ -687,34 +691,22 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
     });
     let me = Rc::downgrade(&tabs);
     // The engine's Design calls the tab makes (#31): New design and Recent
-    // designs, and saving a tab's Design (by its tab: its file may have
+    // designs, and a tab's Design's file (by its tab: its file may have
     // changed since the script last heard).
-    for (action, method) in [("design.new", "NewDesign"), ("design.recent", "RecentDesigns")] {
+    let calls = [
+        ("design.new", "NewDesign", false),
+        ("design.recent", "RecentDesigns", false),
+        ("design.saving", "DesignSaving", true),
+        ("design.save", "SaveDesign", true),
+        ("design.save_as", "SaveDesignAs", true),
+        ("design.discard", "DiscardDesign", true),
+    ];
+    for (action, method, of_tab) in calls {
         let me = Rc::downgrade(&tabs);
         host.async_action(action, move |arg| {
             let me = me.clone();
             async move {
-                let tabs = me.upgrade().ok_or("the window closed")?;
-                let asked = tabs.source.ask(method, crate::plugins::value_json(&arg));
-                drop(tabs);
-                Ok(crate::plugins::json_value(&asked.await?))
-            }
-        });
-    }
-    for (action, method) in [("design.save", "SaveDesign"), ("design.save_as", "SaveDesignAs"), ("design.discard", "DiscardDesign")] {
-        let me = Rc::downgrade(&tabs);
-        host.async_action(action, move |arg| {
-            let me = me.clone();
-            async move {
-                let tabs = me.upgrade().ok_or("the window closed")?;
-                let tab = arg.field("tab").map(crate::auth::text).unwrap_or_default();
-                let path = tabs.tabs.borrow().get(&tab).map(|c| c.path.clone()).ok_or("no Design in that tab")?;
-                let mut params = json!({ "path": path });
-                if let Some(to) = arg.field("to") {
-                    params["to"] = json!(crate::auth::text(to));
-                }
-                let asked = tabs.source.ask(method, params);
-                drop(tabs);
+                let asked = me.upgrade().ok_or("the window closed")?.ask(method, &arg, of_tab)?;
                 Ok(crate::plugins::json_value(&asked.await?))
             }
         });
@@ -751,6 +743,21 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
 }
 
 impl DesignTabs {
+    /// The engine's `method` with the script's `arg`, or (`of_tab`) with the
+    /// file of the tab it names (and its `to`, for Save as).
+    fn ask(&self, method: &str, arg: &Value, of_tab: bool) -> Result<Asked, String> {
+        if !of_tab {
+            return Ok(self.source.ask(method, crate::plugins::value_json(arg)));
+        }
+        let tab = arg.field("tab").map(crate::auth::text).unwrap_or_default();
+        let path = self.tabs.borrow().get(&tab).map(|c| c.path.clone()).ok_or("no Design in that tab")?;
+        let mut params = json!({ "path": path });
+        if let Some(to) = arg.field("to") {
+            params["to"] = json!(crate::auth::text(to));
+        }
+        Ok(self.source.ask(method, params))
+    }
+
     fn open(self: &Rc<Self>, tab: &str, path: &str) {
         if tab.is_empty() || path.is_empty() {
             return;
@@ -771,7 +778,7 @@ impl DesignTabs {
             back: None,
             tiles: HashMap::new(),
             flashes: Vec::new(),
-            saving: Saving::default(),
+            saving: FileState::default(),
         };
         self.tabs.borrow_mut().insert(tab.to_owned(), canvas);
         self.follow(tab);

@@ -3126,6 +3126,9 @@
       "no_recent": "No Designs on this computer yet.",
       "failed": "The Design didn't open",
       "in_progress": "In progress",
+      "discard": "Discard",
+      "failed_save": "The Design wasn't saved",
+      "failed_new": "No new Design was made",
       "save": "Save",
       "remote": "Designs open only for chats on this computer.",
       "command": {

@@ -191,10 +191,12 @@ test("the Design row and D open a Design tab here; on another device they say De
 	expect(eventually(app, function(): boolean
 		return home_kinds(app) == "design"
 	end)).to_be(true)
-	back_home(app)
+	-- (A Design tab's + opens another Design tab, not the home: D from a
+	-- fresh one.)
+	app = home()
 	app:key("d")
 	expect(eventually(app, function(): boolean
-		return home_kinds(app) == "design,design"
+		return home_kinds(app) == "design"
 	end)).to_be(true)
 
 	-- A chat on the devbox: the row says so, and no tab opens.

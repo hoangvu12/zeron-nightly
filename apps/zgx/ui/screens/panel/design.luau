@@ -28,6 +28,8 @@
 
 local ds = require("@ds")
 local motion = require("@ds/motion")
+local PanelHome = require("@ds/panel_home")
+local toast = require("@ds/toast")
 local state = require("@app/screens/panel/state")
 local api = require("@app/screens/panel/design_api")
 
@@ -45,6 +47,12 @@ local FLASH_MS = 900
 -- Each tab's view: where the Canvas's origin is in it, and its zoom.
 type View = { x: number, y: number, zoom: number }
 local views = ui.state("design_views", {} :: { [string]: View })
+-- Recovered changes a tab was told to keep (`tab:path`): its notice put
+-- away while the engine still holds them unsaved.
+local kept = ui.state("design_kept", {} :: { [string]: boolean })
+-- The Recent designs each start page read, and the visit it read them in
+-- (a reload reads nothing again).
+local recent_read = ui.state("design_recent_read", {} :: { [string]: { any } })
 -- The flashes already shown (`tab:version:node`), kept across reloads.
 local flashed = ui.state("design_flashed", {} :: { [string]: boolean })
 
@@ -70,34 +78,69 @@ function M.dirty(tab: Tab): boolean
 	return b ~= nil and b.unsaved == true
 end
 
--- (What fails is said by the engine's words, in the window's log: the tab
--- keeps its marker, so nothing is lost by it.)
-local function said(what: string): (any) -> ()
+-- What failed, said in the engine's words (the tab keeps its marker, so
+-- nothing is lost by it).
+local function said(title: string): (any) -> ()
 	return function(err: any)
-		print(`zeron-zgx: design: {what}: {if type(err) == "table" and err.message then err.message else tostring(err)}`)
+		toast.show {
+			title = ui.t(title):get(),
+			body = if type(err) == "table" and err.message then tostring(err.message) else tostring(err),
+			tone = "danger",
+		}
 	end
 end
 
--- (`done` once the engine has: a close waits for it.)
+-- One of the engine's calls on a tab's file (#28), then `done`.
+local function on_file(call: string, tab: Tab, done: (() -> ())?)
+	api.call(call, { tab = tab.id }):after(function()
+		if done then
+			done()
+		end
+	end, said("panel.design.failed_save"))
+end
+
+-- Its file written now (⌘S); `done` once it is (a close waits for it).
 function M.save(tab: Tab, done: (() -> ())?)
-	api.call("design.save", { tab = tab.id }):after(function()
-		if done then
-			done()
-		end
-	end, said("save"))
+	on_file("design.save", tab, done)
 end
 
+-- Back as its file holds it, its unsaved changes gone.
 function M.discard(tab: Tab, done: (() -> ())?)
-	api.call("design.discard", { tab = tab.id }):after(function()
-		if done then
-			done()
-		end
-	end, said("discard"))
+	on_file("design.discard", tab, done)
 end
 
--- The Design tab showing now, and how to save it as another file (⌘S and
--- ⌘⇧S act on it; one panel shows at a time).
-local front: { tab: Tab, save_as: () -> () }? = nil
+-- Whether closing it should ask Save or Discard: it has changes its file
+-- doesn't, and isn't one of Zeron's own (those save themselves, a moment
+-- after a change). Unknown, it asks.
+function M.closing(tab: Tab, done: (ask: boolean) -> ())
+	if not M.dirty(tab) then
+		done(false)
+		return
+	end
+	api.call("design.saving", { tab = tab.id }):after(function(saving: any)
+		done(not (type(saving) == "table" and saving.managed == true))
+	end, function()
+		done(true)
+	end)
+end
+
+-- Whether the panel shows (its shell's; set by screens/panel): ⌘S is a
+-- Design tab's only then.
+M.shown = function(): boolean
+	return true
+end
+
+-- The Design tab in front of its panel now, and how to save it as another
+-- file: ⌘S and ⌘⇧S act on it while the panel shows and it has a Design.
+local front: { key: string, id: string, save_as: () -> () }? = nil
+local function front_tab(): Tab?
+	local f = front
+	if not f or not M.shown() then
+		return nil
+	end
+	local t = state.find(f.key, f.id)
+	return if t and t.path then t else nil
+end
 
 local function design_filter(): { any }
 	return { { ui.t("panel.design.filter"):get(), { "zdesign" } } }
@@ -109,10 +152,11 @@ ui.command {
 	menu = "File",
 	key = "cmd+s",
 	run = function(): boolean
-		if not front then
+		local t = front_tab()
+		if not t then
 			return false
 		end
-		M.save(front.tab)
+		M.save(t)
 		return true
 	end,
 }
@@ -122,10 +166,11 @@ ui.command {
 	menu = "File",
 	key = "cmd+shift+s",
 	run = function(): boolean
-		if not front then
+		local f = front
+		if not f or not front_tab() then
 			return false
 		end
-		front.save_as()
+		f.save_as()
 		return true
 	end,
 }
@@ -440,16 +485,23 @@ local function start(key: string, id: string): Node
 	local function open(path: string)
 		state.set_path(key, id, path)
 	end
-	local recent = ui.use_state(nil :: { any }?)
-	ui.effect(function()
-		api.call("design.recent", {}):after(function(r: any)
-			recent:set(if type(r) == "table" and type(r.recent) == "table" then r.recent else {})
-		end, function(err: any)
-			said("recent designs")(err)
-			recent:set({})
+	-- Read as the start page shows, once a showing (kept across a reload).
+	local function recent(): { any }?
+		return recent_read:get()[id]
+	end
+	if recent_read:peek()[id] == nil then
+		ui.effect(function()
+			api.call("design.recent", {}):after(function(r: any)
+				recent_read:set_key(id, if type(r) == "table" and type(r.recent) == "table" then r.recent else {})
+			end, function()
+				recent_read:set_key(id, {})
+			end)
 		end)
+	end
+	-- (Read again the next time it shows.)
+	ui.on_cleanup(function()
+		recent_read:set_key(id, nil)
 	end)
-	local PanelHome = require("@ds/panel_home")
 	local function row(r: any, i: number): Node
 		return PanelHome.Row {
 			id = `design-recent-{i}`,
@@ -483,7 +535,7 @@ local function start(key: string, id: string): Node
 						if type(made) == "table" and type(made.path) == "string" then
 							open(made.path)
 						end
-					end, said("new design"))
+					end, said("panel.design.failed_new"))
 				end,
 			},
 			secondary = {
@@ -509,7 +561,7 @@ local function start(key: string, id: string): Node
 			gap = "$zeron.list.gap",
 			PanelHome.Heading { label = ui.t("panel.design.recent") },
 			ui.presence(function(): string
-				local r = recent:get()
+				local r = recent()
 				return if r == nil then "loading" elseif #r == 0 then "none" else "some"
 			end, function(which: string): Node
 				if which == "none" then
@@ -518,7 +570,7 @@ local function start(key: string, id: string): Node
 					return ui.column {}
 				end
 				return ui.each(ui.computed(function(): { any }
-					return recent:get() or {}
+					return recent() or {}
 				end), row, {
 					key = function(r: any): string
 						return r.path
@@ -579,20 +631,17 @@ M.Design = ui.component(function(props: Props): Node
 		}):after(function(file: any)
 			local to = if type(file) == "table" then file.path else file
 			if type(to) == "string" and to ~= "" then
-				api.call("design.save_as", { tab = id, to = to }):after(function() end, said("save as"))
+				api.call("design.save_as", { tab = id, to = to }):after(function() end, said("panel.design.failed_save"))
 			end
 		end, function() end)
 	end
-	-- ⌘S and ⌘⇧S are this tab's while it shows.
-	local t0 = tab()
-	local mine = if t0 then { tab = t0, save_as = save_as } else nil
-	if mine then
-		front = mine
-	end
+	-- ⌘S and ⌘⇧S are this tab's while it's its panel's front tab.
+	local mine = { key = key, id = id, save_as = save_as }
 	ui.effect(function()
-		local t = tab()
-		if t and mine then
-			mine.tab = t
+		if state.of(key).active == id then
+			front = mine
+		elseif front == mine then
+			front = nil
 		end
 	end)
 	ui.on_cleanup(function()
@@ -611,12 +660,15 @@ M.Design = ui.component(function(props: Props): Node
 		end
 		return "canvas"
 	end
-	-- Changes found in the backup as it opened: kept (dismissed here) or
-	-- discarded, its file as it is then.
-	local kept = ui.use_state(false)
+	-- Changes found in the backup as it opened: kept (the notice put away
+	-- for this file) or discarded, its file as it is then.
+	local function kept_key(): string
+		local b = host:peek()
+		return `{id}:{if b and b.path then b.path else ""}`
+	end
 	local recovered = ui.show(function(): boolean
 		local b = host:get()
-		return b ~= nil and b.recovered == true and b.unsaved == true and not kept:get()
+		return b ~= nil and b.recovered == true and b.unsaved == true and not kept:get()[`{id}:{b.path or ""}`]
 	end, ui.row {
 		id = `design-recovered-{id}`,
 		w_full = true,
@@ -649,7 +701,7 @@ M.Design = ui.component(function(props: Props): Node
 			tone = "secondary",
 			size = "sm",
 			on_click = function()
-				kept:set(true)
+				kept:set_key(kept_key(), true)
 			end,
 		},
 		ds.Button {
