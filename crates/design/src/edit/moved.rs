@@ -7,6 +7,8 @@ impl Draft {
     /// Canvas without one) at `index` among its children, or last. It keeps
     /// its x and y, now from its new parent.
     pub fn move_to(&mut self, id: &str, parent: Option<&str>, index: Option<usize>) -> Result<(), EditError> {
+        self.outside(Some(id), "Move")?;
+        self.outside(parent, "Move")?;
         let node = self.design.find(id).ok_or_else(|| EditError::NotFound(id.into()))?;
         let node_height = height(node);
         if let Some(parent) = parent

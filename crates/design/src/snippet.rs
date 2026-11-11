@@ -88,25 +88,31 @@ const PRELUDE: &str = r#"(function (native) {
   globalThis.Delete = function (nodes) {
     native.delete(json((Array.isArray(nodes) ? nodes : [nodes]).map(String)));
   };
+  globalThis.SetTokens = function (tokens, options) {
+    native.setTokens(json(tokens), Boolean(options && options.replace));
+  };
+  globalThis.GetTokens = function () {
+    return JSON.parse(native.getTokens());
+  };
   globalThis.FindEmptySpace = function (wanted) {
     return JSON.parse(native.emptySpace(json(wanted)));
   };
   globalThis.TakeScreenshot = function (ids) {
     native.screenshot(json(Array.isArray(ids) ? ids : [ids]));
   };
-  globalThis.Get = function (id, options) {
-    if (typeof id === "function" || (id !== null && typeof id === "object")) { options = id; id = null; }
+  globalThis.Get = function (id, options, visiting) {
+    if (typeof id === "function" || (id !== null && typeof id === "object")) { visiting = options; options = id; id = null; }
     id = id == null ? null : String(id);
     if (typeof options === "function") {
       let skipping = Infinity;
-      for (const { node, info } of JSON.parse(native.visit(id))) {
+      for (const { node, info } of JSON.parse(native.visit(id, json(visiting || {})))) {
         if (info.depth > skipping) continue;
         skipping = options(node, info) === false ? info.depth : Infinity;
       }
       return;
     }
     const depth = options == null || options.depth === undefined ? 1 : Number(options.depth);
-    return JSON.parse(native.get(id, depth));
+    return JSON.parse(native.get(id, depth, json(options || {})));
   };
   globalThis.Print = function (...values) {
     native.print(values.map((value) => typeof value === "string" ? value : String(JSON.stringify(value) ?? value)).join(" "));
@@ -272,14 +278,32 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
     {
         let draft = draft.clone();
         native.set(
+            "setTokens",
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, tokens: String, replace: bool| {
+                let tokens = serde_json::from_str(&tokens).map_err(|e| thrown(&ctx, e))?;
+                draft.borrow_mut().set_tokens(tokens, replace).map_err(|e| thrown(&ctx, e))
+            })?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
+            "getTokens",
+            Function::new(ctx.clone(), move || draft.borrow().tokens().to_string())?,
+        )?;
+    }
+    {
+        let draft = draft.clone();
+        native.set(
             "emptySpace",
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, wanted: String| {
                 let wanted: crate::space::Wanted = serde_json::from_str(&wanted).map_err(|e| {
                     thrown(&ctx, format!("FindEmptySpace takes {{ width, height, direction, padding, from }}: {e}"))
                 })?;
                 let draft = draft.borrow();
-                let laid_out = LaidOut::of(draft.design());
-                let (x, y) = crate::space::find(draft.design(), &laid_out, &wanted).map_err(|e| thrown(&ctx, e))?;
+                let drawn = crate::resolve::drawn(draft.design());
+                let laid_out = LaidOut::of(&drawn);
+                let (x, y) = crate::space::find(&drawn, &laid_out, &wanted).map_err(|e| thrown(&ctx, e))?;
                 Ok::<_, rquickjs::Error>(serde_json::json!({ "x": x, "y": y }).to_string())
             })?,
         )?;
@@ -299,22 +323,31 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
         let draft = draft.clone();
         native.set(
             "get",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: Option<String>, depth: f64| {
-                let depth = crate::read::depth(depth).map_err(|e| thrown(&ctx, e))?;
-                crate::read::nodes(draft.borrow().design(), id.as_deref(), depth)
-                    .map(|nodes| nodes.to_string())
-                    .map_err(|e| thrown(&ctx, e))
-            })?,
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, id: Option<String>, depth: f64, options: String| {
+                    let depth = crate::read::depth(depth).map_err(|e| thrown(&ctx, e))?;
+                    let options = read_options(&ctx, &options)?;
+                    let draft = draft.borrow();
+                    let view = crate::read::view(draft.design(), id.as_deref(), &options);
+                    crate::read::nodes(&view, id.as_deref(), depth)
+                        .map(|nodes| nodes.to_string())
+                        .map_err(|e| thrown(&ctx, e))
+                },
+            )?,
         )?;
     }
     {
         let draft = draft.clone();
         native.set(
             "visit",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: Option<String>| {
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: Option<String>, options: String| {
+                let options = read_options(&ctx, &options)?;
                 let draft = draft.borrow();
-                let laid_out = LaidOut::of(draft.design());
-                crate::read::visit(draft.design(), &laid_out, id.as_deref())
+                let view = crate::read::view(draft.design(), id.as_deref(), &options);
+                // Where nodes are is where they're drawn.
+                let laid_out = LaidOut::of(&crate::resolve::drawn(draft.design()));
+                crate::read::visit(&view, &laid_out, id.as_deref())
                     .map(|visited| serde_json::Value::Array(visited).to_string())
                     .map_err(|e| thrown(&ctx, e))
             })?,
@@ -357,6 +390,11 @@ fn snippet_line(stack: &str) -> Option<usize> {
         let digits: String = stack[at + marker.len()..].chars().take_while(char::is_ascii_digit).collect();
         digits.parse().ok()
     })
+}
+
+/// `Get`'s options, as the prelude passes them.
+fn read_options(ctx: &Ctx<'_>, options: &str) -> rquickjs::Result<crate::read::Options> {
+    serde_json::from_str(options).map_err(|e| thrown(ctx, format!("Get's options: {e}")))
 }
 
 fn thrown(ctx: &Ctx<'_>, message: impl std::fmt::Display) -> rquickjs::Error {

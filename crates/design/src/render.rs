@@ -350,6 +350,7 @@ pub enum RenderError {
 /// Draws one node of `design` on a transparent background at 1x, or
 /// smaller when its longest side is over `max_side`, and encodes it.
 pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot, RenderError> {
+    let design = &crate::resolve::drawn(design);
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let laid_out = LaidOut::of(design);
     let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;

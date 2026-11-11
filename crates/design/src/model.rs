@@ -13,20 +13,24 @@
 mod corners;
 mod effects;
 mod frame;
+mod instance;
 mod kept;
 mod layout;
 mod paint;
 mod rectangle;
 mod stroke;
+pub mod token;
 pub mod warn;
 
 pub use corners::Corners;
 pub use effects::{Effect, EffectKind, Effects, Shadow};
 pub use frame::Frame;
+pub use instance::Instance;
 pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKind, Stop};
 pub use rectangle::Rectangle;
 pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
+pub use token::{Theme, Token, TokenKind};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -43,10 +47,11 @@ pub struct Design {
     pub version: String,
     #[serde(default)]
     pub children: Vec<Node>,
-    /// Theme axes and their values, kept as written until Themes are modelled.
+    /// Each Theme axis's values, the first the one nodes are shown in
+    /// unless they set their own ([`token`]).
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub themes: Map<String, Value>,
-    /// Tokens by name, kept as written until Tokens are modelled.
+    /// Tokens by name, as written ([`Token::read`] reads one).
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub tokens: Map<String, Value>,
     /// Keys the model doesn't know, written back as they were read.
@@ -76,6 +81,17 @@ impl Design {
         let mut json = serde_json::to_string_pretty(self).expect("a Design serializes");
         json.push('\n');
         json
+    }
+
+    /// The Design but its nodes.
+    pub fn without_children(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            children: Vec::new(),
+            themes: self.themes.clone(),
+            tokens: self.tokens.clone(),
+            extra: self.extra.clone(),
+        }
     }
 
     pub fn find(&self, id: &str) -> Option<&Node> {
@@ -167,7 +183,16 @@ pub struct Node {
     /// An agent is still building it (a Screen's mark while it works): the
     /// Design tab shows it as in progress.
     pub in_progress: bool,
+    /// Drawn and laid out; a node not enabled is kept but isn't (the way to
+    /// hide a node inside an Instance, which can't be deleted).
+    pub enabled: bool,
+    /// The Theme it and its children are shown in, axis by axis, over its
+    /// parent's.
+    pub theme: Map<String, Value>,
     pub kind: Kind,
+    /// Properties that refer to Tokens (`$name`), as written: the model
+    /// reads them once they're resolved ([`crate::resolve`]).
+    pub refs: Map<String, Value>,
     /// Properties the model doesn't know (all but its id, for an
     /// [`Opaque`] node), written back as they were read.
     pub extra: Map<String, Value>,
@@ -260,6 +285,7 @@ macro_rules! kinds {
 kinds! {
     /// A container. On the Canvas itself, a Screen or a Component.
     Frame = "frame",
+    Instance = "instance",
     Rectangle = "rectangle",
 }
 

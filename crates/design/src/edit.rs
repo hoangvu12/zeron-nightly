@@ -17,8 +17,10 @@ use crate::printed::Printed;
 
 mod copy;
 mod delete;
+mod inside;
 mod moved;
 mod replace;
+mod tokens;
 mod update;
 mod warning;
 
@@ -106,6 +108,7 @@ impl Draft {
     /// none. A property the model doesn't know is kept, with a warning.
     /// Returns the new node's id.
     pub fn insert(&mut self, parent: Option<&str>, node: Value) -> Result<String, EditError> {
+        self.outside(parent, "Insert")?;
         let depth = self.depth_inside(parent)?;
         self.children_of(parent)?;
         let built = self.build(node, depth, "Insert")?;
@@ -114,8 +117,9 @@ impl Draft {
 
     /// Asks for screenshots of these nodes with the call's result.
     pub fn screenshot(&mut self, ids: Vec<String>) -> Result<(), EditError> {
+        let expanded = ids.iter().any(|id| inside::is_inside(id)).then(|| inside::expanded(&self.design));
         for id in ids {
-            if self.design.find(&id).is_none() {
+            if expanded.as_ref().unwrap_or(&self.design).find(&id).is_none() {
                 return Err(EditError::NotFound(id));
             }
             self.screenshots.push(id);
@@ -134,10 +138,21 @@ impl Draft {
         });
     }
 
-    pub fn finish(self) -> Edited {
+    pub fn finish(mut self) -> Edited {
+        // What can't be drawn as asked, about the nodes this call changed
+        // (or the Instances they're in).
+        let (_, problems) = crate::resolve::resolved(&self.design, crate::resolve::Resolve::DRAWN);
+        for problem in problems {
+            let top = problem.node.split('/').next().unwrap_or_default();
+            if self.changed.contains(&problem.node) || self.changed.contains(top) {
+                self.warn(&problem.node, None, problem.message);
+            }
+        }
         let mut names = Map::new();
         // A node made and deleted in one call was never there.
-        let created = self.created.into_iter().filter(|(_, id)| self.design.find(id).is_some());
+        let expanded = self.created.iter().any(|(_, id)| inside::is_inside(id)).then(|| inside::expanded(&self.design));
+        let there = |id: &str| self.design.find(id).is_some() || expanded.as_ref().is_some_and(|e| e.find(id).is_some());
+        let created: Vec<_> = self.created.iter().filter(|(_, id)| there(id)).cloned().collect();
         for (name, id) in created {
             let mut key = name.clone();
             let mut n = 1;
