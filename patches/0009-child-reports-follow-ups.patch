@@ -1,4 +1,4 @@
-From cfda913ad1f716dccf8c8f64c716524e41843981 Mon Sep 17 00:00:00 2001
+From 7ccf9db7f81826951f62264e33d9a90c9dc9edd3 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 09:39:39 +0700
 Subject: [PATCH] engine: child reports cover follow-up turns, thanks and
@@ -48,19 +48,30 @@ report too long is cut at a paragraph.
 
 send_message asks a busy engine for its snapshots twice before giving
 up, and says the message was not sent and is safe to retry.
+
+Pi helpers reported "finished" with only an extension's toast for words
+("fff path + grep mode enabled") when the provider had refused the
+request. Pi's info toasts no longer go into the reply (warnings and
+errors still do), and a turn whose last answer ends on an error reports
+failed, with the error. Pi without a Zeron account was listed as signed
+out, so agents thought they couldn't delegate to it; it runs on the
+providers in its own settings, so it now reads as unknown, and connected.
 ---
- crates/doc/src/registry.rs           |  14 +
- crates/engine/src/doc_host.rs        |  37 ++-
- crates/engine/src/rpc/agent_gate.rs  |  92 +++++-
- crates/engine/src/session_reports.rs | 423 ++++++++++++++++++++++++---
- crates/engine/src/sessions.rs        | 146 ++++++++-
- crates/engine/src/workspace_host.rs  |   5 +
- crates/mcp/src/jsonrpc.rs            |   5 +
- crates/mcp/src/tools.rs              |   7 +-
- crates/mcp/src/zeron.rs              |  22 +-
- crates/proto/src/agent_messages.rs   |  15 +-
- docs/mcp.md                          |  14 +
- 11 files changed, 707 insertions(+), 73 deletions(-)
+ crates/doc/src/registry.rs              |  14 +
+ crates/engine/src/doc_host.rs           |  37 +-
+ crates/engine/src/rpc/agent_gate.rs     |  92 ++++-
+ crates/engine/src/session_reports.rs    | 441 +++++++++++++++++++++---
+ crates/engine/src/sessions.rs           | 168 ++++++++-
+ crates/engine/src/workspace_host.rs     |   5 +
+ crates/harness/src/pi/mod.rs            |  16 +-
+ crates/harness/tests/fixtures/pi_rpc.rs |   6 +-
+ crates/harness/tests/pi_rpc.rs          |  15 +
+ crates/mcp/src/jsonrpc.rs               |   5 +
+ crates/mcp/src/tools.rs                 |   7 +-
+ crates/mcp/src/zeron.rs                 |  58 +++-
+ crates/proto/src/agent_messages.rs      |  15 +-
+ docs/mcp.md                             |  14 +
+ 14 files changed, 809 insertions(+), 84 deletions(-)
 
 diff --git a/crates/doc/src/registry.rs b/crates/doc/src/registry.rs
 index dae15f24cd16ce84d4af2529453e6640a799ab7f..8843d83281eac98fa80cf0d92feadb15d6bac9db 100644
@@ -275,7 +286,7 @@ index 6a64539f0e0d84386223feb723d51ed4e2ba7b11..19151a587b9f4667b50215e2045a70ab
      /// mark is pinned to the one its MCP server runs in; one that runs in
      /// none can't mark any. Sleep is the person's: no agent sets it.
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588152930d0 100644
+index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..c69f47695d34ab46d1f04fa62ca52a869aeb7a9a 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -47,9 +47,14 @@ const REPORT_CAP: usize = 16 * 1024;
@@ -343,10 +354,17 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
      let Some(at) = request_for_turn(&entries, &parent, cut) else {
          return; // the person's chat alone, or another chat's
      };
-@@ -153,12 +177,29 @@ pub(super) async fn report_turn_end(
+@@ -153,12 +177,36 @@ pub(super) async fn report_turn_end(
          .iter()
          .position(|e| e.role == MessageRole::User && from_parent(&text_of(&e.parts), &parent))
          .map_or(after, |next| &after[..next]);
++    // A turn its runtime called done that ended on an error (the provider
++    // refused the request) failed, and the parent hears why.
++    let status = if status == ReportStatus::Finished && ends_on_error(after) {
++        ReportStatus::Failed
++    } else {
++        status
++    };
 +    // The parent heard an end of this work already. A later turn the child
 +    // started on its own (background work it left running, a timer, a poll
 +    // woke it) is news, reported as a follow-up keyed by its last answer;
@@ -374,7 +392,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
      };
      // A stop that hands the turn to a message already on its way (the
      // person's "send now") is no end: that message's turn reports. A Stop
-@@ -202,38 +243,119 @@ pub(super) async fn report_turn_end(
+@@ -202,38 +250,119 @@ pub(super) async fn report_turn_end(
      {
          tracing::info!(chat = %child, %parent, "parent is waiting on its child: its wait has the reply");
          key.push_str(WAITED);
@@ -505,7 +523,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
      let label = crate::rpc::agent_gate::label(Some(&row), &child);
      let text = agent_messages::child_report(&label, &child, status, &body);
      let Some(request) = host.request_from_chat_row(&parent, &text) else {
-@@ -306,12 +428,18 @@ pub(super) fn owed_on_boot(host: &DocHost, running: impl Fn(&str) -> bool) -> Ve
+@@ -306,12 +435,18 @@ pub(super) fn owed_on_boot(host: &DocHost, running: impl Fn(&str) -> bool) -> Ve
              if stopped_by_parent(&commands, &parent, since) {
                  return None;
              }
@@ -530,7 +548,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
                  ReportStatus::Stopped
              } else if open_question(after).is_some() {
                  ReportStatus::NeedsInput
-@@ -361,12 +489,13 @@ pub(super) fn children_on(host: &DocHost, parent: &str, local: &[Session]) -> Ve
+@@ -361,12 +496,13 @@ pub(super) fn children_on(host: &DocHost, parent: &str, local: &[Session]) -> Ve
              };
              let doc = handle.doc();
              let entries = doc.read_entries().unwrap_or_default();
@@ -547,7 +565,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
          })
          .map(|child| WaitingOn {
              id: child.id.clone(),
-@@ -458,7 +587,8 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+@@ -458,7 +594,8 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
      let remote = ws.read_sessions().unwrap_or_default();
      let now = Utc::now();
      let journal = host.sessions().map(|engine| engine.inner.journal.clone());
@@ -557,7 +575,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
          .read_chats()
          .unwrap_or_default()
          .iter()
-@@ -472,27 +602,47 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+@@ -472,27 +609,47 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
                  .map(str::trim)
                  .filter(|t| !t.is_empty())
                  .map_or_else(|| child.id.chars().take(8).collect(), str::to_owned);
@@ -615,7 +633,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
              match session {
                  Some(s) if s.status == SessionStatus::AwaitingInput => facts.insert(0, "waiting on an answer".into()),
                  Some(s) if s.status == SessionStatus::Working || s.waiting.is_some() => {
-@@ -503,21 +653,65 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+@@ -503,21 +660,65 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
                  Some(_) => return None,
                  None => {
                      // A row from another device gone quiet: the last of it.
@@ -688,7 +706,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
  }
  
  /// A span of milliseconds as a person says it.
-@@ -660,7 +854,10 @@ fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEn
+@@ -660,7 +861,10 @@ fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEn
          let SessionCommandPayload::Run { request, message_id } = &c.payload else {
              return false;
          };
@@ -700,7 +718,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
              return true;
          }
          let ends = |status: ReportStatus| match stage {
-@@ -675,6 +872,132 @@ fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEn
+@@ -675,6 +879,143 @@ fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEn
      })
  }
  
@@ -729,6 +747,17 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
 +    let heard = last_end_report(host, parent, child, &asked.id)
 +        .or_else(|| delivered(host, parent, child, asked, "end").then_some(i64::MIN));
 +    heard.is_some_and(|heard| !session.and_then(|s| s.started_at).is_some_and(|at| at.timestamp_millis() > heard))
++}
++
++/// The turn's last answer ends on an error: nothing it said or did came
++/// after it (its thinking aside).
++fn ends_on_error(after: &[SessionMessageEntry]) -> bool {
++    after
++        .iter()
++        .rev()
++        .find(|e| e.role == MessageRole::Assistant)
++        .and_then(|e| e.parts.iter().rev().find(|p| !matches!(p, MessagePart::Reasoning { .. })))
++        .is_some_and(|p| matches!(p, MessagePart::Error { .. }))
 +}
 +
 +/// The person typed `text` (no chat's header on it).
@@ -833,7 +862,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
  /// Whether `parent`'s agent stopped the child since its message at `since`
  /// (its Stop, in the child's ledger, says who made it).
  fn stopped_by_parent(commands: &[zeron_doc::SessionCommandEntry], parent: &str, since: i64) -> bool {
-@@ -747,8 +1070,10 @@ pub(crate) fn without_waited(host: &DocHost, parent: &str, batch: &str, since: i
+@@ -747,8 +1088,10 @@ pub(crate) fn without_waited(host: &DocHost, parent: &str, batch: &str, since: i
          .iter()
          .zip(&reports)
          .filter(|(_, r)| {
@@ -845,7 +874,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
          })
          .map(|(block, _)| *block)
          .collect();
-@@ -930,6 +1255,10 @@ fn capped(body: String, child: &str) -> String {
+@@ -930,6 +1273,10 @@ fn capped(body: String, child: &str) -> String {
      while !body.is_char_boundary(end) {
          end -= 1;
      }
@@ -857,7 +886,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588
          "{}\n\n[Cut at 16 KB. Read the whole reply with the Zeron `read_chat` tool, chat {child}.]",
          body[..end].trim_end()
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index de82f35460280618c3b8d7103c78ae58931b219c..061f14a803f016a955a3d6cf7d23f0a75f6cc73f 100644
+index de82f35460280618c3b8d7103c78ae58931b219c..e02dd7d7537ae9c3b9c2b10605c37c5158dc1991 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -41,7 +41,7 @@ use crate::doc_host::{ChatDocHandle, DocHost};
@@ -896,7 +925,7 @@ index de82f35460280618c3b8d7103c78ae58931b219c..061f14a803f016a955a3d6cf7d23f0a7
          // Its host ran it and reported; this copy of its doc never caught up.
          let mut report = request();
          report.prompt = zeron_proto::agent_messages::child_report("Remote (kid-r)", "kid-r", ReportStatus::Finished, "LGTM.");
-@@ -8621,4 +8621,142 @@ mod tests {
+@@ -8621,4 +8621,164 @@ mod tests {
          assert_eq!(rig.roster(), "No child is working for you now.");
          rig.core.sessions.shutdown().await;
      }
@@ -1038,6 +1067,28 @@ index de82f35460280618c3b8d7103c78ae58931b219c..061f14a803f016a955a3d6cf7d23f0a7
 +        rig.until("the lead reads the report", |r| !r.reports("lead").is_empty()).await;
 +        rig.core.sessions.shutdown().await;
 +    }
++
++    /// A turn its runtime calls completed that ended on the provider's
++    /// error (a request refused) is reported failed, with the error: it was
++    /// "finished" with only a banner for its words.
++    #[tokio::test]
++    async fn a_turn_that_ended_on_an_error_reports_failed() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Build the prompt.")).await;
++        kid.feed.send(text("Starting.")).unwrap();
++        kid.feed
++            .send(AgentEvent::Error { message: "400: The Provider rejected the request (HTTP 400).".into() })
++            .unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the report", |r| !r.heard().is_empty()).await;
++        let (_, status, body) = rig.heard().pop().unwrap();
++        assert_eq!(status, ReportStatus::Failed, "{body}");
++        assert!(body.contains("rejected the request"), "{body}");
++        rig.core.sessions.shutdown().await;
++    }
  }
 diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
 index 5ae3feca44cc2db973fa3074796165eb38c520b1..dab440425136211951897afb75b766e4ca0ae8b6 100644
@@ -1055,6 +1106,84 @@ index 5ae3feca44cc2db973fa3074796165eb38c520b1..dab440425136211951897afb75b766e4
      pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {
          Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
      }
+diff --git a/crates/harness/src/pi/mod.rs b/crates/harness/src/pi/mod.rs
+index eb25fb038b4910a6536921a6b00309b9c10c1f4f..a7e1f76e882ad88bf38c6546964ebdf073dbfea3 100644
+--- a/crates/harness/src/pi/mod.rs
++++ b/crates/harness/src/pi/mod.rs
+@@ -1042,11 +1042,19 @@ impl Runner {
+             self.process
+                 .dialogs
+                 .request(self.process.transport.client.clone(), &frame);
++            // An extension's toast ("fff path + grep mode enabled" as each
++            // turn starts): Pi's own screen shows it beside the chat, not
++            // in the reply. Only a warning or an error joins the reply; an
++            // info toast alone was all a failed turn's reply said.
+             if frame["method"] == "notify" {
+-                self.emit(AgentEvent::TextDelta {
+-                    text: format!("\n{}\n", string(&frame, "message")),
+-                })
+-                .await?;
++                if matches!(frame["notifyType"].as_str(), Some("warning" | "error")) {
++                    self.emit(AgentEvent::TextDelta {
++                        text: format!("\n{}\n", string(&frame, "message")),
++                    })
++                    .await?;
++                } else {
++                    tracing::info!(message = %string(&frame, "message"), "Pi notice");
++                }
+             }
+             return Ok(());
+         }
+diff --git a/crates/harness/tests/fixtures/pi_rpc.rs b/crates/harness/tests/fixtures/pi_rpc.rs
+index eea0e9a67f6395ef585c3040b694059e411fbd87..319180a77a9a15a9a3c79db6b0ffdec405926776 100644
+--- a/crates/harness/tests/fixtures/pi_rpc.rs
++++ b/crates/harness/tests/fixtures/pi_rpc.rs
+@@ -227,6 +227,10 @@ fn main() {
+                             .unwrap();
+                             out.flush().unwrap();
+                         }
++                        if text == "notices" {
++                            emit(json!({"type":"extension_ui_request","id":"n1","method":"notify","message":"grep mode enabled"}));
++                            emit(json!({"type":"extension_ui_request","id":"n2","method":"notify","message":"index stale","notifyType":"warning"}));
++                        }
+                         if abort.load(Ordering::SeqCst) {
+                             message("", "aborted");
+                         } else if text == "error" {
+@@ -305,7 +309,7 @@ fn main() {
+             "extension_ui_response" => {
+                 if let Some(prompt) = dialog.take() {
+                     emit(
+-                        json!({"type":"extension_ui_request","id":"notice","method":"notify","message":v.to_string()}),
++                        json!({"type":"extension_ui_request","id":"notice","method":"notify","message":v.to_string(),"notifyType":"warning"}),
+                     );
+                     response(&prompt, json!({}));
+                 }
+diff --git a/crates/harness/tests/pi_rpc.rs b/crates/harness/tests/pi_rpc.rs
+index ceb3b83ab96dcf80381d5c38c9f49e47caf08a36..5f611638a99242fbb4c9a37659671171fe4b3dfd 100644
+--- a/crates/harness/tests/pi_rpc.rs
++++ b/crates/harness/tests/pi_rpc.rs
+@@ -135,6 +135,21 @@ async fn nested_agent_environment_is_not_inherited() {
+     assert_eq!(text, "reply:env:false");
+ }
+ 
++/// An extension's info toast isn't the reply (a turn that failed said only
++/// "grep mode enabled"); a warning still reaches the reader.
++#[tokio::test]
++async fn an_info_notice_stays_out_of_the_reply_and_a_warning_joins_it() {
++    let text: String = collect("notices")
++        .await
++        .iter()
++        .filter_map(|e| match e {
++            AgentEvent::TextDelta { text } => Some(text.as_str()),
++            _ => None,
++        })
++        .collect();
++    assert_eq!(text, "\nindex stale\nreply:notices");
++}
++
+ #[tokio::test]
+ async fn resumes_the_same_session_after_process_shutdown() {
+     let dir = tempfile::tempdir().unwrap();
 diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
 index 5f37b345b93d6e59a9cdc695b747c6dff3fbd792..9d287ad84c0d50e609ee1c6e6044a217d261f82c 100644
 --- a/crates/mcp/src/jsonrpc.rs
@@ -1103,10 +1232,29 @@ index 49cefa6309c4e1df58179afbef00159521c823fa..dbed283beb38202f6e3ea6443e8526cc
          // the others are delivered through the doc, host reachable or not.
          let harnesses = if chat.config.is_some() {
 diff --git a/crates/mcp/src/zeron.rs b/crates/mcp/src/zeron.rs
-index abb426bb0d1d2c1af67d7332f2055aeae9972c14..7bef3245879b18507012cfe5f59859b6bd8733d3 100644
+index abb426bb0d1d2c1af67d7332f2055aeae9972c14..bed96f680acd9ff15d00db381d164363b2864c66 100644
 --- a/crates/mcp/src/zeron.rs
 +++ b/crates/mcp/src/zeron.rs
-@@ -277,17 +277,21 @@ impl Zeron {
+@@ -77,6 +77,18 @@ fn transport(error: anyhow::Error) -> RpcError {
+     RpcError::Transport(format!("{error:#}"))
+ }
+ 
++/// Whether `harness` is signed in, as its device's agent accounts say: an
++/// active account is. Pi also runs on the providers in its own settings
++/// (`models.json`, keys Zeron never sees), so Pi without one is unknown,
++/// not signed out: agents read signed out as "can't delegate there".
++fn login_state(harness: HarnessId, accounts: &[zeron_proto::AgentAccount]) -> Option<bool> {
++    let active = accounts.iter().any(|a| a.harness == harness && a.active);
++    match harness {
++        HarnessId::Pi if !active => None,
++        _ => Some(active),
++    }
++}
++
+ /// `ListHarnesses` row — the engine's `HarnessDescriptor`, re-declared here
+ /// so this crate does not link the engine.
+ #[derive(Debug, Clone, Deserialize)]
+@@ -277,17 +289,21 @@ impl Zeron {
          }
      }
  
@@ -1137,6 +1285,44 @@ index abb426bb0d1d2c1af67d7332f2055aeae9972c14..7bef3245879b18507012cfe5f59859b6
      }
  
      async fn snapshot_as<T: serde::de::DeserializeOwned>(
+@@ -359,12 +375,7 @@ impl Zeron {
+             .and_then(|v| serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(v).ok());
+         if let Some(snapshot) = accounts {
+             for harness in &mut harnesses {
+-                harness.signed_in = Some(
+-                    snapshot
+-                        .accounts
+-                        .iter()
+-                        .any(|a| a.harness == harness.id && a.active),
+-                );
++                harness.signed_in = login_state(harness.id, &snapshot.accounts);
+             }
+         }
+         Ok(harnesses)
+@@ -929,6 +940,23 @@ mod tests {
+     use super::*;
+     use chrono::Utc;
+ 
++    #[test]
++    fn pi_without_an_account_is_not_signed_out() {
++        let account = |harness: &str, active: bool| -> zeron_proto::AgentAccount {
++            serde_json::from_value(json!({
++                "id": "a", "harness": harness, "active": active, "email": null, "planLabel": null
++            }))
++            .unwrap()
++        };
++        // Its own providers may run it: unknown, so still connected.
++        assert_eq!(login_state(HarnessId::Pi, &[]), None);
++        assert_eq!(login_state(HarnessId::Pi, &[account("pi", false)]), None);
++        assert_eq!(login_state(HarnessId::Pi, &[account("pi", true)]), Some(true));
++        // A CLI that needs its login is signed out without one.
++        assert_eq!(login_state(HarnessId::ClaudeCode, &[]), Some(false));
++        assert_eq!(login_state(HarnessId::ClaudeCode, &[account("claude-code", true)]), Some(true));
++    }
++
+     #[tokio::test]
+     async fn coalesced_repeated_interrupts_need_fresh_native_outcome_evidence() {
+         use futures::StreamExt;
 diff --git a/crates/proto/src/agent_messages.rs b/crates/proto/src/agent_messages.rs
 index 94382b19bd5697862e83761c271a2d69408e38d0..0d9bffc258b662192aa34b2f017b0aef900d6759 100644
 --- a/crates/proto/src/agent_messages.rs
