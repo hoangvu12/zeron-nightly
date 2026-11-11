@@ -194,7 +194,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // anything below sets a variable; started by one, the launch it
     // replaces waited out first.
     relaunch::remember();
-    zeron_design::keep_linked();
     // No type check after each reload unless asked (`ZGX_CHECK=1`): a debug
     // zgx host runs `luau-lsp analyze` over the whole app on every reload,
     // on a thread of its own that a newer reload doesn't stop. With several

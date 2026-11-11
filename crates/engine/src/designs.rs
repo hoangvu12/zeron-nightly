@@ -1,0 +1,293 @@
+//! Designs (apps/zgx/docs/design): this engine owns every live Design on
+//! its computer (ADR-0003) and applies agents' snippets to each in order.
+//!
+//! A call ([`Designs::execute`]) finds its Design ([`Designs::target`]),
+//! runs its snippet against a draft of it in the QuickJS sandbox, and on
+//! success keeps the draft ([`Live::commit`]): the file is saved and the
+//! call's screenshots drawn. A failed call changes nothing, on disk or in
+//! memory. New Designs are made in the managed folder, `designs/` in the
+//! engine's data dir, one folder each with an `images/` folder beside the
+//! `.zdesign` file.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use zeron_design::Design;
+use zeron_design::edit::{Draft, Edited};
+use zeron_design::snippet::{self, Limits};
+
+/// A `.zdesign` file's extension.
+pub const EXTENSION: &str = "zdesign";
+
+/// Longest name a managed Design's folder takes from its Design's name.
+const MAX_NAME_CHARS: usize = 64;
+
+/// `DesignExecute`'s params, as Zeron's `design_execute` tool sends them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteParams {
+    /// The calling chat (the agent's, set by the engine for an agent).
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    pub snippet: String,
+    /// What the call does, in a few words.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A `.zdesign` file to change.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The name of a new managed Design to make.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DesignError {
+    /// The request can't be met as asked; the agent can fix it and retry.
+    #[error("{0}")]
+    Refused(String),
+    #[error(transparent)]
+    Snippet(#[from] snippet::SnippetError),
+    #[error("{0}")]
+    Io(String),
+}
+
+#[derive(Clone)]
+pub struct Designs {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    root: PathBuf,
+    limits: Limits,
+    /// Designs held live, by file: one owner each, so calls apply in order.
+    live: Mutex<HashMap<PathBuf, Arc<Mutex<Live>>>>,
+}
+
+/// One Design as the engine holds it.
+struct Live {
+    path: PathBuf,
+    design: Design,
+}
+
+impl Designs {
+    /// Designs whose managed folder is `designs/` in `data_dir`.
+    pub fn new(data_dir: &Path) -> Self {
+        // Made now and in its canonical form, so a managed Design named by
+        // its path later is the one already held.
+        let root = data_dir.join("designs");
+        let root = std::fs::create_dir_all(&root)
+            .and_then(|()| canonical(&root))
+            .unwrap_or(root);
+        Self {
+            inner: Arc::new(Inner {
+                root,
+                limits: Limits::default(),
+                live: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// The managed folder new Designs are made in.
+    pub fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    /// Runs one `design_execute` call to its end (blocking: run it off the
+    /// async runtime). Returns the Design's name and path, the name-to-id
+    /// map of the nodes the call made, and its screenshots as base64 PNG.
+    pub fn execute(&self, params: ExecuteParams) -> Result<Value, DesignError> {
+        if params.snippet.trim().is_empty() {
+            return Err(DesignError::Refused("the snippet is empty".into()));
+        }
+        let target = self.target(&params)?;
+        let ran = self.run(&target.live, &params.snippet);
+        if ran.is_err() && target.new {
+            // Nothing was made: the name is free again.
+            lock(&self.inner.live).retain(|_, live| !Arc::ptr_eq(live, &target.live));
+        }
+        ran
+    }
+
+    fn run(&self, live: &Mutex<Live>, code: &str) -> Result<Value, DesignError> {
+        let mut live = lock(live);
+        let draft = snippet::run(Draft::new(live.design.clone()), code, self.inner.limits)?;
+        let edited = draft.finish();
+        let screenshots = live.commit(&edited)?;
+        Ok(json!({
+            "design": { "name": design_name(&live.path), "path": live.path },
+            "ids": edited.names,
+            "screenshots": screenshots,
+        }))
+    }
+
+    /// The Design a call is for: the file it names, or a new managed
+    /// Design by the name it gives (made on disk when the call succeeds).
+    fn target(&self, params: &ExecuteParams) -> Result<Target, DesignError> {
+        match (params.path.as_deref(), params.name.as_deref()) {
+            (Some(path), None) => Ok(Target {
+                live: self.open(Path::new(path))?,
+                new: false,
+            }),
+            (None, Some(name)) => Ok(Target {
+                live: self.create(name)?,
+                new: true,
+            }),
+            (Some(_), Some(_)) => Err(DesignError::Refused(
+                "give either the path of a Design or the name of a new one, not both".into(),
+            )),
+            (None, None) => Err(DesignError::Refused(
+                "name a Design: the path of a .zdesign file, or a name for a new one".into(),
+            )),
+        }
+    }
+
+    /// The live Design of the `.zdesign` file at `path`, read on first use.
+    fn open(&self, path: &Path) -> Result<Arc<Mutex<Live>>, DesignError> {
+        if path.extension().and_then(|e| e.to_str()) != Some(EXTENSION) {
+            return Err(DesignError::Refused(format!(
+                "{} is not a .{EXTENSION} file",
+                path.display()
+            )));
+        }
+        let path = canonical(path)
+            .map_err(|e| DesignError::Refused(format!("can't open {}: {e}", path.display())))?;
+        let mut live = lock(&self.inner.live);
+        if let Some(design) = live.get(&path) {
+            return Ok(design.clone());
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| DesignError::Refused(format!("can't read {}: {e}", path.display())))?;
+        let design = Design::from_json(&text).map_err(|e| {
+            DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
+        })?;
+        let design = Arc::new(Mutex::new(Live {
+            path: path.clone(),
+            design,
+        }));
+        live.insert(path, design.clone());
+        Ok(design)
+    }
+
+    /// A new managed Design named `name`, held from now on, in a folder of
+    /// its own named after it (`Name 2` and so on when that's taken). Its
+    /// file is written when the call making it succeeds.
+    fn create(&self, name: &str) -> Result<Arc<Mutex<Live>>, DesignError> {
+        let base = folder_name(name)?;
+        let mut live = lock(&self.inner.live);
+        let taken = |folder: &Path| {
+            folder.exists() || live.keys().any(|path| path.parent() == Some(folder))
+        };
+        let mut folder = base.clone();
+        let mut n = 1;
+        while taken(&self.inner.root.join(&folder)) {
+            n += 1;
+            folder = format!("{base} {n}");
+        }
+        let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
+        let design = Arc::new(Mutex::new(Live {
+            path: path.clone(),
+            design: Design::default(),
+        }));
+        live.insert(path, design.clone());
+        Ok(design)
+    }
+}
+
+/// The Design a call is for, and whether the call is making it.
+struct Target {
+    live: Arc<Mutex<Live>>,
+    new: bool,
+}
+
+impl Live {
+    /// Keeps a successful call's draft: saves the file, then draws the
+    /// screenshots the call asked for.
+    fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
+        let screenshots = edited
+            .screenshots
+            .iter()
+            .map(|id| {
+                zeron_design::render::screenshot(
+                    &edited.design,
+                    id,
+                    zeron_design::render::SCREENSHOT_MAX_SIDE,
+                )
+                .map_err(|e| DesignError::Refused(format!("TakeScreenshot: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        save(&self.path, &edited.design)?;
+        self.design = edited.design.clone();
+        Ok(screenshots
+            .into_iter()
+            .map(|shot| {
+                json!({
+                    "id": shot.id,
+                    "width": shot.width,
+                    "height": shot.height,
+                    "mimeType": "image/png",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&shot.png),
+                })
+            })
+            .collect())
+    }
+}
+
+/// Writes the file whole or not at all, making a new managed Design's
+/// folder (with its `images/`) on its first save.
+fn save(path: &Path, design: &Design) -> Result<(), DesignError> {
+    let io = |e: std::io::Error| DesignError::Io(format!("can't save {}: {e}", path.display()));
+    let folder = path.parent().ok_or_else(|| DesignError::Io("a Design's path has no folder".into()))?;
+    if !path.exists() {
+        std::fs::create_dir_all(folder.join("images")).map_err(io)?;
+    }
+    let mut file = tempfile::NamedTempFile::new_in(folder).map_err(io)?;
+    std::io::Write::write_all(&mut file, design.to_json().as_bytes()).map_err(io)?;
+    file.persist(path).map_err(|e| io(e.error))?;
+    Ok(())
+}
+
+/// A Design's name: its file's, without the extension.
+fn design_name(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `name` as a folder name every file system takes: characters Windows
+/// refuses become `-`, and it's cut to [`MAX_NAME_CHARS`].
+fn folder_name(name: &str) -> Result<String, DesignError> {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let cleaned = cleaned.trim_end_matches(['.', ' ']).trim().to_owned();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '-' || c == '.') {
+        return Err(DesignError::Refused(format!(
+            "\"{name}\" can't name a Design: use letters or digits"
+        )));
+    }
+    Ok(cleaned)
+}
+
+fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    // Without Windows' `\?\` prefix, as the agent and the person write paths.
+    #[cfg(windows)]
+    let path = dunce::simplified(&path).to_path_buf();
+    Ok(path)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

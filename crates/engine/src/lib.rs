@@ -47,6 +47,7 @@ pub mod cloud_disk;
 pub mod commit_credit;
 pub mod credentials;
 pub mod deferred;
+pub mod designs;
 pub mod desktop_notify;
 pub mod device_stats;
 pub mod diff_sync;
@@ -199,6 +200,8 @@ pub struct EngineCore {
     pub local_import: Option<local_import::LocalImporter>,
     /// Plugins under `{data}/plugins/` (the plugins contract).
     pub plugins: plugins::Plugins,
+    /// This computer's live Designs, and the managed folder under `{data}/designs/`.
+    pub designs: designs::Designs,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -497,6 +500,7 @@ impl EngineCore {
             device_id,
             local_import,
             plugins,
+            designs: designs::Designs::new(data_dir),
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -663,7 +667,8 @@ impl EngineCore {
         .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_viewport_focus(self.viewport_focus.clone())
-        .with_plugins(self.plugins.clone());
+        .with_plugins(self.plugins.clone())
+        .with_designs(self.designs.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -1284,7 +1289,6 @@ impl Engine {
     pub async fn run(self) -> anyhow::Result<()> {
         let mut config = self.config;
         tracing::info!(data_dir = %config.data_dir.display(), "engine starting");
-        zeron_design::keep_linked();
 
         std::fs::create_dir_all(&config.data_dir)?;
         update_trial::boot(&config.data_dir)?;

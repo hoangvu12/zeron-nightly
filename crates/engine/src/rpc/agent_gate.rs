@@ -82,6 +82,11 @@ impl EngineRpc {
             params["chatId"] = json!(chat);
             return Ok(params);
         }
+        // A design call is its own chat's (or no chat's), whatever it sends.
+        if method == methods::DESIGN_EXECUTE {
+            params["chatId"] = json!(chat);
+            return Ok(params);
+        }
         if !matches!(method, methods::MUTATE | methods::QUEUE_MESSAGE | methods::QUEUE_COMMAND) {
             return Ok(params);
         }

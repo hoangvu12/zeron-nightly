@@ -69,7 +69,9 @@ content sits directly on the chat with no cards or boxed panels, text uses the i
 and type scale, and colors are theme tokens that work on frosted glass or opaque, light or dark. \
 The reader sees the visual above that reply, so don't announce or restate it. To show the \
 reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
-draw images through `show_visual`.";
+draw images through `show_visual`.\n\
+\n\
+To make or change a visual design (Screens, components, a design system), use `design_execute`.";
 
 /// Appended to [`INSTRUCTIONS`] where the agent is offered
 /// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
@@ -315,14 +317,23 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             match tools.call(name, arguments).await {
-                Ok(value) => ok_response(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": pretty(&value) }],
-                        "structuredContent": wrap_structured(value),
-                        "isError": false,
-                    }),
-                ),
+                Ok(mut value) => {
+                    let images = value
+                        .as_object_mut()
+                        .and_then(|value| value.remove(crate::tools::IMAGE_CONTENT));
+                    let mut content = vec![json!({ "type": "text", "text": pretty(&value) })];
+                    if let Some(Value::Array(images)) = images {
+                        content.extend(images);
+                    }
+                    ok_response(
+                        id,
+                        json!({
+                            "content": content,
+                            "structuredContent": wrap_structured(value),
+                            "isError": false,
+                        }),
+                    )
+                }
                 Err(message) => ok_response(
                     id,
                     json!({

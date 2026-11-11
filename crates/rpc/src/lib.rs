@@ -352,6 +352,11 @@ pub mod methods {
     /// Store an image file an agent shows and fold it into that chat's live
     /// turn as an image part (`show_image`). Local only, like `PublishVisual`.
     pub const PUBLISH_IMAGE: &str = "PublishImage";
+    /// Run an agent's snippet against a Design (`design_execute`): `{chatId?,
+    /// snippet, description?, path? | name?}` → `{design: {name, path}, ids,
+    /// screenshots: [{id, width, height, mimeType, data}]}`. Local only:
+    /// Designs live on the engine of their computer.
+    pub const DESIGN_EXECUTE: &str = "DesignExecute";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -712,6 +717,8 @@ pub fn local_only(method: &str) -> bool {
             | methods::UPDATE_TEMPLATE
             | methods::DESCRIBE_APP
             | methods::DESCRIBE_ELEMENTS
+            // Designs: this computer's own (ADR-0003).
+            | methods::DESIGN_EXECUTE
             // Themes: this device's library and choice, never another's.
             | methods::LIST_THEMES
             | methods::GET_THEME
@@ -792,6 +799,8 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::PUBLISH_IMAGE
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
+            // Designs: running snippets against them.
+            | methods::DESIGN_EXECUTE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, exporting (to Zeron's plugin-exports
             // folder only: the engine refuses an agent's `to`), and their

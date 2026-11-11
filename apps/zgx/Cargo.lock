@@ -7389,7 +7389,11 @@ dependencies = [
 name = "zeron-design"
 version = "0.2.139"
 dependencies = [
+ "serde",
+ "serde_json",
  "skia-safe",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]

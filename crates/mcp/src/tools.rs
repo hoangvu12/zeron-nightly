@@ -277,6 +277,23 @@ fn catalog() -> Vec<ToolDef> {
         }),
     });
     tools.push(ToolDef {
+        name: DESIGN_EXECUTE,
+        description: "Make or change a Design (Screens on a Canvas, saved as a .zdesign file) by running a JavaScript snippet against it; returns the new nodes' ids by name, and screenshots the snippet asks for.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "snippet": {
+                    "type": "string",
+                    "description": "JavaScript run in a sandbox. `Insert(parent, node)` adds a node as the last child of the node with id `parent` (or on the Canvas with `Insert(node)`) and returns its id; a node is {type: \"frame\" | \"rectangle\", name, x, y, width, height, fill: \"#RRGGBB\"}, and a frame takes `children` inline. `TakeScreenshot([ids])` attaches a PNG of each node, at most 400 px on its longest side. A snippet that throws changes nothing."
+                },
+                "description": { "type": "string", "description": "What this call does, in a few words." },
+                "name": { "type": "string", "description": "A name for a new Design, made in Zeron's designs folder." },
+                "path": { "type": "string", "description": "The .zdesign file to change (a previous call's `design.path`)." }
+            },
+            "required": ["snippet"]
+        }),
+    });
+    tools.push(ToolDef {
         name: WAIT_ON_BACKGROUND,
         description: WAIT_ON_BACKGROUND_DESCRIPTION,
         input_schema: json!({
@@ -308,6 +325,14 @@ const SHOW_VISUAL: &str = "show_visual";
 
 /// Shows an image file in the CALLING chat; offered like `show_visual`.
 const SHOW_IMAGE: &str = "show_image";
+
+/// Runs a snippet against a Design in this computer's engine.
+const DESIGN_EXECUTE: &str = "design_execute";
+
+/// Where a tool's result carries images for the client, as MCP image
+/// content (`{type: "image", data, mimeType}`); the transport moves them
+/// out of the result's text.
+pub(crate) const IMAGE_CONTENT: &str = "imageContent";
 
 /// Says what the CALLING chat's agent waits on after its turn; offered like
 /// `show_visual`.
@@ -567,6 +592,17 @@ async fn read_image(path: &str) -> anyhow::Result<Vec<u8>> {
 #[derive(Deserialize)]
 struct ShowImageArgs {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct DesignExecuteArgs {
+    snippet: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -873,6 +909,7 @@ impl Tools {
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             SHOW_IMAGE => self.show_image(parse(args)?).await,
+            DESIGN_EXECUTE => self.design_execute(parse(args)?).await,
             WAIT_ON_BACKGROUND => self.wait_on_background(parse(args)?).await,
             plugins::CREATE_PLUGIN => return self.create_plugin(args).await,
             plugins::LIST_PLUGINS => return self.list_plugins().await,
@@ -1622,6 +1659,35 @@ impl Tools {
             "image": shown,
             "message": "Shown to the reader above your reply. Don't mention or describe the image; reply with only what it doesn't already show.",
         }))
+    }
+
+    async fn design_execute(&self, args: DesignExecuteArgs) -> anyhow::Result<Value> {
+        let mut executed = self
+            .zeron
+            .call(
+                zeron_rpc::methods::DESIGN_EXECUTE,
+                json!({
+                    "chatId": self.zeron.origin().chat_id,
+                    "snippet": args.snippet,
+                    "description": args.description,
+                    "name": args.name,
+                    "path": args.path,
+                }),
+            )
+            .await?;
+        // Each screenshot's PNG goes to the client as an image; its id and
+        // size stay in the text.
+        let mut images = Vec::new();
+        if let Some(shots) = executed["screenshots"].as_array_mut() {
+            for shot in shots {
+                if let (Some(data), Some(shot)) = (shot.get("data").cloned(), shot.as_object_mut()) {
+                    shot.remove("data");
+                    images.push(json!({ "type": "image", "data": data, "mimeType": shot.remove("mimeType") }));
+                }
+            }
+        }
+        executed[IMAGE_CONTENT] = Value::Array(images);
+        Ok(executed)
     }
 
     async fn wait_on_background(&self, args: WaitOnBackgroundArgs) -> anyhow::Result<Value> {

@@ -38,4 +38,5 @@ _Avoid_: Variable, style
 
 **Theme**:
 A set of Token values chosen together, such as light or dark.
+A Design's Themes belong to that Design and colour only its nodes; Zeron's own look is the app's theme family and variant (CONTEXT.md), which never changes a Design.
 _Avoid_: Mode, skin

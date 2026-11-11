@@ -21,7 +21,7 @@ mod tools;
 mod transcript;
 mod zeron;
 
-pub use jsonrpc::serve_stdio;
+pub use jsonrpc::{handle_request, serve_stdio};
 pub use tools::{ListedTool, ToolDef, Tools};
 pub use transcript::{RenderOptions, RenderedMessage, render_entries};
 pub use zeron::{Origin, Zeron};

@@ -883,6 +883,8 @@ pub struct EngineRpc {
     viewport_focus: crate::desktop_notify::ViewportFocus,
     /// The plugins service (absent in bare test assemblies).
     plugins: Option<crate::plugins::Plugins>,
+    /// Live Designs (absent in bare test assemblies).
+    designs: Option<crate::designs::Designs>,
     engine_info: EngineInfo,
 }
 
@@ -944,6 +946,7 @@ impl EngineRpc {
             credentials: None,
             viewport_focus: Default::default(),
             plugins: None,
+            designs: None,
             engine_info,
         }
     }
@@ -951,6 +954,11 @@ impl EngineRpc {
     /// Attach the plugins service (the Plugin* methods).
     pub fn with_plugins(mut self, plugins: crate::plugins::Plugins) -> Self {
         self.plugins = Some(plugins);
+        self
+    }
+
+    pub fn with_designs(mut self, designs: crate::designs::Designs) -> Self {
+        self.designs = Some(designs);
         self
     }
 
@@ -5790,6 +5798,21 @@ impl RpcService for EngineRpc {
                     "mimeType": image.mime_type,
                     "bytes": image.size,
                 }))
+            }
+            methods::DESIGN_EXECUTE => {
+                let designs = self
+                    .designs
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("Designs aren't available on this engine".into()))?;
+                let p: crate::designs::ExecuteParams = parse_params(params)?;
+                let executed = tokio::task::spawn_blocking(move || designs.execute(p))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| match e {
+                        crate::designs::DesignError::Io(e) => RpcError::Failed(e),
+                        e => RpcError::BadParams(e.to_string()),
+                    })?;
+                RpcReply::value(&executed)
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
