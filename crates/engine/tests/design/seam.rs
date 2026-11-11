@@ -17,12 +17,15 @@ use zeron_proto::HarnessId;
 /// The chat the agent calls from.
 pub const CHAT: &str = "designer";
 
+/// A second chat, for Designs shared between chats.
+pub const OTHER: &str = "implementer";
+
 pub struct Seam {
     pub core: EngineCore,
     tools: Tools,
     /// Iconify, played by the fixture icons.
     pub iconify: Arc<FixtureIcons>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 /// Icons served from `fixtures/icons/<set>/<name>.svg` in place of
@@ -111,8 +114,13 @@ impl Seam {
             core,
             tools,
             iconify,
-            _dir: dir,
+            dir,
         }
+    }
+
+    /// The engine's data folder.
+    pub fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("engine")
     }
 
     /// Zeron's MCP tool list, as `tools/list` gives it.

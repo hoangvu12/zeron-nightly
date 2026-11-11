@@ -7,4 +7,5 @@ mod layout;
 mod reading;
 mod seam;
 mod shapes;
+mod targeting;
 mod tracer;
