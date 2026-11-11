@@ -68,6 +68,24 @@ impl History {
         }
     }
 
+    /// Notes a change from `before` to `after` as part of the latest step,
+    /// if that's described as `description` too (a run of keystrokes, one
+    /// step to undo): it then puts back what both changed, as it was before
+    /// the first. Else as [`History::record`].
+    pub fn record_joined(&mut self, description: &str, before: &Design, after: &Design) {
+        let Some(latest) = self.undo.last_mut().filter(|step| step.description == description) else {
+            return self.record(description, before, after);
+        };
+        let Some(step) = Step::between(description, before, after) else { return };
+        for (id, node) in step.nodes {
+            latest.nodes.entry(id).or_insert(node);
+        }
+        if latest.rest.is_none() {
+            latest.rest = step.rest;
+        }
+        self.redo.clear();
+    }
+
     /// `current` with the latest step undone, and that step's description;
     /// none with nothing to undo.
     pub fn undo(&mut self, current: &Design) -> Option<(Design, String)> {

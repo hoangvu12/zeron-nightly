@@ -196,11 +196,12 @@ ui.command {
 
 -- The person's edits by hand on tab `id`'s Design (#33): one change, one
 -- undo step, told to every tab showing it.
-local function edit(id: string, edits: { any }, description: string)
-	api.call("design.edit", { tab = id, edits = edits, description = description }):after(function() end, said("panel.design.failed_edit"))
+local function edit(id: string, edits: { any }, description: string, join: boolean?)
+	api.call("design.edit", { tab = id, edits = edits, description = description, join = join == true })
+		:after(function() end, said("panel.design.failed_edit"))
 end
 
--- The Design's one history, whoever's change is latest (ADR-0003).
+-- A step through the Design's one history, whoever's change is latest.
 local function step(call: string)
 	local t = front_tab()
 	if not t then
@@ -382,14 +383,18 @@ local function properties(id: string): Node
 		local b = host:get()
 		return if b then b.props else nil
 	end
+	-- A property as its field shows it: blank for one it can't (none, or
+	-- a list such as a padding per side).
+	local function shown(v: any): string
+		return if v == nil or type(v) == "table" then "" else tostring(v)
+	end
 	local function field(f: { key: string, label: string, number: boolean }, node: string, start: any): Node
-		local value = ui.use_state(if start == nil then "" elseif type(start) == "table" then "" else tostring(start))
+		local value = ui.use_state(shown(start))
 		-- (Following what the Design says as it changes, by anyone.)
 		ui.effect(function()
 			local now = props()
 			if now and now.id == node then
-				local v = now[f.key]
-				value:set(if v == nil or type(v) == "table" then "" else tostring(v))
+				value:set(shown(now[f.key]))
 			end
 		end)
 		return ds.TextField {
@@ -398,6 +403,11 @@ local function properties(id: string): Node
 			size = "sm",
 			w_full = true,
 			on_commit = function(text: string)
+				-- (Committed as shown, it changes nothing: a blank list stays.)
+				local now = props()
+				if now and now.id == node and shown(now[f.key]) == text then
+					return
+				end
 				local v: any = text
 				if f.number and tonumber(text) then
 					v = tonumber(text)
@@ -517,10 +527,7 @@ local function toolbar(id: string): Node
 			size = "sm",
 			tone = "quiet",
 			on_click = function()
-				local t = front_tab()
-				if t then
-					api.call("design.undo", { tab = t.id }):after(function() end, said("panel.design.failed_edit"))
-				end
+				step("design.undo")
 			end,
 			ds.Icon { name = "arrow-left", size = 14 },
 		},
@@ -529,10 +536,7 @@ local function toolbar(id: string): Node
 			size = "sm",
 			tone = "quiet",
 			on_click = function()
-				local t = front_tab()
-				if t then
-					api.call("design.redo", { tab = t.id }):after(function() end, said("panel.design.failed_edit"))
-				end
+				step("design.redo")
 			end,
 			ds.Icon { name = "arrow-right", size = 14 },
 		},
@@ -579,7 +583,7 @@ local function canvas(id: string): Node
 			return
 		end
 		local count = utf8.len(content) or #content
-		editing:set({ node = node, content = content, at = count, anchor = count })
+		editing:set({ node = node, content = content, at = count, anchor = count, typed = false })
 		if box.focus then
 			box:focus()
 		end
@@ -590,8 +594,9 @@ local function canvas(id: string): Node
 		if not e then
 			return
 		end
-		editing:set({ node = e.node, content = content, at = at, anchor = at })
-		edit(id, { { update = e.node, props = { content = content } } }, "Edit text")
+		editing:set({ node = e.node, content = content, at = at, anchor = at, typed = true })
+		-- (After its first, an edit's keystrokes join it: one undo step.)
+		edit(id, { { update = e.node, props = { content = content } } }, "Edit text", e.typed)
 	end
 	local function on_text_key(k: any): boolean
 		local e = editing:peek()
@@ -606,6 +611,12 @@ local function canvas(id: string): Node
 			return head .. tail, from
 		end
 		local key = k.key
+		-- ⌘Z and ⌘⇧Z end it, so the words typed don't write over what they
+		-- take back (the command still runs).
+		if (key == "z" or key == "Z") and (k.cmd or k.ctrl or k.meta) then
+			editing:set(nil)
+			return false
+		end
 		if key == "Escape" or (key == "Enter" and not k.shift) then
 			editing:set(nil)
 			return true
@@ -628,7 +639,7 @@ local function canvas(id: string): Node
 				elseif key == "ArrowRight" then math.min(e.at + 1, count)
 				elseif key == "Home" then 0
 				else count
-			editing:set({ node = e.node, content = e.content, at = at, anchor = if k.shift then e.anchor else at })
+			editing:set({ node = e.node, content = e.content, at = at, anchor = if k.shift then e.anchor else at, typed = e.typed })
 			return true
 		end
 		local char = if key == "Enter" then "\n" elseif key == "Space" or key == " " then " " else key
@@ -640,14 +651,15 @@ local function canvas(id: string): Node
 		end
 		return false
 	end
-	-- Where the caret and what's selected are, as the text is drawn.
-	local function caret(): any
+	-- Where the caret and what's selected are, as the text is drawn (laid
+	-- out once a change, for all the overlays reading it).
+	local carets = ui.computed(function(): any
 		local e = editing:get()
 		if not e then
 			return nil
 		end
 		return api.call_sync("design.caret", { tab = id, id = e.node, content = e.content, at = e.at, from = e.anchor, to = e.at })
-	end
+	end)
 
 	-- The host told what shows, as it changes.
 	ui.effect(function()
@@ -915,7 +927,7 @@ local function canvas(id: string): Node
 				if under == e_now.node then
 					local place = api.call_sync("design.caret", { tab = id, id = e_now.node, content = e_now.content, x = x, y = y })
 					if type(place) == "number" then
-						editing:set({ node = e_now.node, content = e_now.content, at = place, anchor = place })
+						editing:set({ node = e_now.node, content = e_now.content, at = place, anchor = place, typed = e_now.typed })
 					end
 					return
 				end
@@ -998,7 +1010,7 @@ local function canvas(id: string): Node
 		-- Editing text: what's selected of it, and the caret, where the
 		-- drawn glyphs are.
 		ui.each(ui.computed(function(): { any }
-			local c = caret()
+			local c = carets:get()
 			return if c and c.range then c.range else {}
 		end), function(r: any, i: number): Node
 			local o = over({ x = r.x, y = r.y, w = r.w, h = r.h })
@@ -1017,15 +1029,15 @@ local function canvas(id: string): Node
 			w = 2,
 			bg = "$accent",
 			left = function(): number
-				local c, v = caret(), view()
+				local c, v = carets:get(), view()
 				return if c and v then v.x + c.caret.x * v.zoom - 1 else 0
 			end,
 			top = function(): number
-				local c, v = caret(), view()
+				local c, v = carets:get(), view()
 				return if c and v then v.y + c.caret.y * v.zoom else 0
 			end,
 			h = function(): number
-				local c, v = caret(), view()
+				local c, v = carets:get(), view()
 				return if c and v then c.caret.h * v.zoom else 0
 			end,
 		}),

@@ -391,7 +391,8 @@ fn moved(scene: &Scene, id: &str, dx: f32, dy: f32) -> Option<Json> {
                 .get()
                 .children()
                 .iter()
-                .filter(|sibling| sibling.id != id)
+                // (Those placed apart from the layout aren't in its order.)
+                .filter(|sibling| sibling.id != id && !sibling.absolute)
                 .filter(|sibling| scene.laid_out.get(&sibling.id).is_some_and(|p| middle(p.bounds) < at))
                 .count();
             Some(json!({ "move": id, "parent": parent.id, "index": index }))
@@ -918,8 +919,6 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
             tabs.close(&crate::auth::text(&arg));
         }
     });
-    // Selecting (#32): what a click on the Canvas hits, and the tab's
-    // selection, told to the engine for the chat's agent.
     // Hand edits (#33): what a drag of a node by (`dx`, `dy`) Canvas units
     // changes, for the script to send (`design.edit`).
     let me = Rc::downgrade(&tabs);
@@ -960,6 +959,8 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
         };
         tabs.show_in(&tab, theme);
     });
+    // Selecting (#32): what a click on the Canvas hits, and the tab's
+    // selection, told to the engine for the chat's agent.
     let me = Rc::downgrade(&tabs);
     host.function("design.hit", move |arg| {
         let Some(tabs) = me.upgrade() else { return Value::Nil };

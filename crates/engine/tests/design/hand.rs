@@ -93,6 +93,39 @@ async fn undo_takes_back_the_latest_change_whoever_made_it_and_redo_does_it_agai
 }
 
 #[tokio::test]
+async fn a_text_edits_keystrokes_joined_are_one_step_to_undo() {
+    let seam = Seam::new().await;
+    let made = seam.create("Typing", SCREEN).await;
+    let path = made.path();
+    let title = made.id("Title");
+    let was = named(&on_disk(&path)["children"][0], "Title").unwrap()["content"].clone();
+    let edit = |content: &str, join: bool| {
+        json!({ "path": path, "description": "Edit text", "join": join, "edits": [{ "update": title, "props": { "content": content } }] })
+    };
+    seam.window("EditDesign", json!({ "path": path, "edits": [{ "update": title, "props": { "y": 250 } }] })).await.unwrap();
+    seam.window("EditDesign", edit("H", false)).await.unwrap();
+    seam.window("EditDesign", edit("Hi", true)).await.unwrap();
+    seam.window("EditDesign", edit("Hi!", true)).await.unwrap();
+    assert_eq!(named(&on_disk(&path)["children"][0], "Title").unwrap()["content"], "Hi!");
+
+    // One undo: all the typing; the next, the move before it.
+    seam.window("UndoDesign", json!({ "path": path })).await.unwrap();
+    let shown = on_disk(&path);
+    assert_eq!(named(&shown["children"][0], "Title").unwrap()["content"], was);
+    assert_eq!(named(&shown["children"][0], "Title").unwrap()["y"].as_f64(), Some(250.));
+    seam.window("UndoDesign", json!({ "path": path })).await.unwrap();
+    assert_eq!(named(&on_disk(&path)["children"][0], "Title").unwrap()["y"].as_f64(), Some(200.));
+    // (Joined to nothing alike, an edit is a step of its own.)
+    seam.window("RedoDesign", json!({ "path": path })).await.unwrap();
+    seam.window("EditDesign", edit("Yo", true)).await.unwrap();
+    seam.window("UndoDesign", json!({ "path": path })).await.unwrap();
+    let shown = on_disk(&path);
+    assert_eq!(named(&shown["children"][0], "Title").unwrap()["content"], was);
+    assert_eq!(named(&shown["children"][0], "Title").unwrap()["y"].as_f64(), Some(250.));
+    seam.shutdown().await;
+}
+
+#[tokio::test]
 async fn agents_cannot_edit_by_hand_or_step_through_the_history() {
     for method in ["EditDesign", "UndoDesign", "RedoDesign"] {
         assert!(!zeron_rpc::agent_allowed(method), "{method}");

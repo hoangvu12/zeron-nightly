@@ -1371,6 +1371,9 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
     tab.app.key(zgx::input::Key::Backspace);
     tab.app.frames(2);
     assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "title", "props": { "content": "Helo" } }]));
+    // (The edit's keystrokes after its first join it: one step to undo.)
+    let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
+    assert_eq!(joins, [false, true, true]);
     tab.app.key(zgx::input::Key::Escape);
     tab.app.frames(2);
     assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());

@@ -188,6 +188,10 @@ pub struct EditParams {
     #[serde(default)]
     pub description: Option<String>,
     pub edits: Vec<HandEdit>,
+    /// Part of the latest change, if it has the same description (the
+    /// keystrokes of one text edit, one undo step).
+    #[serde(default)]
+    pub join: bool,
 }
 
 /// `NewDesign`'s params.
@@ -718,10 +722,10 @@ impl Designs {
     }
 
     /// The person's edits by hand in a Design tab (`EditDesign`), applied
-    /// together as one change (one undo step), told to its tabs as theirs:
-    /// says as [`Designs::saving`] does. An edit the Design refuses changes
-    /// nothing.
-    pub fn edit(&self, path: &Path, edits: Vec<HandEdit>, description: Option<&str>) -> Result<Value, DesignError> {
+    /// together as one change (one undo step, or part of the latest if
+    /// `join`ed and described alike), told to its tabs as theirs: says as
+    /// [`Designs::saving`] does. An edit the Design refuses changes nothing.
+    pub fn edit(&self, path: &Path, edits: Vec<HandEdit>, description: Option<&str>, join: bool) -> Result<Value, DesignError> {
         let live = self.open(path)?;
         let mut live = lock(&live);
         let mut draft = Draft::new(live.design.clone());
@@ -733,7 +737,8 @@ impl Designs {
             done.map_err(|e| DesignError::Refused(e.to_string()))?;
         }
         let edited = draft.finish();
-        live.commit(&edited, description.unwrap_or("Edit by hand"), Changer::Person)?;
+        let record = if join { History::record_joined } else { History::record };
+        live.commit_as(&edited, description.unwrap_or("Edit by hand"), Changer::Person, record)?;
         Ok(live.saving())
     }
 
@@ -1494,8 +1499,19 @@ impl Live {
     /// described as `description`: saves the file, then draws the
     /// screenshots it asked for with its assets.
     fn commit(&mut self, edited: &Edited, description: &str, by: Changer) -> Result<Vec<Value>, DesignError> {
+        self.commit_as(edited, description, by, History::record)
+    }
+
+    /// As [`Live::commit`], the step noted by `record`.
+    fn commit_as(
+        &mut self,
+        edited: &Edited,
+        description: &str,
+        by: Changer,
+        record: fn(&mut History, &str, &Design, &Design),
+    ) -> Result<Vec<Value>, DesignError> {
         let before = self.keep(edited.design.clone(), edited.changed.iter().cloned().collect(), by)?;
-        self.history.record(description, &before, &self.design);
+        record(&mut self.history, description, &before, &self.design);
         let assets = self.assets.beside(&self.folder());
         Ok(edited
             .screenshots

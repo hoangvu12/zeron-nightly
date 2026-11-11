@@ -1054,7 +1054,7 @@ impl EngineRpc {
             }
             methods::EDIT_DESIGN => {
                 let p: crate::designs::EditParams = parse_params(params)?;
-                self.design_saving(move |designs| designs.edit(&p.path, p.edits, p.description.as_deref())).await
+                self.design_saving(move |designs| designs.edit(&p.path, p.edits, p.description.as_deref(), p.join)).await
             }
             methods::UNDO_DESIGN | methods::REDO_DESIGN => {
                 let p: crate::designs::PathParams = parse_params(params)?;
