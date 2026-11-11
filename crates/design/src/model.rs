@@ -15,16 +15,19 @@ mod kept;
 mod layout;
 mod paint;
 mod rectangle;
+mod text;
 
 pub use frame::Frame;
 pub use layout::{Align, Direction, Justify, Layout, Padding, Sizing};
 pub use paint::{Color, Fill, Paint};
 pub use rectangle::Rectangle;
+pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::render::Painter;
+use crate::skia::Typesetter;
 
 /// The format version new Designs are written with.
 pub const VERSION: &str = "1.0";
@@ -167,6 +170,12 @@ pub trait NodeKind {
         false
     }
 
+    /// The size of its own content, for a type whose content isn't its
+    /// children (text), at `width` when its parent decides that.
+    fn measure(&self, _typesetter: &Typesetter, _width: Option<f32>) -> Option<[f32; 2]> {
+        None
+    }
+
     /// Draws the node itself, not its children, at its laid-out `size`
     /// with its top-left at the painter's origin.
     fn paint(&self, size: (f32, f32), painter: &mut dyn Painter);
@@ -222,6 +231,7 @@ kinds! {
     /// A container. On the Canvas itself, a Screen or a Component.
     Frame = "frame",
     Rectangle = "rectangle",
+    Text = "text",
 }
 
 /// A node of a type the model doesn't know (one a newer Zeron wrote, say):

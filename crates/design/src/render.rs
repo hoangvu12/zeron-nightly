@@ -3,8 +3,9 @@
 //! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
 //! would replace that and a painter of its own.
 
+use crate::fonts::Fonts;
 use crate::layout::LaidOut;
-use crate::model::{Design, Node, Paint};
+use crate::model::{Design, Node, Paint, Text};
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -34,6 +35,9 @@ pub trait Painter {
     fn clip_rect(&mut self, rect: Rect);
     /// Fills `rect` with each paint in turn.
     fn fill_rect(&mut self, rect: Rect, paints: &[Paint]);
+    /// Draws `text` in a box of `size` at the origin, in each of its fill's
+    /// paints in turn.
+    fn text(&mut self, text: &Text, size: (f32, f32));
 }
 
 /// Draws `node` and its descendants where `laid_out` puts them, with its
@@ -86,9 +90,10 @@ pub enum RenderError {
 
 /// Draws one node of `design` on a transparent background at 1x, or
 /// smaller when its longest side is over `max_side`, and encodes it.
-pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot, RenderError> {
+pub fn screenshot(design: &Design, id: &str, max_side: f32, fonts: &Fonts) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
-    let laid_out = LaidOut::of(design);
+    let typesetter = fonts.typesetter(design);
+    let laid_out = LaidOut::of(design, &typesetter);
     let bounds = laid_out.get(id).ok_or_else(|| RenderError::NotFound(id.into()))?.bounds;
     let (width, height) = (bounds.width, bounds.height);
     if !(width > 0. && height > 0.) {
@@ -103,7 +108,7 @@ pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas());
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas(), &typesetter);
         painter.scale(scale);
         paint_node(node, &laid_out, &mut painter);
     }

@@ -208,7 +208,8 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
             "visit",
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: Option<String>| {
                 let draft = draft.borrow();
-                let laid_out = LaidOut::of(draft.design());
+                let typesetter = draft.fonts().typesetter(draft.design());
+                let laid_out = LaidOut::of(draft.design(), &typesetter);
                 crate::read::visit(draft.design(), &laid_out, id.as_deref())
                     .map(|visited| serde_json::Value::Array(visited).to_string())
                     .map_err(|e| thrown(&ctx, e))

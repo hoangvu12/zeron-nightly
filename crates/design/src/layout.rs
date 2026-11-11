@@ -8,12 +8,16 @@
 //! fit-content children take their size, fill-container ones share what's
 //! left, and the rest is spread by `justifyContent` along the row and
 //! `alignItems` across it. Any other child sits at its x and y.
+//!
+//! Widths are settled before heights, so a node's height can follow the
+//! width it gets: text wraps at it ([`crate::model::NodeKind::measure`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::model::{Align, Design, Direction, Justify, Layout, Node, Sizing};
 use crate::render::Rect;
+use crate::skia::Typesetter;
 
 /// What a fill-container child counts for in a fit-content parent when it
 /// has no content of its own and none of its siblings gives a size.
@@ -46,6 +50,8 @@ pub enum Problem {
     /// Its size fits its content, and its children all fill it along that
     /// side, so neither can size the other.
     FitAroundFill,
+    /// Its text is taller than its height, so it overflows.
+    TextOverflow,
 }
 
 impl fmt::Display for Problem {
@@ -57,16 +63,23 @@ impl fmt::Display for Problem {
                 "fit content around children that all fill container: sized from their own content, \
                  or 100 px each without any"
             }
+            Problem::TextOverflow => "text taller than its height, overflowing it",
         })
     }
 }
 
 impl LaidOut {
-    /// Lays out the whole Design: each Canvas node at its x and y.
-    pub fn of(design: &Design) -> Self {
-        let mut pass = Pass::default();
+    /// Lays out the whole Design, its text set by `typesetter` (made for
+    /// it): each Canvas node at its x and y.
+    pub fn of(design: &Design, typesetter: &Typesetter) -> Self {
+        let mut pass = Pass {
+            typesetter,
+            measured: HashMap::new(),
+            fit_around_fill: HashSet::new(),
+            placed: HashMap::new(),
+        };
         for node in &design.children {
-            let size = pass.measure(node);
+            let size = pass.measure(node, None);
             pass.place(node, [node.x, node.y], size, None);
         }
         Self { nodes: pass.placed }
@@ -78,11 +91,13 @@ impl LaidOut {
     }
 }
 
-/// One run of the layout pass, measuring each node once.
-#[derive(Default)]
+/// One run of the layout pass, measuring each node once for each width it
+/// is given.
 struct Pass<'a> {
-    /// Each node's size where its parent leaves it to the node, by id.
-    measured: HashMap<&'a str, [f32; 2]>,
+    typesetter: &'a Typesetter,
+    /// Each node's size where its parent leaves it to the node, by id and
+    /// the width it was given (as bits).
+    measured: HashMap<(&'a str, Option<u32>), [f32; 2]>,
     /// Nodes found fitting children that all fill them.
     fit_around_fill: HashSet<&'a str>,
     placed: HashMap<String, Placed>,
@@ -118,27 +133,40 @@ fn largest(extents: impl IntoIterator<Item = f32>) -> f32 {
 impl<'a> Pass<'a> {
     /// `node`'s size when its parent doesn't decide it: fixed, or fitting
     /// its content (fill container too, with no parent's room to fill).
-    fn measure(&mut self, node: &'a Node) -> [f32; 2] {
-        if let Some(size) = self.measured.get(node.id.as_str()) {
+    /// `width` is the width its parent gives it when it fills it; its
+    /// height then fits its content at that width.
+    fn measure(&mut self, node: &'a Node, width: Option<f32>) -> [f32; 2] {
+        let sizing = sizing(node);
+        let width = match sizing[0] {
+            Sizing::Fixed(pixels) => Some(pixels),
+            Sizing::FitContent => None,
+            Sizing::FillContainer => width,
+        };
+        let key = (node.id.as_str(), width.map(f32::to_bits));
+        if let Some(size) = self.measured.get(&key) {
             return *size;
         }
-        let sizing = sizing(node);
-        let content = if sizing.iter().all(|s| matches!(s, Sizing::Fixed(_))) {
+        let content = if width.is_some() && matches!(sizing[1], Sizing::Fixed(_)) {
             [0.; 2]
         } else {
-            self.content(node, sizing)
+            self.content(node, sizing, width)
         };
-        let size = [0, 1].map(|axis| match sizing[axis] {
+        let height = match sizing[1] {
             Sizing::Fixed(pixels) => pixels,
-            Sizing::FitContent | Sizing::FillContainer => content[axis],
-        });
-        self.measured.insert(&node.id, size);
+            Sizing::FitContent | Sizing::FillContainer => content[1],
+        };
+        let size = [width.unwrap_or(content[0]), height];
+        self.measured.insert(key, size);
         size
     }
 
-    /// The size `node`'s children need, inside its padding when it lays
-    /// them out, and to reach its farthest one when it doesn't.
-    fn content(&mut self, node: &'a Node, own: [Sizing; 2]) -> [f32; 2] {
+    /// The size `node`'s content needs at `width` (when known): its own
+    /// (text's), or its children's, inside its padding when it lays them
+    /// out, and to reach its farthest one when it doesn't.
+    fn content(&mut self, node: &'a Node, own: [Sizing; 2], width: Option<f32>) -> [f32; 2] {
+        if let Some(size) = node.kind.get().measure(self.typesetter, width) {
+            return size;
+        }
         let (layout, main) = arrangement(node);
         let flow: Vec<&'a Node> = node
             .kind
@@ -146,6 +174,12 @@ impl<'a> Pass<'a> {
             .children()
             .iter()
             .filter(|child| main.is_none() || in_flow(child, main))
+            .collect();
+        let measured: Vec<[f32; 2]> = self
+            .widths(&layout, main, width, &flow)
+            .into_iter()
+            .zip(&flow)
+            .map(|(width, child)| self.measure(child, width))
             .collect();
         let mut size = [0.; 2];
         for axis in [0, 1] {
@@ -157,8 +191,8 @@ impl<'a> Pass<'a> {
                 self.fit_around_fill.insert(&node.id);
             }
             let mut extents = Vec::with_capacity(flow.len());
-            for child in &flow {
-                let mut extent = self.measure(child)[axis];
+            for (child, measured) in flow.iter().zip(&measured) {
+                let mut extent = measured[axis];
                 if all_fill && extent <= 0. {
                     extent = FILL_FALLBACK;
                 }
@@ -184,6 +218,38 @@ impl<'a> Pass<'a> {
         size
     }
 
+    /// The width each of `children` gets from a parent `width` wide (once
+    /// that's known) when it fills it: the rest of it from the child's x
+    /// without a layout, its inside across a column, and a share of what
+    /// the others leave along a row.
+    fn widths(
+        &mut self,
+        layout: &Layout,
+        main: Option<usize>,
+        width: Option<f32>,
+        children: &[&'a Node],
+    ) -> Vec<Option<f32>> {
+        let Some(width) = width else {
+            return vec![None; children.len()];
+        };
+        let [[left, right], _] = padding(layout);
+        let inner = (width - left - right).max(0.);
+        match main {
+            None => children.iter().map(|child| Some((width - child.x).max(0.))).collect(),
+            Some(1) => vec![Some(inner); children.len()],
+            Some(_) => {
+                let fills = children.iter().filter(|child| sizing(child)[0] == Sizing::FillContainer).count();
+                let mut taken = layout.gap * children.len().saturating_sub(1) as f32;
+                for child in children {
+                    if sizing(child)[0] != Sizing::FillContainer {
+                        taken += self.measure(child, None)[0];
+                    }
+                }
+                vec![Some((inner - taken).max(0.) / fills.max(1) as f32); children.len()]
+            }
+        }
+    }
+
     /// Places `node` at `origin` on the Canvas at `size`, then its children;
     /// `visible` is the part of the Canvas the Frames above it don't clip.
     fn place(&mut self, node: &'a Node, origin: [f32; 2], size: [f32; 2], visible: Option<Rect>) {
@@ -196,6 +262,11 @@ impl<'a> Pass<'a> {
         let mut problems: Vec<Problem> = visible.and_then(|visible| clipped(bounds, visible)).into_iter().collect();
         if self.fit_around_fill.contains(&node.id.as_str()) {
             problems.push(Problem::FitAroundFill);
+        }
+        if let Some([_, content]) = node.kind.get().measure(self.typesetter, Some(size[0]))
+            && content > size[1] + EPSILON
+        {
+            problems.push(Problem::TextOverflow);
         }
         self.placed.insert(node.id.clone(), Placed { bounds, problems });
 
@@ -213,12 +284,17 @@ impl<'a> Pass<'a> {
                 continue;
             }
             // At its x and y, filling the rest of its parent from there.
-            let measured = self.measure(child);
             let at = [child.x, child.y];
-            let child_size = [0, 1].map(|axis| match sizing(child)[axis] {
-                Sizing::FillContainer => (size[axis] - at[axis]).max(0.),
-                _ => measured[axis],
-            });
+            let child_sizing = sizing(child);
+            let width = match child_sizing[0] {
+                Sizing::FillContainer => (size[0] - at[0]).max(0.),
+                _ => self.measure(child, None)[0],
+            };
+            let height = match child_sizing[1] {
+                Sizing::FillContainer => (size[1] - at[1]).max(0.),
+                _ => self.measure(child, Some(width))[1],
+            };
+            let child_size = [width, height];
             self.place(child, [origin[0] + child.x, origin[1] + child.y], child_size, visible);
         }
         if let Some(main) = main {
@@ -245,28 +321,30 @@ impl<'a> Pass<'a> {
         let inner_origin = [0, 1].map(|axis| origin[axis] + padding[axis][0]);
         let inner = [0, 1].map(|axis| (size[axis] - padding[axis][0] - padding[axis][1]).max(0.));
 
-        // Sizes along the row first: fills share what the others leave.
-        let mut sizes: Vec<[f32; 2]> = Vec::with_capacity(children.len());
-        // Which of them fill along the row.
-        let mut fills = Vec::new();
-        for child in children {
-            let sizing = sizing(child);
-            let mut child_size = self.measure(child);
-            if sizing[main] == Sizing::FillContainer {
-                fills.push(sizes.len());
-                child_size[main] = 0.;
-            }
-            if sizing[cross] == Sizing::FillContainer {
-                child_size[cross] = inner[cross];
-            }
-            sizes.push(child_size);
-        }
+        // Widths first, then heights at them: along the row, fills share
+        // what the others leave; across it, they take the inside.
         let gaps = layout.gap * (children.len() - 1) as f32;
-        let taken: f32 = sizes.iter().map(|size| size[main]).sum::<f32>() + gaps;
-        if !fills.is_empty() {
-            let share = (inner[main] - taken).max(0.) / fills.len() as f32;
-            for &fill in &fills {
-                sizes[fill][main] = share;
+        let mut sizes = vec![[0.; 2]; children.len()];
+        for axis in [0, 1] {
+            // Which of them fill along the row.
+            let mut fills = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                sizes[i][axis] = match sizing(child)[axis] {
+                    Sizing::FillContainer if axis == main => {
+                        fills.push(i);
+                        0.
+                    }
+                    Sizing::FillContainer => inner[axis],
+                    _ if axis == 0 => self.measure(child, None)[0],
+                    _ => self.measure(child, Some(sizes[i][0]))[1],
+                };
+            }
+            if !fills.is_empty() {
+                let taken: f32 = sizes.iter().map(|size| size[main]).sum::<f32>() + gaps;
+                let share = (inner[main] - taken).max(0.) / fills.len() as f32;
+                for &fill in &fills {
+                    sizes[fill][main] = share;
+                }
             }
         }
         let used: f32 = sizes.iter().map(|size| size[main]).sum::<f32>() + gaps;

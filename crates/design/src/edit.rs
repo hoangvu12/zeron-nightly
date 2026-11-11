@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::fonts::Fonts;
 use crate::model::{Design, Kind, Node};
 use crate::printed::Printed;
 
@@ -32,6 +33,8 @@ pub enum EditError {
 /// One call's working copy of a Design.
 pub struct Draft {
     design: Design,
+    /// What the Design's text is set in, for reading its layout back.
+    fonts: Fonts,
     ids: HashSet<String>,
     /// Nodes made by this call, as (name, id), in order.
     created: Vec<(String, String)>,
@@ -70,6 +73,7 @@ impl Draft {
         });
         Self {
             design,
+            fonts: Fonts::default(),
             ids,
             created: Vec::new(),
             changed: BTreeSet::new(),
@@ -77,6 +81,17 @@ impl Draft {
             printed: Printed::default(),
             warnings: Vec::new(),
         }
+    }
+
+    /// The draft with its text set in `fonts` (else in the bundled font
+    /// only).
+    pub fn with_fonts(mut self, fonts: Fonts) -> Self {
+        self.fonts = fonts;
+        self
+    }
+
+    pub fn fonts(&self) -> &Fonts {
+        &self.fonts
     }
 
     /// The Design as this call has it so far.
@@ -112,7 +127,7 @@ impl Draft {
         let node: Node = serde_json::from_value(node)
             .map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
         let mut warnings = Vec::new();
-        warn_unknown(&node, &mut warnings);
+        warn_about(&node, &mut warnings);
         let siblings = match parent {
             None => &mut self.design.children,
             Some(parent) => {
@@ -215,8 +230,9 @@ impl Draft {
 }
 
 /// A warning for each property `node` and its children have that the model
-/// doesn't know (kept, but doing nothing): most often a typo.
-fn warn_unknown(node: &Node, warnings: &mut Vec<String>) {
+/// doesn't know (kept, but doing nothing): most often a typo; and for each
+/// text without a fill, which can't be seen.
+fn warn_about(node: &Node, warnings: &mut Vec<String>) {
     for property in node.unknown_properties() {
         warnings.push(format!(
             "\"{}\" ({}) has a property \"{property}\" Zeron doesn't know; it's kept, but does nothing",
@@ -224,8 +240,16 @@ fn warn_unknown(node: &Node, warnings: &mut Vec<String>) {
             node.kind.name()
         ));
     }
+    if let Kind::Text(text) = &node.kind
+        && text.fill.fill.is_empty()
+    {
+        warnings.push(format!(
+            "\"{}\" (text) has no fill, so it's invisible: give it a fill colour",
+            node.name
+        ));
+    }
     for child in node.kind.get().children() {
-        warn_unknown(child, warnings);
+        warn_about(child, warnings);
     }
 }
 

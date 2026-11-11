@@ -14,6 +14,10 @@
 //! engine also keeps which Designs each chat's Design tabs show
 //! ([`Designs::set_tabs`]), and the Designs touched most recently on this
 //! computer ([`Designs::recent`]), in `recent-designs.json`.
+//!
+//! Text is set in Google Fonts fetched on first use into `design-fonts/`
+//! in the engine's data dir, the font cache the Design tab draws from too,
+//! or in font files beside its Design ([`zeron_design::fonts`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
+use zeron_design::fonts::{Fonts, GoogleFonts};
+use zeron_design::model::Kind;
 use zeron_design::snippet::{self, Globals, Limits};
 
 /// A `.zdesign` file's extension.
@@ -109,6 +115,8 @@ struct Inner {
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
     recent_file: PathBuf,
+    /// This computer's fonts, for every Design's text.
+    fonts: Mutex<Fonts>,
 }
 
 /// One Design as the engine holds it.
@@ -144,8 +152,18 @@ impl Designs {
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
+                fonts: Mutex::new(Fonts::new(
+                    Some(data_dir.join("design-fonts")),
+                    Some(Box::new(GoogleFonts::default())),
+                )),
             }),
         }
+    }
+
+    /// Sets text in `fonts` from now on, in place of the font cache and
+    /// Google Fonts (for tests, which run offline).
+    pub fn use_fonts(&self, fonts: Fonts) {
+        *lock(&self.inner.fonts) = fonts;
     }
 
     /// The managed folder new Designs are made in.
@@ -180,13 +198,28 @@ impl Designs {
         let globals = chat
             .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
             .unwrap_or_default();
-        let (draft, globals) =
-            snippet::run(Draft::new(live.design.clone()), globals, &params.snippet, self.inner.limits)?;
-        let edited = draft.finish();
+        let fonts = lock(&self.inner.fonts).clone();
+        let fonts = match live.path.parent() {
+            Some(folder) => fonts.beside(folder),
+            None => fonts,
+        };
+        let draft = Draft::new(live.design.clone()).with_fonts(fonts.clone());
+        let (draft, globals) = snippet::run(draft, globals, &params.snippet, self.inner.limits)?;
+        let mut edited = draft.finish();
+        // Fonts the call's text couldn't get.
+        let mut texts = Vec::new();
+        edited.design.walk(&mut |node| {
+            if let Kind::Text(text) = &node.kind
+                && edited.changed.contains(&node.id)
+            {
+                texts.push(text.clone());
+            }
+        });
+        edited.warnings.extend(fonts.warnings(&texts));
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
-        let screenshots = live.commit(&edited)?;
+        let screenshots = live.commit(&edited, &fonts)?;
         if let Some(chat) = chat {
             lock(&self.inner.globals).insert(chat.to_owned(), globals);
             let version = live.version;
@@ -420,7 +453,7 @@ impl Live {
 
     /// Keeps a successful call's draft: saves the file, then draws the
     /// screenshots the call asked for.
-    fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
+    fn commit(&mut self, edited: &Edited, fonts: &Fonts) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
         self.version += 1;
@@ -432,6 +465,7 @@ impl Live {
                     &self.design,
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
+                    fonts,
                 );
                 match shot {
                     Ok(shot) => json!({
