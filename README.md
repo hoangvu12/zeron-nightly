@@ -1,40 +1,44 @@
 # Zeron nightly
 
-Nightly Windows builds of [Zeron](https://github.com/zeronsh/zeron): upstream
-`main` plus a short list of patches that aren't (yet) upstream. Installed
-nightlies update themselves from this repo's releases.
+Nightly Windows builds of [Zeron](https://github.com/zeronsh/zeron) v3, the
+zgx interface (`apps/zgx`): upstream's `zeron/zgx` branch plus a short list of
+patches that aren't (yet) upstream. Installed nightlies update themselves from
+this repo's releases.
 
-- `main` (this branch) holds only the tooling: `patches.toml`, `patches/`,
-  `rerere/`, `scripts/assemble.py` and the workflow.
-- `nightly` is generated. Every run rebuilds it from scratch, linux-next
-  style, so never base work on it. It appears once the optional push token
-  below is set; every release also attaches `nightly.bundle` with its exact
-  commits.
+The v2 nightly (upstream `main`, the `crates/ui` interface) is no longer
+built. Its old releases stay up, but get no updates.
+
+- `main` (this branch) holds only the tooling: `patches-v3.toml`, `patches/`,
+  `rerere/`, `scripts/` and the workflow.
+- `nightly-v3` is generated. Every run rebuilds it from scratch, linux-next
+  style, so never base work on it.
 
 ## How a nightly is made
 
-`.github/workflows/nightly.yml` runs at 19:00 UTC and on demand
-(Actions → nightly → Run workflow).
+`.github/workflows/nightly-v3.yml` runs at 19:30 UTC (02:30 in Vietnam) and
+on demand (Actions → nightly-v3 → Run workflow).
 
-1. `scripts/assemble.py` resets `nightly` to upstream `main` and applies each
-   enabled `[[patch]]` in order: upstream PRs at a pinned commit, patch files
-   with `git am -3`, or branches of this repo.
+1. `scripts/assemble.py` resets the tree to upstream `zeron/zgx` and applies
+   each enabled `[[patch]]` in `patches-v3.toml` in order: upstream PRs at a
+   pinned commit, patch files with `git am -3`, or branches of this repo.
 2. A patch that no longer applies is **dropped from that build** and listed in
    the release notes. The build goes on without it, unless the entry says
    `required = true`: then the run fails and nothing ships, since installs
    update to every release. Conflicts resolved once replay from `rerere/`.
 3. Upstream's own `.github/workflows` are removed (they belong to
    zeronsh/zeron), and the version becomes the next patch release's
-   prerelease: upstream `0.2.136` → `0.2.137-nightly.YYYYMMDDHHMM`. That sorts
-   above the release it was built on and below the next one.
+   prerelease: upstream `0.2.139` → `0.2.140-v3.YYYYMMDDHHMM`.
 4. If upstream and the patch list are unchanged since the last release, the
-   run stops there. Otherwise Windows builds, the updater tests run, and a
-   release `v<version>` is published with the installer, portable zip, updater
-   `.exe` and `manifest.json`. The last 14 releases are kept.
+   run stops there. Otherwise `scripts/package-v3-windows.ps1` builds
+   `zeron-zgx` with its `beta` feature (production sign-in, Zeron's own data)
+   and the engine from the same tree, and packages them with the `ui` scripts
+   as a portable zip and a per-user installer (`dist/zeron-v3.iss`). A
+   prerelease `v<version>` is published, and the `v3-latest` release's
+   installer and `manifest.json` are replaced. The last 14 releases are kept.
 
 ## Changing what goes in
 
-Edit `patches.toml`:
+Edit `patches-v3.toml`:
 
 ```toml
 [[patch]]
@@ -44,7 +48,7 @@ sha = "<full commit sha>" # the commit you reviewed; new pushes wait for you
 
 [[patch]]
 name = "local-tweak"
-file = "patches/0002-local-tweak.patch"  # git format-patch output
+file = "patches/0002-local-tweak.patch"  # git format-patch --full-index output
 
 [[patch]]
 name = "bigger-work"
@@ -53,84 +57,49 @@ branch = "work/bigger"    # a branch pushed to this repo
 
 Set `enabled = false` to park an entry. The release notes say when a pinned
 PR has new commits, is in upstream (then delete the entry) or was closed. A
-PR merged into another branch than the list's (into `main`, for the v3 list)
-is no help yet: it stays applied at its pin, and the notes say so.
+PR merged into `main` is no help yet: it stays applied at its pin until
+`zeron/zgx` takes it, and the notes say so.
+
+Make patch files with `git format-patch --full-index`: CI's clone has no
+blobs to fall back on, so `git am -3` needs the full ids.
 
 To try it locally, use a checkout dedicated to the script (it resets it):
 
 ```sh
-git clone https://github.com/zeronsh/zeron.git ../zeron-nightly-src
-python scripts/assemble.py --src ../zeron-nightly-src
+git clone https://github.com/zeronsh/zeron.git ../zeron-v3-src
+python scripts/assemble.py --src ../zeron-v3-src
+pwsh scripts/package-v3-windows.ps1 -Src ../zeron-v3-src
 ```
 
 ### When a patch conflicts
 
 1. Run `assemble.py` locally. Note which patch was dropped.
-2. In `../zeron-nightly-src`, apply that patch by hand (`git merge <sha>` or
+2. In `../zeron-v3-src`, apply that patch by hand (`git merge <sha>` or
    `git am -3 patches/...`), resolve the conflict and commit. With
    `rerere.enabled` (the script sets it) git records the resolution.
-3. `python scripts/assemble.py --src ../zeron-nightly-src --save-rerere`, then
+3. `python scripts/assemble.py --src ../zeron-v3-src --save-rerere`, then
    commit `rerere/`. Later runs replay it, locally and in CI.
 
 If the conflict is bigger than a resolution can carry, rebase the work onto
-upstream instead and point the entry at the result (a `branch` or a new pin).
+upstream instead and regenerate the patch file (or point the entry at a
+`branch` or a new pin).
 
 ## Installing a nightly
 
-The first install is by hand, because stable Zeron's updater only accepts
-plain `X.Y.Z` versions (the `windows-prerelease-versions` patch lifts that):
-
 1. Quit Zeron. Back up `%LOCALAPPDATA%\Zeron` if you want a way back.
-2. Run the latest release's `zeron-<version>-windows-x86_64-setup.exe`.
-   It installs over stable and writes `zeron-update.json` pointing here.
+2. Run the `v3-latest` release's installer. It installs to
+   `%LOCALAPPDATA%\Programs\Zeron v3` and uses `%LOCALAPPDATA%\Zeron` and the
+   engine on port 27654, as other Zeron installs do: run one app at a time.
 
-From then on Zeron updates from
-`https://github.com/hoangvu12/zeron-nightly/releases/latest/download`.
-
-**Back to stable:** run the official installer from zeronsh/zeron. It restores
-the upstream feed. A nightly may have written data a stable build doesn't
-know yet; stable catches up at its next release.
-
-## Zeron v3 nightly
-
-v3 is the zgx interface (`apps/zgx`), which upstream builds on its
-`zeron/zgx` branch. `.github/workflows/nightly-v3.yml` runs at 19:30 UTC and
-on demand. It works like the v2 nightly, with these differences:
-
-- It assembles `zeron/zgx` plus `patches-v3.toml` (`assemble.py --config
-  patches-v3.toml`). The version is `<next patch release>-v3.YYYYMMDDHHMM`.
-- `scripts/package-v3-windows.ps1` builds `zeron-zgx` with its `beta`
-  feature (production sign-in, Zeron's own data) and the engine from the same
-  tree. It packages them with the `ui` scripts as a portable zip and a
-  per-user installer (`dist/zeron-v3.iss`).
-- Releases are prereleases and never the latest, so v2 installs never see
-  them. Each keeps its own last 14.
-- It installs to `%LOCALAPPDATA%\Programs\Zeron v3`, next to v2. Both share
-  `%LOCALAPPDATA%\Zeron` and the engine on port 27654. v3 uses an engine that
-  already runs, so run one app at a time to be safe.
-- v3 installs update themselves from the `v3-latest` release. Each run
-  replaces its installer and `manifest.json` there. The app downloads that
-  installer and runs it silently over its folder, since swapping `zeron.exe`
-  alone would leave `ui` and the engine behind (`patches/0005`). The engine
-  restarts into the new one once it is idle.
-
-To try it locally, use a separate checkout from the v2 one:
-
-```sh
-git clone https://github.com/zeronsh/zeron.git ../zeron-v3-src
-python scripts/assemble.py --src ../zeron-v3-src --config patches-v3.toml
-pwsh scripts/package-v3-windows.ps1 -Src ../zeron-v3-src
-```
-
-## Optional: publish the `nightly` branch
-
-GitHub's built-in token cannot push commits that touch workflow files, and
-upstream's history has plenty. To publish the branch, add a fine-grained token
-scoped to this repo with **Contents: read and write** and **Workflows: read
-and write** as the secret `NIGHTLY_PUSH_TOKEN`.
+From then on it updates itself from the `v3-latest` release: the app
+downloads that installer and runs it silently over its folder, since swapping
+`zeron.exe` alone would leave `ui` and the engine behind (`patches/0005`).
+The engine restarts into the new one once it is idle.
 
 ## Notes
 
 - GitHub disables scheduled workflows in a repo with no activity for 60 days.
   Any commit here (a patch-list change) resets that.
 - Builds are unsigned, so Windows SmartScreen may warn on the installer.
+- Releases are prereleases and never the latest: old v2 installs follow
+  `releases/latest`, and must not update into a v3 build.

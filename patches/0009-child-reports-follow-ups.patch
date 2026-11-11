@@ -1,0 +1,1212 @@
+From cfda913ad1f716dccf8c8f64c716524e41843981 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 11 Nov 2026 09:39:39 +0700
+Subject: [PATCH] engine: child reports cover follow-up turns, thanks and
+ handoffs
+
+Real use of child reports (twenty parent chats over three days) found
+where they went wrong, and this fixes each.
+
+A child that ended its turn while its tests built, or with a timer or a
+poll set, was reported finished, and the turn its runtime started on its
+own later was lost: each message from the parent had one report of its
+end. Now a later turn on the same message reports again, as a follow-up
+keyed by its last answer, when it has something to say. A report says
+what the child left running in its background, and the still-working
+note lists a reported child whose background still runs.
+
+A child that sent its result with send_message and then said it again as
+its final reply was reported twice; the report now says the reply repeats
+that message instead of the words. Parents thanked each report, and each
+thanks woke the child for an "ok, stopping" that came back as another
+report: report headers say no reply is needed, the instructions say
+reports need no thanks and a child's result goes in its final reply, and
+a short, tool-free answer to the parent's short thanks is kept in the
+parent's ledger (-quiet) without waking its agent.
+
+The still-working note no longer says "sent, not started" of a child on
+another device whose copy here hasn't caught up (the row's last outcome
+counts however stale), leaves out a chat the person has taken over,
+names five children with how each stands and counts the rest, and only
+names them when they're the ones its last note listed.
+
+After a handoff, children kept reporting to the archived orchestrator,
+and standalone chats kept waking their archived creator. An agent's
+message to an archived chat (not its own child) is now refused, and a
+child whose parent is archived or gone becomes the child of the next
+parentless chat that writes to it. A result a create_chat(s) wait
+returned isn't reported again, hours later or from another device.
+
+A Stop an agent sends says which chat sent it, so another chat's Stop
+isn't read as the person's; a turn Zeron cut off (a restart) says so
+rather than "the person stopped it", and is reported failed when found
+on the next start; a Stop the person sends before writing to the child
+themselves says they stepped in. A report that came in after the person
+stopped the parent sat in its paused queue until they wrote again; it now
+wakes the parent, the person's own queued messages still paused. A
+report too long is cut at a paragraph.
+
+send_message asks a busy engine for its snapshots twice before giving
+up, and says the message was not sent and is safe to retry.
+---
+ crates/doc/src/registry.rs           |  14 +
+ crates/engine/src/doc_host.rs        |  37 ++-
+ crates/engine/src/rpc/agent_gate.rs  |  92 +++++-
+ crates/engine/src/session_reports.rs | 423 ++++++++++++++++++++++++---
+ crates/engine/src/sessions.rs        | 146 ++++++++-
+ crates/engine/src/workspace_host.rs  |   5 +
+ crates/mcp/src/jsonrpc.rs            |   5 +
+ crates/mcp/src/tools.rs              |   7 +-
+ crates/mcp/src/zeron.rs              |  22 +-
+ crates/proto/src/agent_messages.rs   |  15 +-
+ docs/mcp.md                          |  14 +
+ 11 files changed, 707 insertions(+), 73 deletions(-)
+
+diff --git a/crates/doc/src/registry.rs b/crates/doc/src/registry.rs
+index dae15f24cd16ce84d4af2529453e6640a799ab7f..8843d83281eac98fa80cf0d92feadb15d6bac9db 100644
+--- a/crates/doc/src/registry.rs
++++ b/crates/doc/src/registry.rs
+@@ -1453,6 +1453,20 @@ impl RegistryDoc {
+         Ok(true)
+     }
+ 
++    /// The chat that made `chat_id` (its reports go there), now `parent`.
++    pub fn set_chat_parent(&mut self, chat_id: &str, parent: &str) -> Result<bool, DocError> {
++        if !self.row_exists(KIND_CHATS, chat_id) {
++            return Ok(false);
++        }
++        self.write(
++            KIND_CHATS,
++            chat_id,
++            OpKind::Update,
++            fields([("parentChatId", json!(parent))]),
++        );
++        Ok(true)
++    }
++
+     pub fn set_chat_archived(&mut self, chat_id: &str, archived: bool) -> Result<bool, DocError> {
+         if !self.row_exists(KIND_CHATS, chat_id) {
+             return Ok(false);
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index 4bae060738b1a20ac8fe8828ee6f7c5646168109..41db7a8be2b266ddced82a3c3f1a43cc52486c53 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -4663,13 +4663,23 @@ impl DocHost {
+         // unnecessary while it waited simply finds nothing to do.
+         let _drain = handle.drain_lock.lock().await;
+         self.thaw_recovered_queue(handle, &sessions);
+-        if handle.queue_paused.load(Ordering::Acquire) {
++        // A Stop pauses the queue, but it ended the agent's turn, not its
++        // children's work: their reports that came in since still go (and
++        // only they: the person's own rows wait for the person).
++        let paused = handle.queue_paused.load(Ordering::Acquire);
++        if paused && !self.reports_since_stop(handle) {
++            if self.holds_report(handle) {
++                tracing::info!(chat = %handle.chat_id, "held reports wait: the queue is paused by a Stop");
++            }
+             return;
+         }
+         loop {
+             let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
+                 return;
+             };
++            if paused && !held_report_row(&head) {
++                return;
++            }
+             match &head.delivery_gate {
+                 Some(QueueDeliveryGate::Editing {
+                     lease_id,
+@@ -6209,6 +6219,11 @@ impl DocHost {
+                     if message_id.ends_with(crate::sessions::REPORT_WAITED) {
+                         return Ok((SessionCommandStatus::Applied, Some("its wait returned it".into())));
+                     }
++                    // A thanks answered: the child's chat keeps it, the
++                    // agent here needn't read it.
++                    if message_id.ends_with(crate::sessions::REPORT_QUIET) {
++                        return Ok((SessionCommandStatus::Applied, Some("an answer to a thanks".into())));
++                    }
+                     // Sent again (a restart, a retry): it's here already.
+                     let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
+                         c.id != entry.id
+@@ -6616,6 +6631,26 @@ impl DocHost {
+         });
+     }
+ 
++    /// The queue opens with children's reports that came in after the latest
++    /// Stop sent to this chat (see [`Self::drain_queue`]).
++    fn reports_since_stop(&self, handle: &Arc<ChatDocHandle>) -> bool {
++        let Ok(queue) = handle.doc.read_queue() else {
++            return false;
++        };
++        let Some(head) = queue.first().filter(|row| held_report_row(row)) else {
++            return false;
++        };
++        let stopped = handle
++            .doc
++            .read_commands()
++            .unwrap_or_default()
++            .iter()
++            .filter(|c| matches!(c.payload, SessionCommandPayload::Interrupt { .. }))
++            .map(|c| c.issued_at)
++            .max();
++        stopped.is_none_or(|at| head.issued_at > at)
++    }
++
+     /// The chat holds a child's report in its queue (see [`Self::hold_report`]).
+     fn holds_report(&self, handle: &Arc<ChatDocHandle>) -> bool {
+         handle
+diff --git a/crates/engine/src/rpc/agent_gate.rs b/crates/engine/src/rpc/agent_gate.rs
+index 6a64539f0e0d84386223feb723d51ed4e2ba7b11..19151a587b9f4667b50215e2045a70ab720eb916 100644
+--- a/crates/engine/src/rpc/agent_gate.rs
++++ b/crates/engine/src/rpc/agent_gate.rs
+@@ -85,8 +85,42 @@ impl EngineRpc {
+         if !matches!(method, methods::MUTATE | methods::QUEUE_MESSAGE | methods::QUEUE_COMMAND) {
+             return Ok(params);
+         }
+-        let chats = self.workspace.read_chats().unwrap_or_default();
++        let mut chats = self.workspace.read_chats().unwrap_or_default();
+         let calling = chat.as_deref().map(|id| self.calling(id, &chats));
++        // What it writes into a chat to be read (not a Stop, not an answer).
++        let writes = method == methods::QUEUE_MESSAGE
++            || (method == methods::QUEUE_COMMAND && matches!(params["command"]["kind"].as_str(), Some("run" | "steer")));
++        if writes && let Some(c) = calling.as_ref() {
++            let target_id = params["chatId"].as_str().unwrap_or_default();
++            if let Some(at) = chats.iter().position(|t| t.id == target_id && t.id != c.id) {
++                let target = &chats[at];
++                // A chat put away (handed off, or done) isn't listening: a
++                // message there would only wake it. Its own parent may.
++                if target.archived && target.parent_chat_id.as_deref() != Some(c.id.as_str()) {
++                    return Err(refused(format!(
++                        "{} is archived, so nobody reads it there: nothing was sent. If it made you, your final reply is your report; nothing else needs sending.",
++                        label(Some(target), target_id)
++                    )));
++                }
++                // A child whose parent is archived (or gone) belongs to the
++                // chat that asks it something next: after a handoff, the new
++                // orchestrator hears its reports, not the one put away. Only
++                // a chat that is no one's child can take it (one level deep).
++                let orphaned = target.parent_chat_id.as_deref().is_some_and(|p| {
++                    p != c.id && chats.iter().find(|x| x.id == p).is_none_or(|x| x.archived)
++                });
++                let free = chats.iter().find(|x| x.id == c.id).is_some_and(|x| x.parent_chat_id.is_none());
++                if orphaned && free {
++                    match self.workspace.set_chat_parent(target_id, &c.id) {
++                        Ok(_) => {
++                            tracing::info!(chat = %target_id, parent = %c.id, "agents: a chat whose parent was put away has a new one");
++                            chats[at].parent_chat_id = Some(c.id.clone());
++                        }
++                        Err(error) => tracing::warn!(chat = %target_id, %error, "agents: couldn't hand a chat to its new parent"),
++                    }
++                }
++            }
++        }
+         // A parent's message tells its child the reply comes back on its
+         // own; a child's to its parent is a report, held and joined with
+         // its siblings' while the parent works (`DocHost::hold_report`).
+@@ -178,11 +212,12 @@ impl EngineRpc {
+                         let prompt = command["prompt"].as_str().unwrap_or_default();
+                         command["prompt"] = json!(attributed(&target_id, prompt));
+                     }
+-                    // A parent stopping its own child hears nothing back of
+-                    // the turn it stopped: the Stop says who made it, in the
+-                    // child's doc, so the child's host knows on any device.
++                    // The Stop says which chat's agent made it, in the
++                    // child's doc, so the child's host knows on any device:
++                    // its parent hears nothing back of the turn it stopped,
++                    // and one another chat stopped isn't read as the person's.
+                     "interrupt" => {
+-                        if let Some(c) = calling.as_ref().filter(|c| parent_of(&target_id) == Some(c.id.as_str())) {
++                        if let Some(c) = calling.as_ref() {
+                             command["stoppedBy"] = json!(c.id);
+                         }
+                     }
+@@ -459,6 +494,53 @@ mod tests {
+         core.sessions.shutdown().await;
+     }
+ 
++    /// After a handoff: an agent's message to an archived chat is refused
++    /// (it would only wake it), unless it's that chat's parent; a child of
++    /// an archived parent goes to the next chat that asks it something; and
++    /// a Stop says which chat made it, whoever's child it stopped.
++    #[tokio::test]
++    async fn after_a_handoff_the_new_orchestrator_has_the_children() {
++        let (_temp, core) = core().await;
++        chat(&core, "old", "Old lead", "workspace-write", "full-access").await;
++        chat(&core, "new", "New lead", "workspace-write", "full-access").await;
++        let rpc = core.rpc_service();
++        rpc.handle(
++            methods::MUTATE,
++            json!({"op":"createChat", "chatId":"kid", "deviceId":core.device_id, "parentChatId":"old",
++                "config":{"harness":"codex","sandbox":"workspace-write","access":"full-access"}}),
++        )
++        .await
++        .unwrap();
++        let rpc = &rpc;
++        let send = |from: &'static str, to: &'static str| {
++            with_caller(agent(from), async move {
++                rpc.agent_gate(methods::QUEUE_MESSAGE, json!({"chatId": to, "text": "Status?"}))
++            })
++        };
++        // While its parent works, a stranger's message leaves it be.
++        send("new", "kid").await.unwrap();
++        assert_eq!(core.workspace.chat("kid").unwrap().unwrap().parent_chat_id.as_deref(), Some("old"));
++
++        core.workspace.set_chat_archived("old", true).unwrap();
++        let refused = send("kid", "old").await.unwrap_err();
++        assert!(refused.to_string().contains("archived"), "{refused}");
++        let gated = send("new", "kid").await.unwrap();
++        assert_eq!(core.workspace.chat("kid").unwrap().unwrap().parent_chat_id.as_deref(), Some("new"));
++        assert!(gated["text"].as_str().unwrap().contains("Your reply reaches it on its own"), "{gated}");
++
++        // An archived child still hears from its own parent.
++        core.workspace.set_chat_archived("kid", true).unwrap();
++        send("new", "kid").await.unwrap();
++
++        let stop = with_caller(agent("kid"), async {
++            rpc.agent_gate(methods::QUEUE_COMMAND, json!({"chatId":"new", "command":{"kind":"interrupt"}}))
++        })
++        .await
++        .unwrap();
++        assert_eq!(stop["command"]["stoppedBy"], "kid");
++        core.sessions.shutdown().await;
++    }
++
+     /// An agent says what its OWN chat waits on: whatever chat it names, the
+     /// mark is pinned to the one its MCP server runs in; one that runs in
+     /// none can't mark any. Sleep is the person's: no agent sets it.
+diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
+index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..78e389e03efd749b4118efe6a31e6588152930d0 100644
+--- a/crates/engine/src/session_reports.rs
++++ b/crates/engine/src/session_reports.rs
+@@ -47,9 +47,14 @@ const REPORT_CAP: usize = 16 * 1024;
+ /// What each child has reported, in memory on its host: the parent's
+ /// message its latest reports answered, and which of them went (its end, and
+ /// each question it asked on the way). A turn settles through several status
+-/// writes; this is what makes it one report.
++/// writes; this is what makes it one report. Also, by parent, the children
++/// its last note named as still working ([`roster`]), so an unchanged list
++/// isn't spelled out again.
+ #[derive(Default)]
+-pub(super) struct Reported(Mutex<HashMap<String, (String, HashSet<String>)>>);
++pub(super) struct Reported(
++    Mutex<HashMap<String, (String, HashSet<String>)>>,
++    Mutex<HashMap<String, Vec<String>>>,
++);
+ 
+ impl Reported {
+     /// Claim `stage` of the report on `message` for `child`: false when it
+@@ -73,8 +78,28 @@ impl Reported {
+             entry.1.remove(stage);
+         }
+     }
++
++    /// Note `names` as the children `parent`'s latest note lists: whether
++    /// they're the ones its last note listed.
++    fn same_roster(&self, parent: &str, names: Vec<String>) -> bool {
++        lock(&self.1).insert(parent.to_owned(), names.clone()).is_some_and(|last| last == names)
++    }
+ }
+ 
++/// What a report's key ends on when it's a short answer, with no tool used,
++/// to the parent's short word after an earlier report (an "ok, stopping" to
++/// a "thanks, that's all"): kept in the ledger, never read by its agent, so a
++/// thanks starts no round of them. Its chat keeps it for the person.
++pub(crate) const QUIET: &str = "-quiet";
++
++/// How a follow-up report opens: the end of a turn the child started on its
++/// own, after the parent heard the end of its work on that message.
++const FOLLOW_UP: &str =
++    "(Follow-up: a turn it started on its own after its last report to you, woken by its background work or a timer.)";
++
++/// How long an exchange may be, each side, and still be a mere thanks.
++const QUIET_CHARS: usize = 300;
++
+ /// How close before a turn's settle a Stop must have been sent to be the
+ /// one that ended it.
+ const STOP_SETTLE_MS: i64 = 60 * 1000;
+@@ -134,15 +159,14 @@ pub(super) async fn report_turn_end(
+             commands
+                 .iter()
+                 .filter(|c| matches!(c.payload, SessionCommandPayload::Interrupt { .. }))
+-                .map(|c| c.issued_at)
+-                .filter(|&at| at <= settled_at && settled_at - at <= STOP_SETTLE_MS)
+-                .max()
++                .filter(|c| c.issued_at <= settled_at && settled_at - c.issued_at <= STOP_SETTLE_MS)
++                .max_by_key(|c| c.issued_at)
+         })
+         .flatten();
+     // A stopped turn answered what was sent before its Stop (strictly: one
+     // sent in the same millisecond came with it, not before): the parent's
+     // next message, sent after it, may be in already, its turn not begun.
+-    let cut = stop.map_or(settled_at, |at| at - 1);
++    let cut = stop.map_or(settled_at, |c| c.issued_at - 1);
+     let Some(at) = request_for_turn(&entries, &parent, cut) else {
+         return; // the person's chat alone, or another chat's
+     };
+@@ -153,12 +177,29 @@ pub(super) async fn report_turn_end(
+         .iter()
+         .position(|e| e.role == MessageRole::User && from_parent(&text_of(&e.parts), &parent))
+         .map_or(after, |next| &after[..next]);
++    // The parent heard an end of this work already. A later turn the child
++    // started on its own (background work it left running, a timer, a poll
++    // woke it) is news, reported as a follow-up keyed by its last answer;
++    // the same turn settling again is not, nor a turn the person started.
++    let follow_up = last_end_report(&host, &parent, &child, &asked)
++        .filter(|_| status != ReportStatus::NeedsInput)
++        .and_then(|heard| {
++            let last = after.iter().rev().find(|e| e.role == MessageRole::Assistant)?;
++            let person_since = after.iter().any(|e| e.role == MessageRole::User && e.created_at > heard);
++            (last.created_at > heard && !person_since).then(|| last.id.clone())
++        });
++    if follow_up.is_some() && reply_body(after, status).is_empty() {
++        return; // woke, and had nothing to say
++    }
+     let stage = match status {
+         ReportStatus::NeedsInput => match open_question(after) {
+             Some((request_id, _)) => format!("ask:{request_id}"),
+             None => return,
+         },
+-        _ => end_stage(status).to_owned(),
++        _ => match &follow_up {
++            Some(answer) => format!("{}:{answer}", end_stage(status)),
++            None => end_stage(status).to_owned(),
++        },
+     };
+     // A stop that hands the turn to a message already on its way (the
+     // person's "send now") is no end: that message's turn reports. A Stop
+@@ -202,38 +243,119 @@ pub(super) async fn report_turn_end(
+     {
+         tracing::info!(chat = %child, %parent, "parent is waiting on its child: its wait has the reply");
+         key.push_str(WAITED);
++    } else if first_turn
++        && follow_up.is_none()
++        && status != ReportStatus::NeedsInput
++        && host
++            .open(&parent)
++            .is_ok_and(|doc| create_returned(&doc.doc().read_entries().unwrap_or_default(), &child))
++    {
++        // The `create_chat(s)` wait that made it returned this turn's reply
++        // already, maybe hours ago, maybe on another device.
++        tracing::info!(chat = %child, %parent, "its parent's create wait returned the reply");
++        key.push_str(WAITED);
+     }
++    // What the child sent its parent itself on the way, with `send_message`.
++    let sent: Vec<String> = with_inputs(&journal, &child, after.to_vec())
++        .iter()
++        .flat_map(|e| &e.parts)
++        .filter_map(|p| match p {
++            MessagePart::Tool { call, .. } => agent_messages::outgoing_messages(call),
++            _ => None,
++        })
++        .flatten()
++        .filter(|m| agent_messages::resolve_chat_key(&m.chat, &keys) == Some(parent.as_str()))
++        .map(|m| m.text)
++        .collect();
+     let body = match status {
+         ReportStatus::NeedsInput => question_body(after, &child),
+         // What it wrote is from before the stop, however sure of itself it
+-        // sounds. Only a Stop nobody's agent sent is the person's.
++        // sounds. Only a Stop nobody's agent sent is the person's; with no
++        // Stop at all, Zeron cut the run (it stopped, or restarted).
+         ReportStatus::Stopped => {
+             let reply = reply_body(after, status);
+-            let by_person = commands.iter().any(|c| {
++            let by = stop.map(|c| match &c.payload {
++                SessionCommandPayload::Interrupt { stopped_by } => stopped_by.clone(),
++                _ => None,
++            });
++            // The person wrote to it themselves since the parent's message:
++            // they stepped in, and it works for them now.
++            let person_wrote = commands.iter().any(|c| {
+                 c.issued_at >= entries[at].created_at
+-                    && matches!(c.payload, SessionCommandPayload::Interrupt { stopped_by: None })
++                    && match &c.payload {
++                        SessionCommandPayload::Run { request, .. } => typed(&request.prompt),
++                        SessionCommandPayload::Steer { prompt, .. } => typed(prompt),
++                        _ => false,
++                    }
+             });
+-            let said = match (by_person, reply.is_empty()) {
+-                (true, true) => "The person stopped it before it wrote anything.".to_owned(),
+-                (true, false) => {
+-                    format!("The person stopped it. What it wrote before the Stop, possibly unfinished:\n\n{reply}")
++            let what = match by {
++                Some(None) if person_wrote => {
++                    "The person stepped in: they stopped it and wrote to it themselves, so it works for them now."
++                        .to_owned()
+                 }
+-                (false, true) => "Its turn was cut off before it wrote anything.".to_owned(),
+-                (false, false) => {
+-                    format!("Its turn was cut off before it finished. What it wrote, possibly unfinished:\n\n{reply}")
++                Some(None) => "The person stopped it.".to_owned(),
++                Some(Some(by)) => {
++                    let row = chats.iter().find(|c| c.id == by);
++                    format!("Chat {} stopped it.", crate::rpc::agent_gate::label(row, &by))
+                 }
++                None => "Zeron cut its run off (it stopped or restarted).".to_owned(),
++            };
++            let said = if reply.is_empty() {
++                format!("{what} It hadn't written anything yet.")
++            } else {
++                format!("{what} What it wrote before that, possibly unfinished:\n\n{reply}")
+             };
+             capped(said, &child)
+         }
+         _ => {
+             let mut reply = reply_body(after, status);
++            if status == ReportStatus::Finished && sent.iter().any(|text| repeats(&reply, text)) {
++                reply = "(Its final reply repeats the message it sent you with `send_message` during this turn: not repeated here.)"
++                    .to_owned();
++            } else if reply.is_empty() {
++                reply = "(It ended its turn without writing a reply.)".to_owned();
++            }
++            if follow_up.is_some() {
++                reply = format!("{FOLLOW_UP}\n\n{reply}");
++            }
+             // Cut off by the engine going down, found on its next start.
+             if after.last().is_some_and(|e| e.status == Some(MessageStatus::Aborted)) {
+-                reply.push_str("\n\n(Its run was cut off when the engine stopped, before it finished.)");
++                reply.push_str("\n\n(Zeron cut its run off when it stopped or restarted, before it finished.)");
++            }
++            // Work it left running, which may wake it again.
++            let background = host
++                .sessions()
++                .and_then(|engine| engine.local_sessions().into_iter().find(|s| s.chat_id == child))
++                .map(|s| s.background_tasks)
++                .unwrap_or_default();
++            if !background.is_empty() {
++                let now = Utc::now();
++                let tasks: Vec<String> = background
++                    .iter()
++                    .map(|t| {
++                        let what = t.description.as_deref().unwrap_or(&t.command);
++                        format!("{} ({})", one_line(what, 80), ago((now - t.started_at).num_milliseconds()))
++                    })
++                    .collect();
++                reply.push_str(&format!(
++                    "\n\n(Still running in its background: {}. If that wakes it, its next turn reports to you as a follow-up.)",
++                    tasks.join("; ")
++                ));
+             }
+             capped(reply.trim().to_owned(), &child)
+         }
+     };
++    // A short, tool-free answer to the parent's short word after an
++    // earlier report: a thanks answered, kept from the parent's agent.
++    if !key.ends_with(WAITED)
++        && status == ReportStatus::Finished
++        && follow_up.is_none()
++        && background_free(&host, &child)
++        && acknowledges(&host, &parent, &child, &entries[at], after)
++    {
++        tracing::info!(chat = %child, %parent, "a short answer to a thanks: kept from the parent's agent");
++        key.push_str(QUIET);
++    }
+     let label = crate::rpc::agent_gate::label(Some(&row), &child);
+     let text = agent_messages::child_report(&label, &child, status, &body);
+     let Some(request) = host.request_from_chat_row(&parent, &text) else {
+@@ -306,12 +428,18 @@ pub(super) fn owed_on_boot(host: &DocHost, running: impl Fn(&str) -> bool) -> Ve
+             if stopped_by_parent(&commands, &parent, since) {
+                 return None;
+             }
+-            let stopped = commands
+-                .iter()
+-                .any(|c| c.issued_at >= since && matches!(c.payload, SessionCommandPayload::Interrupt { .. }));
+-            let failed = last.status == Some(MessageStatus::Aborted)
+-                || last.parts.iter().any(|p| matches!(p, MessagePart::Error { .. }));
+-            let status = if stopped {
++            // A Stop ended it only when sent shortly before it ended; one
++            // cut off by the engine going down failed, and says why.
++            let ended = last.created_at + last.duration_ms.unwrap_or(0);
++            let stopped = commands.iter().any(|c| {
++                c.issued_at >= since
++                    && c.issued_at <= ended + STOP_SETTLE_MS
++                    && ended - c.issued_at <= STOP_SETTLE_MS
++                    && matches!(c.payload, SessionCommandPayload::Interrupt { .. })
++            });
++            let cut_off = last.status == Some(MessageStatus::Aborted);
++            let failed = cut_off || last.parts.iter().any(|p| matches!(p, MessagePart::Error { .. }));
++            let status = if stopped && !cut_off {
+                 ReportStatus::Stopped
+             } else if open_question(after).is_some() {
+                 ReportStatus::NeedsInput
+@@ -361,12 +489,13 @@ pub(super) fn children_on(host: &DocHost, parent: &str, local: &[Session]) -> Ve
+             };
+             let doc = handle.doc();
+             let entries = doc.read_entries().unwrap_or_default();
+-            if on_its_way(host, &doc.read_commands().unwrap_or_default(), &entries, parent, &child.id, session) {
++            let last_row = session.or_else(|| last_row_of(child, &remote));
++            if on_its_way(host, &doc.read_commands().unwrap_or_default(), &entries, parent, &child.id, last_row) {
+                 return true;
+             }
+             working
+-                && request_message(&entries, parent)
+-                    .is_some_and(|at| !delivered(host, parent, &child.id, &entries[at], "end"))
++                && parents_turn(&entries, parent)
++                    .is_some_and(|at| !reported_done(host, parent, &child.id, &entries[at], session))
+         })
+         .map(|child| WaitingOn {
+             id: child.id.clone(),
+@@ -458,7 +587,8 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+     let remote = ws.read_sessions().unwrap_or_default();
+     let now = Utc::now();
+     let journal = host.sessions().map(|engine| engine.inner.journal.clone());
+-    let open: Vec<String> = ws
++    let since = |ms: i64| ago(now.timestamp_millis() - ms);
++    let open: Vec<(String, String)> = ws
+         .read_chats()
+         .unwrap_or_default()
+         .iter()
+@@ -472,27 +602,47 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+                 .map(str::trim)
+                 .filter(|t| !t.is_empty())
+                 .map_or_else(|| child.id.chars().take(8).collect(), str::to_owned);
++            let line = |facts: String| Some((label.clone(), format!("{label} ({facts})")));
+             let commands = doc.read_commands().unwrap_or_default();
+             if commands
+                 .iter()
+                 .any(|c| c.status == SessionCommandStatus::Pending && matches!(c.payload, SessionCommandPayload::Interrupt { .. }))
+             {
+-                return Some(format!("{label} (stop requested)"));
++                return line("stop requested".into());
+             }
+             let entries = doc.read_entries().unwrap_or_default();
+             let session = session_of(host, child, local, &remote, now);
+-            if on_its_way(host, &commands, &entries, parent, &child.id, session) {
+-                return Some(format!("{label} (sent, not started)"));
++            let last_row = session.or_else(|| last_row_of(child, &remote));
++            if on_its_way(host, &commands, &entries, parent, &child.id, last_row) {
++                // This device's copy of another device's chat can lag: not
++                // seen started isn't not started.
++                return line(if child.device_id == host.device_id() {
++                    "sent, not started".into()
++                } else {
++                    match last_row {
++                        Some(row) => format!("sent; its device last heard from {} ago", since(row.updated_at.timestamp_millis())),
++                        None => "sent; no word from its device yet".into(),
++                    }
++                });
+             }
+-            let at = request_message(&entries, parent)?;
+-            if delivered(host, parent, &child.id, &entries[at], "end")
+-                || stopped_by_parent(&commands, parent, entries[at].created_at)
+-            {
++            // A chat the person has taken over works for them, not here.
++            let at = parents_turn(&entries, parent)?;
++            if stopped_by_parent(&commands, parent, entries[at].created_at) {
+                 return None;
+             }
+-            let asked = entries[at].created_at;
+-            let since = |ms: i64| ago(now.timestamp_millis() - ms);
+-            let mut facts = vec![format!("asked {} ago", since(asked))];
++            if reported_done(host, parent, &child.id, &entries[at], session) {
++                // Reported, but what it left running may wake it again.
++                let tasks = session.map(|s| s.background_tasks.as_slice()).unwrap_or_default();
++                let oldest = tasks.iter().map(|t| t.started_at.timestamp_millis()).min()?;
++                let first = tasks[0].description.as_deref().unwrap_or(&tasks[0].command);
++                let more = if tasks.len() > 1 { format!(" and {} more", tasks.len() - 1) } else { String::new() };
++                return line(format!(
++                    "reported; its background still runs: {}{more}, for {}",
++                    one_line(first, 60),
++                    since(oldest)
++                ));
++            }
++            let mut facts = vec![format!("asked {} ago", since(entries[at].created_at))];
+             match session {
+                 Some(s) if s.status == SessionStatus::AwaitingInput => facts.insert(0, "waiting on an answer".into()),
+                 Some(s) if s.status == SessionStatus::Working || s.waiting.is_some() => {
+@@ -503,21 +653,65 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+                 Some(_) => return None,
+                 None => {
+                     // A row from another device gone quiet: the last of it.
+-                    let last = remote
+-                        .iter()
+-                        .find(|s| s.chat_id == child.id && s.device_id == child.device_id)
++                    let last = last_row_of(child, &remote)
+                         .filter(|s| matches!(s.status, SessionStatus::Working | SessionStatus::AwaitingInput))?;
+                     facts.push(format!("its device last heard from {} ago", since(last.updated_at.timestamp_millis())));
+                 }
+             }
+-            Some(format!("{label} ({})", facts.join(", ")))
++            line(facts.join(", "))
+         })
+         .collect();
+     if open.is_empty() {
+-        "No child is working for you now.".into()
+-    } else {
+-        format!("Still working for you: {}. Their reports reach you on their own.", open.join("; "))
++        return "No child is working for you now.".into();
++    }
++    let names: Vec<String> = open.iter().map(|(name, _)| name.clone()).collect();
++    let same = host
++        .sessions()
++        .is_some_and(|engine| engine.inner.reported.same_roster(parent, names.clone()));
++    let more = |shown: usize| {
++        if open.len() > shown {
++            format!(" and {} more (the Zeron `list_chats` tool with parent {parent} lists them all)", open.len() - shown)
++        } else {
++            String::new()
++        }
++    };
++    if same {
++        // Said in full in the last note: only who, not again how each is.
++        let shown = names.len().min(ROSTER_NAMED * 2);
++        return format!(
++            "Still working for you, as in the last note: {}{}.",
++            names[..shown].join(", "),
++            more(shown)
++        );
+     }
++    let shown = open.len().min(ROSTER_NAMED);
++    let lines: Vec<&str> = open[..shown].iter().map(|(_, line)| line.as_str()).collect();
++    format!(
++        "Still working for you: {}{}. Their reports reach you on their own.",
++        lines.join("; "),
++        more(shown)
++    )
++}
++
++/// How many children a note describes, each with how it stands; past them
++/// it counts the rest.
++const ROSTER_NAMED: usize = 5;
++
++/// `child`'s latest row from its device, however old: what it last said of
++/// itself (a turn's outcome stays true when the row goes stale).
++fn last_row_of<'a>(child: &Chat, remote: &'a [Session]) -> Option<&'a Session> {
++    remote.iter().find(|s| s.chat_id == child.id && s.device_id == child.device_id)
++}
++
++/// Where the parent's latest message sits in `entries` (see
++/// [`request_message`]), while the child's latest turn is still the
++/// parent's: none once the person wrote to it since, taking it over.
++fn parents_turn(entries: &[SessionMessageEntry], parent: &str) -> Option<usize> {
++    let at = request_message(entries, parent)?;
++    let person_since = entries[at + 1..]
++        .iter()
++        .any(|e| e.role == MessageRole::User && typed(&text_of(&e.parts)));
++    (!person_since).then_some(at)
+ }
+ 
+ /// A span of milliseconds as a person says it.
+@@ -660,7 +854,10 @@ fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEn
+         let SessionCommandPayload::Run { request, message_id } = &c.payload else {
+             return false;
+         };
+-        if message_id.strip_prefix(key.as_str()).is_some_and(|rest| rest.is_empty() || rest == WAITED) {
++        if message_id
++            .strip_prefix(key.as_str())
++            .is_some_and(|rest| rest.is_empty() || rest == WAITED || rest == QUIET)
++        {
+             return true;
+         }
+         let ends = |status: ReportStatus| match stage {
+@@ -675,6 +872,132 @@ fn delivered(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEn
+     })
+ }
+ 
++/// When `parent`'s ledger got the latest report of a turn of `child`'s
++/// ending on its message `asked` (finished, failed or stopped, a follow-up's
++/// too), as the child's host stamped it.
++fn last_end_report(host: &DocHost, parent: &str, child: &str, asked: &str) -> Option<i64> {
++    let doc = host.open(parent).ok()?;
++    let prefix = format!("report-{child}-{asked}-");
++    doc.doc()
++        .read_commands()
++        .unwrap_or_default()
++        .iter()
++        .filter(|c| {
++            matches!(&c.payload, SessionCommandPayload::Run { message_id, .. }
++                if message_id.strip_prefix(&prefix).is_some_and(|stage| stage.starts_with("end") || stage.starts_with("stopped")))
++        })
++        .map(|c| c.issued_at)
++        .max()
++}
++
++/// Whether the parent's work on `asked` is reported done: a report of its
++/// end is in the parent's ledger, and no turn of the child's (`session`)
++/// began since (one woken on its own works on it still).
++fn reported_done(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEntry, session: Option<&Session>) -> bool {
++    let heard = last_end_report(host, parent, child, &asked.id)
++        .or_else(|| delivered(host, parent, child, asked, "end").then_some(i64::MIN));
++    heard.is_some_and(|heard| !session.and_then(|s| s.started_at).is_some_and(|at| at.timestamp_millis() > heard))
++}
++
++/// The person typed `text` (no chat's header on it).
++fn typed(text: &str) -> bool {
++    agent_messages::agent_message_sender(text).is_none()
++}
++
++/// `reply` says what `sent` said already: the same words, give or take
++/// spacing, or most of them, one inside the other.
++fn repeats(reply: &str, sent: &str) -> bool {
++    let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
++    let (reply, sent) = (squash(reply), squash(sent));
++    if reply.is_empty() || sent.is_empty() {
++        return false;
++    }
++    let (short, long) = if reply.len() <= sent.len() { (&reply, &sent) } else { (&sent, &reply) };
++    long.contains(short.as_str()) && short.len() * 10 >= long.len() * 8
++}
++
++/// `text` on one line, at most `max` characters.
++fn one_line(text: &str, max: usize) -> String {
++    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
++    match line.char_indices().nth(max) {
++        Some((at, _)) => format!("{}…", &line[..at]),
++        None => line,
++    }
++}
++
++/// `child` (hosted here) has no background work running.
++fn background_free(host: &DocHost, child: &str) -> bool {
++    host.sessions()
++        .and_then(|engine| engine.local_sessions().into_iter().find(|s| s.chat_id == child))
++        .is_none_or(|s| s.background_tasks.is_empty())
++}
++
++/// The child's turn on the parent's message `asked` only acknowledged a
++/// thanks: `asked` is short, asks nothing, and came after an earlier report
++/// of the child's; the turn (`after`) used no tool and answered briefly.
++fn acknowledges(host: &DocHost, parent: &str, child: &str, asked: &SessionMessageEntry, after: &[SessionMessageEntry]) -> bool {
++    let text = text_of(&asked.parts);
++    let Some((_, said)) = agent_messages::agent_message_sender(&text) else {
++        return false;
++    };
++    if said.trim().chars().count() > QUIET_CHARS || said.contains('?') {
++        return false;
++    }
++    let tools = after
++        .iter()
++        .flat_map(|e| &e.parts)
++        .any(|p| matches!(p, MessagePart::Tool { .. } | MessagePart::Input { .. }));
++    let reply = reply_body(after, ReportStatus::Finished);
++    if tools || reply.is_empty() || reply.chars().count() > QUIET_CHARS {
++        return false;
++    }
++    let Ok(doc) = host.open(parent) else {
++        return false;
++    };
++    let prefix = format!("report-{child}-");
++    doc.doc().read_commands().unwrap_or_default().iter().any(|c| {
++        c.issued_at < asked.created_at
++            && matches!(&c.payload, SessionCommandPayload::Run { message_id, .. } if message_id.starts_with(&prefix))
++    })
++}
++
++/// A `create_chat(s)` call in the parent's transcript (`entries`) that
++/// waited, and returned `child`'s first turn settled: its result names the
++/// child with a turn whose outcome is in (not timed out, not unknown).
++fn create_returned(entries: &[SessionMessageEntry], child: &str) -> bool {
++    fn names(value: &Value, child: &str) -> bool {
++        match value {
++            Value::Object(map) => {
++                let settled = map.get("turn").and_then(|t| t.get("outcome")).and_then(Value::as_str);
++                (map.get("chatId").and_then(Value::as_str) == Some(child)
++                    && settled.is_some_and(|o| !matches!(o, "timedOut" | "unknown")))
++                    || map.values().any(|v| names(v, child))
++            }
++            Value::Array(items) => items.iter().any(|v| names(v, child)),
++            // A result wrapped as text (MCP content) holds the JSON inside.
++            Value::String(text) => parsed(text).is_some_and(|v| names(&v, child)),
++            _ => false,
++        }
++    }
++    fn parsed(text: &str) -> Option<Value> {
++        let text = text.trim();
++        serde_json::from_str(text).ok().or_else(|| {
++            let (start, end) = (text.find(['{', '['])?, text.rfind(['}', ']'])?);
++            (start < end).then(|| serde_json::from_str(&text[start..=end]).ok()).flatten()
++        })
++    }
++    entries.iter().flat_map(|e| &e.parts).any(|part| {
++        let MessagePart::Tool { call: ToolCall::Mcp { server, tool, .. }, resolved: true, is_error: false, output: Some(output), .. } = part
++        else {
++            return false;
++        };
++        server == "zeron"
++            && matches!(tool.as_str(), "create_chat" | "create_chats")
++            && output.contains(child)
++            && parsed(output).is_some_and(|value| names(&value, child))
++    })
++}
++
+ /// Whether `parent`'s agent stopped the child since its message at `since`
+ /// (its Stop, in the child's ledger, says who made it).
+ fn stopped_by_parent(commands: &[zeron_doc::SessionCommandEntry], parent: &str, since: i64) -> bool {
+@@ -747,8 +1070,10 @@ pub(crate) fn without_waited(host: &DocHost, parent: &str, batch: &str, since: i
+         .iter()
+         .zip(&reports)
+         .filter(|(_, r)| {
++            // (A follow-up is a later turn than any wait returned.)
+             !(matches!(r.status, ReportStatus::Finished | ReportStatus::Failed | ReportStatus::Stopped)
+-                && returned(&calls, &r.sender.chat_id, &keys))
++                && !r.body.starts_with(FOLLOW_UP)
++                && (returned(&calls, &r.sender.chat_id, &keys) || create_returned(&calls, &r.sender.chat_id)))
+         })
+         .map(|(block, _)| *block)
+         .collect();
+@@ -930,6 +1255,10 @@ fn capped(body: String, child: &str) -> String {
+     while !body.is_char_boundary(end) {
+         end -= 1;
+     }
++    // At the paragraph it's in, when that leaves most of it.
++    if let Some(at) = body[..end].rfind("\n\n").filter(|&at| at >= REPORT_CAP / 2) {
++        end = at;
++    }
+     format!(
+         "{}\n\n[Cut at 16 KB. Read the whole reply with the Zeron `read_chat` tool, chat {child}.]",
+         body[..end].trim_end()
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index de82f35460280618c3b8d7103c78ae58931b219c..061f14a803f016a955a3d6cf7d23f0a75f6cc73f 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -41,7 +41,7 @@ use crate::doc_host::{ChatDocHandle, DocHost};
+ mod activity;
+ #[path = "session_reports.rs"]
+ mod reports;
+-pub(crate) use reports::{report_notes, without_waited, WAITED as REPORT_WAITED};
++pub(crate) use reports::{report_notes, without_waited, QUIET as REPORT_QUIET, WAITED as REPORT_WAITED};
+ use crate::registry::{HarnessDescriptor, HarnessRegistry};
+ use crate::run_journal::RunJournal;
+ use crate::{EngineError, new_id, now_ms};
+@@ -8445,7 +8445,7 @@ mod tests {
+             (
+                 "kid-a".into(),
+                 ReportStatus::Stopped,
+-                "The person stopped it. What it wrote before the Stop, possibly unfinished:\n\nHalfway through.".into(),
++                "The person stopped it. What it wrote before that, possibly unfinished:\n\nHalfway through.".into(),
+             ),
+             ("kid-a".into(), ReportStatus::Finished, "Rebased.".into()),
+         ];
+@@ -8501,7 +8501,7 @@ mod tests {
+             (
+                 "kid-a".into(),
+                 ReportStatus::Stopped,
+-                "The person stopped it. What it wrote before the Stop, possibly unfinished:\n\nHalfway through.".into(),
++                "The person stopped it. What it wrote before that, possibly unfinished:\n\nHalfway through.".into(),
+             ),
+         ];
+         // (The finished one says the next turn's reply, whatever it is.)
+@@ -8607,7 +8607,7 @@ mod tests {
+             .doc_host
+             .queue_command("kid-r", zeron_doc::SessionCommandPayload::Run { request: ask, message_id: "r-m1".into() })
+             .unwrap();
+-        assert_eq!(rig.roster(), "Still working for you: Remote (sent, not started). Their reports reach you on their own.");
++        assert_eq!(rig.roster(), "Still working for you: Remote (sent; no word from its device yet). Their reports reach you on their own.");
+         // Its host ran it and reported; this copy of its doc never caught up.
+         let mut report = request();
+         report.prompt = zeron_proto::agent_messages::child_report("Remote (kid-r)", "kid-r", ReportStatus::Finished, "LGTM.");
+@@ -8621,4 +8621,142 @@ mod tests {
+         assert_eq!(rig.roster(), "No child is working for you now.");
+         rig.core.sessions.shutdown().await;
+     }
++
++    impl FamilyRig {
++        /// `chat`'s run as it stands now, started if it's a new one since
++        /// `was`; a parked run reads the next message from its mailbox.
++        async fn current_run(&self, chat: &str, was: &ChatRun) -> ChatRun {
++            let run = lock(&self.harness.runs).get(chat).cloned().unwrap();
++            if run.feed.same_channel(&was.feed) {
++                self.take_steer(&run).await;
++            } else {
++                run.feed.send(started()).unwrap();
++            }
++            run
++        }
++
++        /// The lead's ledger: every command's message id.
++        fn ledger(&self) -> Vec<String> {
++            let handle = self.core.doc_host.open("lead").unwrap();
++            handle
++                .doc()
++                .read_commands()
++                .unwrap()
++                .into_iter()
++                .filter_map(|c| match c.payload {
++                    zeron_doc::SessionCommandPayload::Run { message_id, .. } => Some(message_id),
++                    _ => None,
++                })
++                .collect()
++        }
++    }
++
++    /// A child that ends its turn while its tests build, and later finishes
++    /// in a turn its runtime starts on its own: the lead hears that too, as
++    /// a follow-up, once. (It used to be lost: one report per message.)
++    #[tokio::test]
++    async fn a_turn_a_child_starts_on_its_own_reports_as_a_follow_up() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Push once the tests pass.")).await;
++        kid.feed.send(text("The tests are building.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the first report", |r| r.heard().len() == 1).await;
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++
++        // Its tests finish: the runtime wakes it for a turn of its own.
++        kid.turn.note_wake();
++        rig.until("Tests works again", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        kid.feed.send(text("Pushed abc123.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the follow-up", |r| r.heard().len() == 2).await;
++        let (from, status, body) = rig.heard().pop().unwrap();
++        assert_eq!((from.as_str(), status), ("kid-a", ReportStatus::Finished));
++        assert!(body.starts_with("(Follow-up:"), "{body}");
++        assert!(body.ends_with("Pushed abc123."), "{body}");
++        rig.quiet().await;
++        assert_eq!(rig.heard().len(), 2, "once");
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A child that sent its result with `send_message` and then said it
++    /// again as its final reply: the report says so, not the words again.
++    #[tokio::test]
++    async fn a_final_reply_repeating_what_the_child_sent_isnt_said_twice() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        let said = "All 40 tests pass on main.";
++        kid.feed
++            .send(tool_call("s1", "send_message", serde_json::json!({ "chat": "lead", "text": said })))
++            .unwrap();
++        kid.feed.send(tool_result("s1")).unwrap();
++        kid.feed.send(text(said)).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the report", |r| !r.heard().is_empty()).await;
++        let (_, status, body) = rig.heard().pop().unwrap();
++        assert_eq!(status, ReportStatus::Finished);
++        assert!(body.contains("repeats the message it sent you"), "{body}");
++        assert!(!body.contains(said), "{body}");
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// The lead thanks a child for its report; the child's "ok" back is
++    /// kept from the lead's agent (in its ledger, marked), so a thanks
++    /// starts no round of them. A question back is news, and goes.
++    #[tokio::test]
++    async fn a_childs_answer_to_a_thanks_doesnt_wake_the_lead() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Green.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the report", |r| r.heard().len() == 1).await;
++
++        rig.lead_writes("kid-a", "Thanks, that is all.", "lead-m2", false);
++        rig.until("Tests reads it", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        let run = rig.current_run("kid-a", &kid).await;
++        run.feed.send(text("Ok, stopping here.")).unwrap();
++        run.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("its answer is in the ledger", |r| r.ledger().iter().any(|id| id.ends_with(reports::QUIET)))
++            .await;
++        rig.quiet().await;
++        assert_eq!(rig.heard().len(), 1, "the lead's agent never reads it");
++
++        rig.lead_writes("kid-a", "Thanks. Did you push?", "lead-m3", false);
++        rig.until("Tests reads it", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        let again = rig.current_run("kid-a", &run).await;
++        again.feed.send(text("No, not yet.")).unwrap();
++        again.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("a question's answer goes", |r| r.heard().len() == 2).await;
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// The person stops the lead: its queue pauses (their own messages
++    /// wait for them), but a child's report that comes in after the Stop
++    /// still wakes it. It used to sit there until the person wrote again.
++    #[tokio::test]
++    async fn a_report_after_the_person_stops_the_lead_still_reaches_it() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Get the tests run.").await;
++        lead.feed.send(text("Asked Tests.")).unwrap();
++        rig.core
++            .doc_host
++            .queue_command("lead", zeron_doc::SessionCommandPayload::Interrupt { stopped_by: None })
++            .unwrap();
++        rig.until("the lead stops", |r| r.status("lead").status != SessionStatus::Working).await;
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++
++        let kid = rig.start("kid-a", &from_lead("Run the tests.")).await;
++        kid.feed.send(text("Green.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead reads the report", |r| !r.reports("lead").is_empty()).await;
++        rig.core.sessions.shutdown().await;
++    }
+ }
+diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
+index 5ae3feca44cc2db973fa3074796165eb38c520b1..dab440425136211951897afb75b766e4ca0ae8b6 100644
+--- a/crates/engine/src/workspace_host.rs
++++ b/crates/engine/src/workspace_host.rs
+@@ -1395,6 +1395,11 @@ impl WorkspaceHost {
+         Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)
+     }
+ 
++    /// Hand `chat_id` to another parent chat (see `RegistryDoc::set_chat_parent`).
++    pub fn set_chat_parent(&self, chat_id: &str, parent: &str) -> Result<bool, EngineError> {
++        Ok(self.mutate(|doc| doc.set_chat_parent(chat_id, parent))?)
++    }
++
+     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {
+         Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
+     }
+diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
+index 5f37b345b93d6e59a9cdc695b747c6dff3fbd792..9d287ad84c0d50e609ee1c6e6044a217d261f82c 100644
+--- a/crates/mcp/src/jsonrpc.rs
++++ b/crates/mcp/src/jsonrpc.rs
+@@ -70,6 +70,11 @@ Delegation is one level deep: a chat that has a parent cannot create chats. \
+ Pass `cloud: true` to run a child on a Cloud machine of its own (Codex or Claude Code); \
+ from a Cloud chat it clones the same repository, and without `cloud` it shares your machine.\n\
+ \n\
++Children report back on their own: when a child's turn ends, its final reply reaches the chat \
++that made it as a report. So in a chat another chat made, put your result in your final reply \
++and don't also send it with `send_message`; and a report needs no thanks or acknowledgement, \
++since any message to a child starts another turn there.\n\
++\n\
+ When a chart, table, diagram, dashboard, or 3D view would say more than prose and \
+ `show_visual` is available, write a Luau visual script and show it with `show_visual` before \
+ your final reply. Zeron renders it with its own native interface and enforces its style: \
+diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
+index 49cefa6309c4e1df58179afbef00159521c823fa..dbed283beb38202f6e3ea6443e8526cc7f4ad856 100644
+--- a/crates/mcp/src/tools.rs
++++ b/crates/mcp/src/tools.rs
+@@ -918,7 +918,7 @@ impl Tools {
+                 match result {
+                     Ok(result) => json!({"index": index, "isError": false, "result": result}),
+                     Err(error) => {
+-                        json!({"index": index, "isError": true, "error": error.to_string()})
++                        json!({"index": index, "isError": true, "error": format!("{error:#}")})
+                     }
+                 }
+             },
+@@ -1472,14 +1472,15 @@ impl Tools {
+         if text.is_empty() {
+             anyhow::bail!("text is empty");
+         }
+-        let chat = self.zeron.resolve_chat(&args.chat).await?;
++        let chat = self.zeron.resolve_chat(&args.chat).await.context("not sent")?;
+         if self.zeron.origin().chat_id.as_deref() == Some(chat.id.as_str()) {
+             anyhow::bail!(
+                 "refusing to send a message to your own chat ({})",
+                 short(&chat.id)
+             );
+         }
+-        let (spaces, sessions) = tokio::try_join!(self.zeron.spaces(), self.zeron.sessions())?;
++        let (spaces, sessions) =
++            tokio::try_join!(self.zeron.spaces(), self.zeron.sessions()).context("not sent")?;
+         // Only a chat with no harness of its own needs its host's catalog:
+         // the others are delivered through the doc, host reachable or not.
+         let harnesses = if chat.config.is_some() {
+diff --git a/crates/mcp/src/zeron.rs b/crates/mcp/src/zeron.rs
+index abb426bb0d1d2c1af67d7332f2055aeae9972c14..7bef3245879b18507012cfe5f59859b6bd8733d3 100644
+--- a/crates/mcp/src/zeron.rs
++++ b/crates/mcp/src/zeron.rs
+@@ -277,17 +277,21 @@ impl Zeron {
+         }
+     }
+ 
+-    /// First item of a watch stream, then cancel it.
++    /// First item of a watch stream, then cancel it. An engine too busy to
++    /// answer in time (heavy disk work) is asked once more.
+     pub async fn snapshot(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+-        let mut rx = self.subscribe(method, params).await?;
+-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, rx.recv()).await {
+-            Ok(Some(item)) => Ok(item),
+-            Ok(None) => bail!("{method}: stream ended before its first snapshot"),
+-            Err(_) => bail!(
+-                "{method}: no snapshot within {}s",
+-                SNAPSHOT_TIMEOUT.as_secs()
+-            ),
++        for _ in 0..2 {
++            let mut rx = self.subscribe(method, params.clone()).await?;
++            match tokio::time::timeout(SNAPSHOT_TIMEOUT, rx.recv()).await {
++                Ok(Some(item)) => return Ok(item),
++                Ok(None) => bail!("{method}: stream ended before its first snapshot"),
++                Err(_) => tracing::warn!(method, "no snapshot in time; asking again"),
++            }
+         }
++        bail!(
++            "{method}: no snapshot within {}s, twice (Zeron's engine is busy); safe to retry",
++            SNAPSHOT_TIMEOUT.as_secs()
++        )
+     }
+ 
+     async fn snapshot_as<T: serde::de::DeserializeOwned>(
+diff --git a/crates/proto/src/agent_messages.rs b/crates/proto/src/agent_messages.rs
+index 94382b19bd5697862e83761c271a2d69408e38d0..0d9bffc258b662192aa34b2f017b0aef900d6759 100644
+--- a/crates/proto/src/agent_messages.rs
++++ b/crates/proto/src/agent_messages.rs
+@@ -15,9 +15,13 @@ const TO_CHILD: &str = ". Your reply reaches it on its own when your turn ends;
+ /// A report (or a child's message) to its parent: it has the child's
+ /// words, so a thanks or an echo back is only another turn for both.
+ const TO_PARENT: &str = ". Write to it with the Zeron `send_message` tool only when it needs more from you, chat ";
++/// [`TO_PARENT`] as said since: parents thanked each report, and each
++/// thanks woke the child for a turn, and another report.
++const TO_PARENT_NO_REPLY: &str =
++    ". No reply needed: a message to it starts another turn there. Only to ask it for more, write with the Zeron `send_message` tool, chat ";
+ /// Every phrase a header ends on, the oldest first (a transcript keeps
+ /// headers written before the others).
+-const PHRASES: [&str; 3] = [REPLY, TO_CHILD, TO_PARENT];
++const PHRASES: [&str; 4] = [REPLY, TO_CHILD, TO_PARENT, TO_PARENT_NO_REPLY];
+ 
+ /// How the chat a message is from stands to the chat it's for, which says
+ /// what its header asks of the agent reading it.
+@@ -134,7 +138,7 @@ pub fn child_report(label: &str, chat_id: &str, status: ReportStatus, body: &str
+     let label = clean_label(&label.replace(STATUS_SEP.trim(), " "));
+     let chat_id = clean_label(chat_id);
+     format!(
+-        "{REPORT_PREFIX}{label}{STATUS_SEP}{}{TO_PARENT}{chat_id}.]\n\n{}",
++        "{REPORT_PREFIX}{label}{STATUS_SEP}{}{TO_PARENT_NO_REPLY}{chat_id}.]\n\n{}",
+         status.as_str(),
+         quote_headers(body)
+     )
+@@ -451,11 +455,14 @@ mod tests {
+         let text = child_report("Layout pass (WING-PC) (cd27c5c2)", id, ReportStatus::Finished, "All done.");
+         assert_eq!(
+             text,
+-            format!("[Report from Zeron chat Layout pass (WING-PC) (cd27c5c2) · finished. Write to it with the Zeron `send_message` tool only when it needs more from you, chat {id}.]\n\nAll done.")
++            format!("[Report from Zeron chat Layout pass (WING-PC) (cd27c5c2) · finished. No reply needed: a message to it starts another turn there. Only to ask it for more, write with the Zeron `send_message` tool, chat {id}.]\n\nAll done.")
+         );
+-        // One written before reports said so still reads.
++        // Ones written before reports said so still read.
+         let older = format!("[Report from Zeron chat Layout pass (cd27c5c2) · failed. Reply to it with the Zeron `send_message` tool, chat {id}.]\n\nNo.");
+         assert_eq!(child_reports(&older).unwrap()[0].status, ReportStatus::Failed);
++        let old = format!("[Report from Zeron chat Layout pass (cd27c5c2) · stopped. Write to it with the Zeron `send_message` tool only when it needs more from you, chat {id}.]\n\nNo.");
++        let report = &child_reports(&old).unwrap()[0];
++        assert_eq!((report.sender.chat_id.as_str(), report.status), (id, ReportStatus::Stopped));
+         let reports = child_reports(&text).unwrap();
+         assert_eq!(
+             reports,
+diff --git a/docs/mcp.md b/docs/mcp.md
+index d293ec54ea6de12ff4bb0c7dcc4d3adaf156fcb4..53453f39460e6068d1c831337f971a07bc40c230 100644
+--- a/docs/mcp.md
++++ b/docs/mcp.md
+@@ -65,6 +65,20 @@ the parent is busy wait as one message, each block opening with its own header.
+ Older transcripts read a report as a message from the child; zgx renders it as
+ a subagent row.
+ 
++A turn the child's runtime starts on its own after its report (woken by
++background work it left running, or a timer) reports again, opening with
++`(Follow-up: …)`. A report whose reply repeats what the child already sent its
++parent with `send_message` says so instead of the words. A short, tool-free
++answer to the parent's short thanks after a report is kept in the parent's
++ledger (`…-quiet`) and never read by its agent. A report that comes in after
++the person stopped the parent still wakes it; the person's own queued messages
++stay paused.
++
++An agent can't write to an archived chat other than its own child (refused:
++it would only wake it). A child whose parent is archived or gone becomes the
++child of the next chat with no parent of its own that writes to it, so after a
++handoff the new orchestrator hears its reports.
++
+ ### Parent links
+ 
+ `create_chat` and each request in `create_chats` accept `kind`:
+-- 
+2.55.0.windows.2
+

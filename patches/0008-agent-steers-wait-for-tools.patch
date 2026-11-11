@@ -1,4 +1,4 @@
-From a9cd0fc44652439992c983a20d693b949270826e Mon Sep 17 00:00:00 2001
+From 4865570b7a19399f81d35357bb5aca2e0c86257a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 9 Nov 2026 11:46:29 +0700
 Subject: [PATCH] An agent's message to a busy chat waits for the command it
@@ -32,10 +32,12 @@ written `next`, with no interrupt before it.
 ---
  crates/client/src/demo/mod.rs                |  2 +-
  crates/client/src/session/mod.rs             |  2 +
+ crates/client/tests/cloud_attachments.rs     |  1 +
  crates/doc/examples/gen_fixture.rs           |  1 +
  crates/doc/src/commands.rs                   | 34 +++++++
  crates/doc/src/schema.rs                     |  1 +
- crates/engine/src/doc_host.rs                | 30 ++++--
+ crates/engine/src/doc_host.rs                | 32 +++++--
+ crates/engine/src/doc_host_attachments.rs    |  2 +-
  crates/engine/src/plugin_agents.rs           |  2 +-
  crates/engine/src/sessions.rs                | 99 +++++++++++++++++---
  crates/engine/tests/acp_lifecycle.rs         |  2 +
@@ -50,7 +52,7 @@ written `next`, with no interrupt before it.
  crates/harness/tests/fixtures/fake-claude.sh | 18 ++++
  crates/mcp/src/tools.rs                      | 15 ++-
  docs/mcp.md                                  | 11 ++-
- 20 files changed, 322 insertions(+), 29 deletions(-)
+ 22 files changed, 325 insertions(+), 31 deletions(-)
 
 diff --git a/crates/client/src/demo/mod.rs b/crates/client/src/demo/mod.rs
 index 553afd3e37dd14a479b2788c2ff908e750d7eca4..94c5137dbd16ce5a49f85d929120fbcf23e5b1d8 100644
@@ -66,10 +68,10 @@ index 553afd3e37dd14a479b2788c2ff908e750d7eca4..94c5137dbd16ce5a49f85d929120fbcf
                      let steps = self.reply_for(&prompt);
                      let id = message_id.unwrap_or_else(crate::new_id);
 diff --git a/crates/client/src/session/mod.rs b/crates/client/src/session/mod.rs
-index 14425f5e5f5b737654195eddfcf653378482fd86..ac47502357211bbc5649325236b0c60f6001dfb9 100644
+index e2bf64d70131f2bc57adf797eb433225bcbb801a..8f4a21408753023ee87444cf6247bfae014ab93f 100644
 --- a/crates/client/src/session/mod.rs
 +++ b/crates/client/src/session/mod.rs
-@@ -748,6 +748,7 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
+@@ -977,6 +977,7 @@ fn derive_pending(
              SessionCommandPayload::Steer {
                  prompt,
                  message_id: Some(message_id),
@@ -77,14 +79,26 @@ index 14425f5e5f5b737654195eddfcf653378482fd86..ac47502357211bbc5649325236b0c60f
              } => (message_id, prompt, PendingKind::Steer),
              _ => continue,
          };
-@@ -1145,6 +1146,7 @@ impl SessionHandle {
+@@ -1476,6 +1477,7 @@ impl SessionHandle {
                      SessionCommandPayload::Steer {
                          prompt: content,
                          message_id: Some(message_id.clone()),
 +                        at_once: true,
                      },
-                 )?;
-                 SendOutcome::Steered { message_id }
+                     &refs,
+                     via_store,
+diff --git a/crates/client/tests/cloud_attachments.rs b/crates/client/tests/cloud_attachments.rs
+index 5a1b39ceabbd9fdafd3338945aad2b8a3c962cbb..58c91b184c495f0e1c3500d5877019bfe2a6ddeb 100644
+--- a/crates/client/tests/cloud_attachments.rs
++++ b/crates/client/tests/cloud_attachments.rs
+@@ -464,6 +464,7 @@ async fn a_month_old_failed_send_is_still_there_to_retry_or_remove() {
+                 payload: SessionCommandPayload::Steer {
+                     prompt: "from a month ago".into(),
+                     message_id: Some("m-old".into()),
++                    at_once: true,
+                 },
+             },
+             uploads: Vec::new(),
 diff --git a/crates/doc/examples/gen_fixture.rs b/crates/doc/examples/gen_fixture.rs
 index 7678b31ae2e8fc40ca5ba941e91d6646a9549a71..bc82b62ae7c0563ca04600fcabc1d35f1a87f516 100644
 --- a/crates/doc/examples/gen_fixture.rs
@@ -175,10 +189,10 @@ index c7d4d900440360a32be59336dbbd1dd6736b6369..1fbfa3d88407ab017ac788c0257b7aa3
      fn composer_cancel_rules() {
          let e = steer("c1", 1_000);
 diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
-index e1ead668a5903390be40feb5abdcb316c3387c67..c8fd30eab60e9bdd6931814f43d5fc0f281c2cda 100644
+index 70fdfbb1a14a623b36fa97937391fba367d1ba9f..8b9f5e372bc322ea1977918bdd9af68b53690817 100644
 --- a/crates/doc/src/schema.rs
 +++ b/crates/doc/src/schema.rs
-@@ -2578,6 +2578,7 @@ mod tests {
+@@ -2583,6 +2583,7 @@ mod tests {
              payload: SessionCommandPayload::Steer {
                  prompt: "focus".into(),
                  message_id: None,
@@ -187,10 +201,10 @@ index e1ead668a5903390be40feb5abdcb316c3387c67..c8fd30eab60e9bdd6931814f43d5fc0f
              issued_by: "dev-b".into(),
              issued_at: 10,
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index fe43ae17ae036a631ad7388035833b26c5374c6b..67c2efcc99c5974863b579d069060faceafff79f 100644
+index 8e6a5b042b05920d84fcdbdf7c40fc7330f82594..2da627665f05d32604ef18a5a2e8f747df1476b7 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -5730,13 +5730,18 @@ impl DocHost {
+@@ -6177,13 +6177,18 @@ impl DocHost {
                  handle.queue_paused.store(false, Ordering::Release);
                  Ok((SessionCommandStatus::Applied, None))
              }
@@ -210,7 +224,7 @@ index fe43ae17ae036a631ad7388035833b26c5374c6b..67c2efcc99c5974863b579d069060fac
                  )
                  .await
              }
-@@ -5895,6 +5900,8 @@ impl DocHost {
+@@ -6372,6 +6377,8 @@ impl DocHost {
      /// resume then reattaches the prior harness conversation.
      ///
      /// Turn-boundary drivers retain explicit steers until their next boundary.
@@ -219,7 +233,7 @@ index fe43ae17ae036a631ad7388035833b26c5374c6b..67c2efcc99c5974863b579d069060fac
      async fn deliver_prompt(
          &self,
          sessions: &SessionsEngine,
-@@ -5902,6 +5909,7 @@ impl DocHost {
+@@ -6379,6 +6386,7 @@ impl DocHost {
          prompt: &str,
          message_id: Option<String>,
          issued_at: i64,
@@ -227,7 +241,7 @@ index fe43ae17ae036a631ad7388035833b26c5374c6b..67c2efcc99c5974863b579d069060fac
      ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
          let chat_id = &handle.chat_id;
          // Explicit steering uses the run mailbox when the agent reads it
-@@ -5934,12 +5942,20 @@ impl DocHost {
+@@ -6411,12 +6419,20 @@ impl DocHost {
          {
              tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
          }
@@ -254,8 +268,30 @@ index fe43ae17ae036a631ad7388035833b26c5374c6b..67c2efcc99c5974863b579d069060fac
              SteerOutcome::Accepted => {
                  handle.queue_paused.store(false, Ordering::Release);
                  Ok((SessionCommandStatus::Applied, None))
+@@ -7397,7 +7413,7 @@ mod publication_eviction_tests {
+         );
+         assert!(host.open("").is_err());
+         assert!(host.open_local("").is_err());
+-        let steer = SessionCommandPayload::Steer { prompt: "hi".into(), message_id: None };
++        let steer = SessionCommandPayload::Steer { prompt: "hi".into(), message_id: None, at_once: true };
+         assert!(host.queue_command_with_transfers("", steer, Vec::new()).is_err());
+         assert!(lock(&host.inner.handles).is_empty());
+         host.shutdown_workers().await;
+diff --git a/crates/engine/src/doc_host_attachments.rs b/crates/engine/src/doc_host_attachments.rs
+index 3a26b03041542f83b7672360771a5a0b83813664..86f985e2021bfe693eeef11e35058df0de234d67 100644
+--- a/crates/engine/src/doc_host_attachments.rs
++++ b/crates/engine/src/doc_host_attachments.rs
+@@ -90,7 +90,7 @@ impl DocHost {
+                         request,
+                         message_id,
+                     } => (Some(message_id.clone()), request.prompt.clone()),
+-                    SessionCommandPayload::Steer { prompt, message_id } => {
++                    SessionCommandPayload::Steer { prompt, message_id, .. } => {
+                         (message_id.clone(), prompt.clone())
+                     }
+                     _ => return None,
 diff --git a/crates/engine/src/plugin_agents.rs b/crates/engine/src/plugin_agents.rs
-index e78ead4dddc073f88ab20a0ebf5822f998fbc655..5ae01a0d8d3cd0d274235a51931f09a7806e9288 100644
+index ca1151e20bac3f346ee0c7747268a38be790b29f..17cb028762bb9247bf26aa4d98a8cc877b803c80 100644
 --- a/crates/engine/src/plugin_agents.rs
 +++ b/crates/engine/src/plugin_agents.rs
 @@ -100,7 +100,7 @@ impl AgentHost for EngineAgentHost {
@@ -268,7 +304,7 @@ index e78ead4dddc073f88ab20a0ebf5822f998fbc655..5ae01a0d8d3cd0d274235a51931f09a7
                  Ok(id)
              }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c95564ab52 100644
+index 4571c5e8972efbf17f2a279d47ca08f7d589b744..fd32599dc0140d82293aced20bcde1c6134dbd6f 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -167,6 +167,9 @@ struct RunHandle {
@@ -281,7 +317,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
      /// A steer is stopping this turn ([`SessionsEngine::steer_now`]): the
      /// steers the stop cancels go to `redeliver` instead of being dropped.
      redeliver_on_stop: Arc<std::sync::atomic::AtomicBool>,
-@@ -1227,6 +1230,7 @@ impl SessionsEngine {
+@@ -1273,6 +1276,7 @@ impl SessionsEngine {
                      && harness.stops_turn_in_place()
                      && harness.steer_stops_tool(),
                  open_tools: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -289,7 +325,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
                  redeliver_on_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                  redeliver: Arc::new(Mutex::new(Vec::new())),
                  turn: turn.clone(),
-@@ -1437,6 +1441,21 @@ impl SessionsEngine {
+@@ -1482,6 +1486,21 @@ impl SessionsEngine {
          attachments: Vec<String>,
          message_id: Option<String>,
          issued_at: i64,
@@ -311,7 +347,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
      ) -> Result<SteerOutcome, EngineError> {
          let target = lock(&self.inner.runs)
              .get(chat_id)
-@@ -1459,6 +1478,11 @@ impl SessionsEngine {
+@@ -1504,6 +1523,11 @@ impl SessionsEngine {
          let user_id = message_id.unwrap_or_else(new_id);
          let bootstrap = self.warm_fork_history(chat_id, harness_id, prompt, &history_sent);
          let delivered = bootstrap.as_deref().unwrap_or(prompt);
@@ -323,7 +359,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
          // A steer runs on the configuration live now; record it with the
          // message so a re-dispatch keeps it.
          let sent_with = self.last_request(chat_id).map(|mut request| {
-@@ -1559,6 +1583,10 @@ impl SessionsEngine {
+@@ -1604,6 +1628,10 @@ impl SessionsEngine {
      /// under their own ids. Otherwise, or when the stop doesn't settle, it
      /// is an ordinary steer ([`Self::steer_at`]), read at the next step
      /// boundary. Nothing here tears a runtime down.
@@ -334,7 +370,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
      pub(crate) async fn steer_now(
          &self,
          chat_id: &str,
-@@ -1567,7 +1595,17 @@ impl SessionsEngine {
+@@ -1612,7 +1640,17 @@ impl SessionsEngine {
          message_id: Option<String>,
          issued_at: i64,
      ) -> Result<SteerOutcome, EngineError> {
@@ -353,7 +389,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
              let earlier = lock(&self.inner.runs)
                  .get(chat_id)
                  .map(|h| std::mem::take(&mut *lock(&h.redeliver)))
-@@ -1592,7 +1630,7 @@ impl SessionsEngine {
+@@ -1637,7 +1675,7 @@ impl SessionsEngine {
                  }
              }
          }
@@ -362,7 +398,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
              .await
      }
  
-@@ -3456,6 +3494,42 @@ fn revival_prompt(original: &str) -> String {
+@@ -3483,6 +3521,42 @@ fn revival_prompt(original: &str) -> String {
  /// The note a turn the engine's own shutdown cut off ends with.
  const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
  
@@ -405,7 +441,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
  /// The note a reply opens with when the provider no longer had the session
  /// the run asked to resume.
  const FRESH_START_NOTICE: &str = "The provider no longer has this chat's earlier session, \
-@@ -4106,18 +4180,19 @@ async fn drive_run(
+@@ -4095,18 +4169,19 @@ async fn drive_run(
      // folding the echo would mint an orphan chip mid-text in the NEXT
      // segment — the mid-word transcript splits.
      let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -431,7 +467,7 @@ index 5b0f0ac4f061af504ec8b51523e6bbdc799656e9..cdacf745b87ed5106b83b282888f77c9
      };
      let mut seen_images = std::collections::HashSet::new();
      for entry in doc_ref.read_entries().unwrap_or_default() {
-@@ -5293,16 +5368,18 @@ async fn drive_run(
+@@ -5268,16 +5343,18 @@ async fn drive_run(
              _ => {}
          }
          match &event {
@@ -523,7 +559,7 @@ index 0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2..74470d4379147e1a51b39b1701c87ea4
      );
      wait_for(
 diff --git a/crates/engine/tests/message_queue.rs b/crates/engine/tests/message_queue.rs
-index dd81433f7e4077fc5d4ef5863e3fb1f3aecc9a15..0a00573d0fc0cfd29b968eb64f787e3127853488 100644
+index 977b82245bb2d6c6bdf41a1de2a81c4693883859..81cb0890073d1feb3be7a89f5605e0f8cb1d4f2a 100644
 --- a/crates/engine/tests/message_queue.rs
 +++ b/crates/engine/tests/message_queue.rs
 @@ -563,6 +563,7 @@ async fn a_steer_command_for_a_turn_boundary_agent_waits_in_the_queue_for_the_tu
@@ -563,10 +599,10 @@ index 8fbf16bb2daeacc5008b97a2b727b5814ac4869f..fbcff78b6bbdb0d676f881d232b9b6d6
                  )
                  .unwrap();
 diff --git a/crates/engine/tests/restart_resume.rs b/crates/engine/tests/restart_resume.rs
-index d4acca07afb34e1fc1af841437a00bb3cc0bc2af..70466ec2c2270db98a2ec23f33a136e3543d943c 100644
+index f2aa86932b02993fb134da0ed207a559bb7813e8..55acf9026bd514ff90ea306f7bff930165efd988 100644
 --- a/crates/engine/tests/restart_resume.rs
 +++ b/crates/engine/tests/restart_resume.rs
-@@ -1412,6 +1412,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
+@@ -1475,6 +1475,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
              SessionCommandPayload::Steer {
                  prompt: "actually, also add tests".into(),
                  message_id: Some("msg-user-2".into()),
@@ -785,10 +821,10 @@ index 3a6ba5950a405d137fef6081dd1893b18133e7c4..30b5b9bcd9e1a0c132000e3bb6380e07
    # "Send now" while a turn's result is held for a queued steer: the CLI is
    # slow to answer the stop, had already begun the steer's turn, and that
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 8991b315f0e2e2d4218c32b521bd83dc45040ee6..d5d52d28dfbd0b5d4cabf5814d0fa801542a66df 100644
+index af0a11ea94e40162dde65229c0aec4f472ed7db5..70e64b3b60296b656dd952c4746005ec84e55fc8 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -162,7 +162,7 @@ fn catalog() -> Vec<ToolDef> {
+@@ -169,7 +169,7 @@ fn catalog() -> Vec<ToolDef> {
          },
          ToolDef {
              name: "send_message",
@@ -797,27 +833,27 @@ index 8991b315f0e2e2d4218c32b521bd83dc45040ee6..d5d52d28dfbd0b5d4cabf5814d0fa801
              input_schema: chat_key_schema(json!({
                  "text": { "type": "string" },
                  "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
-@@ -1722,6 +1722,8 @@ impl Tools {
-                     )
-                     .await?
+@@ -1796,6 +1796,8 @@ impl Tools {
+                     .await?;
+                 (id, new_message_id)
              }
 +            // Only an explicit steer stops a running command to be read now:
 +            // the agent there reads that stop as its call declined.
              "steer" => {
-                 self.zeron
-                     .queue_command(
-@@ -1729,6 +1731,7 @@ impl Tools {
+                 let id = self
+                     .zeron
+@@ -1804,6 +1806,7 @@ impl Tools {
                          &SessionCommandPayload::Steer {
                              prompt: text,
-                             message_id: Some(uuid::Uuid::new_v4().to_string()),
+                             message_id: Some(new_message_id.clone()),
 +                            at_once: mode == "steer",
                          },
                      )
-                     .await?
-@@ -2358,10 +2361,18 @@ mod tests {
+                     .await?;
+@@ -2547,10 +2550,18 @@ mod tests {
              .await
              .unwrap();
-         assert_eq!(sent["delivery"], "steer");
+         assert_eq!(sent.receipt["delivery"], "steer");
 +        // An explicit steer is read at once; an auto one waits for the step.
 +        tools
 +            .deliver(&chats[0], None, &[], Some(&session), "now".into(), "steer")

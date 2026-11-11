@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble Zeron nightly: upstream plus patches.toml, rebuilt from scratch.
+"""Assemble Zeron nightly: upstream plus patches-v3.toml, rebuilt from scratch.
 
 Like linux-next, the `nightly` branch is never updated in place. Every run
 resets it to upstream, applies each enabled patch in order, and stamps a
@@ -131,8 +131,8 @@ def stamp_version(src: Path, stamp: str, label: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--src", type=Path, required=True, help="dedicated git checkout to assemble in")
-    parser.add_argument("--config", type=Path, default=TOOLS / "patches.toml",
-                        help="patch list to assemble (patches.toml; patches-v3.toml for v3)")
+    parser.add_argument("--config", type=Path, default=TOOLS / "patches-v3.toml",
+                        help="patch list to assemble")
     parser.add_argument("--stamp", default=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M"))
     parser.add_argument("--report", type=Path, help="write release notes (Markdown) here")
     parser.add_argument("--json", type=Path, help="write the run summary (JSON) here")

@@ -1,10 +1,8 @@
 # What goes into Zeron v3 nightly: the zgx interface (apps/zgx) on top of
-# upstream's zeron/zgx branch, built and released apart from the v2 nightly
-# (.github/workflows/nightly-v3.yml). Same format as patches.toml.
+# upstream's zeron/zgx branch (.github/workflows/nightly-v3.yml).
 #
-# Most entries are engine fixes from patches.toml: v3 runs the engine built
-# from this same tree. Keep them in step with patches.toml by hand, except
-# for PRs merged into main that zeron/zgx has yet to take.
+# v2 (upstream main and crates/ui) is no longer built: this is the only list.
+# A PR merged into main stays applied at its pin until zeron/zgx takes it.
 
 [upstream]
 repo = "zeronsh/zeron"
@@ -40,34 +38,11 @@ sha = "82a0a07bbe01b51521340a97c7e656741c0953c1"
 note = "Walk-based index for large plain folders, kept current with a watch; disk roots refused. Stacked on #1184."
 
 [[patch]]
-name = "dead-run-shimmer"
-pr = 840
-sha = "febdceb6e950f123f5cbc5f78d3a031d4a70a919"
-note = "Stops the tool-group shimmer on dead runs. v2 interface only; kept so the engine matches v2's. Closed upstream (v3 replaces crates/ui)."
-
-[[patch]]
-name = "flaky-test-fixes"
-pr = 869
-sha = "b9f2c4b89f526f9d7d64d0e2a7496da99cc84c31"
-note = "Retries queue inserts and the Windows composer-defaults read; fixes flaky tests. Closed upstream, which would take it rebased on main."
-
-[[patch]]
-name = "composer-click-through"
-pr = 1191
-sha = "92ea6927e59bffc5df0017b64da949bc4833e11d"
-note = "Clicks in the composer no longer open images underneath it. v2 interface only. Closed upstream (v3 replaces crates/ui)."
-
-[[patch]]
 name = "warm-chats-parked-cap"
 pr = 1101
+enabled = false
 sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
-note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min. Its sessions.rs conflict replays from rerere/."
-
-[[patch]]
-name = "revived-turn-zeron-tools"
-pr = 1285
-sha = "0b2674d93839f081e9a41c95dc59987a12cee080"
-note = "A turn the engine resumes after a crash keeps its Zeron tools (send_message, create_chat, wait_for_turn): it waits for the engine's port before it starts. child-chats-report-back is rebased on this pin: move them together."
+note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min. Off since 2026-11-11: it conflicts with zeron/zgx's background waits in sessions.rs (rerere/ no longer replays it); turn it back on once re-resolved."
 
 [[patch]]
 name = "markdown-reply-images"
@@ -80,12 +55,6 @@ file = "patches/0003-relay-image-reads.patch"
 note = "Images from a chat on another device load in a few relay round trips. Applies on top of markdown-reply-images."
 
 [[patch]]
-name = "composer-menu-follows-selection"
-pr = 1309
-sha = "48921a7152867e87d82758d07b33ae861ee190bc"
-note = "The arrow keys keep the lit row in view in the composer's /, $ and @ lists: past the rows that show, the list scrolls with it."
-
-[[patch]]
 name = "agent-steers-wait-for-tools"
 file = "patches/0008-agent-steers-wait-for-tools.patch"
 note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it lands at the next step. mode 'steer' and the person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. v3 only: it conflicts with main's plugin_agents.rs."
@@ -93,7 +62,9 @@ note = "An agent's send_message to a busy chat no longer stops the command that 
 [[patch]]
 name = "child-chats-report-back"
 file = "patches/0007-child-chats-report-back.patch"
-note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Applies on top of revived-turn-zeron-tools at its pin; goes after agent-steers-wait-for-tools, which its tests need."
+note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Goes after agent-steers-wait-for-tools, which its tests need."
 
-# Not on v3: windows-icon (#1084, parked in patches.toml). zeron/zgx has its
-# own new app icon, which it conflicts with.
+[[patch]]
+name = "child-reports-follow-ups"
+file = "patches/0009-child-reports-follow-ups.patch"
+note = "What real use of child-chats-report-back found: a turn a child starts on its own (its tests done, a timer) reports as a follow-up; a reply repeating what the child sent isn't said twice; a child's answer to a thanks doesn't wake its parent; the still-working note is short and right across devices; a report after the person's Stop still wakes the parent; after a handoff the new orchestrator gets the children, and nobody writes to an archived chat; a restart or another chat's Stop isn't the person's. Applies on top of child-chats-report-back."
