@@ -21,6 +21,20 @@ pub struct Warning {
 }
 
 impl Warning {
+    /// `node`, a text, has no fill, so it can't be seen.
+    pub(super) fn invisible(node: &Node) -> Self {
+        Self {
+            node: Some(node.id.clone()),
+            property: Some("fill".to_owned()),
+            message: format!("\"{}\" (text) has no fill, so it's invisible: give it a fill colour", node.name),
+        }
+    }
+
+    /// Something about the fonts a call's text uses.
+    pub fn fonts(message: String) -> Self {
+        Self { node: None, property: None, message }
+    }
+
     /// `node` has `property`, which the model doesn't know.
     pub(super) fn unknown(node: &Node, property: &str) -> Self {
         Self {

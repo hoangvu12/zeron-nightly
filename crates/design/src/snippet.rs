@@ -302,7 +302,8 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
                 })?;
                 let draft = draft.borrow();
                 let drawn = crate::resolve::drawn(draft.design());
-                let laid_out = LaidOut::of(&drawn);
+                let typesetter = draft.fonts().typesetter(&drawn);
+                let laid_out = LaidOut::of(&drawn, &typesetter);
                 let (x, y) = crate::space::find(&drawn, &laid_out, &wanted).map_err(|e| thrown(&ctx, e))?;
                 Ok::<_, rquickjs::Error>(serde_json::json!({ "x": x, "y": y }).to_string())
             })?,
@@ -346,7 +347,9 @@ fn install<'js>(ctx: &Ctx<'js>, draft: &Rc<RefCell<Draft>>) -> rquickjs::Result<
                 let draft = draft.borrow();
                 let view = crate::read::view(draft.design(), id.as_deref(), &options);
                 // Where nodes are is where they're drawn.
-                let laid_out = LaidOut::of(&crate::resolve::drawn(draft.design()));
+                let drawn = crate::resolve::drawn(draft.design());
+                let typesetter = draft.fonts().typesetter(&drawn);
+                let laid_out = LaidOut::of(&drawn, &typesetter);
                 crate::read::visit(&view, &laid_out, id.as_deref())
                     .map(|visited| serde_json::Value::Array(visited).to_string())
                     .map_err(|e| thrown(&ctx, e))

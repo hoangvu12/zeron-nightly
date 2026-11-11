@@ -22,6 +22,11 @@
 //! computer ([`Designs::recent`]), in `recent-designs.json`. Design tabs
 //! follow a Design ([`Designs::watch`]): it whole, then again after each
 //! change.
+//!
+//! Text is set in Google Fonts fetched on first use into `design-fonts/`
+//! in the engine's data dir, or in font files beside its Design
+//! ([`zeron_design::fonts`]); tabs following a Design are told the font
+//! files it uses, and draw with those.
 
 mod retry;
 
@@ -34,8 +39,10 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_design::Design;
-use zeron_design::edit::{Draft, Edited};
+use zeron_design::edit::{Draft, Edited, Warning};
+use zeron_design::fonts::{FontFile, Fonts, GoogleFonts};
 use zeron_design::history::History;
+use zeron_design::model::Kind;
 use zeron_design::snippet::{self, Globals, Limits, SnippetError};
 
 pub use retry::{Edit, Failure};
@@ -151,12 +158,16 @@ struct Inner {
     /// `recent_file`.
     recent: Mutex<Vec<Recent>>,
     recent_file: PathBuf,
+    /// This computer's fonts, for every Design's text.
+    fonts: Mutex<Fonts>,
 }
 
 /// One Design as the engine holds it.
 struct Live {
     path: PathBuf,
     design: Design,
+    /// What its text is set in, as its last call found them.
+    fonts: Fonts,
     history: History,
     /// Counts the changes kept, whoever made them.
     version: u64,
@@ -166,14 +177,16 @@ struct Live {
     followers: tokio::sync::watch::Sender<Told>,
 }
 
-/// A Design as the tabs following it hear it: its version, and the
-/// changes that made the latest versions (a tab that falls behind hears
-/// each change it missed, up to [`MAX_TOLD_CHANGES`]).
+/// A Design as the tabs following it hear it: its version, the changes
+/// that made the latest versions (a tab that falls behind hears each
+/// change it missed, up to [`MAX_TOLD_CHANGES`]), and the font files its
+/// text uses (none yet for a Design no change was told of).
 #[derive(Clone)]
 struct Told {
     version: u64,
     design: Arc<Design>,
     changes: Vec<Change>,
+    fonts: Option<Arc<Vec<FontFile>>>,
 }
 
 /// One change to a Design, as its tabs hear of it.
@@ -223,6 +236,10 @@ impl Designs {
                 tabs: Mutex::new(HashMap::new()),
                 recent: Mutex::new(recent),
                 recent_file,
+                fonts: Mutex::new(Fonts::new(
+                    Some(data_dir.join("design-fonts")),
+                    Some(Box::new(GoogleFonts::default())),
+                )),
             }),
         }
     }
@@ -329,21 +346,36 @@ impl Designs {
     /// Follows the `.zdesign` file at `path` (`WatchDesign`, a Design
     /// tab's): it whole as it is now, then after each change, as `{version,
     /// design, changes: [{version, changed, by}]}`: the changes since the
-    /// item before (none in the first), `by` "agent". A tab that falls behind hears the latest only.
-    /// Blocking (it may read the file): run it off the async runtime.
+    /// item before (none in the first), `by` "agent"; and `fonts`, the font
+    /// files its text uses (`{family, path}`), for the tab to draw it with.
+    /// A tab that falls behind hears the latest only. Blocking (it may read
+    /// the file, or fetch fonts): run it off the async runtime.
     pub fn watch(&self, path: &str) -> Result<impl Stream<Item = Value> + Send + use<>, DesignError> {
         let live = self.open(Path::new(path))?;
-        let told = {
-            let live = lock(&live);
-            // (Changes with nobody following weren't copied for them.)
-            live.followers.send_if_modified(|told| {
-                let stale = told.version != live.version;
-                if stale {
-                    *told = Told { version: live.version, design: Arc::new(live.design.clone()), changes: Vec::new() };
+        let told = loop {
+            let (version, design, fonts) = {
+                let live = lock(&live);
+                let told = live.followers.borrow();
+                if told.version == live.version && told.fonts.is_some() {
+                    drop(told);
+                    break live.followers.subscribe();
                 }
-                stale
-            });
-            live.followers.subscribe()
+                (live.version, live.design.clone(), self.fonts_for(&live.path))
+            };
+            // Its fonts found (fetched, maybe) without holding the Design up.
+            let files = Arc::new(fonts.files(&design));
+            let live = lock(&live);
+            // (Changes with nobody following weren't copied for them; one
+            // made meanwhile is looked at again.)
+            if live.version == version {
+                live.followers.send_replace(Told {
+                    version,
+                    design: Arc::new(design),
+                    changes: Vec::new(),
+                    fonts: Some(files),
+                });
+                break live.followers.subscribe();
+            }
         };
         // (The version it last told, so each item tells the changes since.)
         Ok(futures::stream::unfold((told, None::<u64>), |(mut told, last)| async move {
@@ -359,9 +391,26 @@ impl Designs {
                 "version": now.version,
                 "design": &*now.design,
                 "changes": since,
+                "fonts": now.fonts.as_deref(),
             });
             Some((item, (told, Some(now.version))))
         }))
+    }
+
+    /// The fonts for the Design at `path`: this computer's, and those
+    /// beside it.
+    fn fonts_for(&self, path: &Path) -> Fonts {
+        let fonts = lock(&self.inner.fonts).clone();
+        match path.parent() {
+            Some(folder) => fonts.beside(folder),
+            None => fonts,
+        }
+    }
+
+    /// Sets text in `fonts` from now on, in place of the font cache and
+    /// Google Fonts (for tests, which run offline).
+    pub fn use_fonts(&self, fonts: Fonts) {
+        *lock(&self.inner.fonts) = fonts;
     }
 
     /// Runs `code` with the calling chat's globals, keeping the globals it
@@ -374,9 +423,20 @@ impl Designs {
         let globals = chat
             .and_then(|chat| lock(&self.inner.globals).get(chat).cloned())
             .unwrap_or_default();
-        let (draft, globals) = snippet::run(Draft::new(live.design.clone()), globals, code, self.inner.limits)
-            .map_err(Ran::Snippet)?;
-        let edited = draft.finish();
+        live.fonts = self.fonts_for(&live.path);
+        let draft = Draft::new(live.design.clone()).with_fonts(live.fonts.clone());
+        let (draft, globals) = snippet::run(draft, globals, code, self.inner.limits).map_err(Ran::Snippet)?;
+        let mut edited = draft.finish();
+        // Fonts the call's text couldn't get.
+        let mut texts = Vec::new();
+        edited.design.walk(&mut |node| {
+            if let Kind::Text(text) = &node.kind
+                && edited.changed.contains(&node.id)
+            {
+                texts.push(text.clone());
+            }
+        });
+        edited.warnings.extend(live.fonts.warnings(&texts).into_iter().map(Warning::fonts));
         let changed = chat
             .and_then(|chat| live.seen.get(chat))
             .is_some_and(|&seen| seen != live.version);
@@ -565,7 +625,7 @@ impl Designs {
         let design = Design::from_json(&text).map_err(|e| {
             DesignError::Refused(format!("{} is not a Design: {e}", path.display()))
         })?;
-        let design = Arc::new(Mutex::new(Live::new(path.clone(), design)));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), design, self.fonts_for(&path))));
         Ok(lock(&self.inner.live).entry(path).or_insert(design).clone())
     }
 
@@ -591,7 +651,7 @@ impl Designs {
             folder = format!("{base} {n}");
         }
         let path = self.inner.root.join(&folder).join(format!("{folder}.{EXTENSION}"));
-        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default())));
+        let design = Arc::new(Mutex::new(Live::new(path.clone(), Design::default(), self.fonts_for(&path))));
         live.insert(path, design.clone());
         Ok(design)
     }
@@ -613,15 +673,17 @@ struct Target {
 }
 
 impl Live {
-    fn new(path: PathBuf, design: Design) -> Self {
+    fn new(path: PathBuf, design: Design, fonts: Fonts) -> Self {
         let told = Told {
             version: 0,
             design: Arc::new(design.clone()),
             changes: Vec::new(),
+            fonts: None,
         };
         Self {
             path,
             design,
+            fonts,
             history: History::default(),
             version: 0,
             seen: HashMap::new(),
@@ -670,9 +732,12 @@ impl Live {
             by,
         };
         let design = Arc::new(self.design.clone());
+        // (Loaded as the change set its text, so found without a fetch.)
+        let fonts = Arc::new(self.fonts.files(&self.design));
         self.followers.send_modify(|told| {
             told.version = change.version;
             told.design = design;
+            told.fonts = Some(fonts);
             told.changes.push(change);
             let over = told.changes.len().saturating_sub(MAX_TOLD_CHANGES);
             told.changes.drain(..over);
@@ -693,6 +758,7 @@ impl Live {
                     &self.design,
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
+                    &self.fonts,
                 );
                 match shot {
                     Ok(shot) => json!({

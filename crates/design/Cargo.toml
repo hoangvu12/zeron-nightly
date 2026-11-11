@@ -10,6 +10,8 @@ description = "Zeron Design: the Design model, its edits and its renderer (Skia 
 # The snippet sandbox agents edit Designs through (QuickJS), for the
 # engine; the zgx app only draws.
 snippet = ["dep:rquickjs"]
+# Fetching Google Fonts (fonts::GoogleFonts) over HTTPS.
+google-fonts = ["dep:ureq"]
 
 [dependencies]
 # Pinned with `gl` to the feature set of a published prebuilt
@@ -20,7 +22,11 @@ skia-safe = { version = "=0.157.0", features = ["gl", "textlayout", "svg"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 # QuickJS-ng compiled by `cc` against bindings rquickjs-sys ships for
 # x86_64-pc-windows-msvc (no bindgen, so no clang or LLVM).
 rquickjs = { version = "0.14", optional = true }
+# Blocking, so a font fetches from inside the layout pass; native TLS
+# (Windows' own), as the rest of the workspace's ureq 3 builds it.
+ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }

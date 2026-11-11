@@ -20,6 +20,7 @@ mod paint;
 mod rectangle;
 mod stroke;
 pub mod token;
+mod text;
 pub mod warn;
 
 pub use corners::Corners;
@@ -31,11 +32,13 @@ pub use paint::{BlendMode, Color, Fill, Gradient, GradientShape, Paint, PaintKin
 pub use rectangle::Rectangle;
 pub use stroke::{Cap, Join, Sides, Stroke, StrokeAlign, StrokeStyle};
 pub use token::{Theme, Token, TokenKind};
+pub use text::{FontSize, FontWeight, Text, TextAlign, TextGrowth, VerticalAlign};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::render::{Look, Painter};
+use crate::skia::Typesetter;
 
 /// The format version new Designs are written with.
 pub const VERSION: &str = "1.0";
@@ -241,6 +244,12 @@ pub trait NodeKind {
     /// not its children, at its laid-out `size` with its top-left at the
     /// painter's origin.
     fn paint(&self, _size: (f32, f32), _painter: &mut dyn Painter) {}
+
+    /// The size of its own content, for a type whose content isn't its
+    /// children (text), at `width` when its parent decides that.
+    fn measure(&self, _typesetter: &Typesetter, _width: Option<f32>) -> Option<[f32; 2]> {
+        None
+    }
 }
 
 macro_rules! kinds {
@@ -294,6 +303,7 @@ kinds! {
     Frame = "frame",
     Instance = "instance",
     Rectangle = "rectangle",
+    Text = "text",
 }
 
 /// A node of a type the model doesn't know (one a newer Zeron wrote, say):
