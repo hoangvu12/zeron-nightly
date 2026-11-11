@@ -110,6 +110,10 @@ fn image_downloads_wait_off_the_snippets_time_and_past_the_cap_leave_the_call_be
     let draft = Draft::new(Design::default()).with_assets(assets.clone());
     assert!(snippet::run(draft, Globals::default(), &place(&more), limits).is_ok());
     assert!(!assets.images().file_of(more[3]).is_file());
+    // Nor is it downloaded to say why it isn't drawn.
+    let why = assets.beside(&dir).image(more[3]).expect_err("not downloaded");
+    assert!(why.contains("next call"), "{why}");
+    assert!(!assets.images().file_of(more[3]).is_file());
     let draft = Draft::new(Design::default()).with_assets(assets.clone());
     assert!(snippet::run(draft, Globals::default(), &place(&more[3..]), limits).is_ok());
     assert!(assets.images().file_of(more[3]).is_file());

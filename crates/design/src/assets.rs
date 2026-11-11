@@ -274,11 +274,12 @@ pub struct Beside {
 }
 
 impl Beside {
-    /// The file of the image at `url`, downloaded now if it's a URL not
-    /// cached yet, or why it can't be drawn.
+    /// The file of the image at `url`, or why it can't be drawn. Never
+    /// downloads: a call downloads the images it places as it runs, within
+    /// its time on the network.
     pub fn image(&self, url: &str) -> Result<PathBuf, String> {
         if ImageFill::is_remote(url) {
-            self.cache.images.load(url)
+            self.cache.images.had(url)
         } else {
             images::beside(&self.folder, url)
         }

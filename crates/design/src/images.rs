@@ -53,10 +53,6 @@ impl Images {
         }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Downloads cache misses from `source` from now on.
     pub fn set_source(&self, source: Arc<dyn ImageSource>) {
         *self.source.write().unwrap_or_else(|e| e.into_inner()) = source;
@@ -65,6 +61,19 @@ impl Images {
     /// The file the image at `url` is cached in, whether it is yet or not.
     pub fn file_of(&self, url: &str) -> PathBuf {
         self.dir.join(format!("{:x}", Sha256::digest(url.as_bytes())))
+    }
+
+    /// The file holding the image at `url` if it's cached, or why it isn't:
+    /// never downloads.
+    pub fn had(&self, url: &str) -> Result<PathBuf, String> {
+        let file = self.file_of(url);
+        if file.is_file() {
+            return Ok(file);
+        }
+        match lock(&self.failed).get(url) {
+            Some((why, _)) => Err(why.clone()),
+            None => Err("it isn't downloaded yet (the call waited on the network as long as it may); the next call may download it".into()),
+        }
     }
 
     /// The file holding the image at `url`, downloaded now if it isn't
