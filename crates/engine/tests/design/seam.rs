@@ -5,10 +5,11 @@
 //! the files on disk.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
+use zeron_design::icons::IconSource;
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_mcp::{Origin, Tools, Zeron};
 use zeron_proto::HarnessId;
@@ -19,7 +20,27 @@ pub const CHAT: &str = "designer";
 pub struct Seam {
     pub core: EngineCore,
     tools: Tools,
+    /// Iconify, played by the fixture icons.
+    pub iconify: Arc<FixtureIcons>,
     _dir: tempfile::TempDir,
+}
+
+/// Icons served from `fixtures/icons/<set>/<name>.svg` in place of
+/// Iconify's API, so tests run offline; it notes each icon asked for.
+#[derive(Default)]
+pub struct FixtureIcons {
+    pub fetched: Mutex<Vec<String>>,
+}
+
+impl IconSource for FixtureIcons {
+    fn fetch(&self, set: &str, name: &str) -> Result<Option<String>, String> {
+        self.fetched.lock().unwrap().push(format!("{set}:{name}"));
+        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/design/fixtures/icons")
+            .join(set)
+            .join(format!("{name}.svg"));
+        Ok(std::fs::read_to_string(file).ok())
+    }
 }
 
 /// One tool call's result, as the agent's client gets it.
@@ -78,6 +99,8 @@ impl Seam {
         core.workspace
             .create_chat(CHAT, None, Some(&core.device_id), None, None)
             .unwrap();
+        let iconify = Arc::new(FixtureIcons::default());
+        core.designs.icons().set_source(iconify.clone());
         let tools = Tools::new(Arc::new(Zeron::with_client(
             zeron_rpc::agent_memory_client(core.rpc_service(), Some(CHAT.into())),
             Origin {
@@ -89,6 +112,7 @@ impl Seam {
         Self {
             core,
             tools,
+            iconify,
             _dir: dir,
         }
     }

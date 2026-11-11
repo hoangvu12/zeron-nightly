@@ -3,7 +3,8 @@
 //! the backend (Skia's raster, [`crate::skia`]), so a tiny-skia renderer
 //! would replace that and a painter of its own.
 
-use crate::model::{Design, Node, Paint};
+use crate::icons::Icons;
+use crate::model::{Color, Design, FillRule, Node, Paint};
 
 /// The longest side of an agent's screenshot, in pixels.
 pub const SCREENSHOT_MAX_SIDE: f32 = 400.;
@@ -23,6 +24,25 @@ impl Rect {
     }
 }
 
+/// An outline other than a rectangle, as the shape node types describe it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shape<'a> {
+    /// The ellipse filling `rect`, or the part of it from `start` through
+    /// `sweep` degrees (0 at 3 o'clock, clockwise), less a hole of `inner`
+    /// times its radii.
+    Ellipse { rect: Rect, start: f32, sweep: f32, inner: f32 },
+    /// The polygon through these corners.
+    Polygon(&'a [(f32, f32)]),
+    /// SVG path data whose `view_box` (or, without one, its own bounds) is
+    /// stretched onto `rect`.
+    Path {
+        geometry: &'a str,
+        view_box: Option<Rect>,
+        rect: Rect,
+        fill_rule: FillRule,
+    },
+}
+
 /// What node types draw with. Calls stack as on a canvas: `save` and
 /// `restore` bracket a `translate`, `scale` or `clip_rect`.
 pub trait Painter {
@@ -33,6 +53,11 @@ pub trait Painter {
     fn clip_rect(&mut self, rect: Rect);
     /// Fills `rect` with each paint in turn.
     fn fill_rect(&mut self, rect: Rect, paints: &[Paint]);
+    /// Fills `shape` with each paint in turn.
+    fn fill_shape(&mut self, shape: Shape<'_>, paints: &[Paint]);
+    /// Draws an icon (`set:name`) into `rect` in `color`, or nothing when
+    /// the painter has no icons or not that one.
+    fn icon(&mut self, icon: &str, weight: Option<u16>, color: Color, rect: Rect);
 }
 
 /// Draws `node` and its descendants with its top-left at the painter's
@@ -76,8 +101,14 @@ pub enum RenderError {
 }
 
 /// Draws one node of `design` on a transparent background at 1x, or
-/// smaller when its longest side is over `max_side`, and encodes it.
-pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot, RenderError> {
+/// smaller when its longest side is over `max_side`, and encodes it. Its
+/// icons come from `icons`.
+pub fn screenshot(
+    design: &Design,
+    id: &str,
+    max_side: f32,
+    icons: &Icons,
+) -> Result<Screenshot, RenderError> {
     let node = design.find(id).ok_or_else(|| RenderError::NotFound(id.into()))?;
     let (width, height) = node.kind.get().size();
     if !(width > 0. && height > 0.) {
@@ -92,7 +123,7 @@ pub fn screenshot(design: &Design, id: &str, max_side: f32) -> Result<Screenshot
     let mut surface =
         crate::skia::surface(pixels_wide as i32, pixels_high as i32).ok_or_else(failed)?;
     {
-        let mut painter = crate::skia::SkiaPainter::new(surface.canvas());
+        let mut painter = crate::skia::SkiaPainter::new(surface.canvas()).with_icons(icons);
         painter.scale(scale);
         paint_node(node, &mut painter);
     }

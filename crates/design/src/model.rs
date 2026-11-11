@@ -6,12 +6,20 @@
 //! property groups shared by the types that have them ([`Size`], [`Fill`]),
 //! and joins [`Kind`] with one line in its `kinds!` list.
 
+mod ellipse;
 mod frame;
+mod icon;
 mod paint;
+mod path;
+mod polygon;
 mod rectangle;
 
+pub use ellipse::Ellipse;
 pub use frame::Frame;
+pub use icon::Icon;
 pub use paint::{Color, Fill, Paint};
+pub use path::{FillRule, Path};
+pub use polygon::Polygon;
 pub use rectangle::Rectangle;
 
 use serde::{Deserialize, Serialize};
@@ -194,6 +202,10 @@ kinds! {
     /// A container. On the Canvas itself, a Screen or a Component.
     Frame = "frame",
     Rectangle = "rectangle",
+    Ellipse = "ellipse",
+    Polygon = "polygon",
+    Path = "path",
+    Icon = "icon",
 }
 
 /// A fixed width and height, in pixels at 1x.

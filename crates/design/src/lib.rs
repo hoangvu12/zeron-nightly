@@ -6,6 +6,7 @@
 //! tiles), so the two draw alike.
 
 pub mod edit;
+pub mod icons;
 pub mod model;
 pub mod render;
 pub mod skia;

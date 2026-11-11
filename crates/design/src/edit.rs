@@ -7,9 +7,11 @@
 //! call's result and for whoever follows the Design.
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+use crate::icons::Icons;
 use crate::model::{Design, Kind, Node};
 
 /// Characters a generated node id is made of.
@@ -38,6 +40,8 @@ pub struct Draft {
     changed: BTreeSet<String>,
     /// Nodes whose screenshots the call asked for, in order.
     screenshots: Vec<String>,
+    /// Where icon names are checked; without, any name is taken.
+    icons: Option<Arc<Icons>>,
 }
 
 /// What a call's draft ends as, once it succeeded.
@@ -62,7 +66,14 @@ impl Draft {
             created: Vec::new(),
             changed: BTreeSet::new(),
             screenshots: Vec::new(),
+            icons: None,
         }
+    }
+
+    /// Checks the icons the call places against `icons`, fetching each.
+    pub fn with_icons(mut self, icons: Arc<Icons>) -> Self {
+        self.icons = Some(icons);
+        self
     }
 
     /// Adds `node` (a node's properties, with any `children` inline) as the
@@ -86,6 +97,7 @@ impl Draft {
         self.prepare(&mut node, &mut made)?;
         let node: Node = serde_json::from_value(node)
             .map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
+        self.check(&node).map_err(|e| EditError::Invalid(format!("Insert: {e}")))?;
         let siblings = match parent {
             None => &mut self.design.children,
             Some(parent) => {
@@ -136,6 +148,23 @@ impl Draft {
             changed: self.changed,
             screenshots: self.screenshots,
         }
+    }
+
+    /// Refuses what `node` or its children can't be drawn with: an icon
+    /// Iconify doesn't have (fetching it now, so it's cached to draw), a
+    /// path that isn't path data, a polygon's side count.
+    fn check(&self, node: &Node) -> Result<(), String> {
+        match &node.kind {
+            Kind::Icon(icon) => {
+                if let Some(icons) = &self.icons {
+                    icons.svg(&icon.icon, icon.weight).map_err(|e| e.to_string())?;
+                }
+            }
+            Kind::Path(path) => path.problem().map_or(Ok(()), Err)?,
+            Kind::Polygon(polygon) => polygon.problem().map_or(Ok(()), Err)?,
+            _ => {}
+        }
+        node.kind.get().children().iter().try_for_each(|child| self.check(child))
     }
 
     /// Gives `node` and its inline children new ids and default names,

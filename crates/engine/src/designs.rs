@@ -7,7 +7,10 @@
 //! call's screenshots drawn (one that can't be drawn says why in its
 //! place). A failed call changes nothing, on disk or in memory. New Designs are made in the managed folder, `designs/` in the
 //! engine's data dir, one folder each with an `images/` folder beside the
-//! `.zdesign` file.
+//! `.zdesign` file. Icons are fetched from Iconify as a call places them
+//! and cached in `design-cache/icons/` beside it.
+
+mod iconify;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +21,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zeron_design::Design;
 use zeron_design::edit::{Draft, Edited};
+use zeron_design::icons::Icons;
 use zeron_design::snippet::{self, Limits};
+
+use self::iconify::Iconify;
 
 /// A `.zdesign` file's extension.
 pub const EXTENSION: &str = "zdesign";
@@ -64,6 +70,7 @@ pub struct Designs {
 struct Inner {
     root: PathBuf,
     limits: Limits,
+    icons: Arc<Icons>,
     /// Designs held live, by file: one owner each, so calls apply in order.
     live: Mutex<HashMap<PathBuf, Arc<Mutex<Live>>>>,
 }
@@ -83,10 +90,12 @@ impl Designs {
         let root = std::fs::create_dir_all(&root)
             .and_then(|()| canonical(&root))
             .unwrap_or(root);
+        let icons = Icons::new(data_dir.join("design-cache").join("icons"), Arc::new(Iconify));
         Self {
             inner: Arc::new(Inner {
                 root,
                 limits: Limits::default(),
+                icons: Arc::new(icons),
                 live: Mutex::new(HashMap::new()),
             }),
         }
@@ -95,6 +104,12 @@ impl Designs {
     /// The managed folder new Designs are made in.
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// The icons Designs draw, cached in `design-cache/icons/` in the
+    /// engine's data dir.
+    pub fn icons(&self) -> &Icons {
+        &self.inner.icons
     }
 
     /// Runs one `design_execute` call to its end (blocking: run it off the
@@ -115,9 +130,9 @@ impl Designs {
 
     fn run(&self, live: &Mutex<Live>, code: &str) -> Result<Value, DesignError> {
         let mut live = lock(live);
-        let draft = snippet::run(Draft::new(live.design.clone()), code, self.inner.limits)?;
-        let edited = draft.finish();
-        let screenshots = live.commit(&edited)?;
+        let draft = Draft::new(live.design.clone()).with_icons(self.inner.icons.clone());
+        let edited = snippet::run(draft, code, self.inner.limits)?.finish();
+        let screenshots = live.commit(&edited, &self.inner.icons)?;
         Ok(json!({
             "design": { "name": design_name(&live.path), "path": live.path },
             "ids": edited.names,
@@ -212,7 +227,7 @@ struct Target {
 impl Live {
     /// Keeps a successful call's draft: saves the file, then draws the
     /// screenshots the call asked for.
-    fn commit(&mut self, edited: &Edited) -> Result<Vec<Value>, DesignError> {
+    fn commit(&mut self, edited: &Edited, icons: &Icons) -> Result<Vec<Value>, DesignError> {
         save(&self.path, &edited.design)?;
         self.design = edited.design.clone();
         Ok(edited
@@ -223,6 +238,7 @@ impl Live {
                     &self.design,
                     id,
                     zeron_design::render::SCREENSHOT_MAX_SIDE,
+                    icons,
                 );
                 match shot {
                     Ok(shot) => json!({
