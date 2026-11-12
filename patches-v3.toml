@@ -104,13 +104,13 @@ note = "A plugin service can run scripts its agents write (`zeron.eval`), behind
 [[patch]]
 name = "service-measure-text"
 pr = 1367
-sha = "42a7ed065b874d1df61a6268d1835c420a307e45"
+sha = "bffc8ee9d92ff5bd84a16a05f02f8135d87989ea"
 note = "A plugin service measures text (`zeron.measure_text`, `zeron.load_font`) with zgx's own shaper (zgx-text, zgx #2094), as its window's canvas does; zgx-nightly-design points the engine's zgx lines at the app's zgx."
 
 [[patch]]
 name = "zgx-nightly-design"
 file = "patches/0012-zgx-nightly-design.patch"
-note = "zgx from hoangvu12/zgx's nightly-design branch (9274b924): zeron/zgx's pinned zgx 06c6d56 with zgx #2074 (ui.load_font, at bb8dbd37), #2080 (ui.render_canvas, with its app-fonts fix and paragraphs wrapped at their width), #2076 (canvas text spacing and wrapping), #2081 (c:image), #2082 (c:shadow) and #2094 (zgx-text: shaping and measuring without the renderer) cherry-picked onto it. Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml (zgx-text too) and both lockfiles move, so the app and the engine use one zgx. Goes after service-measure-text, which gives the engine its zgx lines."
+note = "zgx from hoangvu12/zgx's nightly-design branch (4dc5f79b): zeron/zgx's pinned zgx 06c6d56 with zgx #2074 (ui.load_font, at bb8dbd37), #2080 (ui.render_canvas, with its app-fonts fix and paragraphs wrapped at their width), #2076 (canvas text spacing and wrapping), #2081 (c:image), #2082 (c:shadow) and #2094 (zgx-text: shaping and measuring without the renderer) cherry-picked onto it, plus the Design plugin's base64 fonts and pictures and ui.write_file of any bytes. Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml (zgx-text too) and both lockfiles move, so the app and the engine use one zgx. Goes after service-measure-text, which gives the engine its zgx lines."
 # Another zgx PR: cherry-pick it onto nightly-design (a new commit, never a
 # force-push), run its tests, push. Then in a checkout assembled up to here,
 # replace the old rev with the new one in those two Cargo.toml files and both
@@ -126,3 +126,15 @@ name = "plugin-fonts"
 pr = 1378
 sha = "570dfd9e6593fd999c26103f50fb52f05072c6b8"
 note = "A plugin may ask for \"fonts\" (Capability::Fonts) and load font files in its windows. Goes after zgx-nightly-design: it needs zgx's ui.load_font (#2074), which only that zgx has."
+
+[[patch]]
+name = "service-fetch-binary"
+pr = 1379
+sha = "71e34ef2b93e973e67b932fbf8bab35116c6adf1"
+note = "A plugin service's zeron.fetch can return a font's or a picture's bytes whole, in base64."
+
+[[patch]]
+name = "service-db"
+pr = 1380
+sha = "8c644c5b610fdbb177e633213f42522d662bf624"
+note = "A plugin's service gets zeron.db (the new crates/plugin-db)."
