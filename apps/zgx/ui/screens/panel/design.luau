@@ -201,9 +201,16 @@ ui.command {
 
 -- The person's edits by hand on tab `id`'s Design (#33): one change, one
 -- undo step, told to every tab showing it.
-local function edit(id: string, edits: { any }, description: string, join: boolean?)
+-- (`refused`, if given, hears it refused, after the person's told.)
+local function edit(id: string, edits: { any }, description: string, join: boolean?, refused: (() -> ())?)
+	local tell = said("panel.design.failed_edit")
 	api.call("design.edit", { tab = id, edits = edits, description = description, join = join == true })
-		:after(function() end, said("panel.design.failed_edit"))
+		:after(function() end, function(e: any)
+			tell(e)
+			if refused then
+				refused()
+			end
+		end)
 end
 
 -- A step through the Design's one history, whoever's change is latest.
@@ -407,7 +414,10 @@ local function properties(id: string): Node
 			if f.number and tonumber(text) then
 				v = tonumber(text)
 			end
-			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property")
+			-- (Refused, it shows what the Design says again.)
+			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property", false, function()
+				value:set(known)
+			end)
 		end
 		-- (Following what the Design says as it changes, by anyone, but not
 		-- over what's being typed.)
@@ -451,6 +461,19 @@ local function properties(id: string): Node
 			end,
 			on_focus_change = function(focused: boolean)
 				typing = focused
+				-- (Left, by a click on the Canvas or anywhere: kept.)
+				if not focused then
+					commit()
+				end
+			end,
+			-- (Escape takes back what's typed: the Design's value again.)
+			on_key = function(e: any): boolean?
+				if e.key == "Escape" and value:peek() ~= known then
+					pending = nil
+					value:set(known)
+					return true
+				end
+				return nil
 			end,
 		}
 	end
@@ -605,10 +628,10 @@ local function canvas(id: string): Node
 	local editing = ui.use_state(nil :: { node: string, content: string, at: number, anchor: number, typed: boolean }?)
 	local last_press: { node: string?, at: number }? = nil
 	local field = ui.ref()
-	-- (A press placing the caret, which takes the field's focus a moment;
-	-- and whether the field has it.)
-	local placing = false
+	-- (Whether the field has the focus; and the Canvas, which takes it as an
+	-- edit ends there, rather than the next field along.)
 	local field_focused = false
+	local surface = ui.ref()
 	local function canvas_point(e: any): (number, number)
 		local v = views:peek()[id] :: View
 		return (e.local_x - v.x) / v.zoom, (e.local_y - v.y) / v.zoom
@@ -629,6 +652,15 @@ local function canvas(id: string): Node
 		end
 		local count = utf8.len(content) or #content
 		editing:set({ node = node, content = content, at = count, anchor = count, typed = false })
+	end
+	-- The edit over: the focus, if the field has it, to the Canvas (the
+	-- field leaving with it would hand it to the next field along).
+	local function finish_editing()
+		local canvas_el = surface:peek()
+		if field_focused and canvas_el then
+			canvas_el:focus()
+		end
+		editing:set(nil)
 	end
 	-- The field's caret and selection: anchor and caret, in chars.
 	local function selection(): (number?, number?)
@@ -664,12 +696,12 @@ local function canvas(id: string): Node
 	-- not the field's (whose words would write over what they take back).
 	local function on_field_key(k: any): boolean?
 		if k.key == "Escape" or (k.key == "Enter" and not k.shift) then
-			editing:set(nil)
+			finish_editing()
 			return true
 		end
 		local z, y = k.key == "z" or k.key == "Z", k.key == "y" or k.key == "Y"
 		if (z or y) and (k.cmd or k.ctrl or k.meta) then
-			editing:set(nil)
+			finish_editing()
 			step(if y or k.shift then "design.redo" else "design.undo")
 			return true
 		end
@@ -907,6 +939,13 @@ local function canvas(id: string): Node
 		overflow = "hidden",
 		relative = true,
 		bg = "$surface.sunken",
+		-- (Focused by its own presses, not as a press's default: while text
+		-- is edited, a press on it, a double one too, leaves the field the
+		-- focus.)
+		ref = surface,
+		focusable = true,
+		focus_on_press = false,
+		focus = { outline = 0 },
 		on_resize = function(s: { w: number, h: number })
 			local now = size:peek()
 			if now.w ~= s.w or now.h ~= s.h then
@@ -945,25 +984,21 @@ local function canvas(id: string): Node
 				-- it ends.)
 				if under == e_now.node then
 					local place = api.call_sync("design.caret", { tab = id, id = e_now.node, content = e_now.content, x = x, y = y })
-					if type(place) == "number" then
-						local el = field:peek()
-						if el then
-							el:set_selection(place)
-							follow_caret()
-							-- (The press, on the Canvas, which takes no focus,
-							-- takes the field's: given back after it.)
-							placing = true
-							ui.after(0, function()
-								placing = false
-								if field.mounted then
-									el:focus()
-								end
-							end)
-						end
+					local el = field:peek()
+					if type(place) == "number" and el then
+						el:set_selection(place)
+						follow_caret()
+						-- (A press on the Canvas leaves focus where it is:
+						-- the field keeps it, given back if it was lost.)
+						el:focus()
 					end
 					return
 				end
-				editing:set(nil)
+				finish_editing()
+			elseif surface:peek() then
+				-- (Not editing: the Canvas takes the focus, from a property
+				-- field, say, which keeps what's typed in it as it goes.)
+				surface:peek():focus()
 			end
 			if again and type(under) == "string" and table.find(chosen, under) and single_text(under) then
 				start_editing(under)
@@ -1080,9 +1115,14 @@ local function canvas(id: string): Node
 			o.top = edge("y", function(v: View): number
 				return v.y
 			end, false)
-			o.w = edge("w", function(): number
+			-- (Held inside the Canvas as the words grow past it: the field
+			-- scrolls its own text, nothing around it.)
+			local wide = edge("w", function(): number
 				return 0
 			end, true)
+			o.w = function(): number
+				return math.max(math.min(wide(), size:get().w - o.left()), 1)
+			end
 			o.h = edge("h", function(): number
 				return 0
 			end, true)
@@ -1098,26 +1138,29 @@ local function canvas(id: string): Node
 				follow_caret()
 			end
 			o.on_key = on_field_key
-			-- (Left for elsewhere, the edit ends: its words aren't kept over
-			-- what changes while it's away.)
+			-- (Left for elsewhere in the window, the edit ends: its words
+			-- aren't kept over what changes while it's away. The window left
+			-- for another app keeps it.)
 			o.on_focus = function()
 				field_focused = true
 			end
 			o.on_blur = function()
 				field_focused = false
 				ui.after(0, function()
-					if not placing and not field_focused and editing:peek() then
+					if not field_focused and editing:peek() and ui.window.active:peek() then
 						editing:set(nil)
 					end
 				end)
 			end
-			-- (Focused once the press that started it is done: a press on the
-			-- Canvas, which takes no focus, would take it away again.)
+			-- (Focused at once; its caret put where the edit starts as its
+			-- words have come in, a frame on, unless it's been typed in.)
 			o.on_mount = function(el: any)
+				if editing:peek() then
+					el:focus()
+				end
 				ui.after(0, function()
 					local now = editing:peek()
-					if now then
-						el:focus()
+					if now and not now.typed and field.mounted then
 						el:set_selection(now.anchor, now.at)
 					end
 				end)

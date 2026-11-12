@@ -1486,3 +1486,140 @@ fn switching_theme_draws_the_design_in_that_themes_token_values() {
     // (The tab's alone: nothing was asked of the engine.)
     assert!(tab.edits().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// In-place text and the focus, as a person's mouse and keys give it (#33c):
+// presses through zgx's own input (down, up, down, up, as a double click
+// comes, nothing run between), so the focus moves, and fields hear their
+// focus and blur, as zgx moves them in a window.
+
+impl Tab {
+    /// What has the keyboard focus: its node.
+    fn focused(&self) -> Option<zgx::scene::NodeId> {
+        self.app.ui.input.focused()
+    }
+
+    /// The node `target` names.
+    fn node(&mut self, target: &str) -> zgx::scene::NodeId {
+        self.app.target(target).unwrap_or_else(|e| panic!("{e}\n{}", self.app.tree()))
+    }
+
+    /// A double click at Canvas point (`x`, `y`): two presses and releases
+    /// with nothing between, then what they started.
+    fn double_click_canvas(&mut self, x: f32, y: f32) {
+        let (sx, sy) = self.on_screen(x, y);
+        let at = zgx::scene::Rect { x: sx as f32, y: sy as f32, width: 0., height: 0. };
+        zgx_script::driver::double_click_at(&mut self.app.ui, at);
+        self.app.frames(3);
+    }
+
+    /// The Fill field's text, as assistive technology reads it.
+    fn fill_shown(&mut self) -> String {
+        let fill = self.node("role:textbox \"Fill\"");
+        self.app.ui.editor_within(fill).expect("an editor").value().get()
+    }
+}
+
+fn with_title(content: &str) -> Design {
+    let mut design = landing("#EF4444", false);
+    let zeron_design::model::Kind::Frame(screen) = &mut design.children[0].kind else { panic!("a frame") };
+    screen.children.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "title", "type": "text", "x": 300, "y": 40, "content": content, "fontSize": 40, "fill": "#111827",
+        }))
+        .unwrap(),
+    );
+    design
+}
+
+#[test]
+fn a_double_click_edits_the_text_and_typing_past_the_screen_stays_in_it_as_one_step() {
+    let mut tab = mount(with_title("Hi"));
+    // From nothing selected and no field focused, the title double-clicked:
+    // selected by the first click, edited from the second, its caret at the
+    // end.
+    tab.double_click_canvas(410., 110.);
+    assert_eq!(tab.said_selected(), ["title"]);
+    let field = tab.node(&format!("#design-text-field-{TAB}"));
+    assert_eq!(tab.focused(), Some(field), "the hidden field has the keys");
+    let fill = tab.fill_shown();
+
+    // Typed a character at a time (SendInput's Unicode), on past the
+    // Screen's right edge (800 wide from 100: the title from 400).
+    let typed = " Xin chào Đà Nẵng, Việt Nam ơi";
+    for c in typed.chars() {
+        tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+        tab.app.frames(1);
+    }
+    tab.settle();
+    let edits = tab.edits();
+    assert_eq!(edits.last().unwrap()[0]["props"]["content"], format!("Hi{typed}"));
+    assert_eq!(tab.focused(), Some(tab.node(&format!("#design-text-field-{TAB}"))), "still the field's");
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_some(), "still editing");
+    // (One burst, one undo step: every change after the first joins it.)
+    let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
+    assert_eq!(joins[0], false);
+    assert!(joins[1..].iter().all(|j| j == true), "{joins:?}");
+    assert_eq!(tab.fill_shown(), fill, "nothing typed into Fill");
+
+    // Escape: the edit over, the Canvas has the focus (not the next field).
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
+    assert_eq!(tab.focused(), Some(tab.node(&format!("#design-canvas-{TAB}"))));
+}
+
+#[test]
+fn select_all_and_paste_go_into_the_text_edited_not_a_property_field() {
+    let mut tab = mount(with_title("Hello"));
+    // The title clicked, then double-clicked (the first press of the double
+    // click, so soon after the click, edits it; the second puts the caret
+    // where it lands).
+    tab.click_canvas(420., 110., zgx::input::Modifiers::default());
+    tab.double_click_canvas(420., 110.);
+    // Ctrl+A, then Ctrl+V as the window does it: into the focused editor.
+    tab.app.keys("cmd+a");
+    let focused = tab.focused().expect("a focus");
+    assert_eq!(focused, tab.node(&format!("#design-text-field-{TAB}")));
+    let editor = tab.app.ui.editor_within(focused).expect("an editor");
+    assert_eq!(editor.selection(), (0, "Hello".len()));
+    tab.app.ui.paste_into(&editor, Some("Xin chào Đà Nẵng"));
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap()[0], serde_json::json!({ "update": "title", "props": { "content": "Xin chào Đà Nẵng" } }));
+    assert!(tab.edits().iter().all(|e| e[0]["props"].get("fill").is_none()), "{:?}", tab.edits());
+}
+
+#[test]
+fn the_canvas_takes_the_focus_from_a_property_field_and_escape_takes_back_whats_typed() {
+    let mut tab = mount(with_title("Hello"));
+    tab.click_canvas(420., 110., zgx::input::Modifiers::default());
+    let fill = tab.node("role:textbox \"Fill\"");
+    // A value set from outside, then the field focused and junk typed.
+    assert!(tab.app.ui.set_accessible_value(fill, "#0F172A"));
+    let sent = serde_json::json!([{ "update": "title", "props": { "fill": "#0F172A" } }]);
+    let engine = tab.engine.clone();
+    let last_edit = move || engine.asked.borrow().iter().rev().find(|(m, _)| m == "EditDesign").map(|(_, p)| p["edits"].clone());
+    assert!(tab.app.wait_until(|_| last_edit() == Some(sent.clone())), "{:?}", tab.edits());
+    tab.settle();
+    tab.app.click("role:textbox \"Fill\"");
+    tab.app.ui.dispatch(InputEvent::Text("zzz".into()));
+    tab.app.frames(2);
+    assert!(tab.fill_shown().ends_with("zzz"));
+    // Escape: the Design's value again, nothing sent.
+    let sent_before = tab.edits().len();
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    assert_eq!(tab.fill_shown(), "#0F172A");
+    assert_eq!(tab.edits().len(), sent_before);
+    assert_eq!(tab.focused(), Some(fill), "Escape keeps the field");
+
+    // A click on the empty Canvas takes the focus from it.
+    tab.click_canvas(930., 60., zgx::input::Modifiers::default());
+    assert_eq!(tab.focused(), Some(tab.node(&format!("#design-canvas-{TAB}"))));
+    // And a double click on the title, from there, edits it.
+    tab.double_click_canvas(420., 110.);
+    assert_eq!(tab.focused(), Some(tab.node(&format!("#design-text-field-{TAB}"))));
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap()[0]["props"]["content"], "Hello!");
+}
