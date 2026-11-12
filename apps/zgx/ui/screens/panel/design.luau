@@ -49,6 +49,9 @@ local DOUBLE_MS = 400
 -- Unseen: the in-place text field's words, caret and selection (the Canvas
 -- draws them).
 local CLEAR = "#00000000"
+-- How long a text edit's change waits for the engine's answer before the
+-- next is sent anyway.
+local TEXT_ANSWER_MS = 10000
 -- How long a property field waits after its last change to send it.
 local PROPERTY_PAUSE_MS = 600
 -- How long what an agent just changed flashes (pen.dev's live touches).
@@ -210,31 +213,42 @@ local function edit(
 	description: string,
 	how: { join: boolean?, refused: (() -> ())?, settled: (() -> ())? }?
 )
-	local o = how or {}
+	local options = how or {}
 	local tell = said("panel.design.failed_edit")
-	api.call("design.edit", { tab = id, edits = edits, description = description, join = o.join == true })
-		:after(function()
-			if o.settled then
-				o.settled()
-			end
-		end, function(e: any)
+	local function settled()
+		if options.settled then
+			options.settled()
+		end
+	end
+	api.call("design.edit", { tab = id, edits = edits, description = description, join = options.join == true })
+		:after(settled, function(e: any)
 			tell(e)
-			if o.refused then
-				o.refused()
+			if options.refused then
+				options.refused()
 			end
-			if o.settled then
-				o.settled()
-			end
+			settled()
 		end)
 end
 
 -- A step through the Design's one history, whoever's change is latest.
+-- Each tab's text changes still to send: a step waits for them (else it
+-- could take back part of an edit, the rest landing after it).
+local text_sent: { [string]: (go: () -> ()) -> () } = {}
 local function step(call: string)
 	local t = front_tab()
 	if not t then
 		return false
 	end
-	api.call(call, { tab = t.id }):after(function() end, said("panel.design.failed_edit"))
+	local id = t.id
+	local function go()
+		api.call(call, { tab = id }):after(function() end, said("panel.design.failed_edit"))
+	end
+	local after_sent = text_sent[id]
+	if after_sent then
+		after_sent(go)
+	else
+		go()
+	end
 	return true
 end
 ui.command {
@@ -707,22 +721,59 @@ local function canvas(id: string): Node
 	-- each on a thread of its own, so changes sent together could land in
 	-- any order (an older one last, a joined one before its first). The
 	-- latest of an edit waiting replaces the one before it.
+	-- (A change refused, the next starts a step of its own: joined, it'd
+	-- join whatever "Edit text" was before. An engine not answering in
+	-- TEXT_ANSWER_MS is left behind, so the rest aren't held for ever.)
 	local text_queue: { { node: string, content: string, join: boolean } } = {}
-	local text_sending = false
+	local text_sending: number? = nil
+	local text_sends = 0
+	local text_refused = false
+	local waiting_steps: { () -> () } = {}
 	local function send_text()
-		if text_sending or #text_queue == 0 then
+		if text_sending then
+			return
+		end
+		if #text_queue == 0 then
+			local steps = waiting_steps
+			waiting_steps = {}
+			for _, go in steps do
+				go()
+			end
 			return
 		end
 		local change = table.remove(text_queue, 1) :: any
-		text_sending = true
-		edit(id, { { update = change.node, props = { content = change.content } } }, "Edit text", {
-			join = change.join,
-			settled = function()
-				text_sending = false
+		text_sends += 1
+		local this = text_sends
+		local join = change.join and not text_refused
+		text_refused = false
+		text_sending = this
+		local function settled()
+			if text_sending == this then
+				text_sending = nil
 				send_text()
+			end
+		end
+		ui.after(TEXT_ANSWER_MS, settled)
+		edit(id, { { update = change.node, props = { content = change.content } } }, "Edit text", {
+			join = join,
+			refused = function()
+				text_refused = true
 			end,
+			settled = settled,
 		})
 	end
+	text_sent[id] = function(go: () -> ())
+		if text_sending or #text_queue > 0 then
+			table.insert(waiting_steps, go)
+		else
+			go()
+		end
+	end
+	ui.on_cleanup(function()
+		if text_sent[id] then
+			text_sent[id] = nil
+		end
+	end)
 	local function queue_text(node: string, content: string, join: boolean)
 		local last = text_queue[#text_queue]
 		if last and join and last.node == node then

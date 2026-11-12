@@ -243,7 +243,14 @@ impl Source for Engine {
                 }
                 Ok(serde_json::json!({ "path": path, "done": undone.is_some() }))
             }
-            "RedoDesign" => Ok(serde_json::json!({ "path": path, "done": true })),
+            "RedoDesign" => {
+                let design = me.designs.borrow().get(&path).cloned().unwrap_or_default();
+                let redone = me.history.borrow_mut().redo(&design);
+                if let Some((design, _)) = &redone {
+                    me.say(&path, design.clone());
+                }
+                Ok(serde_json::json!({ "path": path, "done": redone.is_some() }))
+            }
             "DesignSaving" => {
                 let saving = me.saving.borrow().get(&path).cloned().unwrap_or_default();
                 Ok(serde_json::json!({ "path": path, "managed": path.starts_with("C:/designs/"), "unsaved": saving["unsaved"] }))
@@ -1717,6 +1724,15 @@ impl Tab {
         }
         self.settle();
     }
+
+    /// ⌘Z, the engine answering at once, and what the title is then.
+    fn undo_title(&mut self) -> serde_json::Value {
+        self.engine.slow.set(false);
+        assert!(self.app.host.run_command("panel.design.undo"));
+        self.app.frames(2);
+        self.settle();
+        self.title_written()
+    }
 }
 
 #[test]
@@ -1741,11 +1757,7 @@ fn a_burst_faster_than_the_engine_lands_whole_and_is_one_step_to_undo() {
     let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
     assert_eq!(joins, [false, true]);
     // One undo: all of it.
-    tab.engine.slow.set(false);
-    assert!(tab.app.host.run_command("panel.design.undo"));
-    tab.app.frames(2);
-    tab.settle();
-    assert_eq!(tab.title_written(), "Welcome home");
+    assert_eq!(tab.undo_title(), "Welcome home");
 }
 
 #[test]
@@ -1770,11 +1782,7 @@ fn bursts_with_answers_between_them_stay_one_step_and_the_last_always_lands() {
     tab.app.frames(2);
     tab.answer_edits();
     assert_eq!(tab.title_written(), "Welcome home Xin chào Đà Nẵng");
-    tab.engine.slow.set(false);
-    assert!(tab.app.host.run_command("panel.design.undo"));
-    tab.app.frames(2);
-    tab.settle();
-    assert_eq!(tab.title_written(), "Welcome home");
+    assert_eq!(tab.undo_title(), "Welcome home");
 }
 
 #[test]
@@ -1826,4 +1834,47 @@ fn the_selection_outline_of_a_text_edited_follows_its_words_as_typed() {
     let caret = on_screen_of(&mut tab.app, &format!("#design-caret-{TAB}"));
     assert!(after.width > before.width * 3., "{before:?} then {after:?}");
     assert!((after.x + after.width - caret.x).abs() <= 6., "{after:?} against the caret at {}", caret.x);
+}
+
+#[test]
+fn undo_pressed_while_an_edits_changes_are_still_sending_takes_back_all_of_it() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    tab.engine.slow.set(true);
+    for c in " Xin chào".chars() {
+        tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+        tab.app.frames(1);
+    }
+    // ⌘Z in the field, changes still to send: the undo waits for them.
+    tab.app.keys("cmd+z");
+    tab.app.frames(2);
+    let asked = |tab: &Tab| tab.engine.asked.borrow().iter().filter(|(m, _)| m == "UndoDesign").count();
+    assert_eq!(asked(&tab), 0, "not before the edit is all sent");
+    tab.answer_edits();
+    assert_eq!(asked(&tab), 1);
+    assert_eq!(tab.title_written(), "Welcome home");
+    // And redo puts all of it back.
+    assert!(tab.app.host.run_command("panel.design.redo"));
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home Xin chào");
+}
+
+#[test]
+fn a_refused_change_mid_edit_starts_a_step_of_its_own_after_it() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    tab.engine.slow.set(true);
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
+    tab.app.frames(1);
+    tab.app.ui.dispatch(InputEvent::Text("?".into()));
+    tab.app.frames(1);
+    // The first refused (the engine's answer an error), the next sent new.
+    let (_, tell) = tab.engine.waiting.borrow_mut().pop_front().expect("the first change");
+    let _ = tell.send(Err("refused".into()));
+    tab.app.frames(3);
+    tab.answer_edits();
+    let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
+    assert_eq!(joins, [false, false]);
+    assert_eq!(tab.title_written(), "Welcome home!?");
 }
