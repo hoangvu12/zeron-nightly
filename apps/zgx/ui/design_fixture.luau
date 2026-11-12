@@ -7,6 +7,7 @@
 
 ui.theme.strict("warn")
 local ds = require("@ds")
+local toast = require("@ds/toast")
 ds.setup()
 local state = require("@app/screens/panel/state")
 local Design = require("@app/screens/panel/design")
@@ -55,4 +56,6 @@ return ui.column {
 		end
 		return Design.Design { key = KEY, tab = id }
 	end, { w_full = true, grow = 1, min_h = 0 }),
+	-- (Where what failed is said, as the window shows it.)
+	toast.Host {},
 }

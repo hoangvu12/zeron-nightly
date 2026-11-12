@@ -52,8 +52,6 @@ local CLEAR = "#00000000"
 -- How long a text edit's change waits for the engine's answer before the
 -- next is sent anyway.
 local TEXT_ANSWER_MS = 10000
--- How long a property field waits after its last change to send it.
-local PROPERTY_PAUSE_MS = 600
 -- How long what an agent just changed flashes (pen.dev's live touches).
 local FLASH_MS = 900
 
@@ -107,13 +105,21 @@ end
 
 -- What failed, said in the engine's words (the tab keeps its marker, so
 -- nothing is lost by it).
-local function said(title: string): (any) -> ()
+-- (`key`, if given: a new one takes the place of the last with the same.)
+local said_last: { [string]: number } = {}
+local function said(title: string, key: string?): (any) -> ()
 	return function(err: any)
-		toast.show {
+		if key and said_last[key] then
+			toast.dismiss(said_last[key])
+		end
+		local shown_id = toast.show {
 			title = ui.t(title):get(),
 			body = if type(err) == "table" and err.message then tostring(err.message) else tostring(err),
 			tone = "danger",
 		}
+		if key then
+			said_last[key] = shown_id
+		end
 	end
 end
 
@@ -205,16 +211,17 @@ ui.command {
 -- The person's edits by hand on tab `id`'s Design (#33): one change, one
 -- undo step, told to every tab showing it.
 -- `how`: `join`, part of the latest change described alike; `refused`,
--- heard if it's refused, after the person's told; `settled`, heard as the
+-- heard if it's refused, after the person's told (its toast taking the
+-- place of the last with the same `toast` key); `settled`, heard as the
 -- engine answers, either way.
 local function edit(
 	id: string,
 	edits: { any },
 	description: string,
-	how: { join: boolean?, refused: (() -> ())?, settled: (() -> ())? }?
+	how: { join: boolean?, refused: (() -> ())?, settled: (() -> ())?, toast: string? }?
 )
 	local options = how or {}
-	local tell = said("panel.design.failed_edit")
+	local tell = said("panel.design.failed_edit", if options.toast then `{id}:{options.toast}` else nil)
 	local function settled()
 		if options.settled then
 			options.settled()
@@ -234,12 +241,19 @@ end
 -- Each tab's text changes still to send: a step waits for them (else it
 -- could take back part of an edit, the rest landing after it).
 local text_sent: { [string]: (go: () -> ()) -> () } = {}
+-- And each tab's edit in place, ended as a step comes (the words it holds
+-- would write over what the step takes back or puts back).
+local text_ends: { [string]: () -> () } = {}
 local function step(call: string)
 	local t = front_tab()
 	if not t then
 		return false
 	end
 	local id = t.id
+	local end_text = text_ends[id]
+	if end_text then
+		end_text()
+	end
 	local function go()
 		api.call(call, { tab = id }):after(function() end, said("panel.design.failed_edit"))
 	end
@@ -258,6 +272,15 @@ ui.command {
 	key = "cmd+z",
 	run = function(): boolean
 		return step("design.undo")
+	end,
+}
+-- (Ctrl+Y too, as Windows' apps redo; off the menus, ⌘⇧Z naming it.)
+ui.command {
+	id = "panel.design.redo_y",
+	title = ui.t("panel.design.command.redo"):get(),
+	key = "ctrl+y",
+	run = function(): boolean
+		return step("design.redo")
 	end,
 }
 ui.command {
@@ -425,18 +448,14 @@ local function properties(id: string): Node
 	end
 	local function field(f: { key: string, label: string, number: boolean }, node: string, start: any): Node
 		local value = ui.use_state(shown(start))
-		-- What the Design last said, as the field shows it.
+		-- What the Design last said, as the field shows it; and what was
+		-- sent last, so Enter and then leaving send it once.
 		local known = shown(start)
-		local typing = false
 		local sent: string? = nil
-		local pending: (() -> ())? = nil
+		-- (Kept only on Enter or on leaving the field (a click on the Canvas
+		-- among them); never as it's typed, nor a draft in a field never
+		-- focused as the selection moves on.)
 		local function commit()
-			if pending then
-				pending()
-				pending = nil
-			end
-			-- (Committed as shown, or as just sent (Enter, then leaving), it
-			-- changes nothing: a blank list stays.)
 			local text = value:peek()
 			if text == known or text == sent then
 				return
@@ -448,6 +467,7 @@ local function properties(id: string): Node
 			end
 			-- (Refused, it shows what the Design says again.)
 			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property", {
+				toast = `{node}:{f.key}`,
 				refused = function()
 					sent = nil
 					value:set(known)
@@ -455,37 +475,15 @@ local function properties(id: string): Node
 			})
 		end
 		-- (Following what the Design says as it changes, by anyone, but not
-		-- over what's being typed.)
+		-- over a draft being typed.)
 		ui.effect(function()
 			local now = props()
 			if now and now.id == node then
+				local was = known
 				known = shown(now[f.key])
-				if pending == nil then
+				if value:peek() == was then
 					value:set(known)
 				end
-			end
-		end)
-		-- (Typed, it's kept on Enter or on leaving the field. Set from
-		-- outside, by assistive technology with the field unfocused, it's
-		-- kept a moment after it stops changing, as the settings' fields
-		-- are; and either, as the selection moves on.)
-		ui.effect(function()
-			local text = value:get()
-			-- (Running again cancels the wait it made last.)
-			pending = nil
-			if text == known or typing then
-				return
-			end
-			pending = ui.after(PROPERTY_PAUSE_MS, function()
-				pending = nil
-				if not typing then
-					commit()
-				end
-			end)
-		end)
-		ui.on_cleanup(function()
-			if pending or typing then
-				commit()
 			end
 		end)
 		return ds.TextField {
@@ -495,15 +493,6 @@ local function properties(id: string): Node
 			w_full = true,
 			on_commit = function()
 				commit()
-			end,
-			on_focus_change = function(focused: boolean)
-				typing = focused
-				-- (Focused, what's typed waits for Enter or leaving: told a
-				-- moment after the keys, it drops the wait they began.)
-				if focused and pending then
-					pending()
-					pending = nil
-				end
 			end,
 			-- (Escape takes back what's typed: the Design's value again.)
 			on_key = function(e: any): boolean?
@@ -683,12 +672,16 @@ local function canvas(id: string): Node
 		end
 		return nil
 	end
+	-- The words an edit has sent: the engine telling them back is the
+	-- edit's own change, not one from outside.
+	local sent_words: { [string]: boolean } = {}
 	local function start_editing(node: string)
 		local content = single_text(node)
 		if not content then
 			return
 		end
 		local count = utf8.len(content) or #content
+		table.clear(sent_words)
 		editing:set({ node = node, content = content, at = count, anchor = count, typed = false })
 	end
 	-- The edit over: the focus to the Canvas, if the field has it (the
@@ -700,6 +693,11 @@ local function canvas(id: string): Node
 			canvas_el:focus()
 		end
 		editing:set(nil)
+	end
+	text_ends[id] = function()
+		if editing:peek() then
+			finish_editing()
+		end
 	end
 	-- The field's caret and selection: anchor and caret, in chars.
 	local function selection(): (number?, number?)
@@ -770,9 +768,8 @@ local function canvas(id: string): Node
 		end
 	end
 	ui.on_cleanup(function()
-		if text_sent[id] then
-			text_sent[id] = nil
-		end
+		text_sent[id] = nil
+		text_ends[id] = nil
 	end)
 	local function queue_text(node: string, content: string, join: boolean)
 		local last = text_queue[#text_queue]
@@ -794,8 +791,32 @@ local function canvas(id: string): Node
 		editing:set({ node = e.node, content = content, at = e.at, anchor = e.anchor, typed = true })
 		follow_caret()
 		-- (After its first, an edit's changes join it: one undo step.)
+		sent_words[content] = true
 		queue_text(e.node, content, e.typed)
 	end
+	-- The text changed from outside as it's edited (an agent, another tab,
+	-- an undo the edit didn't end): the field holds it now, the caret kept
+	-- where it can be, and what's typed next a step of its own. (The edit's
+	-- own changes told back, or any while some are still to send, aren't.)
+	ui.effect(function()
+		local e = editing:get()
+		local b = host:get()
+		local now = if b then b.props else nil
+		if not e or not now or now.id ~= e.node or now.type ~= "text" then
+			return
+		end
+		local words = now.content or ""
+		if words == e.content or sent_words[words] or text_sending or #text_queue > 0 then
+			return
+		end
+		local count = utf8.len(words) or #words
+		local at, anchor = math.min(e.at, count), math.min(e.anchor, count)
+		editing:set({ node = e.node, content = words, at = at, anchor = anchor, typed = false })
+		local el = field:peek()
+		if el then
+			el:set_selection(anchor, at)
+		end
+	end)
 	-- The keys the field gives way to: Escape and Enter end the edit (Shift
 	-- and Enter breaks the line), and ⌘Z, ⌘⇧Z and Ctrl+Y step the Design's history,
 	-- not the field's (whose words would write over what they take back).

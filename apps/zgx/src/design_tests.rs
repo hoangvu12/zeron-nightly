@@ -1494,13 +1494,15 @@ fn the_properties_panel_sends_each_property_as_a_change_and_undo_and_redo_reach_
     tab.app.frames(2);
     assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "hero", "props": { "width": 240 } }]));
     // A value set from outside (assistive technology's, UI Automation's
-    // ValuePattern), no Enter: sent once it stops changing.
+    // ValuePattern): kept on Enter, as typing is, never on its own.
     let fill = tab.app.target("role:textbox \"Fill\"").unwrap();
     assert!(tab.app.ui.set_accessible_value(fill, "#3B82F6"));
-    let sent = serde_json::json!([{ "update": "hero", "props": { "fill": "#3B82F6" } }]);
-    let engine = tab.engine.clone();
-    let last_edit = move || engine.asked.borrow().iter().rev().find(|(m, _)| m == "EditDesign").map(|(_, p)| p["edits"].clone());
-    assert!(tab.app.wait_until(|_| last_edit() == Some(sent.clone())), "{:?}", tab.edits());
+    tab.app.frames(120);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "hero", "props": { "width": 240 } }]));
+    tab.app.click("role:textbox \"Fill\"");
+    tab.app.key(zgx::input::Key::Enter);
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "hero", "props": { "fill": "#3B82F6" } }]));
 
     // ⌘Z and ⌘⇧Z: the Design's one history (their shortcuts bound as the
     // window binds commands' keys: src/shortcut_tests.rs presses them).
@@ -1643,12 +1645,11 @@ fn the_canvas_takes_the_focus_from_a_property_field_and_escape_takes_back_whats_
     let mut tab = mount(with_title("Hello"));
     tab.click_canvas(420., 110., zgx::input::Modifiers::default());
     let fill = tab.node("role:textbox \"Fill\"");
-    // A value set from outside, then the field focused and junk typed.
-    assert!(tab.app.ui.set_accessible_value(fill, "#0F172A"));
-    let sent = serde_json::json!([{ "update": "title", "props": { "fill": "#0F172A" } }]);
-    let engine = tab.engine.clone();
-    let last_edit = move || engine.asked.borrow().iter().rev().find(|(m, _)| m == "EditDesign").map(|(_, p)| p["edits"].clone());
-    assert!(tab.app.wait_until(|_| last_edit() == Some(sent.clone())), "{:?}", tab.edits());
+    // A value kept (Enter), then the field focused and junk typed.
+    tab.app.fill("role:textbox \"Fill\"", "#0F172A");
+    tab.app.key(zgx::input::Key::Enter);
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "title", "props": { "fill": "#0F172A" } }]));
     tab.settle();
     tab.app.click("role:textbox \"Fill\"");
     tab.app.ui.dispatch(InputEvent::Text("zzz".into()));
@@ -1877,4 +1878,145 @@ fn a_refused_change_mid_edit_starts_a_step_of_its_own_after_it() {
     let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
     assert_eq!(joins, [false, false]);
     assert_eq!(tab.title_written(), "Welcome home!?");
+}
+
+#[test]
+fn an_edit_started_after_an_undo_holds_the_text_as_it_is_now() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    for c in " abc".chars() {
+        tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+        tab.app.frames(1);
+    }
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home abc");
+    // Undone from the field, then the still-selected title edited again.
+    tab.app.keys("cmd+z");
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home");
+    tab.double_click_canvas(420., 110.);
+    let field = tab.node(&format!("#design-text-field-{TAB}"));
+    let editor = tab.app.ui.editor_within(field).expect("an editor");
+    assert_eq!(editor.value().get(), "Welcome home");
+    // (The second press of the double click put the caret where it
+    // landed: at the end, then typed.)
+    tab.app.key(zgx::input::Key::End);
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home!");
+}
+
+// ---------------------------------------------------------------------------
+// #33e: property fields keep only what the person keeps; an edit open as
+// the Design changes from elsewhere; Ctrl+Y; one toast a field.
+
+#[test]
+fn typing_in_a_property_field_never_keeps_itself_even_unheard_as_focused() {
+    let mut tab = mount(with_title("Hello"));
+    tab.click_canvas(420., 110., zgx::input::Modifiers::default());
+    let size = tab.node("role:textbox \"Font size\"");
+    // Keys to the field with no focus told first (as a real click seems to
+    // give them), and a value set from outside: nothing kept, however long.
+    tab.app.ui.input.dispatch_to(&tab.app.ui.scene, size, InputEvent::Text("9".into()));
+    tab.app.frames(150);
+    let fill = tab.node("role:textbox \"Fill\"");
+    assert!(tab.app.ui.set_accessible_value(fill, "#475569junk"));
+    tab.app.frames(150);
+    assert!(tab.edits().is_empty(), "{:?}", tab.edits());
+    // Focused and typed in, left a while: still nothing.
+    tab.app.click("role:textbox \"Font size\"");
+    tab.app.ui.dispatch(InputEvent::Text("9".into()));
+    tab.app.frames(150);
+    assert!(tab.edits().is_empty(), "{:?}", tab.edits());
+    // Kept on a click on the Canvas (leaving it).
+    tab.click_canvas(930., 60., zgx::input::Modifiers::default());
+    tab.app.frames(2);
+    assert_eq!(tab.edits().len(), 1, "{:?}", tab.edits());
+    assert_eq!(tab.edits()[0][0]["update"], "title");
+    assert!(tab.edits()[0][0]["props"].get("fontSize").is_some(), "{:?}", tab.edits());
+}
+
+#[test]
+fn an_undo_from_the_menu_ends_an_open_edit_and_the_next_holds_the_text_as_it_is() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    for c in " abc".chars() {
+        tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+        tab.app.frames(1);
+    }
+    tab.settle();
+    // ⌘Z by the window's menu (its accelerator, before the field's keys).
+    assert!(tab.app.host.run_command("panel.design.undo"));
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home");
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none(), "the edit ended");
+    // The still-selected title edited again: its words as they are now.
+    tab.app.frames(30);
+    tab.double_click_canvas(420., 110.);
+    let field = tab.node(&format!("#design-text-field-{TAB}"));
+    assert_eq!(tab.app.ui.editor_within(field).expect("an editor").value().get(), "Welcome home");
+    // (The second press of the double click put the caret where it
+    // landed: at the end, then typed.)
+    tab.app.key(zgx::input::Key::End);
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home!");
+}
+
+#[test]
+fn an_open_edit_takes_a_change_from_elsewhere_and_goes_on_from_it_as_a_new_step() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
+    tab.app.frames(2);
+    tab.settle();
+    // An agent rewrites the title meanwhile.
+    let mut changed = with_title("Hello from an agent");
+    let zeron_design::model::Kind::Frame(screen) = &mut changed.children[0].kind else { panic!("a frame") };
+    screen.children.retain(|n| n.id != "title" || true);
+    tab.engine.tell(PATH, changed, &["title"], "agent");
+    tab.app.frames(2);
+    tab.settle();
+    let field = tab.node(&format!("#design-text-field-{TAB}"));
+    assert_eq!(tab.app.ui.editor_within(field).expect("an editor").value().get(), "Hello from an agent");
+    // Typing goes on from it, a step of its own.
+    tab.app.ui.dispatch(InputEvent::Text("?".into()));
+    tab.app.frames(2);
+    tab.settle();
+    let last = tab.engine.asked.borrow().iter().rev().find(|(m, _)| m == "EditDesign").map(|(_, p)| p.clone()).unwrap();
+    assert_eq!(last["join"], false);
+    assert!(tab.title_written().as_str().unwrap().contains("agent"), "{}", tab.title_written());
+}
+
+#[test]
+fn ctrl_y_redoes_as_ctrl_shift_z_does() {
+    let tab = mount(with_title("Hello"));
+    let keys: Vec<_> = tab.app.host.commands().get().into_iter().filter(|c| c.id.starts_with("panel.design.redo")).map(|c| c.key).collect();
+    assert!(keys.contains(&Some("ctrl+y".into())), "{keys:?}");
+    assert!(keys.contains(&Some("cmd+shift+z".into())), "{keys:?}");
+    assert!(tab.app.host.run_command("panel.design.redo_y"));
+    tab.app.frames(2);
+    assert_eq!(tab.engine.asked.borrow().iter().filter(|(m, _)| m == "RedoDesign").count(), 1);
+}
+
+#[test]
+fn a_field_refused_again_says_so_once() {
+    let mut tab = mount(with_title("Hello"));
+    tab.click_canvas(420., 110., zgx::input::Modifiers::default());
+    for junk in ["#1junk", "#2junk", "#3junk"] {
+        tab.app.fill("role:textbox \"Fill\"", junk);
+        tab.app.key(zgx::input::Key::Enter);
+        tab.app.frames(3);
+    }
+    // (Those it replaced gone, their exit played.)
+    tab.app.frames(60);
+    tab.settle();
+    let tree = tab.app.tree();
+    assert!(tree.contains("#3junk"), "the latest said: {tree}");
+    let said = tree.matches("The change didn't go through").count();
+    assert_eq!(said, 1, "{}", tab.app.tree());
 }
