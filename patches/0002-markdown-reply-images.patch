@@ -1,4 +1,4 @@
-From 69fd99dea0bedc12d30c8e9659db8c3dd6a20746 Mon Sep 17 00:00:00 2001
+From 7d959081e1b6193987158332b8b1ba0c2c2321ee Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 5 Nov 2026 23:19:58 +0700
 Subject: [PATCH] Markdown images in replies: any local folder, kept when the
@@ -36,18 +36,18 @@ a_finished_replys_images_outlive_their_files, zeron-mcp (59).
  crates/engine/src/reply_images.rs | 423 ++++++++++++++++++++++++++++++
  crates/engine/src/rpc.rs          | 128 +++------
  crates/engine/src/sessions.rs     |  33 ++-
- crates/engine/src/uploads.rs      | 223 +---------------
+ crates/engine/src/uploads.rs      | 230 +---------------
  crates/engine/tests/e2e.rs        | 130 +++++++--
  crates/mcp/src/jsonrpc.rs         |   6 +-
  crates/ui/src/reply_images.rs     |  50 ++--
- 8 files changed, 636 insertions(+), 358 deletions(-)
+ 8 files changed, 636 insertions(+), 365 deletions(-)
  create mode 100644 crates/engine/src/reply_images.rs
 
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index dd161981cdcc3ce0060cc8e9c85aa5b66e081166..d32409b879688e5c91f921c0761f8863b868f341 100644
+index 610da782f7fe1b8351822fade8cddc431095d77a..18b301478aeb260d3568425047d7c79f4d28d16f 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -62,6 +62,7 @@ pub mod profile;
+@@ -67,6 +67,7 @@ pub mod profile;
  pub mod project_actions;
  pub mod registry;
  pub mod remote_terminals;
@@ -485,10 +485,10 @@ index 0000000000000000000000000000000000000000..ea93405787190af78ed48429e56cda7a
 +    }
 +}
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a9c4fda9c 100644
+index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0feaf61099 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
-@@ -403,43 +403,20 @@ struct OpenTerminalParams {
+@@ -409,43 +409,20 @@ struct OpenTerminalParams {
  /// Matches the UI canvas panel key (`AppState::panel_session_key`).
  const CANVAS_TERMINAL_PREFIX: &str = "space-canvas:";
  
@@ -540,7 +540,7 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
  }
  
  /// A cwd the user (or a project-less chat) meant as "host home", not a folder.
-@@ -1388,12 +1365,10 @@ impl EngineRpc {
+@@ -1435,12 +1412,10 @@ impl EngineRpc {
          self.file_search_root(p).await
      }
  
@@ -557,7 +557,7 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
          let refused = |why: &str| RpcError::BadParams(why.into());
          let chat = self
              .workspace
-@@ -1403,20 +1378,10 @@ impl EngineRpc {
+@@ -1450,20 +1425,10 @@ impl EngineRpc {
          if chat.device_id != self.doc_host.device_id() {
              return Err(refused("chat belongs to another device"));
          }
@@ -580,7 +580,7 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
      }
  
      /// Accept only a checkout already named by a local chat or contained in a
-@@ -5206,9 +5171,16 @@ impl RpcService for EngineRpc {
+@@ -5638,9 +5603,16 @@ impl RpcService for EngineRpc {
              }
              methods::READ_CHAT_IMAGE_CHUNK => {
                  let p: ReadChatImageChunkParams = parse_params(params)?;
@@ -599,7 +599,7 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
                  })
                  .await
                  .map_err(|e| RpcError::Failed(e.to_string()))?
-@@ -5218,7 +5190,7 @@ impl RpcService for EngineRpc {
+@@ -5650,7 +5622,7 @@ impl RpcService for EngineRpc {
              methods::READ_TOOL_OUTPUT => {
                  let p: ReadToolOutputParams = parse_params(params)?;
                  // Only the host has the journal; the same chat check as a
@@ -608,7 +608,7 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
                  // its root chat's.
                  let chat_id = crate::tool_output::journal_chat(&p.chat_id);
                  let chat = self
-@@ -6053,58 +6025,24 @@ mod tests {
+@@ -6602,58 +6574,24 @@ mod tests {
      }
  
      #[test]
@@ -677,10 +677,10 @@ index 7b9d89e07dcd53cb1c62bdfc630bbb2cb3b48918..aa60c492ddb0332139c79ea58031b87a
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 874348dac1d9f6d1a8589fed0291fc95a6cbc768..f18a0b575a69e4574ba426a99abe5e5210b4c443 100644
+index 635f646b701ad89bc219fe299f7e7b3c6d02c9f6..baeaf86eafae8f064299bf1960755e6dfe4b0f92 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -2669,6 +2669,27 @@ impl Inner {
+@@ -2761,6 +2761,27 @@ impl Inner {
          }
      }
  
@@ -708,7 +708,7 @@ index 874348dac1d9f6d1a8589fed0291fc95a6cbc768..f18a0b575a69e4574ba426a99abe5e52
      /// Record the chat's harness-native session id (and its cwd): live-process
      /// cache plus the durable workspace chat row — the row is what survives an
      /// engine restart (zeron sessions.ts:1039).
-@@ -4846,7 +4867,9 @@ async fn drive_run(
+@@ -4892,7 +4913,9 @@ async fn drive_run(
                          ) {
                              tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
                          }
@@ -719,7 +719,7 @@ index 874348dac1d9f6d1a8589fed0291fc95a6cbc768..f18a0b575a69e4574ba426a99abe5e52
                      }
                      folded.clear();
                      dirty = false;
-@@ -5407,7 +5430,9 @@ async fn drive_run(
+@@ -5447,7 +5470,9 @@ async fn drive_run(
              ) {
                  tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
              }
@@ -730,7 +730,7 @@ index 874348dac1d9f6d1a8589fed0291fc95a6cbc768..f18a0b575a69e4574ba426a99abe5e52
              folded.clear();
              dirty = false;
              entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
-@@ -5546,7 +5571,9 @@ async fn drive_run(
+@@ -5586,7 +5611,9 @@ async fn drive_run(
                  ) {
                      tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
                  }
@@ -742,10 +742,10 @@ index 874348dac1d9f6d1a8589fed0291fc95a6cbc768..f18a0b575a69e4574ba426a99abe5e52
              // The turn's session has now seen the transcript through its reply.
              if let Some((session_id, cwd)) = &run_session {
 diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
-index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff956651757376165b64 100644
+index e2b87ffe57c3c6b4ed9ae1d3d57c2d538b659582..8841a081002f32020c2313bcd19d8d6b419561a9 100644
 --- a/crates/engine/src/uploads.rs
 +++ b/crates/engine/src/uploads.rs
-@@ -16,8 +16,8 @@
+@@ -17,8 +17,8 @@
  //! image types, as in zeron; files in the uploads dir read back whatever their
  //! type, so a queued message can restore them for editing.
  //!
@@ -756,7 +756,7 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
  
  use std::path::{Path, PathBuf};
  use std::sync::Arc;
-@@ -84,7 +84,7 @@ pub fn pending_refs_in(text: &str) -> Vec<String> {
+@@ -145,7 +145,7 @@ fn is_upload_name(name: &str) -> bool {
  /// Hard cap on an assembled file.
  const MAX_BYTES: u64 = 32 * 1024 * 1024;
  /// Multiple of 3 so independent base64 chunks concatenate losslessly.
@@ -765,7 +765,7 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
  
  /// `ReadAttachmentChunk` reply.
  #[derive(Debug, Clone, Serialize)]
-@@ -416,47 +416,11 @@ fn jail(path: &str, roots: &[&Path]) -> Option<PathBuf> {
+@@ -540,47 +540,11 @@ fn jail(path: &str, roots: &[&Path]) -> Option<PathBuf> {
          .then_some(resolved)
  }
  
@@ -814,7 +814,7 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
      let name = name.to_string_lossy().to_ascii_uppercase();
      let stem = name
          .split(['.', ':'])
-@@ -477,66 +441,11 @@ fn is_windows_device_name(name: &std::ffi::OsStr) -> bool {
+@@ -601,66 +565,11 @@ fn is_windows_device_name(name: &std::ffi::OsStr) -> bool {
          || numbered("LPT")
  }
  
@@ -882,7 +882,7 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
      use std::path::{Component, Prefix};
      if !path.is_absolute() {
          return None;
-@@ -632,7 +541,7 @@ fn sanitize(file_name: &str) -> String {
+@@ -756,7 +665,7 @@ fn sanitize(file_name: &str) -> String {
      }
  }
  
@@ -891,7 +891,7 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
      match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
          "png" => Some("image/png"),
          "jpg" | "jpeg" => Some("image/jpeg"),
-@@ -899,124 +808,6 @@ mod tests {
+@@ -1133,131 +1042,6 @@ mod tests {
          }
      }
  
@@ -999,15 +999,22 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
 -            assert!(error.contains(why), "{path:?}: {error}");
 -        }
 -
--        // A folder reached through a link of its own (`/tmp` on macOS)
--        // serves its images by either name.
+-        // A folder behind links (its own, or an ancestor's: `/tmp` and
+-        // `/var` on macOS) serves its images by the name the chat knows it
+-        // by and by its real one, the links resolved.
 -        #[cfg(unix)]
 -        {
+-            let real = std::fs::canonicalize(&inside).unwrap();
 -            let via = elsewhere.path().join("chat-folder");
 -            std::os::unix::fs::symlink(folder.path(), &via).unwrap();
--            for path in [via.join("shots").join("before.png"), inside.clone()] {
--                let chunk = read_chat_image_chunk(path.to_str().unwrap(), 0, &via)
--                    .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+-            for (root, path) in [
+-                (folder.path(), inside.clone()),
+-                (folder.path(), real.clone()),
+-                (via.as_path(), via.join("shots").join("before.png")),
+-                (via.as_path(), real.clone()),
+-            ] {
+-                let chunk = read_chat_image_chunk(path.to_str().unwrap(), 0, root)
+-                    .unwrap_or_else(|e| panic!("{path:?} in {root:?}: {e}"));
 -                assert_eq!(BASE64.decode(&chunk.data).unwrap(), png);
 -            }
 -        }
@@ -1016,7 +1023,7 @@ index 63e7e73bbdc0240c0a3f0ebb9d29de5c5a0f8d3e..a79d1deb1f7defa7fb78ff9566517573
      #[test]
      fn windows_device_names_are_recognized_whatever_their_extension() {
          let device = |name: &str| is_windows_device_name(std::ffi::OsStr::new(name));
-@@ -1082,7 +873,7 @@ pub struct ImportedImage {
+@@ -1323,7 +1107,7 @@ pub struct ImportedImage {
  
  const MAX_GENERATED_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
  
@@ -1206,10 +1213,10 @@ index 426fa5c5eabb8a6dfd4492c67d12f85cb0144611..0e6b7ba1fc5713ed67a4d27a1fc412ff
  /// (`ReadToolOutput`), redacted as the doc's ten-line tail is; the doc says
  /// how many lines there are. Only the chat's host answers, and only for a
 diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
-index 8fb5a77af579f34f43681988c770b1a6b9bb2203..1e0447ee86b18e80eb2f925ba8e466acb5dbad3d 100644
+index f381d325fd13d6bc383ab8677c4661014cec9a8d..a4be9e109b60bdc7ca4d004f6d434a2177939261 100644
 --- a/crates/mcp/src/jsonrpc.rs
 +++ b/crates/mcp/src/jsonrpc.rs
-@@ -62,8 +62,10 @@ your final reply. Zeron renders it with its own native interface and enforces it
+@@ -68,8 +68,10 @@ your final reply. Zeron renders it with its own native interface and enforces it
  content sits directly on the chat with no cards or boxed panels, text uses the interface font \
  and type scale, and colors are theme tokens that work on frosted glass or opaque, light or dark. \
  The reader sees the visual above that reply, so don't announce or restate it. To show the \
@@ -1312,5 +1319,5 @@ index 6a2b4a2211ed3b6c7af7b76e6965ca6f03b7959d..28486d6c82a48be5195b3d4bf97d67ce
  
      #[test]
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

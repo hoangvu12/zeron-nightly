@@ -1,7 +1,7 @@
-From 8c6084fead2c8336155050edffb75b48de403170 Mon Sep 17 00:00:00 2001
+From 22938454b5775e2c9f4079bea656a9543ea66491 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 09:39:39 +0700
-Subject: [PATCH 2/3] engine: child reports cover follow-up turns, thanks and
+Subject: [PATCH] engine: child reports cover follow-up turns, thanks and
  handoffs
 
 Real use of child reports (twenty parent chats over three days) found
@@ -74,10 +74,10 @@ providers in its own settings, so it now reads as unknown, and connected.
  14 files changed, 809 insertions(+), 84 deletions(-)
 
 diff --git a/crates/doc/src/registry.rs b/crates/doc/src/registry.rs
-index dfd84de6685c63910a0158380e91f1a56e49d664..adf8663d2da8aadeaf283778463ac1f63925c33b 100644
+index ed711e5fc690f666e3bfa7a5cdb0908f4d613896..7aeefc11a60f8182f4791e8f39eff4ba5c5fea5a 100644
 --- a/crates/doc/src/registry.rs
 +++ b/crates/doc/src/registry.rs
-@@ -1460,6 +1460,20 @@ impl RegistryDoc {
+@@ -1712,6 +1712,20 @@ impl RegistryDoc {
          Ok(true)
      }
  
@@ -99,10 +99,10 @@ index dfd84de6685c63910a0158380e91f1a56e49d664..adf8663d2da8aadeaf283778463ac1f6
          if !self.row_exists(KIND_CHATS, chat_id) {
              return Ok(false);
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 395e87c6aa20041d50484623247bda5744a5190b..6a4588dcfba901dac51c5c28a1bde0824a35a6e8 100644
+index 2eec3d0afc7c43e714d87284c8f69302c2b2114f..e780e88a723d9f152b97c35351ac31cf8e3a4783 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -4980,13 +4980,23 @@ impl DocHost {
+@@ -4995,13 +4995,23 @@ impl DocHost {
          // unnecessary while it waited simply finds nothing to do.
          let _drain = handle.drain_lock.lock().await;
          self.thaw_recovered_queue(handle, &sessions);
@@ -127,7 +127,7 @@ index 395e87c6aa20041d50484623247bda5744a5190b..6a4588dcfba901dac51c5c28a1bde082
              match &head.delivery_gate {
                  Some(QueueDeliveryGate::Editing {
                      lease_id,
-@@ -6526,6 +6536,11 @@ impl DocHost {
+@@ -6541,6 +6551,11 @@ impl DocHost {
                      if message_id.ends_with(crate::sessions::REPORT_WAITED) {
                          return Ok((SessionCommandStatus::Applied, Some("its wait returned it".into())));
                      }
@@ -139,7 +139,7 @@ index 395e87c6aa20041d50484623247bda5744a5190b..6a4588dcfba901dac51c5c28a1bde082
                      // Sent again (a restart, a retry): it's here already.
                      let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
                          c.id != entry.id
-@@ -6933,6 +6948,26 @@ impl DocHost {
+@@ -6948,6 +6963,26 @@ impl DocHost {
          });
      }
  
@@ -1091,10 +1091,10 @@ index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41
 +    }
  }
 diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
-index d471b1da10fa5faa84427cafd50f7d529a48b750..61669fc1af9add39f5979f36aefb1f1246024f3a 100644
+index 4cdf51d0f58b99dce813122e97965d6e49cef814..3b2c9449da364cede93a5a04edfafa06431c67c3 100644
 --- a/crates/engine/src/workspace_host.rs
 +++ b/crates/engine/src/workspace_host.rs
-@@ -1419,6 +1419,11 @@ impl WorkspaceHost {
+@@ -1488,6 +1488,11 @@ impl WorkspaceHost {
          Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)
      }
  
@@ -1394,5 +1394,5 @@ index d293ec54ea6de12ff4bb0c7dcc4d3adaf156fcb4..53453f39460e6068d1c831337f971a07
  
  `create_chat` and each request in `create_chats` accept `kind`:
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

@@ -1,4 +1,4 @@
-From 055c85686ecaf98bafac797193bab3a0994172f1 Mon Sep 17 00:00:00 2001
+From 9cc1dc8b763b3673a6ad8c5b1c69ebf9ba1c90b5 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 4 Nov 2026 23:06:11 +0700
 Subject: [PATCH] Windows: accept prerelease versions in the updater
@@ -15,10 +15,10 @@ x.y.z and a beta's x.y.z-beta.n, so a prerelease build (0.2.137-v3.N,
  1 file changed, 19 insertions(+), 5 deletions(-)
 
 diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
-index c9f06a4c9e398386db539989376163a64cde0902..f35f63e6b863d77a1601e1969f3a748c7ef80ae5 100644
+index 972e65f22d279bf6dcfbf85dbfb7e61d4705a024..f9c49ce90b791b952eb6fe02fc021e33bfdef2e2 100644
 --- a/crates/update/src/windows.rs
 +++ b/crates/update/src/windows.rs
-@@ -71,15 +71,19 @@ fn package(version: &str) -> String {
+@@ -116,15 +116,19 @@ fn package(version: &str) -> String {
      format!("zeron-{version}-windows-{}.zip", std::env::consts::ARCH)
  }
  
@@ -42,7 +42,7 @@ index c9f06a4c9e398386db539989376163a64cde0902..f35f63e6b863d77a1601e1969f3a748c
  }
  
  /// The manifest's mandatory checksum for `file`.
-@@ -538,7 +542,17 @@ mod tests {
+@@ -1003,7 +1007,17 @@ mod tests {
      fn a_beta_s_version_names_files_and_nothing_else_does() {
          assert!(valid_version("0.2.137"));
          assert!(valid_version("0.2.137-beta.1"));
@@ -62,5 +62,5 @@ index c9f06a4c9e398386db539989376163a64cde0902..f35f63e6b863d77a1601e1969f3a748c
          }
      }
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

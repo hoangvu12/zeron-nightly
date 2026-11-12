@@ -1,4 +1,4 @@
-From 2efb8f4343e418be1c82dec085b6b11e66d497f0 Mon Sep 17 00:00:00 2001
+From ee5fdbb4197888b883e96df7cde19c5df7425625 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:03:38 +0700
 Subject: [PATCH] Images from another device load in a few round trips, not one
@@ -47,7 +47,7 @@ index ea93405787190af78ed48429e56cda7aca54d3ac..b66dfd94d15995abbf791a887601650d
  }
  
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index aa60c492ddb0332139c79ea58031b87a9c4fda9c..eb1be33b65878265ff41588c5cd85f39c58496e4 100644
+index 79862336675232ebbab7505c99d9ba0feaf61099..b183212f7951d41402e271f8f0dec1548ec15ae7 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -37,10 +37,10 @@
@@ -65,10 +65,10 @@ index aa60c492ddb0332139c79ea58031b87a9c4fda9c..eb1be33b65878265ff41588c5cd85f39
  //!   (`{text, nextOffset, done, bytes, lines, trimmed, exitCode?}`): one command's
  //!   whole output from this host's run journal, redacted as the doc's tail is
 diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
-index a79d1deb1f7defa7fb78ff956651757376165b64..f0f426a376d1371767849b0e4a1eb38a3010492c 100644
+index 8841a081002f32020c2313bcd19d8d6b419561a9..10c91f9c9a0f0f92034e648b1bbe4e90e447269a 100644
 --- a/crates/engine/src/uploads.rs
 +++ b/crates/engine/src/uploads.rs
-@@ -96,6 +96,9 @@ pub struct AttachmentChunk {
+@@ -157,6 +157,9 @@ pub struct AttachmentChunk {
      pub data: String,
      pub next_offset: u64,
      pub done: bool,
@@ -78,7 +78,7 @@ index a79d1deb1f7defa7fb78ff956651757376165b64..f0f426a376d1371767849b0e4a1eb38a
  }
  
  struct UploadsInner {
-@@ -276,6 +279,7 @@ impl Uploads {
+@@ -395,6 +398,7 @@ impl Uploads {
              data: BASE64.encode(&buf),
              next_offset,
              done: next_offset >= size,
@@ -87,7 +87,7 @@ index a79d1deb1f7defa7fb78ff956651757376165b64..f0f426a376d1371767849b0e4a1eb38a
      }
  
 diff --git a/crates/engine/tests/device_routing.rs b/crates/engine/tests/device_routing.rs
-index 8b99f8cdb9c5b002708c59916e38687978b20d11..6b9f005b3c68d6ba2620a1c70fe0fc3a86612bf0 100644
+index 15c3dd02862a28252a66e46043df9c8dfa0f764f..c71dbd5025afda4da40c7b865815a4e5f422e525 100644
 --- a/crates/engine/tests/device_routing.rs
 +++ b/crates/engine/tests/device_routing.rs
 @@ -878,6 +878,8 @@ async fn target_device_id_routes_over_the_relay() {
@@ -382,5 +382,5 @@ index 98f8af42f2209677622b07affb59e6ff79a9bc58..e966a7eb38639ea678a65e3f5da61654
      fn generated_image_cancelled_load_releases_claim_without_losing_completed_images() {
          let owner = "cancelled-generated-owner";
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

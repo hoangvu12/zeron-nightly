@@ -1,4 +1,4 @@
-From bc2b3f453ecf87b19f5d002c8fa06da2400f7c18 Mon Sep 17 00:00:00 2001
+From 14b4be4b88480c7f5f29c374829e24f3ded8fc8f Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:38:38 +0700
 Subject: [PATCH] zgx on Windows: no console window, and the ui folder beside
@@ -15,10 +15,10 @@ install on Windows keeps ui and plugins-builtin beside zeron.exe.
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
-index 8d4cde9ec2bf93e5e762d282c97f5140f52423c0..93490af9d1b6dddc36a0a190b384962874adb522 100644
+index 02726f3e67460f06fa8549cc547dda5313652791..75be8efd9c705ab6985d49694223df847a318d3d 100644
 --- a/apps/zgx/src/main.rs
 +++ b/apps/zgx/src/main.rs
-@@ -1256,7 +1256,8 @@ fn ui_dir() -> PathBuf {
+@@ -1303,7 +1303,8 @@ fn ui_dir() -> PathBuf {
  /// The packaged scripts of the install this executable runs from, if any:
  /// `Contents/Resources/ui` of a macOS bundle, `ui` beside it on Linux (the
  /// tarball's, scripts/package-linux.sh), `beta\<version>\ui` beside it on
@@ -28,16 +28,16 @@ index 8d4cde9ec2bf93e5e762d282c97f5140f52423c0..93490af9d1b6dddc36a0a190b3849628
  fn bundled_ui() -> Option<PathBuf> {
      static BUNDLED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
      BUNDLED
-@@ -1266,7 +1267,8 @@ fn bundled_ui() -> Option<PathBuf> {
+@@ -1313,7 +1314,8 @@ fn bundled_ui() -> Option<PathBuf> {
              let ui = if cfg!(target_os = "macos") {
                  dir.parent()?.join("Resources").join("ui")
              } else if cfg!(windows) {
--                dir.join("beta").join(about::APP_VERSION).join("ui")
-+                let beta = dir.join("beta").join(about::APP_VERSION).join("ui");
+-                windows_version_files(dir)?.join("ui")
++                let beta = windows_version_files(dir)?.join("ui");
 +                if beta.join("app.luau").is_file() { beta } else { dir.join("ui") }
              } else {
                  dir.join("ui")
              };
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

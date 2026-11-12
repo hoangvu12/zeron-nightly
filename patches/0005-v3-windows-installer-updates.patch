@@ -1,4 +1,4 @@
-From ddb826160e2cc90032cd0349267cd69a783ad079 Mon Sep 17 00:00:00 2001
+From 1914a61c58d3700b57eafa505faef0bbc46a566d Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 06:29:50 +0700
 Subject: [PATCH] Windows: updates by installer for an install of more than
@@ -14,14 +14,17 @@ rest behind.
 - v3 keeps the build of the engine it starts, so it can tell when the
   engine on disk is newer. On Windows nothing else restarts the engine, so
   it restarts an idle one at once and offers Restart to update when busy.
+- Such an install is never "incomplete" (zeron/zgx's 0.3.0 completes a
+  zeron.exe without its beta\<version> folder from the edge's feed): the
+  installer puts its files beside zeron.exe whole.
 ---
- apps/zgx/src/engine/manager.rs | 11 +++++
+ apps/zgx/src/engine/manager.rs | 11 ++++
  apps/zgx/src/engine_update.rs  |  6 ++-
- crates/update/src/windows.rs   | 87 ++++++++++++++++++++++++++++++++++
- 3 files changed, 102 insertions(+), 2 deletions(-)
+ crates/update/src/windows.rs   | 94 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 109 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/engine/manager.rs b/apps/zgx/src/engine/manager.rs
-index 316c40c94d0e391c6143f0fa9a9b2d1cedca1aae..366689861b72fac71c71b59aa351d238d254a581 100644
+index 9180c2487a05a5b0ccf2f698992cf7937359fe6d..e4f96f5e8eb57bf1562cb4c4bcc097930c6f6035 100644
 --- a/apps/zgx/src/engine/manager.rs
 +++ b/apps/zgx/src/engine/manager.rs
 @@ -328,6 +328,17 @@ impl Spawner {
@@ -60,10 +63,10 @@ index 929df56d5017fa8f0455f9dfe6696a9862785aaf..63dddc6e872dee752ac732dcd8ddabe5
              }
              let running = info["build"].as_str().map(str::to_owned);
 diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
-index f35f63e6b863d77a1601e1969f3a748c7ef80ae5..dbc7af598e956aae1fb5f64710780930fec77ad8 100644
+index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b08010930 100644
 --- a/crates/update/src/windows.rs
 +++ b/crates/update/src/windows.rs
-@@ -41,6 +41,25 @@ const PACKAGE: &str = "package";
+@@ -66,6 +66,25 @@ pub fn version_files(directory: &Path, version: &str) -> PathBuf {
  #[derive(serde::Deserialize)]
  struct Config {
      releases_url: String,
@@ -89,18 +92,31 @@ index f35f63e6b863d77a1601e1969f3a748c7ef80ae5..dbc7af598e956aae1fb5f64710780930
  }
  
  pub(super) fn is_managed(exe: &Path) -> bool {
-@@ -215,6 +234,9 @@ pub async fn stage(
+@@ -315,6 +334,9 @@ pub async fn stage(
          valid_version(&manifest.version),
          "invalid Windows release version"
      );
 +    if installer_updates(directory) {
 +        return stage_installer(edge_url, manifest, directory).await;
 +    }
-     if manifest.channel == super::Channel::Beta {
-         return stage_package(edge_url, manifest, directory).await;
+     // The zgx app (this one, or the one whose engine this is: its version's
+     // folder is there) updates from the package, on every channel.
+     if manifest.channel == super::Channel::Beta
+@@ -359,9 +381,12 @@ pub enum Completion {
+ /// the zgx app, and the zgx app's own single-file artifact,
+ /// [`artifact`]) leaves a zgx app: the executable alone. And how an update's
+ /// trial starts one: staged on its own, run in place of the installation.
++/// An install that updates by installer (`"installer": true`) has its files
++/// beside `zeron.exe`, put there whole by each installer: never incomplete.
+ pub fn incomplete_install(exe: &Path, version: &str) -> Option<PathBuf> {
+     let directory = install_directory(exe)?;
+     (is_managed(&directory.join("zeron.exe"))
++        && !installer_updates(&directory)
+         && !files_complete(&version_files(&directory, version)))
+     .then_some(directory)
+ }
+@@ -546,6 +571,68 @@ async fn lock_completion(directory: &Path) -> anyhow::Result<std::fs::File> {
      }
-@@ -233,6 +255,68 @@ pub async fn stage(
-     Ok(staged)
  }
  
 +/// Download the release's installer, verifying its mandatory checksum. An
@@ -168,16 +184,27 @@ index f35f63e6b863d77a1601e1969f3a748c7ef80ae5..dbc7af598e956aae1fb5f64710780930
  fn verify(staged: &Path) -> anyhow::Result<()> {
      let expected = std::fs::read_to_string(staged.with_file_name("sha256"))?;
      verify_digest(staged, expected.trim())
-@@ -271,6 +355,9 @@ fn digest(path: &Path) -> anyhow::Result<String> {
+@@ -584,6 +671,9 @@ fn digest(path: &Path) -> anyhow::Result<String> {
  /// and [`Self::recover_from_backup`] cover the leftovers of a hard crash
  /// between the two renames.
  pub fn apply(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {
 +    if staged.file_name().is_some_and(|name| name == STAGED_INSTALLER) {
 +        return apply_installer(staged, directory, relaunch);
 +    }
-     let installed = directory.join("zeron.exe");
-     ensure!(
-         std::env::current_exe()?.canonicalize()? == installed.canonicalize()?,
+     // From the new version's folder going in to the swap, no start's cleanup
+     // may take that folder for an old one (nothing runs from it yet).
+     let _lock = lock_completion_blocking(directory, std::time::Duration::from_secs(30))?;
+@@ -1121,6 +1211,10 @@ mod tests {
+         assert_eq!(incomplete_install(&exe, "0.2.139"), None);
+         // Another version's files don't count.
+         assert!(incomplete_install(&exe, "0.2.140").is_some());
++        // An install the installer updates has its files beside zeron.exe.
++        std::fs::write(install.path().join(CONFIG), r#"{"releases_url":"https://example.com/feed","installer":true}"#)
++            .unwrap();
++        assert_eq!(incomplete_install(&exe, "0.2.140"), None);
+     }
+ 
+     #[test]
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

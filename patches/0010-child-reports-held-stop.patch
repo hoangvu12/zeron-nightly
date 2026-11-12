@@ -1,8 +1,8 @@
-From bca07e003085fa08cd95f383e1d8730ed9c12763 Mon Sep 17 00:00:00 2001
+From 56b74ae01599da451c9932f0213d1d49426e44dc Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 11:02:36 +0700
-Subject: [PATCH 3/3] engine: the person's Stop on a child is held, and what
- they write next corrects the task
+Subject: [PATCH] engine: the person's Stop on a child is held, and what they
+ write next corrects the task
 
 When the person stopped a child chat to steer it, the parent heard "the
 person stopped it" at once, woke, and reacted mid-correction; the child
@@ -424,5 +424,5 @@ index fdfa9d22e54f0bbd5df45582214ddd41d8ed47a0..e5bb43c5e5982ea52a17bf94782c269a
          /// `chat`'s run as it stands now, started if it's a new one since
          /// `was`; a parked run reads the next message from its mailbox.
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 
