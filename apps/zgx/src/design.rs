@@ -402,7 +402,7 @@ fn moved(scene: &Scene, id: &str, dx: f32, dy: f32) -> Option<Json> {
 }
 
 /// Text node `id` of `scene` laid out as drawn with `content` in its
-/// place, and where its box is on the Canvas.
+/// place, and where its box is on the Canvas with it.
 fn carets_of(scene: &Scene, id: &str, content: &str) -> Option<(zeron_design::skia::Carets, Rect)> {
     let node = scene.design.find(id)?;
     let zeron_design::model::Kind::Text(text) = &node.kind else { return None };
@@ -419,7 +419,7 @@ fn carets_of(scene: &Scene, id: &str, content: &str) -> Option<(zeron_design::sk
         }
         _ => (at.width, at.height),
     };
-    Some((typesetter.carets(&text, size), at))
+    Some((typesetter.carets(&text, size), Rect { width: size.0, height: size.1, ..at }))
 }
 
 fn rect_value(r: Rect) -> Value {

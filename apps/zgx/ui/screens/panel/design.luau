@@ -46,6 +46,9 @@ local SETTLE_MS = 150
 local CLICK_SLOP = 4
 -- How soon a second press on a selected text edits it.
 local DOUBLE_MS = 400
+-- Unseen: the in-place text field's words, caret and selection (the Canvas
+-- draws them).
+local CLEAR = "#00000000"
 -- How long a property field waits after its last change to send it.
 local PROPERTY_PAUSE_MS = 600
 -- How long what an agent just changed flashes (pen.dev's live touches).
@@ -375,8 +378,8 @@ local FIELDS: { { key: string, label: string, number: boolean } } = {
 }
 local function properties(id: string): Node
 	local host = shown(id)
-	local function props(followed: boolean?): any
-		local b = if followed == false then host:peek() else host:get()
+	local function props(): any
+		local b = host:get()
 		return if b then b.props else nil
 	end
 	-- A property as its field shows it: blank for one it can't (none, or
@@ -386,13 +389,10 @@ local function properties(id: string): Node
 	end
 	local function field(f: { key: string, label: string, number: boolean }, node: string, start: any): Node
 		local value = ui.use_state(shown(start))
+		-- What the Design last said, as the field shows it.
+		local known = shown(start)
+		local typing = false
 		local pending: (() -> ())? = nil
-		-- What the Design says now, as the field shows it (`followed`, or
-		-- not); nil once the node's not the one selected.
-		local function written(followed: boolean): string?
-			local now = props(followed)
-			return if now and now.id == node then shown(now[f.key]) else nil
-		end
 		local function commit()
 			if pending then
 				pending()
@@ -400,8 +400,7 @@ local function properties(id: string): Node
 			end
 			-- (Committed as shown, it changes nothing: a blank list stays.)
 			local text = value:peek()
-			local was = written(false)
-			if was == nil or was == text then
+			if text == known then
 				return
 			end
 			local v: any = text
@@ -413,26 +412,34 @@ local function properties(id: string): Node
 		-- (Following what the Design says as it changes, by anyone, but not
 		-- over what's being typed.)
 		ui.effect(function()
-			local was = written(true)
-			if was ~= nil and pending == nil then
-				value:set(was)
+			local now = props()
+			if now and now.id == node then
+				known = shown(now[f.key])
+				if pending == nil then
+					value:set(known)
+				end
 			end
 		end)
-		-- (Kept a moment after it stops changing, as the settings' fields
-		-- are: a value set by assistive technology, or typed and left; and at
-		-- once on Enter or leaving the field.)
+		-- (Typed, it's kept on Enter or on leaving the field. Set from
+		-- outside, by assistive technology with the field unfocused, it's
+		-- kept a moment after it stops changing, as the settings' fields
+		-- are; and either, as the selection moves on.)
 		ui.effect(function()
 			local text = value:get()
-			if text == written(false) then
+			-- (Running again cancels the wait it made last.)
+			pending = nil
+			if text == known or typing then
 				return
-			end
-			if pending then
-				pending()
 			end
 			pending = ui.after(PROPERTY_PAUSE_MS, function()
 				pending = nil
 				commit()
 			end)
+		end)
+		ui.on_cleanup(function()
+			if pending or typing then
+				commit()
+			end
 		end)
 		return ds.TextField {
 			label = ui.t(f.label),
@@ -441,6 +448,9 @@ local function properties(id: string): Node
 			w_full = true,
 			on_commit = function()
 				commit()
+			end,
+			on_focus_change = function(focused: boolean)
+				typing = focused
 			end,
 		}
 	end
@@ -595,6 +605,10 @@ local function canvas(id: string): Node
 	local editing = ui.use_state(nil :: { node: string, content: string, at: number, anchor: number, typed: boolean }?)
 	local last_press: { node: string?, at: number }? = nil
 	local field = ui.ref()
+	-- (A press placing the caret, which takes the field's focus a moment;
+	-- and whether the field has it.)
+	local placing = false
+	local field_focused = false
 	local function canvas_point(e: any): (number, number)
 		local v = views:peek()[id] :: View
 		return (e.local_x - v.x) / v.zoom, (e.local_y - v.y) / v.zoom
@@ -646,16 +660,17 @@ local function canvas(id: string): Node
 		edit(id, { { update = e.node, props = { content = content } } }, "Edit text", e.typed)
 	end
 	-- The keys the field gives way to: Escape and Enter end the edit (Shift
-	-- and Enter breaks the line), and ⌘Z and ⌘⇧Z step the Design's history,
+	-- and Enter breaks the line), and ⌘Z, ⌘⇧Z and Ctrl+Y step the Design's history,
 	-- not the field's (whose words would write over what they take back).
 	local function on_field_key(k: any): boolean?
 		if k.key == "Escape" or (k.key == "Enter" and not k.shift) then
 			editing:set(nil)
 			return true
 		end
-		if (k.key == "z" or k.key == "Z") and (k.cmd or k.ctrl or k.meta) then
+		local z, y = k.key == "z" or k.key == "Z", k.key == "y" or k.key == "Y"
+		if (z or y) and (k.cmd or k.ctrl or k.meta) then
 			editing:set(nil)
-			step(if k.shift then "design.redo" else "design.undo")
+			step(if y or k.shift then "design.redo" else "design.undo")
 			return true
 		end
 		return nil
@@ -935,6 +950,15 @@ local function canvas(id: string): Node
 						if el then
 							el:set_selection(place)
 							follow_caret()
+							-- (The press, on the Canvas, which takes no focus,
+							-- takes the field's: given back after it.)
+							placing = true
+							ui.after(0, function()
+								placing = false
+								if field.mounted then
+									el:focus()
+								end
+							end)
 						end
 					end
 					return
@@ -1033,33 +1057,77 @@ local function canvas(id: string): Node
 			-- Over the text, where an input method puts its window; its own
 			-- words, caret and selection unseen (the Canvas draws them), and
 			-- clicks going on to the Canvas.
-			local e = editing:peek() :: any
-			local c = carets:peek()
-			local o = over(if c then c.box else { x = 0, y = 0, w = 0, h = 0 })
+			-- (Where the text's box is as it's typed: a text as wide as its
+			-- words grows.)
+			local o = over({
+				x = 0,
+				y = 0,
+				w = 0,
+				h = 0,
+			})
+			local function edge(key: string, view_at: (v: View) -> number, scale: boolean): () -> number
+				return function(): number
+					local c, v = carets:get(), view()
+					if not c or not v then
+						return 0
+					end
+					return (if scale then 0 else view_at(v)) + c.box[key] * v.zoom
+				end
+			end
+			o.left = edge("x", function(v: View): number
+				return v.x
+			end, false)
+			o.top = edge("y", function(v: View): number
+				return v.y
+			end, false)
+			o.w = edge("w", function(): number
+				return 0
+			end, true)
+			o.h = edge("h", function(): number
+				return 0
+			end, true)
 			o.id = `design-text-field-{id}`
-			o.label = ui.t("panel.design.edit_text")
+			o.label = ui.t("panel.design.edit_text"):get()
 			o.ref = field
 			o.value = function(): string
 				local now = editing:get()
 				return if now then now.content else ""
 			end
 			o.on_change = typed
-			o.on_caret = follow_caret
+			o.on_caret = function()
+				follow_caret()
+			end
 			o.on_key = on_field_key
+			-- (Left for elsewhere, the edit ends: its words aren't kept over
+			-- what changes while it's away.)
+			o.on_focus = function()
+				field_focused = true
+			end
+			o.on_blur = function()
+				field_focused = false
+				ui.after(0, function()
+					if not placing and not field_focused and editing:peek() then
+						editing:set(nil)
+					end
+				end)
+			end
 			-- (Focused once the press that started it is done: a press on the
 			-- Canvas, which takes no focus, would take it away again.)
 			o.on_mount = function(el: any)
 				ui.after(0, function()
-					el:focus()
-					el:set_selection(e.anchor, e.at)
+					local now = editing:peek()
+					if now then
+						el:focus()
+						el:set_selection(now.anchor, now.at)
+					end
 				end)
 			end
 			o.wrap = true
 			o.pointer_events = "none"
-			o.color = "#00000000"
-			o.caret_color = "#00000000"
-			o.selection_color = "#00000000"
-			o.bg = "#00000000"
+			o.color = CLEAR
+			o.caret_color = CLEAR
+			o.selection_color = CLEAR
+			o.bg = CLEAR
 			o.border = 0
 			o.focus = { outline = 0 }
 			o.px = 0

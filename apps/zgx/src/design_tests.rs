@@ -1396,6 +1396,17 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
     let (x, _, zoom) = tab.canvas.view(TAB).unwrap();
     let expected = tab.origin.0 + x + (400. + place_4) * zoom;
     assert!((caret.x + 1. - expected).abs() <= 1.5, "the caret at {} against place 4 at {expected}", caret.x);
+    // Escape ends it; edited again, a press on the text places the caret
+    // there, and typing goes on.
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
+    tab.click_canvas(420., 110., none);
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_some());
+    tab.click_canvas(401., 110., none);
+    tab.app.ui.dispatch(InputEvent::Text("Đ".into()));
+    tab.app.frames(2);
+    assert_eq!(words(&tab), "ĐHelếo");
 
     // Select all, copy, paste and cut, as in any field (by the field's
     // editor as the window's Edit menu and its keys do them: headless, the
@@ -1403,8 +1414,8 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
     let field = tab.app.target(&format!("#design-text-field-{TAB}")).unwrap();
     let editor = tab.app.ui.editor_within(field).expect("an editor");
     tab.app.keys("cmd+a");
-    assert_eq!(editor.selection(), (0, "Helếo".len()));
-    assert_eq!(editor.copy(), "Helếo");
+    assert_eq!(editor.selection(), (0, "ĐHelếo".len()));
+    assert_eq!(editor.copy(), "ĐHelếo");
     tab.app.ui.paste_into(&editor, Some("Xin chào"));
     tab.app.frames(2);
     assert_eq!(words(&tab), "Xin chào");
@@ -1412,11 +1423,11 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
     assert_eq!(editor.cut(), "Xin chào");
     tab.app.frames(2);
     assert_eq!(words(&tab), "");
-    // (The edit's changes after its first join it: one step to undo.)
+    // (Each edit's changes after its first join it: one step to undo each.)
     let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
-    assert_eq!(joins[0], false);
-    assert!(joins[1..].iter().all(|j| j == true), "{joins:?}");
-    tab.app.key(zgx::input::Key::Escape);
+    assert_eq!(joins, [false, true, true, true, false, true, true]);
+    // Left for another field, the edit ends.
+    tab.app.click("role:textbox \"Fill\"");
     tab.app.frames(2);
     assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
 }
