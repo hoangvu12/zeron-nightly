@@ -1577,7 +1577,8 @@ fn select_all_and_paste_go_into_the_text_edited_not_a_property_field() {
     // where it lands).
     tab.click_canvas(420., 110., zgx::input::Modifiers::default());
     tab.double_click_canvas(420., 110.);
-    // Ctrl+A, then Ctrl+V as the window does it: into the focused editor.
+    // Ctrl+A (`cmd` is Control off macOS), then Ctrl+V as the window
+    // does it: into the focused editor.
     tab.app.keys("cmd+a");
     let focused = tab.focused().expect("a focus");
     assert_eq!(focused, tab.node(&format!("#design-text-field-{TAB}")));
@@ -1612,6 +1613,13 @@ fn the_canvas_takes_the_focus_from_a_property_field_and_escape_takes_back_whats_
     assert_eq!(tab.fill_shown(), "#0F172A");
     assert_eq!(tab.edits().len(), sent_before);
     assert_eq!(tab.focused(), Some(fill), "Escape keeps the field");
+    // A value the engine refuses: told, and the Design's shown again.
+    tab.app.ui.dispatch(InputEvent::Text("nope".into()));
+    tab.app.key(zgx::input::Key::Enter);
+    tab.app.frames(3);
+    assert_eq!(tab.fill_shown(), "#0F172A");
+    let refused = serde_json::json!([{ "update": "title", "props": { "fill": "#0F172Anope" } }]);
+    assert_eq!(tab.edits().iter().filter(|e| **e == refused).count(), 1, "sent once: {:?}", tab.edits());
 
     // A click on the empty Canvas takes the focus from it.
     tab.click_canvas(930., 60., zgx::input::Modifiers::default());
@@ -1622,4 +1630,28 @@ fn the_canvas_takes_the_focus_from_a_property_field_and_escape_takes_back_whats_
     tab.app.ui.dispatch(InputEvent::Text("!".into()));
     tab.app.frames(2);
     assert_eq!(tab.edits().last().unwrap()[0]["props"]["content"], "Hello!");
+}
+
+#[test]
+fn a_slow_double_click_with_frames_between_its_presses_edits_the_text_and_keeps_the_keys() {
+    let mut tab = mount(with_title("Hi"));
+    // Each press and release a frame apart, as a window delivers them.
+    let (sx, sy) = tab.on_screen(410., 110.);
+    let (x, y) = (sx as f32, sy as f32);
+    let button = zgx::input::PointerButton::Primary;
+    for _ in 0..2 {
+        tab.app.ui.dispatch(InputEvent::PointerDown { x, y, button });
+        tab.app.frames(1);
+        tab.app.ui.dispatch(InputEvent::PointerUp { x, y, button });
+        tab.app.frames(1);
+    }
+    tab.app.frames(2);
+    assert_eq!(tab.focused(), Some(tab.node(&format!("#design-text-field-{TAB}"))));
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
+    tab.app.frames(2);
+    assert_eq!(tab.edits().last().unwrap()[0]["props"]["content"], "Hi!");
+    // A press elsewhere on the Canvas ends it, the Canvas taking the keys.
+    tab.click_canvas(930., 60., zgx::input::Modifiers::default());
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
+    assert_eq!(tab.focused(), Some(tab.node(&format!("#design-canvas-{TAB}"))));
 }

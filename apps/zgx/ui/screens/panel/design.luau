@@ -399,23 +399,27 @@ local function properties(id: string): Node
 		-- What the Design last said, as the field shows it.
 		local known = shown(start)
 		local typing = false
+		local sent: string? = nil
 		local pending: (() -> ())? = nil
 		local function commit()
 			if pending then
 				pending()
 				pending = nil
 			end
-			-- (Committed as shown, it changes nothing: a blank list stays.)
+			-- (Committed as shown, or as just sent (Enter, then leaving), it
+			-- changes nothing: a blank list stays.)
 			local text = value:peek()
-			if text == known then
+			if text == known or text == sent then
 				return
 			end
+			sent = text
 			local v: any = text
 			if f.number and tonumber(text) then
 				v = tonumber(text)
 			end
 			-- (Refused, it shows what the Design says again.)
 			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property", false, function()
+				sent = nil
 				value:set(known)
 			end)
 		end
@@ -461,15 +465,10 @@ local function properties(id: string): Node
 			end,
 			on_focus_change = function(focused: boolean)
 				typing = focused
-				-- (Left, by a click on the Canvas or anywhere: kept.)
-				if not focused then
-					commit()
-				end
 			end,
 			-- (Escape takes back what's typed: the Design's value again.)
 			on_key = function(e: any): boolean?
 				if e.key == "Escape" and value:peek() ~= known then
-					pending = nil
 					value:set(known)
 					return true
 				end
@@ -653,11 +652,12 @@ local function canvas(id: string): Node
 		local count = utf8.len(content) or #content
 		editing:set({ node = node, content = content, at = count, anchor = count, typed = false })
 	end
-	-- The edit over: the focus, if the field has it, to the Canvas (the
-	-- field leaving with it would hand it to the next field along).
-	local function finish_editing()
+	-- The edit over: the focus to the Canvas, if the field has it (the
+	-- field leaving with it would hand it to the next field along), or
+	-- always, for a press on the Canvas.
+	local function finish_editing(pressed: boolean?)
 		local canvas_el = surface:peek()
-		if field_focused and canvas_el then
+		if (field_focused or pressed) and canvas_el then
 			canvas_el:focus()
 		end
 		editing:set(nil)
@@ -994,11 +994,14 @@ local function canvas(id: string): Node
 					end
 					return
 				end
-				finish_editing()
-			elseif surface:peek() then
+				finish_editing(true)
+			else
 				-- (Not editing: the Canvas takes the focus, from a property
 				-- field, say, which keeps what's typed in it as it goes.)
-				surface:peek():focus()
+				local canvas_el = surface:peek()
+				if canvas_el then
+					canvas_el:focus()
+				end
 			end
 			if again and type(under) == "string" and table.find(chosen, under) and single_text(under) then
 				start_editing(under)
@@ -1109,19 +1112,22 @@ local function canvas(id: string): Node
 					return (if scale then 0 else view_at(v)) + c.box[key] * v.zoom
 				end
 			end
-			o.left = edge("x", function(v: View): number
+			local left = edge("x", function(v: View): number
 				return v.x
 			end, false)
 			o.top = edge("y", function(v: View): number
 				return v.y
 			end, false)
-			-- (Held inside the Canvas as the words grow past it: the field
-			-- scrolls its own text, nothing around it.)
+			-- (Held inside the Canvas as the words go past either side of it:
+			-- the field scrolls its own text, nothing around it.)
 			local wide = edge("w", function(): number
 				return 0
 			end, true)
+			o.left = function(): number
+				return math.clamp(left(), 0, math.max(size:get().w - 1, 0))
+			end
 			o.w = function(): number
-				return math.max(math.min(wide(), size:get().w - o.left()), 1)
+				return math.max(math.min(left() + wide(), size:get().w) - o.left(), 1)
 			end
 			o.h = edge("h", function(): number
 				return 0
@@ -1165,7 +1171,9 @@ local function canvas(id: string): Node
 					end
 				end)
 			end
-			o.wrap = true
+			-- (Its lines broken only where the words break them: wrapped at its
+			-- own width, held inside the Canvas, it would break them elsewhere.)
+			o.wrap = false
 			o.pointer_events = "none"
 			o.color = CLEAR
 			o.caret_color = CLEAR
