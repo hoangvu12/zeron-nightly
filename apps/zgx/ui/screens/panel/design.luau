@@ -201,14 +201,29 @@ ui.command {
 
 -- The person's edits by hand on tab `id`'s Design (#33): one change, one
 -- undo step, told to every tab showing it.
--- (`refused`, if given, hears it refused, after the person's told.)
-local function edit(id: string, edits: { any }, description: string, join: boolean?, refused: (() -> ())?)
+-- `how`: `join`, part of the latest change described alike; `refused`,
+-- heard if it's refused, after the person's told; `settled`, heard as the
+-- engine answers, either way.
+local function edit(
+	id: string,
+	edits: { any },
+	description: string,
+	how: { join: boolean?, refused: (() -> ())?, settled: (() -> ())? }?
+)
+	local o = how or {}
 	local tell = said("panel.design.failed_edit")
-	api.call("design.edit", { tab = id, edits = edits, description = description, join = join == true })
-		:after(function() end, function(e: any)
+	api.call("design.edit", { tab = id, edits = edits, description = description, join = o.join == true })
+		:after(function()
+			if o.settled then
+				o.settled()
+			end
+		end, function(e: any)
 			tell(e)
-			if refused then
-				refused()
+			if o.refused then
+				o.refused()
+			end
+			if o.settled then
+				o.settled()
 			end
 		end)
 end
@@ -418,10 +433,12 @@ local function properties(id: string): Node
 				v = tonumber(text)
 			end
 			-- (Refused, it shows what the Design says again.)
-			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property", false, function()
-				sent = nil
-				value:set(known)
-			end)
+			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property", {
+				refused = function()
+					sent = nil
+					value:set(known)
+				end,
+			})
 		end
 		-- (Following what the Design says as it changes, by anyone, but not
 		-- over what's being typed.)
@@ -447,7 +464,9 @@ local function properties(id: string): Node
 			end
 			pending = ui.after(PROPERTY_PAUSE_MS, function()
 				pending = nil
-				commit()
+				if not typing then
+					commit()
+				end
 			end)
 		end)
 		ui.on_cleanup(function()
@@ -465,6 +484,12 @@ local function properties(id: string): Node
 			end,
 			on_focus_change = function(focused: boolean)
 				typing = focused
+				-- (Focused, what's typed waits for Enter or leaving: told a
+				-- moment after the keys, it drops the wait they began.)
+				if focused and pending then
+					pending()
+					pending = nil
+				end
 			end,
 			-- (Escape takes back what's typed: the Design's value again.)
 			on_key = function(e: any): boolean?
@@ -678,6 +703,35 @@ local function canvas(id: string): Node
 			editing:set({ node = e.node, content = e.content, at = at, anchor = anchor, typed = e.typed })
 		end
 	end
+	-- The text's changes, sent one at a time, in order: the engine takes
+	-- each on a thread of its own, so changes sent together could land in
+	-- any order (an older one last, a joined one before its first). The
+	-- latest of an edit waiting replaces the one before it.
+	local text_queue: { { node: string, content: string, join: boolean } } = {}
+	local text_sending = false
+	local function send_text()
+		if text_sending or #text_queue == 0 then
+			return
+		end
+		local change = table.remove(text_queue, 1) :: any
+		text_sending = true
+		edit(id, { { update = change.node, props = { content = change.content } } }, "Edit text", {
+			join = change.join,
+			settled = function()
+				text_sending = false
+				send_text()
+			end,
+		})
+	end
+	local function queue_text(node: string, content: string, join: boolean)
+		local last = text_queue[#text_queue]
+		if last and join and last.node == node then
+			last.content = content
+		else
+			table.insert(text_queue, { node = node, content = content, join = join })
+		end
+		send_text()
+	end
 	-- The field's words changed: sent as they change.
 	local function typed(content: string)
 		local e = editing:peek()
@@ -689,7 +743,7 @@ local function canvas(id: string): Node
 		editing:set({ node = e.node, content = content, at = e.at, anchor = e.anchor, typed = true })
 		follow_caret()
 		-- (After its first, an edit's changes join it: one undo step.)
-		edit(id, { { update = e.node, props = { content = content } } }, "Edit text", e.typed)
+		queue_text(e.node, content, e.typed)
 	end
 	-- The keys the field gives way to: Escape and Enter end the edit (Shift
 	-- and Enter breaks the line), and ⌘Z, ⌘⇧Z and Ctrl+Y step the Design's history,
@@ -886,6 +940,21 @@ local function canvas(id: string): Node
 			w = n.w,
 			h = n.h,
 		})
+		-- (The text edited: as big as its words as they're typed.)
+		local function typing_box(): any?
+			local e = editing:get()
+			local c = if e and e.node == n.id then carets:get() else nil
+			return if c then c.box else nil
+		end
+		local at_w, at_h = box.w, box.h
+		box.w = function(): number
+			local b, v = typing_box(), view()
+			return if b and v then b.w * v.zoom else at_w()
+		end
+		box.h = function(): number
+			local b, v = typing_box(), view()
+			return if b and v then b.h * v.zoom else at_h()
+		end
 		local at_left, at_top = box.left, box.top
 		box.left = function(): number
 			local v, dx = view(), by()

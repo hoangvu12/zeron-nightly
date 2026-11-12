@@ -99,9 +99,53 @@ struct StandIn {
     recent: RefCell<Vec<serde_json::Value>>,
     /// The engine calls the window made (`SaveDesign`…), in order.
     asked: RefCell<Vec<(String, serde_json::Value)>>,
+    /// The person's changes as undo steps, joined as the engine joins them
+    /// (`History::record_joined`).
+    history: RefCell<zeron_design::history::History>,
+    /// Slow to answer (#33d): edits wait, unapplied, until the test answers
+    /// them (`answer_edit`), as a busy engine's do.
+    slow: std::cell::Cell<bool>,
+    waiting: RefCell<std::collections::VecDeque<(serde_json::Value, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>)>>,
 }
 
 impl StandIn {
+    /// The person's edits (`EditDesign`), applied as the engine applies
+    /// them (the design crate's own), kept as an undo step (joined to the
+    /// latest if asked) and told to the tab as theirs.
+    fn edit(&self, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = params["path"].as_str().unwrap_or_default().to_owned();
+        let before = self.designs.borrow().get(&path).cloned().unwrap_or_default();
+        let mut draft = zeron_design::edit::Draft::new(before.clone());
+        params["edits"].as_array().into_iter().flatten().try_for_each(|edit| {
+            let done = if let Some(id) = edit["update"].as_str() {
+                draft.update(id, edit["props"].clone())
+            } else {
+                let id = edit["move"].as_str().unwrap_or_default();
+                draft.move_to(id, edit["parent"].as_str(), edit["index"].as_u64().map(|i| i as usize))
+            };
+            done.map_err(|e| e.to_string())
+        })?;
+        let after = draft.finish().design;
+        let description = params["description"].as_str().unwrap_or("Edit by hand");
+        let mut history = self.history.borrow_mut();
+        if params["join"] == true {
+            history.record_joined(description, &before, &after);
+        } else {
+            history.record(description, &before, &after);
+        }
+        drop(history);
+        self.say(&path, after);
+        Ok(serde_json::json!({ "path": path }))
+    }
+
+    /// Answers the edit waiting longest (slow, #33d): applied now; whether
+    /// one was waiting.
+    fn answer_edit(&self) -> bool {
+        let Some((params, tell)) = self.waiting.borrow_mut().pop_front() else { return false };
+        let _ = tell.send(self.edit(&params));
+        true
+    }
+
     /// A new version of the Design at `path`, said to whoever follows it.
     /// A new version the person made (in a Design tab, as #33's edits will
     /// be told): it doesn't flash.
@@ -185,24 +229,21 @@ impl Source for Engine {
             "RecentDesigns" => Ok(serde_json::json!({ "recent": *me.recent.borrow() })),
             // The person's edits, applied as the engine applies them (the
             // design crate's own), and told to the tab as theirs.
-            "EditDesign" => {
-                let design = me.designs.borrow().get(&path).cloned().unwrap_or_default();
-                let mut draft = zeron_design::edit::Draft::new(design);
-                let applied: Result<(), String> = params["edits"].as_array().into_iter().flatten().try_for_each(|edit| {
-                    let done = if let Some(id) = edit["update"].as_str() {
-                        draft.update(id, edit["props"].clone())
-                    } else {
-                        let id = edit["move"].as_str().unwrap_or_default();
-                        draft.move_to(id, edit["parent"].as_str(), edit["index"].as_u64().map(|i| i as usize))
-                    };
-                    done.map_err(|e| e.to_string())
-                });
-                applied.map(|()| {
-                    me.say(&path, draft.finish().design);
-                    serde_json::json!({ "path": path })
-                })
+            "EditDesign" if me.slow.get() => {
+                let (tell, answer) = tokio::sync::oneshot::channel();
+                me.waiting.borrow_mut().push_back((params, tell));
+                return Box::pin(async move { answer.await.unwrap_or_else(|_| Err("dropped".into())) });
             }
-            "UndoDesign" | "RedoDesign" => Ok(serde_json::json!({ "path": path, "done": true })),
+            "EditDesign" => me.edit(&params),
+            "UndoDesign" => {
+                let design = me.designs.borrow().get(&path).cloned().unwrap_or_default();
+                let undone = me.history.borrow_mut().undo(&design);
+                if let Some((design, _)) = &undone {
+                    me.say(&path, design.clone());
+                }
+                Ok(serde_json::json!({ "path": path, "done": undone.is_some() }))
+            }
+            "RedoDesign" => Ok(serde_json::json!({ "path": path, "done": true })),
             "DesignSaving" => {
                 let saving = me.saving.borrow().get(&path).cloned().unwrap_or_default();
                 Ok(serde_json::json!({ "path": path, "managed": path.starts_with("C:/designs/"), "unsaved": saving["unsaved"] }))
@@ -1654,4 +1695,135 @@ fn a_slow_double_click_with_frames_between_its_presses_edits_the_text_and_keeps_
     tab.click_canvas(930., 60., zgx::input::Modifiers::default());
     assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
     assert_eq!(tab.focused(), Some(tab.node(&format!("#design-canvas-{TAB}"))));
+}
+
+// ---------------------------------------------------------------------------
+// Bursts faster than the engine answers (#33d): the stand-in slow, its
+// edits waiting until the test answers them.
+
+impl Tab {
+    /// The words of the title as the engine has them.
+    fn title_written(&self) -> serde_json::Value {
+        let designs = self.engine.designs.borrow();
+        let design = designs.get(PATH).expect("the Design");
+        serde_json::to_value(design.find("title").expect("the title")).unwrap()["content"].clone()
+    }
+
+    /// Answers every edit the engine has waiting, and those the window
+    /// sends on as each is answered.
+    fn answer_edits(&mut self) {
+        while self.engine.answer_edit() {
+            self.app.frames(2);
+        }
+        self.settle();
+    }
+}
+
+#[test]
+fn a_burst_faster_than_the_engine_lands_whole_and_is_one_step_to_undo() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    tab.engine.slow.set(true);
+    let burst = " Xin chào Đà Nẵng";
+    for c in burst.chars() {
+        tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+        tab.app.frames(1);
+    }
+    // One change at a time: the first sent, the rest waiting on it.
+    assert_eq!(tab.edits().len(), 1, "{:?}", tab.edits());
+    // Enter ends the edit with changes still to send: they go on.
+    tab.app.key(zgx::input::Key::Enter);
+    tab.app.frames(2);
+    assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
+    tab.answer_edits();
+    assert_eq!(tab.title_written(), format!("Welcome home{burst}"));
+    // The first sent alone, the latest of the rest after it: joined.
+    let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
+    assert_eq!(joins, [false, true]);
+    // One undo: all of it.
+    tab.engine.slow.set(false);
+    assert!(tab.app.host.run_command("panel.design.undo"));
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home");
+}
+
+#[test]
+fn bursts_with_answers_between_them_stay_one_step_and_the_last_always_lands() {
+    let mut tab = mount(with_title("Welcome home"));
+    tab.double_click_canvas(420., 110.);
+    tab.engine.slow.set(true);
+    // Bursts, the engine answering some between: whatever the timing, the
+    // latest words land and the edit is one step.
+    for (i, word) in [" Xin", " chào", " Đà", " Nẵng"].into_iter().enumerate() {
+        for c in word.chars() {
+            tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+            tab.app.frames(1);
+        }
+        if i % 2 == 0 {
+            tab.engine.answer_edit();
+            tab.app.frames(1);
+        }
+    }
+    // Left (Escape) while changes wait: they land all the same.
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    tab.answer_edits();
+    assert_eq!(tab.title_written(), "Welcome home Xin chào Đà Nẵng");
+    tab.engine.slow.set(false);
+    assert!(tab.app.host.run_command("panel.design.undo"));
+    tab.app.frames(2);
+    tab.settle();
+    assert_eq!(tab.title_written(), "Welcome home");
+}
+
+#[test]
+fn escape_in_a_property_field_drops_what_was_typed_however_long_it_waited() {
+    let mut tab = mount(with_title("Hello"));
+    tab.click_canvas(420., 110., zgx::input::Modifiers::default());
+    let fill = tab.node("role:textbox \"Fill\"");
+    // Clicked and typed in at once, then left a while (past the wait for a
+    // value set from outside), then Escape.
+    // (Pressed and typed in with nothing run between, as real keys follow
+    // a click: before the field has heard it has the focus.)
+    let at = on_screen_of(&mut tab.app, "role:textbox \"Fill\"");
+    let (x, y) = (at.x + at.width / 2., at.y + at.height / 2.);
+    let button = zgx::input::PointerButton::Primary;
+    tab.app.ui.dispatch(InputEvent::PointerDown { x, y, button });
+    tab.app.ui.dispatch(InputEvent::PointerUp { x, y, button });
+    tab.app.ui.dispatch(InputEvent::Text("junk".into()));
+    tab.app.frames(60);
+    assert!(tab.fill_shown().ends_with("junk"));
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    assert_eq!(tab.fill_shown(), "#111827");
+    // Focused, its words set by assistive technology (as UI Automation's
+    // ValuePattern sets them), then left a while, then Escape: dropped too.
+    assert!(tab.app.ui.set_accessible_value(fill, "#111827junk"));
+    tab.app.frames(60);
+    tab.app.key(zgx::input::Key::Escape);
+    tab.app.frames(2);
+    assert_eq!(tab.fill_shown(), "#111827");
+    // Then left for the Canvas: nothing was sent.
+    tab.click_canvas(930., 60., zgx::input::Modifiers::default());
+    tab.app.frames(60);
+    assert!(tab.edits().is_empty(), "{:?}", tab.edits());
+    assert_eq!(tab.focused().map(|f| f != fill), Some(true));
+}
+
+#[test]
+fn the_selection_outline_of_a_text_edited_follows_its_words_as_typed() {
+    let mut tab = mount(with_title("Hi"));
+    tab.double_click_canvas(410., 110.);
+    let before = on_screen_of(&mut tab.app, &format!("#design-selected-{TAB}-title"));
+    tab.engine.slow.set(true);
+    for c in " there, everyone".chars() {
+        tab.app.ui.dispatch(InputEvent::Text(c.to_string()));
+        tab.app.frames(1);
+    }
+    // (The engine not yet answered: the outline as wide as the words typed.)
+    let after = on_screen_of(&mut tab.app, &format!("#design-selected-{TAB}-title"));
+    let caret = on_screen_of(&mut tab.app, &format!("#design-caret-{TAB}"));
+    assert!(after.width > before.width * 3., "{before:?} then {after:?}");
+    assert!((after.x + after.width - caret.x).abs() <= 6., "{after:?} against the caret at {}", caret.x);
 }
