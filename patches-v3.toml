@@ -78,3 +78,45 @@ note = "The person's Stop on a child is held for two minutes: what they write to
 name = "reply-long-page-picture"
 file = "patches/0011-reply-long-page-picture.patch"
 note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its top across its frame at its own shape, not blown up with its middle cropped: its `ui.image` took its pixels' own height as a flex item, and `cover` filled that. Not yet a PR upstream."
+
+# The Design plugin's plugin-API PRs (pure-Luau Design plugin, developed
+# against this nightly until upstream merges them). Move a `sha` when its PR
+# gets new commits; delete the entry once the release notes say it's in.
+
+[[patch]]
+name = "plugin-tool-images"
+pr = 1362
+sha = "9d353580b41ac3fc0becf856eb6d87a58675399e"
+note = "A plugin tool's answer can show the agent images: a top-level `imageContent` array goes out as MCP image content."
+
+[[patch]]
+name = "plugin-memory-limit"
+pr = 1363
+sha = "306d0b76c39f2eb61383e42bf13fab91f92576dd"
+note = "A plugin service can ask for more than 64 MB of Luau memory in its manifest."
+
+[[patch]]
+name = "plugin-eval"
+pr = 1366
+sha = "bef96321848bb1023f24ba736d8287165b6da8eb"
+note = "A plugin service can run scripts its agents write (`zeron.eval`), behind an \"eval\" permission."
+
+[[patch]]
+name = "service-measure-text"
+pr = 1367
+sha = "d034b682484a31713e773844cae5ca7ca1354280"
+note = "A plugin service measures text (`zeron.measure_text`, `zeron.load_font`) with zgx's own shaper, as its window's canvas does; the engine depends on zgx at the app's rev."
+
+[[patch]]
+name = "zgx-nightly-design"
+file = "patches/0012-zgx-nightly-design.patch"
+note = "zgx from hoangvu12/zgx's nightly-design branch (b620a918): zeron/zgx's pinned zgx 06c6d56 with zgx #2074 (ui.load_font), #2080 (ui.render_canvas), #2076 (canvas text spacing and wrapping), #2081 (c:image) and #2082 (c:shadow) cherry-picked onto it. Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after service-measure-text, which gives the engine its zgx lines."
+# Another zgx PR: cherry-pick it onto nightly-design (a new commit, never a
+# force-push), run its tests, push. Then in a checkout assembled up to here,
+# replace the old rev with the new one in those two Cargo.toml files and both
+# Cargo.lock files, check `cargo metadata --locked` in the root and in
+# apps/zgx, commit, and regenerate this file with
+# `git format-patch --full-index`. When zeron/zgx moves its zgx pin, rebuild
+# the branch from the new pin (a new branch, e.g. nightly-design-<rev>) and
+# do the same. Once a PR is in zeron/zgx's pin, drop its commit there too;
+# once all are, delete this entry.
