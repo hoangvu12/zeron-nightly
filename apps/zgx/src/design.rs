@@ -23,7 +23,7 @@
 //! invoke  design.tabs       { chat, paths }          a chat's Design tabs, front first
 //! function design.hit       { tab, x, y, deep? } → id?   what a click at a Canvas point selects
 //! function design.moved     { tab, id, dx, dy } → edit?  what dragging a node so changes
-//! function design.caret     { tab, id, content, at, from, to } → { caret, range }, or
+//! function design.caret     { tab, id, content, at, from, to } → { caret, range, box }, or
 //!                           { tab, id, content, x, y } → place   a text's caret, as drawn
 //! invoke  design.theme      { tab, theme }           the Theme the tab shows (axis → value)
 //! call    design.edit       { tab, edits, description? }   the person's edits, one change
@@ -410,7 +410,16 @@ fn carets_of(scene: &Scene, id: &str, content: &str) -> Option<(zeron_design::sk
     let mut text = text.clone();
     text.content = content.to_owned();
     let typesetter = scene.fonts.typesetter(&scene.design);
-    Some((typesetter.carets(&text, (at.width, at.height)), at))
+    // (A text as wide as its words grows as they're typed: laid out as wide
+    // as they are now, not as they were drawn last, so none wraps.)
+    let size = match text.growth() {
+        zeron_design::model::TextGrowth::Auto => {
+            let [w, h] = typesetter.measure(&text, None);
+            (w, h)
+        }
+        _ => (at.width, at.height),
+    };
+    Some((typesetter.carets(&text, size), at))
 }
 
 fn rect_value(r: Rect) -> Value {
@@ -946,6 +955,7 @@ pub fn register(host: &ScriptHost, source: Box<dyn Source>) -> (Rc<DesignTabs>, 
             None => Value::record([
                 ("caret", shift(carets.caret(place("at")))),
                 ("range", Value::List(carets.range(place("from"), place("to")).into_iter().map(shift).collect::<Vec<_>>().into())),
+                ("box", rect_value(at)),
             ]),
         }
     });

@@ -1337,6 +1337,7 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
         }))
         .unwrap(),
     );
+    let written = design.clone();
     let mut tab = mount(design);
     let none = zgx::input::Modifiers::default();
     // Selected, then pressed again at once: editing, the caret at its end.
@@ -1361,8 +1362,10 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
     let past = caret.x - ink_right as f32;
     assert!((-1. ..=7.).contains(&past), "the caret at {} against the ink's end at {ink_right}", caret.x);
 
-    // A character typed is sent as the text's new words.
-    tab.app.key(zgx::input::Key::Character("!".into()));
+    // Text that comes in as text (what a keyboard layout, Unikey's
+    // Telex, a SendInput of Unicode give) is sent as the text's new words.
+    let words = |tab: &Tab| tab.edits().last().unwrap()[0]["props"]["content"].clone();
+    tab.app.ui.dispatch(InputEvent::Text("!".into()));
     tab.app.frames(2);
     assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "title", "props": { "content": "Hello!" } }]));
     // Backspace, and the caret moved back one place.
@@ -1370,10 +1373,49 @@ fn text_edits_in_place_with_the_caret_on_the_drawn_glyphs_and_each_change_is_sen
     tab.app.key(zgx::input::Key::ArrowLeft);
     tab.app.key(zgx::input::Key::Backspace);
     tab.app.frames(2);
-    assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "title", "props": { "content": "Helo" } }]));
-    // (The edit's keystrokes after its first join it: one step to undo.)
+    assert_eq!(words(&tab), "Helo");
+    // An input method's: nothing sent while it composes, its words as it
+    // commits them, where the caret was.
+    let sent = tab.edits().len();
+    tab.app.ui.dispatch(InputEvent::ImePreedit { text: "ê".into(), cursor: Some((2, 2)) });
+    tab.app.frames(2);
+    assert_eq!(tab.edits().len(), sent);
+    tab.app.ui.dispatch(InputEvent::ImeCommit("ế".into()));
+    tab.app.frames(2);
+    assert_eq!(words(&tab), "Helếo");
+    // The caret drawn after it: past the "ế", before the "o".
+    let caret = on_screen_of(&mut tab.app, &format!("#design-caret-{TAB}"));
+    // (Where the design crate's own layout of the words puts place 4.)
+    let mut typed = written.clone();
+    let zeron_design::model::Kind::Frame(screen) = &mut typed.children[0].kind else { panic!("a frame") };
+    let title = screen.children.iter_mut().find(|n| n.id == "title").unwrap();
+    let zeron_design::model::Kind::Text(text) = &mut title.kind else { panic!("a text") };
+    text.content = "Helếo".into();
+    let text = text.clone();
+    let place_4 = Fonts::default().typesetter(&typed).carets(&text, (1000., 100.)).caret(4).x;
+    let (x, _, zoom) = tab.canvas.view(TAB).unwrap();
+    let expected = tab.origin.0 + x + (400. + place_4) * zoom;
+    assert!((caret.x + 1. - expected).abs() <= 1.5, "the caret at {} against place 4 at {expected}", caret.x);
+
+    // Select all, copy, paste and cut, as in any field (by the field's
+    // editor as the window's Edit menu and its keys do them: headless, the
+    // keys have no clipboard of their own).
+    let field = tab.app.target(&format!("#design-text-field-{TAB}")).unwrap();
+    let editor = tab.app.ui.editor_within(field).expect("an editor");
+    tab.app.keys("cmd+a");
+    assert_eq!(editor.selection(), (0, "Helếo".len()));
+    assert_eq!(editor.copy(), "Helếo");
+    tab.app.ui.paste_into(&editor, Some("Xin chào"));
+    tab.app.frames(2);
+    assert_eq!(words(&tab), "Xin chào");
+    tab.app.keys("cmd+a");
+    assert_eq!(editor.cut(), "Xin chào");
+    tab.app.frames(2);
+    assert_eq!(words(&tab), "");
+    // (The edit's changes after its first join it: one step to undo.)
     let joins: Vec<_> = tab.engine.asked.borrow().iter().filter(|(m, _)| m == "EditDesign").map(|(_, p)| p["join"].clone()).collect();
-    assert_eq!(joins, [false, true, true]);
+    assert_eq!(joins[0], false);
+    assert!(joins[1..].iter().all(|j| j == true), "{joins:?}");
     tab.app.key(zgx::input::Key::Escape);
     tab.app.frames(2);
     assert!(tab.app.find(&format!("#design-caret-{TAB}")).is_none());
@@ -1392,6 +1434,14 @@ fn the_properties_panel_sends_each_property_as_a_change_and_undo_and_redo_reach_
     tab.app.key(zgx::input::Key::Enter);
     tab.app.frames(2);
     assert_eq!(tab.edits().last().unwrap(), &serde_json::json!([{ "update": "hero", "props": { "width": 240 } }]));
+    // A value set from outside (assistive technology's, UI Automation's
+    // ValuePattern), no Enter: sent once it stops changing.
+    let fill = tab.app.target("role:textbox \"Fill\"").unwrap();
+    assert!(tab.app.ui.set_accessible_value(fill, "#3B82F6"));
+    let sent = serde_json::json!([{ "update": "hero", "props": { "fill": "#3B82F6" } }]);
+    let engine = tab.engine.clone();
+    let last_edit = move || engine.asked.borrow().iter().rev().find(|(m, _)| m == "EditDesign").map(|(_, p)| p["edits"].clone());
+    assert!(tab.app.wait_until(|_| last_edit() == Some(sent.clone())), "{:?}", tab.edits());
 
     // ⌘Z and ⌘⇧Z: the Design's one history (their shortcuts bound as the
     // window binds commands' keys: src/shortcut_tests.rs presses them).

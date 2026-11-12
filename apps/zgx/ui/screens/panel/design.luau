@@ -46,6 +46,8 @@ local SETTLE_MS = 150
 local CLICK_SLOP = 4
 -- How soon a second press on a selected text edits it.
 local DOUBLE_MS = 400
+-- How long a property field waits after its last change to send it.
+local PROPERTY_PAUSE_MS = 600
 -- How long what an agent just changed flashes (pen.dev's live touches).
 local FLASH_MS = 900
 
@@ -229,12 +231,6 @@ ui.command {
 	end,
 }
 
--- `text`'s chars before place `at` and from it (places count chars).
-local function split(text: string, at: number): (string, string)
-	local byte = utf8.offset(text, at + 1) or (#text + 1)
-	return string.sub(text, 1, byte - 1), string.sub(text, byte)
-end
-
 function M.close(tab: Tab)
 	api.invoke("design.close", tab.id)
 	views:set_key(tab.id, nil)
@@ -379,8 +375,8 @@ local FIELDS: { { key: string, label: string, number: boolean } } = {
 }
 local function properties(id: string): Node
 	local host = shown(id)
-	local function props(): any
-		local b = host:get()
+	local function props(followed: boolean?): any
+		local b = if followed == false then host:peek() else host:get()
 		return if b then b.props else nil
 	end
 	-- A property as its field shows it: blank for one it can't (none, or
@@ -390,29 +386,61 @@ local function properties(id: string): Node
 	end
 	local function field(f: { key: string, label: string, number: boolean }, node: string, start: any): Node
 		local value = ui.use_state(shown(start))
-		-- (Following what the Design says as it changes, by anyone.)
-		ui.effect(function()
-			local now = props()
-			if now and now.id == node then
-				value:set(shown(now[f.key]))
+		local pending: (() -> ())? = nil
+		-- What the Design says now, as the field shows it (`followed`, or
+		-- not); nil once the node's not the one selected.
+		local function written(followed: boolean): string?
+			local now = props(followed)
+			return if now and now.id == node then shown(now[f.key]) else nil
+		end
+		local function commit()
+			if pending then
+				pending()
+				pending = nil
 			end
+			-- (Committed as shown, it changes nothing: a blank list stays.)
+			local text = value:peek()
+			local was = written(false)
+			if was == nil or was == text then
+				return
+			end
+			local v: any = text
+			if f.number and tonumber(text) then
+				v = tonumber(text)
+			end
+			edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property")
+		end
+		-- (Following what the Design says as it changes, by anyone, but not
+		-- over what's being typed.)
+		ui.effect(function()
+			local was = written(true)
+			if was ~= nil and pending == nil then
+				value:set(was)
+			end
+		end)
+		-- (Kept a moment after it stops changing, as the settings' fields
+		-- are: a value set by assistive technology, or typed and left; and at
+		-- once on Enter or leaving the field.)
+		ui.effect(function()
+			local text = value:get()
+			if text == written(false) then
+				return
+			end
+			if pending then
+				pending()
+			end
+			pending = ui.after(PROPERTY_PAUSE_MS, function()
+				pending = nil
+				commit()
+			end)
 		end)
 		return ds.TextField {
 			label = ui.t(f.label),
 			value = value,
 			size = "sm",
 			w_full = true,
-			on_commit = function(text: string)
-				-- (Committed as shown, it changes nothing: a blank list stays.)
-				local now = props()
-				if now and now.id == node and shown(now[f.key]) == text then
-					return
-				end
-				local v: any = text
-				if f.number and tonumber(text) then
-					v = tonumber(text)
-				end
-				edit(id, { { update = node, props = { [f.key] = v } } }, "Change a property")
+			on_commit = function()
+				commit()
 			end,
 		}
 	end
@@ -559,11 +587,14 @@ local function canvas(id: string): Node
 	-- Selected nodes being dragged, and how far (Canvas units): their
 	-- outlines follow; the move is sent as the drag ends (#33).
 	local dragging = ui.use_state(nil :: { ids: { string }, dx: number, dy: number }?)
-	-- A text being edited in place: its node, the words as typed, and the
-	-- caret (and the other end of what's selected), as char places.
-	local editing = ui.use_state(nil :: { node: string, content: string, at: number, anchor: number }?)
+	-- A text being edited in place: its node, the words as typed, the caret
+	-- (and the other end of what's selected) as char places, and whether
+	-- it's sent a change yet. The words are held by a real text field, out
+	-- of sight over the text (`field`): what's typed, an input method's,
+	-- pasted or set by assistive technology goes in as it does in any.
+	local editing = ui.use_state(nil :: { node: string, content: string, at: number, anchor: number, typed: boolean }?)
 	local last_press: { node: string?, at: number }? = nil
-	local box = ui.ref()
+	local field = ui.ref()
 	local function canvas_point(e: any): (number, number)
 		local v = views:peek()[id] :: View
 		return (e.local_x - v.x) / v.zoom, (e.local_y - v.y) / v.zoom
@@ -584,72 +615,50 @@ local function canvas(id: string): Node
 		end
 		local count = utf8.len(content) or #content
 		editing:set({ node = node, content = content, at = count, anchor = count, typed = false })
-		if box.focus then
-			box:focus()
+	end
+	-- The field's caret and selection: anchor and caret, in chars.
+	local function selection(): (number?, number?)
+		local el = field:peek()
+		if not el then
+			return nil, nil
+		end
+		return el:selection()
+	end
+	-- The field's caret and selection, as the edit's (the caret drawn there).
+	local function follow_caret()
+		local e = editing:peek()
+		local anchor, at = selection()
+		if e and anchor and at and (at ~= e.at or anchor ~= e.anchor) then
+			editing:set({ node = e.node, content = e.content, at = at, anchor = anchor, typed = e.typed })
 		end
 	end
-	-- Typed: the words sent as they change, the caret after them.
-	local function typed(content: string, at: number)
+	-- The field's words changed: sent as they change.
+	local function typed(content: string)
 		local e = editing:peek()
-		if not e then
+		if not e or content == e.content then
 			return
 		end
-		editing:set({ node = e.node, content = content, at = at, anchor = at, typed = true })
-		-- (After its first, an edit's keystrokes join it: one undo step.)
+		-- (The words kept before the field's caret is read: reading it
+		-- settles the field, which would otherwise show the words before.)
+		editing:set({ node = e.node, content = content, at = e.at, anchor = e.anchor, typed = true })
+		follow_caret()
+		-- (After its first, an edit's changes join it: one undo step.)
 		edit(id, { { update = e.node, props = { content = content } } }, "Edit text", e.typed)
 	end
-	local function on_text_key(k: any): boolean
-		local e = editing:peek()
-		if not e then
-			return false
-		end
-		local count = utf8.len(e.content) or #e.content
-		local from, to = math.min(e.at, e.anchor), math.max(e.at, e.anchor)
-		local function cut(): (string, number)
-			local head = split(e.content, from)
-			local _, tail = split(e.content, to)
-			return head .. tail, from
-		end
-		local key = k.key
-		-- ⌘Z and ⌘⇧Z end it, so the words typed don't write over what they
-		-- take back (the command still runs).
-		if (key == "z" or key == "Z") and (k.cmd or k.ctrl or k.meta) then
-			editing:set(nil)
-			return false
-		end
-		if key == "Escape" or (key == "Enter" and not k.shift) then
+	-- The keys the field gives way to: Escape and Enter end the edit (Shift
+	-- and Enter breaks the line), and ⌘Z and ⌘⇧Z step the Design's history,
+	-- not the field's (whose words would write over what they take back).
+	local function on_field_key(k: any): boolean?
+		if k.key == "Escape" or (k.key == "Enter" and not k.shift) then
 			editing:set(nil)
 			return true
-		elseif key == "Backspace" or key == "Delete" then
-			if from ~= to then
-				local rest, at = cut()
-				typed(rest, at)
-			elseif key == "Backspace" and e.at > 0 then
-				local head, tail = split(e.content, e.at)
-				local shorter = split(head, e.at - 1)
-				typed(shorter .. tail, e.at - 1)
-			elseif key == "Delete" and e.at < count then
-				local head, tail = split(e.content, e.at)
-				local _, rest = split(tail, 1)
-				typed(head .. rest, e.at)
-			end
-			return true
-		elseif key == "ArrowLeft" or key == "ArrowRight" or key == "Home" or key == "End" then
-			local at = if key == "ArrowLeft" then math.max(e.at - 1, 0)
-				elseif key == "ArrowRight" then math.min(e.at + 1, count)
-				elseif key == "Home" then 0
-				else count
-			editing:set({ node = e.node, content = e.content, at = at, anchor = if k.shift then e.anchor else at, typed = e.typed })
+		end
+		if (k.key == "z" or k.key == "Z") and (k.cmd or k.ctrl or k.meta) then
+			editing:set(nil)
+			step(if k.shift then "design.redo" else "design.undo")
 			return true
 		end
-		local char = if key == "Enter" then "\n" elseif key == "Space" or key == " " then " " else key
-		if type(char) == "string" and utf8.len(char) == 1 and not (k.cmd or k.ctrl or k.meta or k.alt) then
-			local rest, at = cut()
-			local head, tail = split(rest, at)
-			typed(head .. char .. tail, at + 1)
-			return true
-		end
-		return false
+		return nil
 	end
 	-- Where the caret and what's selected are, as the text is drawn (laid
 	-- out once a change, for all the overlays reading it).
@@ -883,11 +892,6 @@ local function canvas(id: string): Node
 		overflow = "hidden",
 		relative = true,
 		bg = "$surface.sunken",
-		ref = box,
-		focusable = true,
-		on_key = function(k: any): boolean?
-			return if on_text_key(k) then true else nil
-		end,
 		on_resize = function(s: { w: number, h: number })
 			local now = size:peek()
 			if now.w ~= s.w or now.h ~= s.h then
@@ -927,7 +931,11 @@ local function canvas(id: string): Node
 				if under == e_now.node then
 					local place = api.call_sync("design.caret", { tab = id, id = e_now.node, content = e_now.content, x = x, y = y })
 					if type(place) == "number" then
-						editing:set({ node = e_now.node, content = e_now.content, at = place, anchor = place, typed = e_now.typed })
+						local el = field:peek()
+						if el then
+							el:set_selection(place)
+							follow_caret()
+						end
 					end
 					return
 				end
@@ -1019,6 +1027,45 @@ local function canvas(id: string): Node
 			o.bg = "$selection.item"
 			return ui.div(o)
 		end),
+		ui.show(function(): boolean
+			return editing:get() ~= nil
+		end, ui.component(function(_: {}): Node
+			-- Over the text, where an input method puts its window; its own
+			-- words, caret and selection unseen (the Canvas draws them), and
+			-- clicks going on to the Canvas.
+			local e = editing:peek() :: any
+			local c = carets:peek()
+			local o = over(if c then c.box else { x = 0, y = 0, w = 0, h = 0 })
+			o.id = `design-text-field-{id}`
+			o.label = ui.t("panel.design.edit_text")
+			o.ref = field
+			o.value = function(): string
+				local now = editing:get()
+				return if now then now.content else ""
+			end
+			o.on_change = typed
+			o.on_caret = follow_caret
+			o.on_key = on_field_key
+			-- (Focused once the press that started it is done: a press on the
+			-- Canvas, which takes no focus, would take it away again.)
+			o.on_mount = function(el: any)
+				ui.after(0, function()
+					el:focus()
+					el:set_selection(e.anchor, e.at)
+				end)
+			end
+			o.wrap = true
+			o.pointer_events = "none"
+			o.color = "#00000000"
+			o.caret_color = "#00000000"
+			o.selection_color = "#00000000"
+			o.bg = "#00000000"
+			o.border = 0
+			o.focus = { outline = 0 }
+			o.px = 0
+			o.py = 0
+			return ui.textarea(o)
+		end)({})),
 		ui.show(function(): boolean
 			return editing:get() ~= nil
 		end, ui.div {

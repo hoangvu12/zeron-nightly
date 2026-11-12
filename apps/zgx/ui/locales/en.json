@@ -3143,6 +3143,7 @@
         "font": "Font"
       },
       "select_one": "Select a node to change its fill, size, spacing and type.",
+      "edit_text": "Text",
       "save": "Save",
       "remote": "Designs open only for chats on this computer.",
       "command": {
