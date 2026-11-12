@@ -105,8 +105,16 @@ end
 
 -- What failed, said in the engine's words (the tab keeps its marker, so
 -- nothing is lost by it).
--- (`key`, if given: a new one takes the place of the last with the same.)
+-- (`key`, if given: a new one takes the place of the last with the same.
+-- Keys start with their tab's id, forgotten as it goes.)
 local said_last: { [string]: number } = {}
+local function forget_said(tab: string)
+	for key in said_last do
+		if string.sub(key, 1, #tab + 1) == `{tab}:` then
+			said_last[key] = nil
+		end
+	end
+end
 local function said(title: string, key: string?): (any) -> ()
 	return function(err: any)
 		if key and said_last[key] then
@@ -272,15 +280,6 @@ ui.command {
 	key = "cmd+z",
 	run = function(): boolean
 		return step("design.undo")
-	end,
-}
--- (Ctrl+Y too, as Windows' apps redo; off the menus, ⌘⇧Z naming it.)
-ui.command {
-	id = "panel.design.redo_y",
-	title = ui.t("panel.design.command.redo"):get(),
-	key = "ctrl+y",
-	run = function(): boolean
-		return step("design.redo")
 	end,
 }
 ui.command {
@@ -452,9 +451,10 @@ local function properties(id: string): Node
 		-- sent last, so Enter and then leaving send it once.
 		local known = shown(start)
 		local sent: string? = nil
-		-- (Kept only on Enter or on leaving the field (a click on the Canvas
-		-- among them); never as it's typed, nor a draft in a field never
-		-- focused as the selection moves on.)
+		local focused = false
+		-- (Kept only on Enter, on leaving the field (a click on the Canvas
+		-- among them) or as the selection moves on from it focused; never
+		-- as it's typed, nor a draft in a field never focused.)
 		local function commit()
 			local text = value:peek()
 			if text == known or text == sent then
@@ -476,6 +476,11 @@ local function properties(id: string): Node
 		end
 		-- (Following what the Design says as it changes, by anyone, but not
 		-- over a draft being typed.)
+		ui.on_cleanup(function()
+			if focused then
+				commit()
+			end
+		end)
 		ui.effect(function()
 			local now = props()
 			if now and now.id == node then
@@ -493,6 +498,14 @@ local function properties(id: string): Node
 			w_full = true,
 			on_commit = function()
 				commit()
+			end,
+			-- (Left, it's kept, whether or not the input heard it focused:
+			-- a real click's focus can come after the keys.)
+			on_focus_change = function(now: boolean)
+				focused = now
+				if not now then
+					commit()
+				end
 			end,
 			-- (Escape takes back what's typed: the Design's value again.)
 			on_key = function(e: any): boolean?
@@ -682,6 +695,9 @@ local function canvas(id: string): Node
 		end
 		local count = utf8.len(content) or #content
 		table.clear(sent_words)
+		-- (Its words as they were count as its own: told back late, after
+		-- the engine's answer, they aren't a change from outside.)
+		sent_words[content] = true
 		editing:set({ node = node, content = content, at = count, anchor = count, typed = false })
 	end
 	-- The edit over: the focus to the Canvas, if the field has it (the
@@ -724,6 +740,9 @@ local function canvas(id: string): Node
 	-- TEXT_ANSWER_MS is left behind, so the rest aren't held for ever.)
 	local text_queue: { { node: string, content: string, join: boolean } } = {}
 	local text_sending: number? = nil
+	-- (Whether any are still to send, followed: what's told from outside
+	-- waits on it.)
+	local text_busy = ui.use_state(false)
 	local text_sends = 0
 	local text_refused = false
 	local waiting_steps: { () -> () } = {}
@@ -732,6 +751,7 @@ local function canvas(id: string): Node
 			return
 		end
 		if #text_queue == 0 then
+			text_busy:set(false)
 			local steps = waiting_steps
 			waiting_steps = {}
 			for _, go in steps do
@@ -745,6 +765,7 @@ local function canvas(id: string): Node
 		local join = change.join and not text_refused
 		text_refused = false
 		text_sending = this
+		text_busy:set(true)
 		local function settled()
 			if text_sending == this then
 				text_sending = nil
@@ -770,6 +791,7 @@ local function canvas(id: string): Node
 	ui.on_cleanup(function()
 		text_sent[id] = nil
 		text_ends[id] = nil
+		forget_said(id)
 	end)
 	local function queue_text(node: string, content: string, join: boolean)
 		local last = text_queue[#text_queue]
@@ -799,14 +821,15 @@ local function canvas(id: string): Node
 	-- where it can be, and what's typed next a step of its own. (The edit's
 	-- own changes told back, or any while some are still to send, aren't.)
 	ui.effect(function()
-		local e = editing:get()
 		local b = host:get()
+		local busy = text_busy:get()
+		local e = editing:peek()
 		local now = if b then b.props else nil
 		if not e or not now or now.id ~= e.node or now.type ~= "text" then
 			return
 		end
 		local words = now.content or ""
-		if words == e.content or sent_words[words] or text_sending or #text_queue > 0 then
+		if words == e.content or sent_words[words] or busy then
 			return
 		end
 		local count = utf8.len(words) or #words
@@ -818,8 +841,9 @@ local function canvas(id: string): Node
 		end
 	end)
 	-- The keys the field gives way to: Escape and Enter end the edit (Shift
-	-- and Enter breaks the line), and ⌘Z, ⌘⇧Z and Ctrl+Y step the Design's history,
-	-- not the field's (whose words would write over what they take back).
+	-- and Enter breaks the line), and ⌘Z, ⌘⇧Z and Ctrl+Y step the Design's
+	-- history, not the field's (whose words would write over what they take
+	-- back).
 	local function on_field_key(k: any): boolean?
 		if k.key == "Escape" or (k.key == "Enter" and not k.shift) then
 			finish_editing()
@@ -1654,6 +1678,16 @@ M.Design = ui.component(function(props: Props): Node
 				w_full = true,
 				grow = 1,
 				min_h = 0,
+				-- (Ctrl+Y redoes too, as Windows' apps do: the tab's own key,
+				-- not a command's, so the menus name Redo once, by ⌘⇧Z.)
+				on_key = function(k: any): boolean?
+					-- (`cmd` with `ctrl`: Control off macOS, where it's Control's
+					-- own and ⌘⇧Z redoes.)
+					if (k.key == "y" or k.key == "Y") and k.ctrl and k.cmd and not k.shift then
+						return step("design.redo")
+					end
+					return nil
+				end,
 				layers(id),
 				ui.column {
 					grow = 1,
