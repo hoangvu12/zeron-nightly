@@ -110,7 +110,7 @@ note = "A plugin service measures text (`zeron.measure_text`, `zeron.load_font`)
 [[patch]]
 name = "zgx-nightly-design"
 file = "patches/0012-zgx-nightly-design.patch"
-note = "zgx from hoangvu12/zgx's nightly-design branch (b620a918): zeron/zgx's pinned zgx 06c6d56 with zgx #2074 (ui.load_font), #2080 (ui.render_canvas), #2076 (canvas text spacing and wrapping), #2081 (c:image) and #2082 (c:shadow) cherry-picked onto it. Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after service-measure-text, which gives the engine its zgx lines."
+note = "zgx from hoangvu12/zgx's nightly-design branch (b1853da3): zeron/zgx's pinned zgx 06c6d56 with zgx #2074 (ui.load_font), #2080 (ui.render_canvas, with its app-fonts fix and, on top of #2076, paragraphs wrapped at their width), #2076 (canvas text spacing and wrapping), #2081 (c:image) and #2082 (c:shadow) cherry-picked onto it. Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after service-measure-text, which gives the engine its zgx lines."
 # Another zgx PR: cherry-pick it onto nightly-design (a new commit, never a
 # force-push), run its tests, push. Then in a checkout assembled up to here,
 # replace the old rev with the new one in those two Cargo.toml files and both
