@@ -86,13 +86,18 @@ note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its t
 [[patch]]
 name = "design-plugin-apis"
 pr = 1392
-sha = "9ff1698fbb2f753e1a6bb7a1980985513ee66851"
-note = "The Design plugin's plugin APIs as one PR (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 \"fonts\", #1379 fetch bytes in base64, #1380 a service's zeron.db, with its close-before-forget fix, #1398 zeron.write_file and \"files.write\"). Its last commit points the app and the engine at the combined zgx PR (#2110's head, 6d3a20fd); zgx-nightly-design, next, moves them to hoangvu12/zgx nightly-design."
+sha = "58444b48ad3d97e6e88475632c450453303188e9"
+note = "The Design plugin's plugin APIs as one PR (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 \"fonts\", #1379 fetch bytes in base64, #1380 a service's zeron.db, with its close-before-forget fix, #1398 zeron.write_file and \"files.write\"). Its last commit points the app and the engine at the combined zgx PR (#2110's head rebased on zgx main, 41ffcef3); zgx-nightly-design, below, moves them to hoangvu12/zgx nightly-design-export."
+
+[[patch]]
+name = "plugin-window-memory"
+file = "patches/0013-plugin-window-memory.patch"
+note = "A plugin's window gets the memory its manifest asks for its service (service_memory_mb, at most 512 MB), by zgx's ScriptHost::plugin_memory; the Design plugin's window stopped on a large design (\"not enough memory\"). 00d1f31e7 (branch window-memory, on #1392's c52121b51), not yet in #1392: cherry-picked onto the assembly as a file. Needs the zgx setter (aff65ee94, in nightly-design-export); goes after design-plugin-apis and before zgx-nightly-design."
 
 [[patch]]
 name = "zgx-nightly-design"
 file = "patches/0012-zgx-nightly-design.patch"
-note = "The app's and the engine's zgx from hoangvu12/zgx's nightly-design-export branch (6cc6cbfc) instead of #1392's combined zgx PR (#2110, 6d3a20fd, on zgx main): zeron/zgx's pinned zgx 06c6d56 with the same zgx PRs cherry-picked onto it: #2074, #2095, #2096 (fonts, decode_image, file bytes), #2080 (render_canvas), #2076, #2081, #2082 (text spacing, c:image, c:shadow), #2094 (zgx-text), #2097, #2098 (text order, clips, transforms, with the fast path), gradients, #2100, #2101 (raster pan and zoom), #2103 (a view canvas draws its text into its raster), #2110's Canvas::layers fix, #2115-#2118 (ui.zip, JPEG/WebP, write_file append, render_canvas to a file), #2119 (canvas glyph and layout cache, with the fonts-key fix) and the canvas culling, zoom-job and backdrop work, and canvas tiles (256-px tiles made off the frame on pan and zoom, uploaded within about 4 ms a frame). Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after design-plugin-apis."
+note = "The app's and the engine's zgx from hoangvu12/zgx's nightly-design-export branch (dc90d8fa) instead of #1392's combined zgx PR (#2110, 41ffcef3, on zgx main): zeron/zgx's pinned zgx 06c6d56 with the same zgx PRs cherry-picked onto it: #2074, #2095, #2096 (fonts, decode_image, file bytes), #2080 (render_canvas), #2076, #2081, #2082 (text spacing, c:image, c:shadow), #2094 (zgx-text), #2097, #2098 (text order, clips, transforms, with the fast path), gradients, #2100, #2101 (raster pan and zoom), #2103 (a view canvas draws its text into its raster), #2110's Canvas::layers fix, #2115-#2118 (ui.zip, JPEG/WebP, write_file append, render_canvas to a file), #2119 (canvas glyph and layout cache, with the fonts-key fix) and the canvas culling, zoom-job and backdrop work, and canvas tiles (256-px tiles made off the frame on pan and zoom, uploaded within about 4 ms a frame, kept in one atlas, at most 12 uploads a frame, the atlas kept while a window rests), a plugin's own heap limit (ScriptHost::plugin_memory), and full-size export (zip:add_canvas, render_canvas append). Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after design-plugin-apis."
 # Another zgx PR: cherry-pick it onto nightly-design (a new commit, never a
 # force-push), run its tests, push. Then in a checkout assembled up to here,
 # replace the old rev with the new one in those two Cargo.toml files and both
