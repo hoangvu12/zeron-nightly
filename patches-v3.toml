@@ -84,33 +84,15 @@ note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its t
 # gets new commits; delete the entry once the release notes say it's in.
 
 [[patch]]
-name = "plugin-tool-images"
-pr = 1362
-sha = "9d353580b41ac3fc0becf856eb6d87a58675399e"
-note = "A plugin tool's answer can show the agent images: a top-level `imageContent` array goes out as MCP image content."
-
-[[patch]]
-name = "plugin-memory-limit"
-pr = 1363
-sha = "3e8d363c5e975bec8ea8b2bc34aec9df584e8200"
-note = "A plugin service can ask for more than 64 MB of Luau memory in its manifest."
-
-[[patch]]
-name = "plugin-eval"
-pr = 1366
-sha = "bef96321848bb1023f24ba736d8287165b6da8eb"
-note = "A plugin service can run scripts its agents write (`zeron.eval`), behind an \"eval\" permission."
-
-[[patch]]
-name = "service-measure-text"
-pr = 1367
-sha = "bffc8ee9d92ff5bd84a16a05f02f8135d87989ea"
-note = "A plugin service measures text (`zeron.measure_text`, `zeron.load_font`) with zgx's own shaper (zgx-text, zgx #2094), as its window's canvas does; zgx-nightly-design points the engine's zgx lines at the app's zgx."
+name = "design-plugin-apis"
+pr = 1392
+sha = "059d97e29ef759d972855e2aa8d007fd6d72407c"
+note = "The Design plugin's plugin APIs as one PR (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 \"fonts\", #1379 fetch bytes in base64, #1380 a service's zeron.db, with its close-before-forget fix). Its last commit points the app and the engine at the combined zgx PR (#2110's head); zgx-nightly-design, next, moves them to hoangvu12/zgx nightly-design."
 
 [[patch]]
 name = "zgx-nightly-design"
 file = "patches/0012-zgx-nightly-design.patch"
-note = "zgx from hoangvu12/zgx's nightly-design branch (70578619): zeron/zgx's pinned zgx 06c6d56 with zgx #2074 (ui.load_font, at bb8dbd37), #2080 (ui.render_canvas, with its app-fonts fix and paragraphs wrapped at their width), #2076 (canvas text spacing and wrapping), #2081 (c:image), #2082 (c:shadow) and #2094 (zgx-text: shaping and measuring without the renderer) cherry-picked onto it, plus the Design plugin's base64 fonts and pictures, ui.write_file and ui.read_file of any bytes, canvas text in order/clipped/turned, radial and conic gradients, and raster pan and zoom (#2100, #2101). Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml (zgx-text too) and both lockfiles move, so the app and the engine use one zgx. Goes after service-measure-text, which gives the engine its zgx lines."
+note = "The app's and the engine's zgx from hoangvu12/zgx's nightly-design branch (cac4bb92) instead of #1392's combined zgx PR (#2110, on zgx main): zeron/zgx's pinned zgx 06c6d56 with the same zgx PRs cherry-picked onto it: #2074, #2095, #2096 (fonts, decode_image, file bytes), #2080 (render_canvas), #2076, #2081, #2082 (text spacing, c:image, c:shadow), #2094 (zgx-text), #2097, #2098 (text order, clips, transforms, with the fast path), gradients, #2100, #2101 (raster pan and zoom) and #2103 (a view canvas draws its text into its raster, with the zoom thread's own text rasterizer). Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after design-plugin-apis."
 # Another zgx PR: cherry-pick it onto nightly-design (a new commit, never a
 # force-push), run its tests, push. Then in a checkout assembled up to here,
 # replace the old rev with the new one in those two Cargo.toml files and both
@@ -120,21 +102,3 @@ note = "zgx from hoangvu12/zgx's nightly-design branch (70578619): zeron/zgx's p
 # the branch from the new pin (a new branch, e.g. nightly-design-<rev>) and
 # do the same. Once a PR is in zeron/zgx's pin, drop its commit there too;
 # once all are, delete this entry.
-
-[[patch]]
-name = "plugin-fonts"
-pr = 1378
-sha = "570dfd9e6593fd999c26103f50fb52f05072c6b8"
-note = "A plugin may ask for \"fonts\" (Capability::Fonts) and load font files in its windows. Goes after zgx-nightly-design: it needs zgx's ui.load_font (#2074), which only that zgx has."
-
-[[patch]]
-name = "service-fetch-binary"
-pr = 1379
-sha = "71e34ef2b93e973e67b932fbf8bab35116c6adf1"
-note = "A plugin service's zeron.fetch can return a font's or a picture's bytes whole, in base64."
-
-[[patch]]
-name = "service-db"
-pr = 1380
-sha = "8c644c5b610fdbb177e633213f42522d662bf624"
-note = "A plugin's service gets zeron.db (the new crates/plugin-db)."
