@@ -1951,12 +1951,24 @@ impl View {
         });
         // (An engine from before it ends the watch at once: nothing waits, as before.)
         let weak = Rc::downgrade(self);
+        let chat = id.clone();
         let waiting = rpc.watch("WatchWaitingMessages", json!({ "chatId": id }), move |item| {
             if let Some(view) = weak.upgrade()
                 && view.generation.get() == generation
             {
+                let items = item["items"].as_array().cloned().unwrap_or_default();
+                // A send its sandbox refused (an agent its template lacks):
+                // not on its way any more. Its words go back to the composer
+                // (`refused`), not into the transcript.
+                let refused: Vec<&str> = items.iter().filter_map(refused_message).collect();
+                for message in &refused {
+                    view.forget_pending(&chat, message);
+                }
                 if let Some(open) = view.open.borrow_mut().as_mut() {
-                    open.waiting = item["items"].as_array().cloned().unwrap_or_default();
+                    open.waiting = items.clone();
+                }
+                if !refused.is_empty() {
+                    view.publish_messages();
                 }
                 view.publish_session();
             }
@@ -5701,6 +5713,8 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
         ("ask", ask),
         ("queue", Value::List(queue.into())),
         ("waiting", waiting_value(&open.waiting)),
+        // A send its sandbox refused, for the composer to say so and take back.
+        ("refused", refused_value(&open.waiting)),
         // A new chat on Cloud before its machine is known (`chat.creating`).
         ("cloud", Value::Bool(chat["cloud"].as_bool() == Some(true))),
         ("todos", todos(open)),
@@ -5941,6 +5955,37 @@ fn waiting_value(items: &[Json]) -> Value {
             .collect::<Vec<_>>()
             .into(),
     )
+}
+
+/// The message a waiting send became, when its sandbox refused it for an
+/// agent its template lacks (`agent_not_on_template:`, zeron_proto `places`).
+fn refused_message(w: &Json) -> Option<&str> {
+    zeron_proto::places::agent_missing(w["failure"].as_str()?)?;
+    w["messageId"].as_str()
+}
+
+/// The newest send its sandbox refused (#46): the message it is (sent again
+/// with that id, it goes once), the agent it named, the words saying so
+/// ("Codex isn't on this template"), and its own words, back for the
+/// composer. Nil when none waits. The agent is never swapped here: the
+/// person picks another and sends it again.
+fn refused_value(items: &[Json]) -> Value {
+    items
+        .iter()
+        .rev()
+        .find_map(|w| {
+            let (agent, words) = zeron_proto::places::agent_missing(w["failure"].as_str()?)?;
+            let (text, _) = split_attachments(w["prompt"].as_str().unwrap_or_default());
+            Some(Value::record([
+                // (The command refused: each refusal, even of the same message.)
+                ("id", Value::from(w["id"].as_str().unwrap_or_default())),
+                ("message", Value::from(w["messageId"].as_str()?)),
+                ("agent", Value::from(agent.as_str())),
+                ("words", Value::from(words)),
+                ("text", Value::from(text.as_str())),
+            ]))
+        })
+        .unwrap_or(Value::Nil)
 }
 
 /// Whether a device's agent is one its composer offers. On a Cloud session's
@@ -7536,6 +7581,27 @@ mod tests {
         assert_eq!(out[1]["held"], true);
         assert!(out[1]["expires"].is_null());
         assert!(out[1]["failure"].as_str().unwrap().starts_with("too many files"));
+    }
+
+    #[test]
+    fn a_send_its_sandbox_refused_reads_as_the_agent_missing_and_its_words() {
+        let reason = zeron_proto::places::agent_missing_reason(zeron_proto::HarnessId::Codex, "Codex");
+        let items = vec![
+            json!({ "id": "c1", "messageId": "m1", "prompt": "Ship it", "sentAt": 1_800_000_000_000_i64 }),
+            json!({ "id": "c2", "messageId": "m2", "prompt": "Add a landing page", "sentAt": 1_800_000_000_000_i64,
+                "failure": reason }),
+        ];
+        let out: Json = serde_json::from_str(&super::refused_value(&items).to_json()).unwrap();
+        assert_eq!(out["id"], "c2");
+        assert_eq!(out["message"], "m2");
+        assert_eq!(out["agent"], "codex");
+        assert_eq!(out["words"], "Codex isn't on this template");
+        assert_eq!(out["text"], "Add a landing page");
+        assert_eq!(super::refused_message(&items[1]), Some("m2"));
+        assert_eq!(super::refused_message(&items[0]), None);
+        // Any other failure isn't a refusal: nothing to take back.
+        let other = vec![json!({ "id": "o1", "prompt": "x", "held": true, "failure": "too many files" })];
+        assert!(super::refused_value(&other) == Value::Nil);
     }
 
     #[test]

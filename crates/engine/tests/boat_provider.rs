@@ -117,6 +117,32 @@ async fn connecting_checks_the_key_and_keeps_it_on_this_device_only() {
     again.create(create("c", "1")).await.unwrap();
 }
 
+/// The key moves with the host device (#42): exported once, kept by the
+/// next device, forgotten by the last.
+#[tokio::test]
+async fn the_key_moves_with_the_host_device() {
+    let old = connected().await;
+    let dir = tempfile::tempdir().unwrap();
+    let next = BoatProvider::new(KeySlot::open(dir.path(), "boat"))
+        .with_base(&old.stub.base)
+        .with_poll(Duration::from_millis(5));
+    assert_eq!(next.export_key(), None, "not connected there yet");
+
+    let key = old.provider.export_key().expect("connected here");
+    let account = next.adopt_key(key).await.unwrap();
+    assert_eq!(next.account(), Some(account));
+    next.create(create("moved", "1")).await.unwrap();
+
+    old.provider.forget_key().await;
+    assert_eq!(old.provider.account(), None);
+    assert_eq!(old.slot.get(), None);
+    let refused = old.provider.create(create("x", "1")).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Config, "{refused}");
+
+    let empty = next.adopt_key("  ".into()).await.unwrap_err();
+    assert_eq!(empty.kind, ErrorKind::Config, "{empty}");
+}
+
 #[tokio::test]
 async fn creates_idempotently_runs_extends_stops_starts_and_deletes() {
     let boat = connected().await;

@@ -114,6 +114,7 @@ impl WorkspaceDoc {
         // An old engine can update its app version without knowing SDK fields.
         // Treat retained SDK metadata as unknown after such a downgrade.
         set_opt_str(&row, "cursorSdkEngineVersion", device.version.as_deref())?;
+        set_opt_ms(&row, "onlineSince", device.online_since)?;
         row.insert(
             "capabilities",
             crate::schema::loro_value_from_json(&serde_json::json!(&device.capabilities)),
@@ -649,6 +650,8 @@ pub(crate) struct RawDevice {
     cursor_sdk_engine_version: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+    #[serde(default)]
+    online_since: Option<i64>,
 }
 
 impl From<RawDevice> for Device {
@@ -663,6 +666,7 @@ impl From<RawDevice> for Device {
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
             version: raw.version,
+            online_since: raw.online_since.map(dt),
             cursor_sdk_version: sdk_version,
             capabilities: raw.capabilities,
         }
@@ -893,6 +897,7 @@ mod tests {
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
             version: Some("0.1.0".into()),
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
         }

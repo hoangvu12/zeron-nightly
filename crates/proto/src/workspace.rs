@@ -50,6 +50,14 @@ pub mod capabilities {
     /// such a host until its bytes are stored; older hosts get them over the
     /// peer link, as they always did.
     pub const ATTACHMENT_STORE_V1: &str = "attachment-store-v1";
+    /// The engine can be a sandbox provider's host device (spec #37): it takes
+    /// a provider's key (`AdoptSandboxProvider`) and answers for the chats on
+    /// it. Only a device with it is picked or handed the key.
+    pub const SANDBOX_HOST_V1: &str = "sandbox-host-v1";
+    /// The engine runs as `zeron headless`, the always-on server kind, which
+    /// is picked as host device first. Advertised only by those, so not in
+    /// [`CURRENT`].
+    pub const HEADLESS_V1: &str = "headless-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -67,6 +75,7 @@ pub mod capabilities {
         UPDATE_ABILITY_V1,
         ATTACHMENT_STORE_V1,
         crate::voice::remote::CAPABILITY,
+        SANDBOX_HOST_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -161,7 +170,8 @@ mod tests {
                     "zgx-interface-v1",
                     "update-ability-v1",
                     "attachment-store-v1",
-                    "voice-client-media-v1"
+                    "voice-client-media-v1",
+                    "sandbox-host-v1"
                 ],
             })
         );

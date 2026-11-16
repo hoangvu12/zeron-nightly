@@ -292,6 +292,33 @@ impl SandboxProvider for BoatProvider {
         self.key().ok().map(|_| account())
     }
 
+    fn export_key(&self) -> Option<String> {
+        self.key().ok()
+    }
+
+    async fn adopt_key(&self, raw: String) -> Result<Account, ProviderError> {
+        let key = raw.trim();
+        if key.is_empty() {
+            return Err(ProviderError::new(
+                ErrorKind::Config,
+                "the other device sent no Boat key; connect Boat again",
+            ));
+        }
+        self.slot.set(key).map_err(|err| {
+            ProviderError::new(
+                ErrorKind::Fatal,
+                format!("couldn't keep the Boat key on this device: {err}"),
+            )
+        })?;
+        Ok(account())
+    }
+
+    async fn forget_key(&self) {
+        if let Err(err) = self.slot.clear() {
+            tracing::warn!(error = %err, "boat: couldn't remove the key from its slot");
+        }
+    }
+
     async fn connect(&self, credential: Credential) -> Result<Account, ProviderError> {
         // Boat takes a pasted key only (no device sign-in).
         let key = match &credential {

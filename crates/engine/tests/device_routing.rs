@@ -2665,6 +2665,7 @@ fn device_row(id: &str, version: &str, seen_hours_ago: i64) -> zeron_proto::Devi
         last_seen_at: Some(chrono::Utc::now() - chrono::Duration::hours(seen_hours_ago)),
         created_at: None,
         version: Some(version.into()),
+        online_since: None,
         cursor_sdk_version: None,
         capabilities: Vec::new(),
     }

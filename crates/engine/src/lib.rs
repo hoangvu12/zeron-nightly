@@ -91,7 +91,8 @@ mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{
-    Auth, AuthConfig, AuthState, AuthUser, LentSignIn, OrgMembership, ScreenHint, SignInOptions,
+    Auth, AuthConfig, AuthState, AuthUser, LentGrant, LentSignIn, OrgMembership, ScreenHint,
+    SignInOptions,
 };
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
@@ -540,8 +541,16 @@ impl EngineCore {
         self.plugins.attach_auth(auth.clone());
         // A chat deleted on any device takes its sandbox (and the sign-in
         // lent it) with it.
+        // Its delete scripts run here too (they need no relay). Held weakly,
+        // so the following doesn't keep the engine alive.
+        let host = sandboxes::Host {
+            workspace: self.workspace.clone(),
+            doc_host: self.doc_host.clone(),
+            auth: Some(auth.clone()),
+            links: None,
+        };
         self.sandboxes
-            .follow_deletions(self.workspace.watch_chats(), auth.clone());
+            .follow_deletions(self.workspace.watch_chats(), host.downgrade());
         *self
             .auth
             .lock()
@@ -887,6 +896,17 @@ impl EngineRuntime {
         &self.core
     }
 
+    /// `zeron headless`: the user's always-on server, picked first as a
+    /// sandbox provider's host device. A sandbox's or Cloud machine's engine
+    /// runs headless too, but is never one.
+    pub fn advertise_headless(&self) {
+        let auth = self.core.auth();
+        if auth.is_lent() || auth.is_runner() {
+            return;
+        }
+        self.core.workspace.advertise_headless();
+    }
+
     pub fn workspace_scope(&self) -> WorkspaceScope {
         self.core.workspace_scope()
     }
@@ -1224,6 +1244,11 @@ impl Engine {
             }
             core.set_cloud(runner::CloudRunner::new(broker, activity, heartbeat));
         }
+        // A sandbox's engine runs on its template's agents: a send for one
+        // it lacks is refused (#46).
+        if auth.is_lent() {
+            core.sessions.runs_on_a_template();
+        }
         // A sandbox's engine, like a Cloud machine, comes up with sends
         // already waiting for it (a chat's first message, queued while its
         // steps ran): look at every chat it hosts once the registry has synced.
@@ -1379,6 +1404,15 @@ impl Engine {
             // A sandbox asks the device lending it tokens for the next one
             // through these links.
             auth.attach_lender_links(links.clone());
+            // ...and, when the host device moved, finds the one lending now.
+            let workspace_for_lenders = core.workspace.clone();
+            auth.attach_lender_directory(Arc::new(move || {
+                workspace_for_lenders
+                    .sandbox_hosts()
+                    .into_iter()
+                    .map(|host| host.host_device_id)
+                    .collect()
+            }));
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
@@ -1443,6 +1477,7 @@ impl Engine {
             .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
 
         let runtime = Self::assemble_runtime(&config, auth, profile).await?;
+        runtime.advertise_headless();
         // The desktop app or `zeron update` may install a newer binary under
         // a running service; restart into it once no run or terminal is live.
         if let Some(updater) = runtime.core().updater() {
