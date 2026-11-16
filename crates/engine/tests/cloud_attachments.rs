@@ -353,6 +353,7 @@ async fn sender(dir: &Path, edge: Option<&FakeEdge>, host: &str, capable: bool) 
         last_seen_at: Some(chrono::Utc::now()),
         created_at: None,
         version: Some("0.2.138".into()),
+        online_since: None,
         cursor_sdk_version: None,
         capabilities: if capable {
             zeron_proto::capabilities::current()

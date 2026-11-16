@@ -304,22 +304,42 @@ impl LentSignIn {
     }
 }
 
+/// The devices a sandbox may find its lender on now: the host devices the
+/// registry names (spec #37). The host device can change while it runs.
+pub type LenderDirectory = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// A sandbox's engine: where its next token comes from.
 struct Borrower {
-    lender: String,
+    /// The device lending it tokens: the one it was started by, until that
+    /// one stops answering and another host device does.
+    lender: Mutex<String>,
     key: String,
     /// The relay links it asks the lender through, once the runtime has them.
     links: Mutex<Option<Arc<zeron_rpc::LinkCache>>>,
+    directory: Mutex<Option<LenderDirectory>>,
 }
 
-/// One sandbox this device lends tokens to, pinned to the org it was lent for.
+/// One sandbox this device lends tokens to, pinned to the org it was lent
+/// for. Handed to the next host device when the host device moves
+/// ([`Auth::lending_to`], [`Auth::take_over_lending`]).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Grant {
-    sandbox: String,
-    org_id: String,
-    key: String,
+pub struct LentGrant {
+    pub sandbox: String,
+    pub org_id: String,
+    pub key: String,
 }
+
+impl std::fmt::Debug for LentGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LentGrant")
+            .field("sandbox", &self.sandbox)
+            .field("org_id", &self.org_id)
+            .finish_non_exhaustive()
+    }
+}
+
+type Grant = LentGrant;
 
 /// Access-token cache. Expiry ages the token's own lifetime (`exp - iat`) by
 /// BOTH clocks, pessimistically. Monotonic alone (`Instant`) freezes across
@@ -541,9 +561,10 @@ impl Auth {
             }
         };
         let borrower = Borrower {
-            lender: sign_in.lender,
+            lender: Mutex::new(sign_in.lender),
             key: sign_in.key,
             links: Mutex::new(None),
+            directory: Mutex::new(None),
         };
         let auth = Self::assemble(config, None, false, None, initial, None, Some(borrower));
         // What's left of it now: it may have been lent minutes ago.
@@ -629,6 +650,22 @@ impl Auth {
         if let Some(borrower) = &self.inner.borrower {
             *lock(&borrower.links) = Some(links);
         }
+    }
+
+    /// Lent mode: where to look for the lender when the one it has stops
+    /// lending (the host device moved).
+    pub fn attach_lender_directory(&self, directory: LenderDirectory) {
+        if let Some(borrower) = &self.inner.borrower {
+            *lock(&borrower.directory) = Some(directory);
+        }
+    }
+
+    /// Lent mode: the device lending this engine its tokens now.
+    pub fn lender(&self) -> Option<String> {
+        self.inner
+            .borrower
+            .as_ref()
+            .map(|borrower| lock(&borrower.lender).clone())
     }
 
     /// Whether this is a Cloud runner (enrolled key, no WorkOS session).
@@ -1716,6 +1753,39 @@ impl Auth {
         }
     }
 
+    /// What this device lends `sandboxes`, for the next host device to go on
+    /// lending ([`Self::take_over_lending`]). This device goes on until it
+    /// [`Self::stop_lending`]s.
+    pub fn lending_to(&self, sandboxes: &[String]) -> Vec<LentGrant> {
+        lock(&self.inner.lending)
+            .iter()
+            .filter(|grant| sandboxes.contains(&grant.sandbox))
+            .cloned()
+            .collect()
+    }
+
+    /// Go on lending what the last host device lent: each sandbox's next
+    /// `LendToken` under the key it has is answered here.
+    pub fn take_over_lending(&self, taken: Vec<LentGrant>) -> Result<(), EngineError> {
+        if self.is_runner() || self.is_lent() {
+            return Err(EngineError::Other(
+                "only a device signed in to your account can lend a sandbox its sign-in".into(),
+            ));
+        }
+        if taken.is_empty() {
+            return Ok(());
+        }
+        let mut grants = lock(&self.inner.lending);
+        grants.retain(|grant| !taken.iter().any(|t| t.sandbox == grant.sandbox));
+        for grant in taken {
+            tracing::info!(sandbox = %grant.sandbox, org = %grant.org_id,
+                "auth: lending a sandbox its sign-in, as host device now");
+            grants.push(grant);
+        }
+        self.persist_lending(&grants);
+        Ok(())
+    }
+
     /// `LendToken`: the next token for the sandbox lent under `key`, in the
     /// org it was lent for, and how long it lasts.
     pub async fn lent_token(&self, key: &str) -> Result<(String, Duration), EngineError> {
@@ -1905,7 +1975,7 @@ impl Auth {
                 self.inner
                     .token_tx
                     .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-                tracing::error!(lender = %borrower.lender,
+                tracing::error!(lender = %lock(&borrower.lender),
                     "auth: the lent token ran out and the host device lent no other; offline");
                 return;
             };
@@ -1940,15 +2010,44 @@ impl Auth {
         }
     }
 
-    /// `LendToken` on the lender, through the relay: the next token, checked
-    /// to be for this engine's org, and how long it lasts.
+    /// The next token from the lender. When it doesn't lend one (the host
+    /// device moved, or it's gone), each other host device the registry
+    /// names is asked under the same key; the one that lends is the lender
+    /// from then on.
     async fn ask_lender(&self, borrower: &Borrower) -> Result<(String, Duration), String> {
+        let lender = lock(&borrower.lender).clone();
+        let error = match self.ask_device(borrower, &lender).await {
+            Ok(lent) => return Ok(lent),
+            Err(error) => error,
+        };
+        let directory = lock(&borrower.directory).clone();
+        let mut others: Vec<String> = directory.map(|list| list()).unwrap_or_default();
+        others.retain(|device| *device != lender);
+        others.dedup();
+        for device in others {
+            if let Ok(lent) = self.ask_device(borrower, &device).await {
+                tracing::info!(from = %lender, to = %device,
+                    "auth: another host device lends this sandbox its tokens now");
+                *lock(&borrower.lender) = device;
+                return Ok(lent);
+            }
+        }
+        Err(error)
+    }
+
+    /// `LendToken` on `lender`, through the relay: the next token, checked to
+    /// be for this engine's org, and how long it lasts.
+    async fn ask_device(
+        &self,
+        borrower: &Borrower,
+        lender: &str,
+    ) -> Result<(String, Duration), String> {
         let links = lock(&borrower.links)
             .clone()
             .ok_or("the relay isn't up yet")?;
         let ask = async {
             let client = links
-                .client(&borrower.lender)
+                .client(lender)
                 .await
                 .map_err(|e| format!("the host device can't be reached: {e}"))?;
             client
@@ -1962,7 +2061,7 @@ impl Auth {
         let reply = match tokio::time::timeout(LENT_ASK_TIMEOUT, ask).await {
             Ok(Ok(reply)) => reply,
             outcome => {
-                links.invalidate(&borrower.lender);
+                links.invalidate(lender);
                 return Err(match outcome {
                     Ok(Err(err)) => err,
                     _ => "the host device didn't answer".into(),

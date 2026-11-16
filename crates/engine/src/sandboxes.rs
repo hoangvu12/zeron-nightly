@@ -10,9 +10,12 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
+mod host_device;
 mod provider;
 mod steps;
 
+pub use host_device::{ProviderFactory, pick_host};
+pub(crate) use host_device::Handover;
 pub use provider::{
     Command, CreateSandbox, ErrorKind, Exit, Finished, Ops, Placement, ProviderError, RunEvent,
     RunStream, SandboxProvider, Template, run_to_end,
@@ -123,7 +126,12 @@ struct ChatSandbox {
 #[derive(Default)]
 struct Inner {
     records_path: Option<PathBuf>,
+    /// The providers' keys this device keeps as host device, one 0600 file
+    /// each.
+    keys_dir: Option<PathBuf>,
     providers: Mutex<Vec<Arc<dyn SandboxProvider>>>,
+    /// The providers built in, each made from its key when connected.
+    factories: Mutex<HashMap<String, ProviderFactory>>,
     chats: Mutex<HashMap<String, Arc<ChatSandbox>>>,
 }
 
@@ -166,7 +174,9 @@ impl Sandboxes {
         Self {
             inner: Arc::new(Inner {
                 records_path: Some(records_path),
+                keys_dir: Some(data_dir.join(host_device::KEYS_DIR)),
                 providers: Mutex::default(),
+                factories: Mutex::default(),
                 chats: Mutex::new(chats),
             }),
         }

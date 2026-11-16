@@ -56,6 +56,7 @@ fn device_row(relay: bool) -> Device {
         last_seen_at: Some(now),
         created_at: Some(now),
         version: Some(env!("CARGO_PKG_VERSION").into()),
+        online_since: None,
         cursor_sdk_version: None,
         capabilities,
     }

@@ -91,7 +91,8 @@ mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{
-    Auth, AuthConfig, AuthState, AuthUser, LentSignIn, OrgMembership, ScreenHint, SignInOptions,
+    Auth, AuthConfig, AuthState, AuthUser, LentGrant, LentSignIn, OrgMembership, ScreenHint,
+    SignInOptions,
 };
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
@@ -883,6 +884,17 @@ impl EngineRuntime {
         &self.core
     }
 
+    /// `zeron headless`: the user's always-on server, picked first as a
+    /// sandbox provider's host device. A sandbox's or Cloud machine's engine
+    /// runs headless too, but is never one.
+    pub fn advertise_headless(&self) {
+        let auth = self.core.auth();
+        if auth.is_lent() || auth.is_runner() {
+            return;
+        }
+        self.core.workspace.advertise_headless();
+    }
+
     pub fn workspace_scope(&self) -> WorkspaceScope {
         self.core.workspace_scope()
     }
@@ -1364,6 +1376,15 @@ impl Engine {
             // A sandbox asks the device lending it tokens for the next one
             // through these links.
             auth.attach_lender_links(links.clone());
+            // ...and, when the host device moved, finds the one lending now.
+            let workspace_for_lenders = core.workspace.clone();
+            auth.attach_lender_directory(Arc::new(move || {
+                workspace_for_lenders
+                    .sandbox_hosts()
+                    .into_iter()
+                    .map(|host| host.host_device_id)
+                    .collect()
+            }));
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
@@ -1428,6 +1449,7 @@ impl Engine {
             .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
 
         let runtime = Self::assemble_runtime(&config, auth, profile).await?;
+        runtime.advertise_headless();
         // The desktop app or `zeron update` may install a newer binary under
         // a running service; restart into it once no run or terminal is live.
         if let Some(updater) = runtime.core().updater() {

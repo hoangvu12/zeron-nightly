@@ -722,6 +722,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 last_seen_at: Some(now),
                 created_at: Some(now),
                 version: Some("0.1.17".into()),
+                online_since: None,
                 cursor_sdk_version: None,
                 capabilities: Vec::new(),
             })
@@ -1091,6 +1092,7 @@ async fn remove_device_retires_an_away_device_everywhere_and_refuses_the_rest() 
         last_seen_at: None,
         created_at: None,
         version: None,
+        online_since: None,
         cursor_sdk_version: None,
         capabilities,
     };

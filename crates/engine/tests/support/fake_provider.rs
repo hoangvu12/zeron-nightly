@@ -321,6 +321,34 @@ impl SandboxProvider for FakeProvider {
         Ok(())
     }
 
+    async fn stop(&self, sandbox: &str) -> Result<(), ProviderError> {
+        self.record(format!("stop {sandbox}"));
+        let engine = {
+            let mut state = self.state.lock().unwrap();
+            let fake = state.boxes.get_mut(sandbox).ok_or_else(|| {
+                ProviderError::new(ErrorKind::NotFound, format!("no sandbox {sandbox}"))
+            })?;
+            fake.running = false;
+            fake.engine.take()
+        };
+        if let Some(engine) = engine {
+            engine.shutdown().await;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, sandbox: &str) -> Result<(), ProviderError> {
+        self.record(format!("delete {sandbox}"));
+        let removed = self.state.lock().unwrap().boxes.remove(sandbox);
+        let fake = removed.ok_or_else(|| {
+            ProviderError::new(ErrorKind::NotFound, format!("no sandbox {sandbox}"))
+        })?;
+        if let Some(engine) = fake.engine {
+            engine.shutdown().await;
+        }
+        Ok(())
+    }
+
     async fn run(&self, sandbox: &str, command: Command) -> Result<RunStream, ProviderError> {
         self.record(format!("run {sandbox}: {}", command.args.join(" ")));
         let dir = self.dir(sandbox)?;

@@ -28,6 +28,7 @@ fn device(capabilities: Vec<String>) -> Device {
         last_seen_at: Some(Utc::now()),
         created_at: Some(Utc::now()),
         version: Some(env!("CARGO_PKG_VERSION").into()),
+        online_since: None,
         cursor_sdk_version: None,
         capabilities,
     }

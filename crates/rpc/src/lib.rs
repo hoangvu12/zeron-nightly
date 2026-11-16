@@ -229,6 +229,31 @@ pub mod methods {
     pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
     /// `{chatId}` → `{ok}`: run a failed step again, and the ones after it.
     pub const RUN_SANDBOX_STEPS_AGAIN: &str = "RunSandboxStepsAgain";
+    // The host device (spec #37): one of the user's devices keeps each
+    // provider's key and does its calls; the others ask it. A chat's
+    // Sandbox* methods, `createChat` on a place and `DeleteSandbox` go to it
+    // by themselves from any device that doesn't keep the provider.
+    /// `{provider}` → `{provider, hostDeviceId, connectedOn?}` or `null`
+    /// (not connected): which device is the provider's host device, from the
+    /// registry.
+    pub const SANDBOX_HOST: &str = "SandboxHost";
+    /// `{provider, key}` → `{ok, hostDeviceId}`: connect a provider with the
+    /// key its sign-in gave this device. The key goes to the host device
+    /// (the provider's, or else one picked: the online `zeron headless`
+    /// device online longest, else this one), once, and never comes back.
+    pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
+    /// Device to device: `{provider, key, connectedOn?, grants?, chats?}` →
+    /// `{ok}`: become `provider`'s host device, keeping its key (0600, never
+    /// answered back), the sign-ins the last one lent its sandboxes, and
+    /// their chats. Needs `sandbox-host-v1`.
+    pub const ADOPT_SANDBOX_PROVIDER: &str = "AdoptSandboxProvider";
+    /// `{provider, deviceId}` → `{ok, hostDeviceId}`: move the host device.
+    /// The current one hands the key, its lent sign-ins and chats over;
+    /// running sandboxes keep going, their next token lent by `deviceId`.
+    pub const SET_SANDBOX_HOST: &str = "SetSandboxHost";
+    /// `{chatId}` → `{ok}`: delete the chat's sandbox (the provider deletes
+    /// it, and its sign-in isn't lent any more). The chat stays.
+    pub const DELETE_SANDBOX: &str = "DeleteSandbox";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run
@@ -1434,6 +1459,10 @@ mod tests {
             methods::ACCESS_TOKEN,
             methods::STEP_UP,
             methods::LEND_TOKEN,
+            methods::CONNECT_SANDBOX_PROVIDER,
+            methods::ADOPT_SANDBOX_PROVIDER,
+            methods::SET_SANDBOX_HOST,
+            methods::DELETE_SANDBOX,
             methods::DELETE_ACCOUNT,
             methods::SIGN_IN,
             methods::COMPLETE_SIGN_IN,
