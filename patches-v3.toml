@@ -107,3 +107,8 @@ note = "The app's and the engine's zgx from hoangvu12/zgx's nightly-design-expor
 # the branch from the new pin (a new branch, e.g. nightly-design-<rev>) and
 # do the same. Once a PR is in zeron/zgx's pin, drop its commit there too;
 # once all are, delete this entry.
+
+[[patch]]
+name = "agent-device-commands"
+file = "patches/0014-agent-device-commands.patch"
+note = "#1458 at a4e90bbf as a file: its own diff (from main f6a9bbfc), not a `pr` entry, since its head carries 127 commits of main that zeron/zgx lacks. Agents run shell commands on any online device (Zeron MCP's run_command, command_output, stop_command, list_commands), with background ones in the chat's background band; Cloud chats reach every device (the edge part only takes effect once upstream deploys it). zgx doesn't have main's PowerShell terminal picker, so agent commands get it as terminals::command_shell (PowerShell on Windows, as the PR's Windows tests expect) while terminal tabs keep zgx's %COMSPEC%; the plugin preview blocks agents.cloud_key only (main's agents.add_key and agents.rename aren't in zgx). Both devices need this build: the command runs on the target's engine. Applied last; regenerate it when #1458 gets new commits."
