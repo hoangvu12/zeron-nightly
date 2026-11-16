@@ -2502,6 +2502,11 @@ fn forwardable(method: &str) -> bool {
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
+            // Step scripts are files on the host device.
+            | methods::LIST_STEP_SCRIPTS
+            | methods::READ_STEP_SCRIPT
+            | methods::WRITE_STEP_SCRIPT
+            | methods::DELETE_STEP_SCRIPT
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
             | methods::TAKE_PROJECT_ACTION_SETUP

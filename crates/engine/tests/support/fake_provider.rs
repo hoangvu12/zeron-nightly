@@ -454,7 +454,12 @@ impl SandboxProvider for FakeProvider {
             ));
         }
         let cwd = command.cwd.map(PathBuf::from).unwrap_or(home.clone());
-        let mut child = tokio::process::Command::new(program);
+        // The sandbox's `sh` (step scripts): on Windows, Git's.
+        let mut child = if program == "sh" {
+            tokio::process::Command::from(zeron_engine::sandboxes::scripts::sh_command())
+        } else {
+            tokio::process::Command::new(program)
+        };
         child
             .args(&command.args[1..])
             .current_dir(&cwd)
