@@ -2215,6 +2215,28 @@ ui.command {
 		store.catalog:set({ state = "ready", complete = true, harnesses = c.harnesses, models = models } :: any)
 	end,
 }
+-- The place's catalog (Docker's zeron-dev template) come complete, without
+-- Opus, as the device keeping the provider answers it (#46).
+ui.command {
+	id = "catalog_place_without_opus",
+	title = "The zeron-dev template's catalog comes, without Opus",
+	run = function()
+		local c = store.catalog:peek()
+		local models: { any } = {}
+		for _, m in c.models do
+			if m.value ~= "opus" then
+				table.insert(models, m)
+			end
+		end
+		store.catalog:set({
+			state = "ready",
+			complete = true,
+			device = "place:docker:zeron-dev",
+			harnesses = c.harnesses,
+			models = models,
+		} :: any)
+	end,
+}
 -- The agent marks a default that isn't its first row (Claude lists
 -- best-first and marks the CLI's own default).
 ui.command {

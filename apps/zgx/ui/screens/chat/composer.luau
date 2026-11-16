@@ -446,6 +446,11 @@ local function Composer(): Node
 			return
 		end
 		local d = run_device()
+		-- Never on a place (#46): its sandbox says on send that the agent
+		-- isn't on its template, and the person switches it.
+		if sandboxes.of(d) then
+			return
+		end
 		if d == Where.CLOUD then
 			if (cat :: any).device ~= Where.CLOUD then
 				return

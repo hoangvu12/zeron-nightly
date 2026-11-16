@@ -953,20 +953,24 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
 /// The other devices online now, as the sidebar judges it (a Cloud one's no
 /// place to look at ahead of time).
 pub(crate) fn other_devices_online() -> Vec<String> {
+    SESSIONS.with(|s| others_online(s))
+}
+
+/// `s`'s other devices online, by id: never Cloud's machines nor a
+/// sandbox's (a place's agents are asked of `place:<provider>`, #46).
+fn others_online(s: &Sessions) -> Vec<String> {
     let now = now_seconds();
-    SESSIONS.with(|s| {
-        let here = s.here.borrow().clone();
-        s.devices
-            .borrow()
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|d| !is_cloud(d))
-            .filter(|d| d["lastSeenAt"].as_str().and_then(unix_seconds).is_some_and(|at| now - at <= ONLINE_SECS))
-            .filter_map(|d| d["id"].as_str().map(str::to_owned))
-            .filter(|id| Some(id.as_str()) != here.as_deref())
-            .collect()
-    })
+    let here = s.here.borrow().clone();
+    s.devices
+        .borrow()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| !is_cloud(d) && sandbox_of(d).is_none())
+        .filter(|d| d["lastSeenAt"].as_str().and_then(unix_seconds).is_some_and(|at| now - at <= ONLINE_SECS))
+        .filter_map(|d| d["id"].as_str().map(str::to_owned))
+        .filter(|id| Some(id.as_str()) != here.as_deref())
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -2722,6 +2726,23 @@ mod tests {
         assert_eq!(sandbox("cloud-s1"), None);
         assert_eq!(cloud("cloud-s1"), Some(zgx_script::Value::Bool(true)));
         assert_eq!(sandbox("odd"), None);
+    }
+
+    /// Catalogs looked at ahead of time skip a sandbox's device (#46: a
+    /// place's agents are asked of its provider), as they skip Cloud's.
+    #[test]
+    fn devices_looked_at_ahead_are_never_a_sandbox_s() {
+        let now = now_seconds();
+        let s = Sessions::default();
+        *s.here.borrow_mut() = Some("here".into());
+        *s.devices.borrow_mut() = json!([
+            { "id": "here", "lastSeenAt": iso(now - 1) },
+            { "id": "pc", "platform": "windows", "lastSeenAt": iso(now - 1) },
+            { "id": "box-1", "platform": "linux", "lastSeenAt": iso(now - 1),
+              "capabilities": ["sandbox:docker"] },
+            { "id": "cloud-s1", "platform": "cloud", "lastSeenAt": iso(now - 1) },
+        ]);
+        assert_eq!(super::others_online(&s), vec!["pc".to_owned()]);
     }
 
     /// A chat on a place: `createChat` with the provider and the template
