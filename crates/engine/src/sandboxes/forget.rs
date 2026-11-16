@@ -67,10 +67,7 @@ pub enum Forgot {
 pub async fn forget_device(data_dir: &Path, ipc_port: u16) -> anyhow::Result<Forgot> {
     if let Ok(client) = zeron_rpc::connect_ipc(ipc_port, Some(data_dir)).await {
         let reply = client
-            .call(
-                zeron_rpc::methods::QUIESCE_FOR_SLEEP,
-                serde_json::json!({}),
-            )
+            .call(zeron_rpc::methods::QUIESCE_FOR_SLEEP, serde_json::json!({}))
             .await
             .map_err(|e| anyhow::anyhow!("QuiesceForSleep failed: {e}"))?;
         if reply["quiesced"].as_bool() != Some(true) {

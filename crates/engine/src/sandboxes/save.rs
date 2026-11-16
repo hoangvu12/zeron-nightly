@@ -101,7 +101,10 @@ fn template_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("Give the template a name.".into());
     }
-    if name.contains(['/', '\\']) || name == "." || name == ".." || name.chars().any(char::is_control)
+    if name.contains(['/', '\\'])
+        || name == "."
+        || name == ".."
+        || name.chars().any(char::is_control)
     {
         return Err("A template's name can't have / in it.".into());
     }
@@ -116,9 +119,9 @@ async fn forget(provider: &dyn SandboxProvider, sandbox: &str) -> Result<(), Str
         .map_err(|e| format!("Couldn't clear Zeron's identity in the sandbox: {e}"))?;
     match done.exit.code {
         Some(0) => Ok(()),
-        Some(FORGET_BUSY_EXIT) => Err(
-            "The chat is still working. Save it as a template once it's done.".into(),
-        ),
+        Some(FORGET_BUSY_EXIT) => {
+            Err("The chat is still working. Save it as a template once it's done.".into())
+        }
         _ => Err(format!(
             "Couldn't clear Zeron's identity in the sandbox: {}",
             done.failure()
@@ -149,7 +152,10 @@ mod tests {
     #[test]
     fn a_template_is_named_plainly() {
         assert_eq!(template_name("  reportly-dev ").unwrap(), "reportly-dev");
-        assert_eq!(template_name("Reportly dev box").unwrap(), "Reportly dev box");
+        assert_eq!(
+            template_name("Reportly dev box").unwrap(),
+            "Reportly dev box"
+        );
         for bad in ["", "   ", "a/b", r"a\b", "..", "a\nb"] {
             assert!(template_name(bad).is_err(), "{bad:?}");
         }

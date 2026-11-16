@@ -264,7 +264,15 @@ impl FakeProvider {
 
     /// `sandbox`'s engine's data folder.
     pub fn data_dir(&self, sandbox: &str) -> Option<PathBuf> {
-        Some(self.state.lock().unwrap().boxes.get(sandbox)?.data_dir.clone())
+        Some(
+            self.state
+                .lock()
+                .unwrap()
+                .boxes
+                .get(sandbox)?
+                .data_dir
+                .clone(),
+        )
     }
 
     /// The templates saved, in order.
@@ -472,7 +480,10 @@ fn list_files(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             list_files(root, &path, out);
         } else {
             let name = path.strip_prefix(root).unwrap().to_string_lossy();
-            out.push((name.replace('\\', "/"), std::fs::read(&path).unwrap_or_default()));
+            out.push((
+                name.replace('\\', "/"),
+                std::fs::read(&path).unwrap_or_default(),
+            ));
         }
     }
 }
@@ -556,11 +567,14 @@ impl SandboxProvider for FakeProvider {
         }
     }
 
+    /// The account's one template, then those saved from its sandboxes.
     async fn templates(&self) -> Result<Vec<Template>, ProviderError> {
-        Ok(vec![Template {
+        let mut templates = vec![Template {
             id: "zeron-dev".into(),
             name: "zeron-dev".into(),
-        }])
+        }];
+        templates.extend(self.saved());
+        Ok(templates)
     }
 
     fn workdir(&self, chat_id: &str) -> String {
@@ -586,12 +600,13 @@ impl SandboxProvider for FakeProvider {
         let mut state = self.state.lock().unwrap();
         state.made += 1;
         let fake = FakeBox::new(dir, state.made, true);
-        // From a saved template: its disk, as it was saved.
-        if let Some(id) = &request.template {
-            let saved = state.saved.iter().find(|s| &s.template.id == id);
-            let saved = saved.ok_or_else(|| {
-                ProviderError::new(ErrorKind::NotFound, format!("no template {id}"))
-            })?;
+        // From a saved template: its disk, as it was saved. (The account's
+        // own template starts as Blank does.)
+        if let Some(saved) = request
+            .template
+            .as_ref()
+            .and_then(|id| state.saved.iter().find(|s| &s.template.id == id))
+        {
             copy_dir(&saved.dir.join("home"), &fake.dir.join("home"));
             copy_dir(&saved.dir.join("zeron-data"), &fake.data_dir);
         }
@@ -665,10 +680,6 @@ impl SandboxProvider for FakeProvider {
         Ok(())
     }
 
-    async fn templates(&self) -> Result<Vec<Template>, ProviderError> {
-        Ok(self.saved())
-    }
-
     /// A copy of the sandbox's whole disk: its home and its engine's data.
     async fn save_template(&self, sandbox: &str, name: &str) -> Result<Template, ProviderError> {
         self.record(format!("save {sandbox}: {name}"));
@@ -707,9 +718,7 @@ impl SandboxProvider for FakeProvider {
                 ])
                 .boxed(),
                 // Under its watchdog, as Zeron starts it, or bare.
-                Some("watchdog" | "headless") if command.detach => {
-                    self.boot(sandbox, &command.env)
-                }
+                Some("watchdog" | "headless") if command.detach => self.boot(sandbox, &command.env),
                 Some(zeron_engine::sandboxes::FORGET_DEVICE) => self.forget(sandbox).await,
                 _ => exit_with(127, "zeron-engine: not found"),
             });

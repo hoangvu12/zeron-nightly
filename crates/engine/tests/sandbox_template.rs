@@ -23,8 +23,7 @@ use std::time::Duration;
 
 use fake_provider::FakeProvider;
 use places::{
-    ORG, SPACE, add_project, create_on_place, eventually, host_device, origin, project, ready,
-    send,
+    ORG, SPACE, add_project, create_on_place, eventually, host_device, origin, project, ready, send,
 };
 use scripted_edge::ScriptedEdge;
 use serde_json::{Value, json};
@@ -124,7 +123,10 @@ async fn a_saved_template_leaves_zerons_identity_and_sign_in_behind() {
     // What was saved: no device id, no data, no sign-in; the release kept.
     let files = provider.template_files(&id);
     let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
-    assert!(names.contains(&"zeron-data/app/1.2.3/zeron-engine"), "{names:#?}");
+    assert!(
+        names.contains(&"zeron-data/app/1.2.3/zeron-engine"),
+        "{names:#?}"
+    );
     for (name, _) in &files {
         let inside = name.trim_start_matches("zeron-data/");
         for gone in [
@@ -153,7 +155,10 @@ async fn a_saved_template_leaves_zerons_identity_and_sign_in_behind() {
 
     // The template is in the picker.
     let listed = rpc
-        .call(methods::LIST_SANDBOX_TEMPLATES, json!({ "provider": "fake" }))
+        .call(
+            methods::LIST_SANDBOX_TEMPLATES,
+            json!({ "provider": "fake" }),
+        )
         .await
         .expect("ListSandboxTemplates");
     assert!(
@@ -166,7 +171,9 @@ async fn a_saved_template_leaves_zerons_identity_and_sign_in_behind() {
 
     // The chat goes on, on the same device.
     assert_eq!(
-        std::fs::read_to_string(data.join("device-id")).ok().as_deref(),
+        std::fs::read_to_string(data.join("device-id"))
+            .ok()
+            .as_deref(),
         Some(device_a.as_str())
     );
     send(&rpc, "chat-a", "chat-a-2", &cwd, "and now").await;
@@ -193,9 +200,14 @@ async fn a_saved_template_leaves_zerons_identity_and_sign_in_behind() {
     assert_ne!(device_b, device_a);
     ready(&rpc, "chat-b").await;
     let data_b = provider.data_dir("chat-b").unwrap();
-    assert!(data_b.join("app/1.2.3/zeron-engine").exists(), "from the template");
+    assert!(
+        data_b.join("app/1.2.3/zeron-engine").exists(),
+        "from the template"
+    );
     assert_eq!(
-        std::fs::read_to_string(data_b.join("device-id")).ok().as_deref(),
+        std::fs::read_to_string(data_b.join("device-id"))
+            .ok()
+            .as_deref(),
         Some(device_b.as_str())
     );
     let dials = edge.host_dials(&device_b);
@@ -228,7 +240,14 @@ async fn what_cant_be_saved_safely_is_refused() {
         .workspace
         .rename_chat("chat-ssh", "Pre-titled")
         .unwrap();
-    send(&rpc, "chat-ssh", "m1", created["cwd"].as_str().unwrap(), "hi").await;
+    send(
+        &rpc,
+        "chat-ssh",
+        "m1",
+        created["cwd"].as_str().unwrap(),
+        "hi",
+    )
+    .await;
     ready(&rpc, "chat-ssh").await;
     let err = save(&rpc, "chat-ssh", "box").await.unwrap_err();
     assert!(err.contains("can't save templates"), "{err}");
