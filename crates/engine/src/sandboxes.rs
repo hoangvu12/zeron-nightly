@@ -10,6 +10,7 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
+pub mod boat;
 mod catalog;
 pub mod docker;
 mod host_device;
@@ -20,6 +21,7 @@ pub mod scripts;
 mod sleep;
 mod steps;
 
+pub use boat::BoatProvider;
 pub use catalog::PlaceCatalog;
 pub(crate) use host_device::Handover;
 pub use host_device::pick_host;

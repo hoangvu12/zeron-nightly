@@ -114,8 +114,8 @@ pub struct FakeProvider {
 }
 
 impl FakeProvider {
-    /// A full cloud: one sandbox per chat, every operation, templates with
-    /// Zeron on them.
+    /// A full cloud: one sandbox per chat, every sandbox operation,
+    /// templates with Zeron on them (no account to connect, no time limit).
     pub fn cloud(root: &Path) -> Arc<Self> {
         let ops = Ops::CREATE
             | Ops::START
