@@ -182,7 +182,8 @@ local function on_sandbox(case: string, open: boolean?): any
 	app:resize(960, 760)
 	app:command("go_s2")
 	app:frames(30)
-	app:command("session_on_box")
+	-- (On the fixture's Docker sandbox device, box-sb.)
+	app:command("sandbox_stub.steps.ready")
 	app:command(`sandbox_stub.{case}`)
 	app:wait("#never-shown", { timeout_ms = 300 })
 	app:frames(30)
@@ -192,7 +193,7 @@ local function on_sandbox(case: string, open: boolean?): any
 	return app
 end
 
-test("opening a chat on another device follows its sandbox", function()
+test("opening a chat on a sandbox follows it", function()
 	local app = on_sandbox("ready")
 	expect(asked(app, "follow:s2") >= 1).to_be(true)
 	-- A sandbox that's up raises nothing.
@@ -205,6 +206,17 @@ test("a chat hosted here is never asked about", function()
 	app:command("go_s2")
 	app:frames(30)
 	expect(asked(app, "follow:s2")).to_be(0)
+end)
+
+test("a chat on another device that isn't a sandbox is never asked about", function()
+	local app = mount("chat_fixture.luau")
+	app:command("go_s2")
+	app:frames(30)
+	app:command("session_on_box")
+	app:wait("#never-shown", { timeout_ms = 300 })
+	app:frames(30)
+	expect(asked(app, "follow:s2")).to_be(0)
+	expect(app:error()).to_be(nil)
 end)
 
 test("deleted outside Zeron: the deck says where, and Start fresh starts one", function()
