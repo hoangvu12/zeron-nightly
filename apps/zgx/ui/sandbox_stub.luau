@@ -62,8 +62,9 @@ local function say(fields: { [string]: any })
 		return
 	end
 	local s: { [string]: any } = { state = "ready", provider = "docker", provider_name = "Docker Sandbox", disk_full = false }
+	-- (`false` for a field it doesn't have: a nil in a table isn't there.)
 	for k, v in fields do
-		s[k] = v
+		s[k] = if v == false and k ~= "disk_full" then nil else v
 	end
 	local now = table.clone(steps:peek())
 	now[chat] = s
@@ -87,11 +88,7 @@ for case, fields in CASES do
 		id = `sandbox_stub.{case}`,
 		title = `The open chat's sandbox: {case}`,
 		run = function()
-			local f = table.clone(fields)
-			if f.provider_name == false then
-				f.provider_name = nil
-			end
-			say(f)
+			say(fields)
 		end,
 	}
 end

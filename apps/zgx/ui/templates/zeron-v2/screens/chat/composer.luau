@@ -31,6 +31,7 @@ local shared = require("@app/screens/chat/shared")
 local sessions = require("@account/sessions")
 local LinkNotice = require("@app/screens/chat/link_notice")
 local CloudTray = require("@app/screens/chat/cloud_tray")
+local SandboxTray = require("@app/screens/chat/sandbox_tray")
 local CloudMachine = require("@app/screens/chat/cloud_machine")
 local files = require("@app/screens/files/api")
 local Where = require("@app/screens/chat/where")
@@ -528,6 +529,28 @@ local function Composer(): Node
 			return CloudMachine.sending_last(store.messages)
 		end,
 	}
+	-- Its sandbox, on a chat that runs on one: deleted outside Zeron, its
+	-- disk full, and Start fresh.
+	local sandbox = SandboxTray.bind {
+		chat = function(): string?
+			return session_id:get()
+		end,
+		device = function(): string?
+			local s = open()
+			return s and s.device
+		end,
+		here = function(): string?
+			return sessions.here:get()
+		end,
+	}
+	-- The deck's alerts: its Cloud machine's, then its sandbox's.
+	local alerts = ui.computed(function(): { any }
+		local out = table.clone(machine.alerts:get())
+		for _, a in sandbox.alerts:get() do
+			table.insert(out, a)
+		end
+		return out
+	end)
 	-- A line above it: one of its own (a send that failed), else the
 	-- session's.
 	local own_notice = ui.state("chat_own_notice", nil :: any)
@@ -1418,8 +1441,14 @@ local function Composer(): Node
 			end,
 			-- (The only notice with an action: a sleeping machine's Wake.)
 			on_notice_action = machine.wake,
-			alerts = machine.alerts,
-			on_alert_action = machine.on_alert,
+			alerts = alerts,
+			on_alert_action = function(id: string)
+				if sandbox.owns(id) then
+					sandbox.on_alert(id)
+				else
+					machine.on_alert(id)
+				end
+			end,
 			on_dismiss_alert = machine.dismiss,
 			disabled = function(): boolean
 				local s = store.session:get()

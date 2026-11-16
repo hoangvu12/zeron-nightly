@@ -12,10 +12,11 @@ local function test(name: string, body: () -> ())
 	named_test(`Sandbox machine: {name}`, body)
 end
 
+-- (`false` for a field it doesn't have: a nil in a table isn't there.)
 local function steps(fields: { [string]: any }): any
 	local s: { [string]: any } = { state = "ready", provider = "docker", provider_name = "Docker Sandbox", disk_full = false }
 	for k, v in fields do
-		s[k] = v
+		s[k] = if v == false and k ~= "disk_full" then nil else v
 	end
 	return s
 end
@@ -34,7 +35,7 @@ test("the provider is named as a place", function()
 	expect(logic.place_name(steps({}))).to_be("Docker")
 	expect(logic.place_name(steps({ provider_name = "Modal" }))).to_be("Modal")
 	expect(logic.place_name(steps({ provider_name = "sandbox" }))).to_be("sandbox")
-	expect(logic.place_name(steps({ provider_name = nil }))).to_be(nil)
+	expect(logic.place_name(steps({ provider_name = false }))).to_be(nil)
 	expect(logic.place_name(steps({ provider_name = "" }))).to_be(nil)
 end)
 
@@ -47,7 +48,7 @@ test("deleted outside Zeron: where, that the conversation's kept, and Start fres
 	expect(string.find(a.body, "what was pushed comes back", 1, true) ~= nil).to_be(true)
 	expect(a.action).to_be("fresh")
 	expect(a.action_label).to_be("Start fresh")
-	local unnamed = logic.alert(steps({ state = "gone", provider_name = nil })) :: any
+	local unnamed = logic.alert(steps({ state = "gone", provider_name = false })) :: any
 	expect(unnamed.title).to_be("Sandbox deleted")
 end)
 
