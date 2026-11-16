@@ -74,6 +74,11 @@ enum Command {
     /// waiting) — the edge then keeps the machine awake.
     #[command(hide = true)]
     Quiesce,
+    /// Before a sandbox is saved as a template: stop the engine here (and its
+    /// watchdog) and wipe its identity and data, keeping the installed
+    /// release. Exits 75 when it's busy, changing nothing.
+    #[command(name = "forget-device", hide = true)]
+    ForgetDevice,
     #[cfg(target_os = "linux")]
     /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
     Appshot,
@@ -205,6 +210,7 @@ pub enum EngineCommand {
     Status,
     Sync,
     Quiesce,
+    ForgetDevice,
     Mcp,
     Plugin(PluginCommand),
     Template(TemplateCommand),
@@ -314,6 +320,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Some(Command::Status) => engine(EngineCommand::Status),
         Some(Command::Sync) => engine(EngineCommand::Sync),
         Some(Command::Quiesce) => engine(EngineCommand::Quiesce),
+        Some(Command::ForgetDevice) => engine(EngineCommand::ForgetDevice),
         Some(Command::Mcp) => engine(EngineCommand::Mcp),
         Some(Command::Plugin { command }) => engine(EngineCommand::Plugin(command)),
         Some(Command::Template { command }) => engine(EngineCommand::Template(command)),
@@ -352,6 +359,7 @@ impl Command {
             | Self::Status
             | Self::Sync
             | Self::Quiesce
+            | Self::ForgetDevice
             | Self::Mcp
             | Self::Plugin { .. }
             | Self::Template { .. } => true,

@@ -21,6 +21,7 @@
 #                  step_scripts: the user's scripts on those steps; sandbox_agents:
 #                  the agents a place offers per template; sandbox_host_device: the
 #                  host device keeps a provider's key, other devices ask it;
+#                  sandbox_template: Save as template, Zeron's identity wiped first;
 #                  sandbox_sleep: idle sandboxes sleep, a send wakes them;
 #                  boat_provider: the Boat adapter against a local stub of
 #                  Boat's API; plugin_services: the
@@ -52,7 +53,7 @@ done
 # `misc` (harness, engine and preview): the small suites, one binary each.
 # The orb geometry tests live in zeron-orb's `geometry`. `restart_hook`
 # stays a binary of its own: the hook it checks is process-wide.
-for t in misc geometry session_publication restart_resume side_chats message_queue voice_runtime device_routing device_room plugin_services restart_hook lent_sign_in sandbox_place sandbox_recovery docker_sandbox step_scripts sandbox_agents sandbox_host_device sandbox_sleep boat_provider; do
+for t in misc geometry session_publication restart_resume side_chats message_queue voice_runtime device_routing device_room plugin_services restart_hook lent_sign_in sandbox_place sandbox_recovery docker_sandbox step_scripts sandbox_agents sandbox_host_device sandbox_sleep boat_provider sandbox_template; do
   tests+=(--test "$t")
 done
 
