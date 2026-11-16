@@ -271,10 +271,25 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
         .call(methods::LIST_SANDBOX_PROVIDERS, json!({}))
         .await
         .unwrap();
+    // Beside the built-in ones (Boat).
+    let fake = offered
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "fake")
+        .cloned();
     assert_eq!(
-        offered,
-        json!([{ "id": "fake", "name": "Fake Sandbox", "icon": "box",
-                 "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"] }])
+        fake,
+        Some(json!({ "id": "fake", "name": "Fake Sandbox", "icon": "box",
+                 "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"] }))
+    );
+    assert!(
+        offered
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "boat" && p["name"] == "Boat"),
+        "{offered}"
     );
 
     let path = project(dirs.path(), &origin_url);

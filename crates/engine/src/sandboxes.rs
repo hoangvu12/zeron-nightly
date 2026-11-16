@@ -10,10 +10,12 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
+mod boat;
 mod keys;
 mod provider;
 mod steps;
 
+pub use boat::BoatProvider;
 pub use keys::KeySlot;
 pub use provider::{
     Account, Command, CreateSandbox, Credential, ErrorKind, Exit, Finished, Ops, Placement,
@@ -179,6 +181,19 @@ impl Sandboxes {
         let mut providers = lock(&self.inner.providers);
         providers.retain(|p| p.id() != provider.id());
         providers.push(provider);
+    }
+
+    /// Offer the providers built into Zeron (Boat), each on its key slot in
+    /// this data dir. Not connected yet, they're offered all the same: Settings
+    /// connects them.
+    pub fn register_built_in(&self) {
+        let Some(data_dir) = self.inner.records_path.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        self.register(Arc::new(BoatProvider::new(KeySlot::open(
+            data_dir,
+            boat::BOAT_ID,
+        ))));
     }
 
     pub fn providers(&self) -> Vec<ProviderInfo> {

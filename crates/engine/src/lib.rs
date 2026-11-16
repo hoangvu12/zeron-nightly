@@ -1151,6 +1151,11 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        // Boat, the user's own cloud, offered on the devices they use (not
+        // in a sandbox or on a Cloud machine).
+        if !auth.is_lent() && !auth.is_runner() {
+            core.sandboxes.register_built_in();
+        }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).
         core.registry
