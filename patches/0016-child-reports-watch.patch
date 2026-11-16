@@ -1,4 +1,4 @@
-From 9c0312ee23cb7b50128d8d632d087c78828d8a85 Mon Sep 17 00:00:00 2001
+From 5fe82055782a15b65fd410c972dc63224f71dae4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 1/4] engine: the parent's host reports for children whose host
@@ -779,7 +779,7 @@ index 7e6aaad3713ccd898a8cc037bb73f8330eccaa42..4ad7623055ee7299cb6839ea9a2c30cb
              assert_eq!(report_key_parts(&key, child), Some((asked.to_owned(), stage.to_owned())), "{key}");
          }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index bb80f7c14149d98760da2588893fa8d483c6e587..a5748a604c98d6c15d09e472b3e4df09932f5bb8 100644
+index cc6704dfd6d29eb9eb2857860425751f7f63a032..2d2704b620adbffc1a5113f6985b51bb08ae66a5 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -527,6 +527,9 @@ impl SessionsEngine {
@@ -1071,7 +1071,7 @@ index cb296456f05e0f8c4f245004a1d6192cef51d611..442fb53a2fb5d2357e9533b1000a3ef5
 2.52.0.windows.1
 
 
-From 0a41b98ed6284cc24ab38a5e9d27048a820d30a2 Mon Sep 17 00:00:00 2001
+From 3d74229d4fab9db119f28b107d05a87448fee110 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
@@ -1082,7 +1082,7 @@ Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
  1 file changed, 71 insertions(+), 17 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 3ee4592e550b89111cd8a54c53a94173699116b2..23e95c16c15f4e19867558e38c056691da45073e 100644
+index 4c18701772a8c278927787cc657d02c6a8920bf4..d1d5eefa88aaf9a705e28ff60e86cd1dacb041ac 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1085,8 +1085,8 @@ impl Tools {
@@ -1242,7 +1242,7 @@ index 3ee4592e550b89111cd8a54c53a94173699116b2..23e95c16c15f4e19867558e38c056691
 2.52.0.windows.1
 
 
-From e28094dbde36f439ea1b76f5be3a6f79deef7e42 Mon Sep 17 00:00:00 2001
+From ebf544d861b0b21d5247b6a2db6158d19cfe2d3d Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 15:37:33 +0700
 Subject: [PATCH 3/4] engine: the parent's watch reports only the turn its
@@ -1713,7 +1713,7 @@ index 4ad7623055ee7299cb6839ea9a2c30cbcd5eed7c..46c4a4fc888e05f5fa76e294b0c9d35b
          }
      };
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index a5748a604c98d6c15d09e472b3e4df09932f5bb8..5e6410fbde5fdfcd69e9daa247480ae57bf1fd56 100644
+index 2d2704b620adbffc1a5113f6985b51bb08ae66a5..effbe6c19667dfc5e01c8899b28e71c0577e1fbd 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -8157,6 +8157,7 @@ mod tests {
@@ -1844,7 +1844,7 @@ index a5748a604c98d6c15d09e472b3e4df09932f5bb8..5e6410fbde5fdfcd69e9daa247480ae5
 2.52.0.windows.1
 
 
-From 8a455910757d0421274b876592910902ef84082d Mon Sep 17 00:00:00 2001
+From 0e4d5263edd481b1ea8a115501f8c76bbb174fe4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 17:51:08 +0700
 Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
@@ -2138,7 +2138,7 @@ index 46c4a4fc888e05f5fa76e294b0c9d35b569b55d8..b32ff234ea8f5e44d709ce0a7b65d6e5
      }
      let first = match *settled {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 5e6410fbde5fdfcd69e9daa247480ae57bf1fd56..5d8d2dcfad9ece3725fc95b5ba6ce92794a6d849 100644
+index effbe6c19667dfc5e01c8899b28e71c0577e1fbd..f6155626a4b1c8355d4e4464913c1ad4dffe6d79 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -9519,11 +9519,17 @@ mod tests {

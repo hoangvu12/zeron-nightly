@@ -1,4 +1,4 @@
-From ae2299799674a21e4dc3ea0c0975596ec4d453de Mon Sep 17 00:00:00 2001
+From 9cc936c3d4a1fd8f9641cd735b66e7ed26d9d0ae Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 15 Nov 2026 20:53:51 +0700
 Subject: [PATCH 1/2] engine: child reports follow one rule: the first turn
@@ -1409,7 +1409,7 @@ index 7c3491b7512c20d0252ade9464bd306709bbe180..a27d38cfe7a0fa71db760720ef3b98a4
      fn a_turn_answers_the_parents_latest_message() {
          let asked = agent_messages::agent_message("Lead (parent00)", "parent", "Run the tests.");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index cdcbd3e2706385c8df52b5b77ef589b3a247c181..15d759144d7e44961b206d8ec23c8c9f422340f9 100644
+index 09fed3529fb773cc53b12e616043ce6d8460a748..092ae8a9bb77c6027cee43950429c17c54af26ca 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -41,7 +41,9 @@ use crate::doc_host::{ChatDocHandle, DocHost};
@@ -2230,7 +2230,7 @@ index 0ffb2d50f28df261f5a61ab9cf5114eed7d54be5..73e7f88ea1c386bb384ef98957843169
                  ],
              })
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 2b000285343fddab10c224cad6ae300408f58669..cec404f6a29d090357073fa9286128ba04992845 100644
+index 53453f39460e6068d1c831337f971a07bc40c230..0f829bddce8b35426b8334cb12dca7cce46a3a41 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -65,12 +65,26 @@ the parent is busy wait as one message, each block opening with its own header.
@@ -2270,7 +2270,7 @@ index 2b000285343fddab10c224cad6ae300408f58669..cec404f6a29d090357073fa9286128ba
 2.52.0.windows.1
 
 
-From c673c33fc2fbe8da49583b3e2ee97a474b298e09 Mon Sep 17 00:00:00 2001
+From 8f5a7994146ea9b23f0182719e8cf240bb72a6cb Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:23:23 +0700
 Subject: [PATCH 2/2] mcp: a subagent on a host that won't report back says so
@@ -2281,7 +2281,7 @@ Subject: [PATCH 2/2] mcp: a subagent on a host that won't report back says so
  1 file changed, 40 insertions(+), 2 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 848f94f2d5ca38fff459df0ad3233cd6dc373c0e..fc46d43ac383725a3bde6a0b08c35d7e371e1cb4 100644
+index a3b94d5addbfcc5a7e89357248cfab7b9e9832af..ca271617c96493c8e1125659a447f9fbc64aeea4 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1400,6 +1400,18 @@ impl Tools {

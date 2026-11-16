@@ -1,4 +1,4 @@
-From 6a4ace9f2b58b2387e0560a00f074bc56dfdddf8 Mon Sep 17 00:00:00 2001
+From e8bb5073d812b065df23f4ea5f7d6197e1f50184 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 11:02:36 +0700
 Subject: [PATCH] engine: the person's Stop on a child is held, and what they
@@ -248,7 +248,7 @@ index 18758900173613fa428e81c28817cef637a176af..7c3491b7512c20d0252ade9464bd3067
  /// spacing, or most of them, one inside the other.
  fn repeats(reply: &str, sent: &str) -> bool {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 16e63438968c2fab064238b230e1649b0c9ec3da..592bbe3218f4794e42cfb200dee083447cb704bc 100644
+index dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e..fab0d212fc3fba1f80cd1d0913fcbc135c10700d 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -7971,6 +7971,7 @@ mod tests {

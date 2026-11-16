@@ -1,4 +1,4 @@
-From 5490a3877ab31beae4f40fd4a515c664558438c2 Mon Sep 17 00:00:00 2001
+From 204e71ff3af80d23fa4959be3c6e7d9f845dd00d Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:52:16 +0700
 Subject: [PATCH 01/12] engine: a child's progress message can wait for its end
@@ -885,7 +885,7 @@ index a27d38cfe7a0fa71db760720ef3b98a486d064b1..991bcafd1224a246b0f066e083a4c77a
      fn says_a_span_as_a_person_would() {
          assert_eq!(ago(42_000), "42 s");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 15d759144d7e44961b206d8ec23c8c9f422340f9..4f931eaeae98b13851496e0d8cf65004dbdcd975 100644
+index 092ae8a9bb77c6027cee43950429c17c54af26ca..83fc9a1c2ce724fff9114b8c3459534c0de0dec9 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -1021,15 +1021,15 @@ index 15d759144d7e44961b206d8ec23c8c9f422340f9..4f931eaeae98b13851496e0d8cf65004
  
      /// A command the subagent runs, open until the test ends it.
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index fc46d43ac383725a3bde6a0b08c35d7e371e1cb4..e5bddf14ffcc669b656bab8f7e086a97a93b13c9 100644
+index ca271617c96493c8e1125659a447f9fbc64aeea4..084542d228c01cd55ed347cd51c2232f9b9b1425 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -174,12 +174,13 @@ fn catalog() -> Vec<ToolDef> {
          },
          ToolDef {
              name: "send_message",
--            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once by a chat whose person is the sender; a message from another chat never stops a running command, so use interrupt_chat when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
-+            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once by a chat whose person is the sender; a message from another chat never stops a running command, so use interrupt_chat when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting. To your own parent, send progress with wake=false (an FYI it reads with its next wake), and never your final result: your turn's end reports it.",
+-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once, stopping a running command (it isn't re-run on its own); use it, or interrupt_chat, only when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
++            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once, stopping a running command (it isn't re-run on its own); use it, or interrupt_chat, only when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting. To your own parent, send progress with wake=false (an FYI it reads with its next wake), and never your final result: your turn's end reports it.",
              input_schema: chat_key_schema(json!({
                  "text": { "type": "string" },
                  "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -1532,7 +1532,7 @@ index 428dbb1e259c433d542f29c29dfffa250725035b..48c2cc2ef97101ad352834201869ec99
          state.push_echo("c1", echo("held"));
          state.push_echo("c1", echo("sent"));
 diff --git a/docs/mcp.md b/docs/mcp.md
-index cec404f6a29d090357073fa9286128ba04992845..2e750cff2386b6866f0c689316242907bd91d9ad 100644
+index 0f829bddce8b35426b8334cb12dca7cce46a3a41..a22878afb902f134bbc3b7201eb237817d88a9bb 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -88,6 +88,26 @@ and a question answered meanwhile is dropped. A report that comes in after
@@ -1566,7 +1566,7 @@ index cec404f6a29d090357073fa9286128ba04992845..2e750cff2386b6866f0c689316242907
 2.52.0.windows.1
 
 
-From fed2870beeeb36649a3a04b1f5847a71cdcc08a2 Mon Sep 17 00:00:00 2001
+From 1677ad856f756ec02259a332d3b274fbfeae4680 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:35:55 +0700
 Subject: [PATCH 02/12] engine: a report the parent's agent already read with
@@ -1925,7 +1925,7 @@ index 991bcafd1224a246b0f066e083a4c77a9ae81762..25fe8b8f814b15ab6487228c70e1bb35
 +    }
  }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 4f931eaeae98b13851496e0d8cf65004dbdcd975..57bf88af669c2e2e7f888b67a948395ca67cb607 100644
+index 83fc9a1c2ce724fff9114b8c3459534c0de0dec9..fd9c9b954b792c1a564866f2cd93c32e795daab2 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,7 @@ mod activity;
@@ -2044,7 +2044,7 @@ index 4f931eaeae98b13851496e0d8cf65004dbdcd975..57bf88af669c2e2e7f888b67a948395c
      async fn an_archived_parent_keeps_its_reports_without_waking() {
          let rig = family_rig().await;
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 2e750cff2386b6866f0c689316242907bd91d9ad..ded4f92c15c63888d2f78bfcba22cd8825f27ff8 100644
+index a22878afb902f134bbc3b7201eb237817d88a9bb..dbc74eb5c8ed8fda72b6600c8eb3204f7fc2c902 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -84,9 +84,13 @@ whose reply repeats what the child already sent its parent with
@@ -2068,7 +2068,7 @@ index 2e750cff2386b6866f0c689316242907bd91d9ad..ded4f92c15c63888d2f78bfcba22cd88
 2.52.0.windows.1
 
 
-From ac0b50fba2def7548cff4289e8cbe90ac88d4848 Mon Sep 17 00:00:00 2001
+From 649304a376ed518a3854717f22da31b6802cc0b0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:39:25 +0700
 Subject: [PATCH 03/12] engine: a child that keeps coming back is paused after
@@ -2529,7 +2529,7 @@ index 25fe8b8f814b15ab6487228c70e1bb35682ebf42..e6982a91d2a8da46914efccd1cf90eeb
 +    }
  }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 57bf88af669c2e2e7f888b67a948395ca67cb607..a0b0b265aa245c5069974a77c332285edc97a97c 100644
+index fd9c9b954b792c1a564866f2cd93c32e795daab2..e6ca621de72f56405a53cec9d5ae709f6424cbc4 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -2770,7 +2770,7 @@ index 57bf88af669c2e2e7f888b67a948395ca67cb607..a0b0b265aa245c5069974a77c332285e
 +    }
  }
 diff --git a/docs/mcp.md b/docs/mcp.md
-index ded4f92c15c63888d2f78bfcba22cd8825f27ff8..34c0313e8b053373f1dabfd249ff62c8d24e8f7d 100644
+index dbc74eb5c8ed8fda72b6600c8eb3204f7fc2c902..bc6c25959faf1f455034c99dccd8bc8a7ecd5679 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -112,6 +112,16 @@ or FYI, the parent's message it's on and its stage, as the report's key
@@ -2794,7 +2794,7 @@ index ded4f92c15c63888d2f78bfcba22cd8825f27ff8..34c0313e8b053373f1dabfd249ff62c8
 2.52.0.windows.1
 
 
-From 1e3bea6873993d2a167000426fab87d921cd1a50 Mon Sep 17 00:00:00 2001
+From 6885fa3a79902fc8d85fcf16304a6fde397d201a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:34:37 +0700
 Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
@@ -2805,7 +2805,7 @@ Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
  1 file changed, 35 insertions(+), 14 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index e5bddf14ffcc669b656bab8f7e086a97a93b13c9..a11e4f6a74276c7d3f64246311220d87e780a3ff 100644
+index 084542d228c01cd55ed347cd51c2232f9b9b1425..f42158555060eb0301b955f910d049bfb74a3989 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1403,17 +1403,10 @@ impl Tools {
@@ -2897,7 +2897,7 @@ index e5bddf14ffcc669b656bab8f7e086a97a93b13c9..a11e4f6a74276c7d3f64246311220d87
 2.52.0.windows.1
 
 
-From 823907f0cc47f07a16c62f866c69e2539e09dd77 Mon Sep 17 00:00:00 2001
+From 3624a02bd56c5bcd89ce18f2f7860f0bb9a971fb Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:44:58 +0700
 Subject: [PATCH 05/12] engine: a child's FYIs never wake the parent alone, and
@@ -3212,7 +3212,7 @@ index e6982a91d2a8da46914efccd1cf90eeb1af9779a..e5eba99a27d8c353016a8182d8d573d6
      fn says_a_span_as_a_person_would() {
          assert_eq!(ago(42_000), "42 s");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index a0b0b265aa245c5069974a77c332285edc97a97c..b5294631c02772b551c57751f5a5befca96da7a1 100644
+index e6ca621de72f56405a53cec9d5ae709f6424cbc4..d956517da04cf775af71251ac7a67d1850b8d597 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -3307,7 +3307,7 @@ index a0b0b265aa245c5069974a77c332285edc97a97c..b5294631c02772b551c57751f5a5befc
  
      /// A command the subagent runs, open until the test ends it.
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index a11e4f6a74276c7d3f64246311220d87e780a3ff..ebbffd0509719c6c6c9769089c759a6c8cade4ef 100644
+index f42158555060eb0301b955f910d049bfb74a3989..c5e386fd8b9e61ba83be82414a4f72d1ec6699b3 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1531,7 +1531,8 @@ impl Tools {
@@ -3401,7 +3401,7 @@ index 3c8b583ae50c61e19ad0fc3383dffad672435ff0..205dd0e837c7230a3ef438b5b5b56dd0
          assert!(child_fyis(&end).is_none());
          // Nobody's words make one: quoted in a report, a message, an FYI.
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 34c0313e8b053373f1dabfd249ff62c8d24e8f7d..df1990901335a60c7fb24088dee554ee86d9f248 100644
+index bc6c25959faf1f455034c99dccd8bc8a7ecd5679..ee4d4ddcb66bf65be0cb03cfe7e4bf261fe5f2be 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -100,11 +100,15 @@ result, which the end report carries. It isn't a report: nothing counts it as
@@ -3429,7 +3429,7 @@ index 34c0313e8b053373f1dabfd249ff62c8d24e8f7d..df1990901335a60c7fb24088dee554ee
 2.52.0.windows.1
 
 
-From 69fd3b318bf5b771a0f9ce23d5918df1613036e3 Mon Sep 17 00:00:00 2001
+From 8de11596dae2730304bec0632138828e7f954088 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:53:13 +0700
 Subject: [PATCH 06/12] engine: while the person talks to the parent, its
@@ -3990,7 +3990,7 @@ index 6012d9086f98c38e075a6f29df4e067e8fd05bf8..10b9fc6f8d690c02007b9c7a87f16ea0
  
  /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index b5294631c02772b551c57751f5a5befca96da7a1..686d52445f578e4b37068b130ac38b810c0b569b 100644
+index d956517da04cf775af71251ac7a67d1850b8d597..013089cb00c44a5364e593068ea9cb36364c0296 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -8050,6 +8050,8 @@ mod tests {
@@ -4268,7 +4268,7 @@ index b5294631c02772b551c57751f5a5befca96da7a1..686d52445f578e4b37068b130ac38b81
 +    }
  }
 diff --git a/docs/mcp.md b/docs/mcp.md
-index df1990901335a60c7fb24088dee554ee86d9f248..e8c1721c6695285b4f068599ab50f357c56ac182 100644
+index ee4d4ddcb66bf65be0cb03cfe7e4bf261fe5f2be..ed689748e3528cf3e95c73cc6ed6bb33a8fb62c2 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -105,7 +105,7 @@ that don't go after all (the agent's wait returned them, they went stale, it
@@ -4305,7 +4305,7 @@ index df1990901335a60c7fb24088dee554ee86d9f248..e8c1721c6695285b4f068599ab50f357
 2.52.0.windows.1
 
 
-From ba8fc469d209d2a8c4ce524ed3f2b2347c3e68a3 Mon Sep 17 00:00:00 2001
+From 089c01657f7eba770cf9c044f90d48b77cc61ea1 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:57:27 +0700
 Subject: [PATCH 07/12] engine: the parent's host decides a child's pause, by
@@ -5355,7 +5355,7 @@ index e5eba99a27d8c353016a8182d8d573d6451b181b..975e5af0f8e860fd005b495f6f28e64b
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 686d52445f578e4b37068b130ac38b810c0b569b..42b7b9e970238ace4e9231abbb5522cc85cea649 100644
+index 013089cb00c44a5364e593068ea9cb36364c0296..e8397bec7f65f1ac749231ddd37eebccb3d29a7b 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,9 +42,8 @@ mod activity;
@@ -5492,7 +5492,7 @@ index 686d52445f578e4b37068b130ac38b810c0b569b..42b7b9e970238ace4e9231abbb5522cc
      }
  
 diff --git a/docs/mcp.md b/docs/mcp.md
-index e8c1721c6695285b4f068599ab50f357c56ac182..2133452b118b5b4989a3b64769cde6c560792595 100644
+index ed689748e3528cf3e95c73cc6ed6bb33a8fb62c2..a9fcd29560ce5a3fd44257723904ab376f9f9312 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -85,12 +85,14 @@ parent's short thanks after a report is kept in the parent's ledger
@@ -5559,7 +5559,7 @@ index e8c1721c6695285b4f068599ab50f357c56ac182..2133452b118b5b4989a3b64769cde6c5
 2.52.0.windows.1
 
 
-From 0b289506312b974363f227761e836770b6aed7eb Mon Sep 17 00:00:00 2001
+From ad08695b5c18923c0d983540578f0e0ac5d1f808 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:05:23 +0700
 Subject: [PATCH 08/12] engine: a parent can ask to hear from a group of
@@ -6603,7 +6603,7 @@ index 975e5af0f8e860fd005b495f6f28e64b1017350b..d21c05f41fc8758420547614a3aec2c6
      fn back_once(i: usize, at: i64) -> SessionCommandEntry {
          let report = agent_messages::child_report("Tests (kid)", "kid", ReportStatus::Finished, "ok");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 42b7b9e970238ace4e9231abbb5522cc85cea649..d4b3e3974ada25e10b4ca1bf9559c24e269e152d 100644
+index e8397bec7f65f1ac749231ddd37eebccb3d29a7b..a410e32b210abea410d7fde37370645d69856f2a 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,8 +42,8 @@ mod activity;
@@ -6875,7 +6875,7 @@ index 29428e06f7dd0f145c1e630533336b2bb1fdeb60..32a2f99dd6401401e6e4d4fae7bff7d1
  `send_message` to your parent mid-task to ask something or share something it \
  needs now; it reads it when its own turn ends, with its other children's. \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index ebbffd0509719c6c6c9769089c759a6c8cade4ef..3ee4592e550b89111cd8a54c53a94173699116b2 100644
+index c5e386fd8b9e61ba83be82414a4f72d1ec6699b3..4c18701772a8c278927787cc657d02c6a8920bf4 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -225,7 +225,7 @@ fn catalog() -> Vec<ToolDef> {
@@ -7426,7 +7426,7 @@ index 05b1d1ab0982bf3e4d9768fec8a7f45041b9778d..0e0d50515995d2e0c428e956567a3db2
              // checking for updates, exporting (to Zeron's plugin-exports
              // folder only: the engine refuses an agent's `to`), and their
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 2133452b118b5b4989a3b64769cde6c560792595..f918118f3ee18800bcbe4f29a28f332d375a0bf2 100644
+index a9fcd29560ce5a3fd44257723904ab376f9f9312..375bea5f0983b2753803b350a21f0782ff466777 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -158,6 +158,29 @@ report kept for the pause counts as having rung it, not a thanks or a wait's
@@ -7459,7 +7459,7 @@ index 2133452b118b5b4989a3b64769cde6c560792595..f918118f3ee18800bcbe4f29a28f332d
  An agent can't write to an archived chat other than its own child (refused:
  it would only wake it). A child whose parent is archived or gone becomes the
  child of the next chat with no parent of its own that writes to it, so after a
-@@ -530,6 +553,9 @@ one tool call, including when the harness executes its tool calls sequentially:
+@@ -529,6 +552,9 @@ one tool call, including when the harness executes its tool calls sequentially:
  }
  ```
  
@@ -7473,7 +7473,7 @@ index 2133452b118b5b4989a3b64769cde6c560792595..f918118f3ee18800bcbe4f29a28f332d
 2.52.0.windows.1
 
 
-From 65d222c7e64bd4bca32b58809472b22fa533cde6 Mon Sep 17 00:00:00 2001
+From 8b53ac892a717149baadd7f09cd355fc351ee664 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:15:30 +0700
 Subject: [PATCH 09/12] engine: report groups work with the person-active hold
@@ -7545,7 +7545,7 @@ index a971e50a26a5c29eb3ff4b63566c64de93346dc3..8cf1b1b6ff01792eab4dc40949e6c740
 2.52.0.windows.1
 
 
-From 436dc21035f213ee3bfeaffcbca0f286aa2645f0 Mon Sep 17 00:00:00 2001
+From 1e127fb134c6641daf62c8469d104d0a114b578a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:15:22 +0700
 Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
@@ -7556,7 +7556,7 @@ Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
  1 file changed, 3 insertions(+), 4 deletions(-)
 
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index d4b3e3974ada25e10b4ca1bf9559c24e269e152d..03b1bacb7cb37e5ceffded2ac63c7c1132ff60f9 100644
+index a410e32b210abea410d7fde37370645d69856f2a..b27ef7282d354754f4782fcf1dfe9c2f6e362af8 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -10250,7 +10250,6 @@ mod tests {
@@ -7597,7 +7597,7 @@ index d4b3e3974ada25e10b4ca1bf9559c24e269e152d..03b1bacb7cb37e5ceffded2ac63c7c11
 2.52.0.windows.1
 
 
-From 5cac547dbb8c54c072212c3c85fad9e8f3141273 Mon Sep 17 00:00:00 2001
+From 23152bacb3de183fec0cd77ba519ffa7b8c1d24a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:20:48 +0700
 Subject: [PATCH 11/12] engine: held reports survive a restart between the
@@ -7768,7 +7768,7 @@ index d21c05f41fc8758420547614a3aec2c6cac9fef9..23a427d22fc2cfcfe3ac1647ff5bede7
  /// sent after it started another turn: the one that ended its last turn.
  fn stop_after(commands: &[SessionCommandEntry], asked: &str) -> Option<String> {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 03b1bacb7cb37e5ceffded2ac63c7c1132ff60f9..39b954fdd12c80f045552e63ff2c6dc29bcedc90 100644
+index b27ef7282d354754f4782fcf1dfe9c2f6e362af8..d28e6f95d55e981167c24fe2c7b51775dbc917a7 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -529,17 +529,18 @@ impl SessionsEngine {
@@ -7834,7 +7834,7 @@ index 03b1bacb7cb37e5ceffded2ac63c7c1132ff60f9..39b954fdd12c80f045552e63ff2c6dc2
 2.52.0.windows.1
 
 
-From 6ff9e7379325750fce8ae53c0bdfe3b5ed1b6e2a Mon Sep 17 00:00:00 2001
+From e2f839081a6367d23d0eafb889ee700a5dc222c9 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:23:32 +0700
 Subject: [PATCH 12/12] engine: a group member's follow-up brings its held end
@@ -7907,7 +7907,7 @@ index 23a427d22fc2cfcfe3ac1647ff5bede710da99f4..7e6aaad3713ccd898a8cc037bb73f833
      let ledger = host
          .open(parent)
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 39b954fdd12c80f045552e63ff2c6dc29bcedc90..bb80f7c14149d98760da2588893fa8d483c6e587 100644
+index d28e6f95d55e981167c24fe2c7b51775dbc917a7..cc6704dfd6d29eb9eb2857860425751f7f63a032 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -10662,10 +10662,11 @@ mod tests {
@@ -7952,7 +7952,7 @@ index 39b954fdd12c80f045552e63ff2c6dc29bcedc90..bb80f7c14149d98760da2588893fa8d4
          rig.core.sessions.shutdown().await;
      }
 diff --git a/docs/mcp.md b/docs/mcp.md
-index f918118f3ee18800bcbe4f29a28f332d375a0bf2..6846186d73b10f25689dd0f41830fe79a395d94a 100644
+index 375bea5f0983b2753803b350a21f0782ff466777..40db62f5b08325948ee99fdc1b115892c1e5e345 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -170,8 +170,9 @@ end on that message, however it was kept (`…`, `…-waited`, `…-quiet`), or

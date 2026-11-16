@@ -1,4 +1,4 @@
-From 521b6c61dd6a64c635fc61a1b6efcb38b8d09305 Mon Sep 17 00:00:00 2001
+From 63fa0e9c04cea1aad129e1475517074ed5f609ff Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
@@ -5301,7 +5301,7 @@ index 0000000000000000000000000000000000000000..02dd5b9281bc5aa8e5df002e7ba13e1e
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 09ef35c3ec680a9709b0f6a3d16c2ac1ffb8b760..d9b1e146006f2a7abca5a6930a1a329d46488de8 100644
+index e7efdca4822aaa6eec95810821e99e7c121ec352..2e617b8647f23b9a7feb50b2faa7c9230fa9c979 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -29,6 +29,7 @@ use zeron_doc::{
@@ -6937,7 +6937,7 @@ index a4be9e109b60bdc7ca4d004f6d434a2177939261..5f37b345b93d6e59a9cdc695b747c6df
  it lists under your chat's Subagents and in its transcript's subagent block. Use \
  `kind: side` only for a side conversation the person should treat as their own, \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 26e619fc182850cc43d1f4f4c321790f93ce2828..186412ca3efff773e766bccef242af36d7d6586c 100644
+index 8997d42843f9a1e5b5486704d085432dbbc41a19..7572be48fbdb8a0578b9b8d8209f51f8abcb71e6 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1501,6 +1501,12 @@ impl Tools {
@@ -7488,7 +7488,7 @@ index 6682ed0c08c26dc41c04a8def9de9329fbc3369b..94382b19bd5697862e83761c271a2d69
      fn reads_the_messages_a_send_call_sends() {
          let call = |tool: &str, input: serde_json::Value| ToolCall::Mcp {
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 0e8ea8a9c44a19010d3e24ff305fb5355c876e33..8cebf1dab257dc24e59d4d61c6c1682fc9f30e0c 100644
+index 8c5c5dfeb164ce06045b116cad5ed7951bd69b5d..d293ec54ea6de12ff4bb0c7dcc4d3adaf156fcb4 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -57,6 +57,14 @@ one, and the server refuses to message its own chat. The transcript renders

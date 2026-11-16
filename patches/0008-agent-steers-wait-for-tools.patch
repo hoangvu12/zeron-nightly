@@ -1,4 +1,4 @@
-From b1c2b0c7f180753a5bb25123d14ae571177bb7bc Mon Sep 17 00:00:00 2001
+From f61cf5227adac5dc47ec0605ed9e619f1a0591f8 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 9 Nov 2026 11:46:29 +0700
 Subject: [PATCH] An agent's message to a busy chat waits for the command it
@@ -34,25 +34,25 @@ written `next`, with no interrupt before it.
  crates/client/src/session/mod.rs             |   3 +
  crates/client/tests/cloud_attachments.rs     |   1 +
  crates/doc/examples/gen_fixture.rs           |   1 +
- crates/doc/src/commands.rs                   |  34 +++++++
+ crates/doc/src/commands.rs                   |  34 ++++++
  crates/doc/src/schema.rs                     |   3 +-
  crates/engine/src/doc_host.rs                |  32 ++++--
  crates/engine/src/doc_host_attachments.rs    |   2 +-
  crates/engine/src/plugin_agents.rs           |   2 +-
- crates/engine/src/sessions.rs                | 102 ++++++++++++++++---
+ crates/engine/src/sessions.rs                | 112 +++++++++++++++----
  crates/engine/tests/acp_lifecycle.rs         |   2 +
  crates/engine/tests/cursor_live.rs           |   2 +-
  crates/engine/tests/e2e.rs                   |   4 +
  crates/engine/tests/message_queue.rs         |   3 +
  crates/engine/tests/queue_order_live.rs      |   1 +
  crates/engine/tests/restart_resume.rs        |   1 +
- crates/engine/tests/steer_now.rs             |  76 +++++++++++++-
+ crates/engine/tests/steer_now.rs             |  80 ++++++++++++-
  crates/engine/tests/steering_live.rs         |   2 +-
- crates/harness/tests/claude.rs               |  47 +++++++++
- crates/harness/tests/fixtures/fake-claude.sh |  18 ++++
+ crates/harness/tests/claude.rs               |  47 ++++++++
+ crates/harness/tests/fixtures/fake-claude.sh |  18 +++
  crates/mcp/src/tools.rs                      |  15 ++-
- docs/mcp.md                                  |  12 ++-
- 22 files changed, 329 insertions(+), 36 deletions(-)
+ docs/mcp.md                                  |  11 +-
+ 22 files changed, 335 insertions(+), 43 deletions(-)
 
 diff --git a/crates/client/src/demo/mod.rs b/crates/client/src/demo/mod.rs
 index 553afd3e37dd14a479b2788c2ff908e750d7eca4..94c5137dbd16ce5a49f85d929120fbcf23e5b1d8 100644
@@ -321,7 +321,7 @@ index ca1151e20bac3f346ee0c7747268a38be790b29f..17cb028762bb9247bf26aa4d98a8cc87
                  Ok(id)
              }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 50fb469d3965643e9d01ab397272afc15eb5d664..09ef35c3ec680a9709b0f6a3d16c2ac1ffb8b760 100644
+index 50fb469d3965643e9d01ab397272afc15eb5d664..e7efdca4822aaa6eec95810821e99e7c121ec352 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -167,6 +167,9 @@ struct RunHandle {
@@ -376,10 +376,19 @@ index 50fb469d3965643e9d01ab397272afc15eb5d664..09ef35c3ec680a9709b0f6a3d16c2ac1
          // A steer runs on the configuration live now; record it with the
          // message so a re-dispatch keeps it.
          let sent_with = self.last_request(chat_id).map(|mut request| {
-@@ -1660,6 +1684,10 @@ impl SessionsEngine {
-     /// every interrupt as the person rejecting the tool call and telling the
-     /// agent to stop and wait, so the agent would take the other chat's
-     /// message as an order to stop. It waits for the step boundary instead.
+@@ -1656,10 +1680,15 @@ impl SessionsEngine {
+     /// is an ordinary steer ([`Self::steer_at`]), read at the next step
+     /// boundary. Nothing here tears a runtime down.
+     ///
+-    /// A message from another chat never stops the turn: Claude Code words
+-    /// every interrupt as the person rejecting the tool call and telling the
+-    /// agent to stop and wait, so the agent would take the other chat's
+-    /// message as an order to stop. It waits for the step boundary instead.
++    /// An agent's ordinary message from another chat never comes here: it is
++    /// a steer with `at_once: false` ([`Self::steer_at`]), since Claude Code
++    /// words every interrupt as the person rejecting the tool call and
++    /// telling the agent to stop and wait. Only the person's steer and an
++    /// agent's explicit `mode: "steer"` stop the command.
 +    ///
 +    /// A stop reaches the agent as its call refused ("the user doesn't
 +    /// want to proceed"), so the prompt it reads after says what happened
@@ -387,16 +396,17 @@ index 50fb469d3965643e9d01ab397272afc15eb5d664..09ef35c3ec680a9709b0f6a3d16c2ac1
      pub(crate) async fn steer_now(
          &self,
          chat_id: &str,
-@@ -1669,10 +1697,17 @@ impl SessionsEngine {
+@@ -1668,11 +1697,17 @@ impl SessionsEngine {
+         message_id: Option<String>,
          issued_at: i64,
      ) -> Result<SteerOutcome, EngineError> {
-         let from_another_chat = zeron_proto::agent_messages::agent_message_sender(prompt).is_some();
+-        let from_another_chat = zeron_proto::agent_messages::agent_message_sender(prompt).is_some();
 -        if !from_another_chat
 -            && self.steer_stops_tool(chat_id)
 -            && self.stop_turn_keeping_runtime(chat_id).await
 -        {
 +        let mut note = None;
-+        if !from_another_chat && self.steer_stops_tool(chat_id) {
++        if self.steer_stops_tool(chat_id) {
 +            let calls = lock(&self.inner.runs)
 +                .get(chat_id)
 +                .map(|h| lock(&h.open_calls).clone())
@@ -631,23 +641,22 @@ index f2aa86932b02993fb134da0ed207a559bb7813e8..55acf9026bd514ff90ea306f7bff9301
          )
          .expect("queue steer command");
 diff --git a/crates/engine/tests/steer_now.rs b/crates/engine/tests/steer_now.rs
-index 042bd21c9341fd5ea2742498a89b3e0a9b933f04..90c0d0b8fb74d1a2c7e175afaf7a698d058fb4ec 100644
+index 042bd21c9341fd5ea2742498a89b3e0a9b933f04..810cbc610ffc8c828350de61bdd036a4d7e44793 100644
 --- a/crates/engine/tests/steer_now.rs
 +++ b/crates/engine/tests/steer_now.rs
-@@ -4,8 +4,10 @@
+@@ -4,8 +4,9 @@
  //! first: the command ends, the runtime and its background work stay, and
  //! the steer starts the next turn in that same runtime. Steers sent before
  //! it, which the stop cancels, go again first. Agents that haven't opted
 -//! in (`Harness::steer_stops_tool`) keep the step-boundary wait, and so does
 -//! a message from another chat.
-+//! in (`Harness::steer_stops_tool`) keep the step-boundary wait, and so do
-+//! a message from another chat and an agent's ordinary send
-+//! (`Steer { at_once: false }`): stopping the command reads to the agent as
-+//! its call declined.
++//! in (`Harness::steer_stops_tool`) keep the step-boundary wait. So does
++//! an agent's ordinary send (`Steer { at_once: false }`): stopping the
++//! command reads to the agent as its call declined.
  
  use std::sync::atomic::{AtomicUsize, Ordering};
  use std::sync::{Arc, Mutex};
-@@ -268,11 +270,22 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
+@@ -268,11 +269,22 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
      }
  }
  
@@ -671,7 +680,7 @@ index 042bd21c9341fd5ea2742498a89b3e0a9b933f04..90c0d0b8fb74d1a2c7e175afaf7a698d
      rig.core
          .doc_host
          .queue_command(
-@@ -280,6 +293,7 @@ fn steer(rig: &Rig, prompt: &str, id: &str) {
+@@ -280,6 +292,7 @@ fn steer(rig: &Rig, prompt: &str, id: &str) {
              SessionCommandPayload::Steer {
                  prompt: prompt.into(),
                  message_id: Some(id.into()),
@@ -679,7 +688,7 @@ index 042bd21c9341fd5ea2742498a89b3e0a9b933f04..90c0d0b8fb74d1a2c7e175afaf7a698d
              },
          )
          .unwrap();
-@@ -347,6 +361,62 @@ async fn a_steer_during_a_command_is_read_at_once_and_keeps_the_runtime() {
+@@ -347,6 +360,62 @@ async fn a_steer_during_a_command_is_read_at_once_and_keeps_the_runtime() {
          1,
          "the steer is in the transcript once"
      );
@@ -742,6 +751,25 @@ index 042bd21c9341fd5ea2742498a89b3e0a9b933f04..90c0d0b8fb74d1a2c7e175afaf7a698d
      rig.core.sessions.shutdown().await;
  }
  
+@@ -444,7 +513,8 @@ async fn a_steer_with_no_command_running_stops_nothing() {
+ /// Claude Code tells the agent the person rejected the call and to stop and
+ /// wait whenever a turn is interrupted, so a message from another chat that
+ /// stopped the command would read as an order to stop. It waits for the
+-/// command instead, as `send_message` promises.
++/// command instead, as `send_message` promises: it comes as an agent's
++/// ordinary send does, `at_once: false`.
+ #[tokio::test]
+ async fn a_message_from_another_chat_never_stops_the_command() {
+     let rig = rig(true);
+@@ -456,7 +526,7 @@ async fn a_message_from_another_chat_never_stops_the_command() {
+     .await;
+     let message =
+         zeron_proto::agent_messages::agent_message("Coordinator (139d8682)", "139d8682", "status?");
+-    steer(&rig, &message, "m-agent");
++    send(&rig, &message, "m-agent", false);
+     tokio::time::sleep(Duration::from_millis(300)).await;
+     assert_eq!(read(&rig).len(), 1, "it waits for the command");
+     assert_eq!(
 diff --git a/crates/engine/tests/steering_live.rs b/crates/engine/tests/steering_live.rs
 index 665fc649afe8caa3786461746ef649f07872b0d9..f8ecabdc18bfd3b3297c01f3c316469e0d2d02b3 100644
 --- a/crates/engine/tests/steering_live.rs
@@ -843,7 +871,7 @@ index 3a6ba5950a405d137fef6081dd1893b18133e7c4..30b5b9bcd9e1a0c132000e3bb6380e07
    # "Send now" while a turn's result is held for a queued steer: the CLI is
    # slow to answer the stop, had already begun the steer's turn, and that
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index d7d8165abc4f29ddc06b7982eb1aac32a64b227e..26e619fc182850cc43d1f4f4c321790f93ce2828 100644
+index d7d8165abc4f29ddc06b7982eb1aac32a64b227e..8997d42843f9a1e5b5486704d085432dbbc41a19 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -169,7 +169,7 @@ fn catalog() -> Vec<ToolDef> {
@@ -851,7 +879,7 @@ index d7d8165abc4f29ddc06b7982eb1aac32a64b227e..26e619fc182850cc43d1f4f4c321790f
          ToolDef {
              name: "send_message",
 -            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
-+            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once by a chat whose person is the sender; a message from another chat never stops a running command, so use interrupt_chat when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
++            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, and steers a running turn through its live mailbox: a command or tool call it is running finishes first, and the message lands at its next step. mode 'steer' is read at once, stopping a running command (it isn't re-run on its own); use it, or interrupt_chat, only when the message can't wait. Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
              input_schema: chat_key_schema(json!({
                  "text": { "type": "string" },
                  "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -893,10 +921,10 @@ index d7d8165abc4f29ddc06b7982eb1aac32a64b227e..26e619fc182850cc43d1f4f4c321790f
  
      #[tokio::test]
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 673a116a9ee42a8cf2f2a5d086d513fd62386506..0e8ea8a9c44a19010d3e24ff305fb5355c876e33 100644
+index 673a116a9ee42a8cf2f2a5d086d513fd62386506..8c5c5dfeb164ce06045b116cad5ed7951bd69b5d 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
-@@ -179,9 +179,15 @@ transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
+@@ -179,9 +179,14 @@ transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
  cancels server-side, exactly what the sidebar does on attach.
  
  `send_message` mode `auto` starts idle chats and steers working chats through
@@ -905,12 +933,11 @@ index 673a116a9ee42a8cf2f2a5d086d513fd62386506..0e8ea8a9c44a19010d3e24ff305fb535
 -creates a held queue row. `awaitingInput` refuses and points at
 +their live mailbox without interrupting tools or child processes
 +(`Steer { atOnce: false }`): a command the agent is running finishes, and the
-+message lands at its next step. A message from another chat never stops a
-+running command, in `steer` mode too (it carries the "from another chat"
-+header); use `interrupt_chat` when it can't wait. The person's own steer is
-+read at once: where a runtime stops its turn in place (Claude), a running
++message lands at its next step. Explicit `steer` mode is read at once, as the
++person's steer is: where a runtime stops its turn in place (Claude), a running
 +command is stopped first, and the steer tells the agent its call was stopped,
-+not declined. Providers consume a steer at their next supported input boundary.
++not declined. Use it, or `interrupt_chat`, only when the message can't wait for
++the command. Providers consume a steer at their next supported input boundary.
 +Only explicit `queue` mode creates a held queue row. `awaitingInput` refuses and points at
  `respond_to_input`. Quiet, long-running turns still receive steering; the host
  falls back to starting a turn if the live runtime has already exited.

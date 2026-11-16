@@ -1,4 +1,4 @@
-From 37dc76e645b8ba9c0b577738cb56784be6944661 Mon Sep 17 00:00:00 2001
+From e40f29371f05dd9d27b1d33408d00411660f9a28 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 09:39:39 +0700
 Subject: [PATCH] engine: child reports cover follow-up turns, thanks and
@@ -886,7 +886,7 @@ index 02dd5b9281bc5aa8e5df002e7ba13e1ecd2fb72f..18758900173613fa428e81c28817cef6
          "{}\n\n[Cut at 16 KB. Read the whole reply with the Zeron `read_chat` tool, chat {child}.]",
          body[..end].trim_end()
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index d9b1e146006f2a7abca5a6930a1a329d46488de8..16e63438968c2fab064238b230e1649b0c9ec3da 100644
+index 2e617b8647f23b9a7feb50b2faa7c9230fa9c979..dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -41,7 +41,7 @@ use crate::doc_host::{ChatDocHandle, DocHost};
@@ -1201,7 +1201,7 @@ index 5f37b345b93d6e59a9cdc695b747c6dff3fbd792..9d287ad84c0d50e609ee1c6e6044a217
  `show_visual` is available, write a Luau visual script and show it with `show_visual` before \
  your final reply. Zeron renders it with its own native interface and enforces its style: \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 186412ca3efff773e766bccef242af36d7d6586c..c98721a17fc0f27e5458eafc8fb58e7a80e963a5 100644
+index 7572be48fbdb8a0578b9b8d8209f51f8abcb71e6..0e73d14cdadfcd72b0e40aed00668740858132cb 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -926,7 +926,7 @@ impl Tools {
@@ -1369,7 +1369,7 @@ index 94382b19bd5697862e83761c271a2d69408e38d0..0d9bffc258b662192aa34b2f017b0aef
          assert_eq!(
              reports,
 diff --git a/docs/mcp.md b/docs/mcp.md
-index 8cebf1dab257dc24e59d4d61c6c1682fc9f30e0c..2b000285343fddab10c224cad6ae300408f58669 100644
+index d293ec54ea6de12ff4bb0c7dcc4d3adaf156fcb4..53453f39460e6068d1c831337f971a07bc40c230 100644
 --- a/docs/mcp.md
 +++ b/docs/mcp.md
 @@ -65,6 +65,20 @@ the parent is busy wait as one message, each block opening with its own header.

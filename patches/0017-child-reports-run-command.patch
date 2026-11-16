@@ -1,4 +1,4 @@
-From 1976abbb4be1b6cd4dba97ff590892a94696b828 Mon Sep 17 00:00:00 2001
+From b565a42276f2f0adf28f365c7cc3754c4fe778db Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 19:41:41 +0700
 Subject: [PATCH] engine: a command left running with run_command doesn't hold
@@ -124,7 +124,7 @@ index b32ff234ea8f5e44d709ce0a7b65d6e5d0e5b053..bda9c3c9333c5eb817819ad7cf187bea
  }
  
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 5d8d2dcfad9ece3725fc95b5ba6ce92794a6d849..826c760565db264d695e4bc345ab9dae61cc7c16 100644
+index f6155626a4b1c8355d4e4464913c1ad4dffe6d79..efd6c980dc944b77c954d1f96054757af8b6ea3a 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -10269,6 +10269,85 @@ mod tests {
