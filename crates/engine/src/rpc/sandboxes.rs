@@ -7,15 +7,18 @@ use zeron_proto::ChatConfig;
 use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use super::{EngineRpc, parse_params, watch_stream};
-use crate::sandboxes::{Host, Sandboxes};
+use crate::sandboxes::{Credential, Host, Sandboxes};
 
 pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_SANDBOX_PROVIDERS
+            | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
+            | methods::CHECK_SANDBOX
+            | methods::START_SANDBOX_FRESH
     )
 }
 
@@ -23,6 +26,15 @@ pub(super) fn handles(method: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectParams {
+    provider: String,
+    /// A pasted key; without one, the provider's own sign-in page.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 impl EngineRpc {
@@ -49,6 +61,31 @@ impl EngineRpc {
         let sandboxes = self.sandboxes()?;
         match method {
             methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
+            methods::CONNECT_SANDBOX_PROVIDER => {
+                let p: ConnectParams = parse_params(params)?;
+                let provider = sandboxes.provider_named(&p.provider).ok_or_else(|| {
+                    RpcError::Failed(format!("{} isn't on this device.", p.provider))
+                })?;
+                let failed = |e: crate::sandboxes::ProviderError| RpcError::Failed(e.message);
+                if let Some(token) = p.token.filter(|t| !t.trim().is_empty()) {
+                    let account = provider
+                        .connect(Credential::Token(token))
+                        .await
+                        .map_err(failed)?;
+                    return RpcReply::value(&serde_json::json!({ "account": account }));
+                }
+                let code = provider.begin_connect().await.map_err(failed)?.ok_or_else(|| {
+                    RpcError::Failed(format!("{} connects with a pasted key.", provider.name()))
+                })?;
+                let shown = serde_json::to_value(&code).unwrap_or_default();
+                // Approved on the provider's page, in the user's time.
+                tokio::spawn(async move {
+                    if let Err(err) = provider.connect(Credential::DeviceCode(code)).await {
+                        tracing::warn!(provider = provider.id(), %err, "sandboxes: connect didn't finish");
+                    }
+                });
+                RpcReply::value(&serde_json::json!({ "deviceCode": shown }))
+            }
             methods::SANDBOX_STEPS => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.steps(&p.chat_id))
@@ -64,6 +101,18 @@ impl EngineRpc {
                 let p: ChatParams = parse_params(params)?;
                 sandboxes
                     .run_again(self.sandbox_host(), &p.chat_id)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CHECK_SANDBOX => {
+                let p: ChatParams = parse_params(params)?;
+                RpcReply::value(&sandboxes.check(self.auth.as_ref(), &p.chat_id).await)
+            }
+            methods::START_SANDBOX_FRESH => {
+                let p: ChatParams = parse_params(params)?;
+                sandboxes
+                    .start_fresh(self.sandbox_host(), &p.chat_id)
+                    .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
@@ -125,6 +174,49 @@ impl EngineRpc {
             // The template hasn't run: every agent this device knows.
             _ => self.handle(method, local).await,
         })
+    }
+
+    /// A child (subagent, side chat) of a chat on a sandbox shares that
+    /// sandbox, its device and checkout, unless it asks for a place of its
+    /// own. `None`: the parent isn't on a sandbox; create as usual.
+    pub(super) fn create_chat_in_parents_sandbox(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        config: Option<ChatConfig>,
+        parent_chat_id: &str,
+        child_kind: Option<zeron_proto::ChildKind>,
+    ) -> Option<Result<RpcReply, RpcError>> {
+        let parent = self.workspace.chat(parent_chat_id).ok().flatten()?;
+        // This device keeps its sandbox, or this engine is that sandbox's.
+        let kept = self
+            .sandboxes
+            .as_ref()
+            .is_some_and(|s| s.hosts_device(&parent.device_id));
+        let here = self.auth.as_ref().is_some_and(crate::auth::Auth::is_lent)
+            && parent.device_id == self.doc_host.device_id();
+        if !kept && !here {
+            return None;
+        }
+        let created = self
+            .workspace
+            .create_chat_hosted(
+                chat_id,
+                space_id,
+                device_id,
+                Some(&parent.device_id),
+                config,
+                parent.cwd.clone(),
+                Some(parent_chat_id.to_owned()),
+                child_kind,
+            )
+            .map_err(|e| RpcError::Failed(e.to_string()));
+        Some(created.and_then(|_| {
+            RpcReply::value(&serde_json::json!({
+                "ok": true, "deviceId": parent.device_id, "cwd": parent.cwd,
+            }))
+        }))
     }
 
     /// `createChat` on a place: the chat's row names its sandbox's device and

@@ -538,6 +538,10 @@ impl EngineCore {
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
         self.plugins.attach_auth(auth.clone());
+        // A chat deleted on any device takes its sandbox (and the sign-in
+        // lent it) with it.
+        self.sandboxes
+            .follow_deletions(self.workspace.watch_chats(), auth.clone());
         *self
             .auth
             .lock()
@@ -1151,6 +1155,14 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        // The built-in sandbox providers, on a device of the user's own (not
+        // in a sandbox or on a Cloud machine).
+        if !auth.is_lent() && !auth.is_runner() {
+            core.sandboxes
+                .register(Arc::new(sandboxes::docker::DockerProvider::new(
+                    sandboxes::KeySlot::open(&config.data_dir, sandboxes::docker::ID),
+                )));
+        }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).
         core.registry

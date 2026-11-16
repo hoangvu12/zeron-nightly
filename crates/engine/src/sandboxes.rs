@@ -11,18 +11,24 @@
 //! the sandbox's engine when the sandbox is Ready.
 
 mod catalog;
+pub mod docker;
+mod keys;
 mod provider;
+mod recovery;
 mod steps;
 
 pub use catalog::PlaceCatalog;
+pub use keys::KeySlot;
 pub use provider::{
-    Command, CreateSandbox, ErrorKind, Exit, Finished, Ops, Placement, ProviderError, RunEvent,
-    RunStream, SandboxProvider, Template, run_to_end,
+    Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,
+    Placement, ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
+    run_to_end,
 };
 pub use steps::{SandboxState, SandboxSteps, Step, StepProgress, StepState};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,7 +38,8 @@ use crate::auth::{Auth, LentSignIn};
 use crate::doc_host::DocHost;
 use crate::workspace_host::WorkspaceHost;
 
-/// Zeron's engine in a sandbox: run as `zeron-engine headless`.
+/// Zeron's engine in a sandbox: run as `zeron-engine watchdog`, which keeps
+/// `zeron-engine headless` running (no systemd there).
 pub const ENGINE_PROGRAM: &str = "zeron-engine";
 /// The device id a sandbox's engine takes on its first start, minted here
 /// so the chat names its host from the start ([`take_device_id`]).
@@ -68,6 +75,8 @@ pub struct ProviderInfo {
     pub name: String,
     pub icon: String,
     pub ops: Vec<&'static str>,
+    /// The account it's connected to here; `None` until the user connects.
+    pub account: Option<Account>,
 }
 
 /// What `createChat` on a place answers: the chat's host and folder.
@@ -120,6 +129,10 @@ struct ChatSandbox {
     busy: Mutex<bool>,
     /// The sign-in lent to it, and when: kept here only.
     lent: Mutex<Option<(LentSignIn, Instant)>>,
+    /// Its chat was deleted: steps still running stop and discard it.
+    deleted: AtomicBool,
+    /// What it left was discarded ([`ChatSandbox::discard`]).
+    discarded: AtomicBool,
 }
 
 #[derive(Default)]
@@ -128,6 +141,8 @@ struct Inner {
     providers: Mutex<Vec<Arc<dyn SandboxProvider>>>,
     chats: Mutex<HashMap<String, Arc<ChatSandbox>>>,
     catalogs: catalog::Catalogs,
+    /// Chat deletions are followed ([`Sandboxes::follow_deletions`]).
+    following: AtomicBool,
 }
 
 /// The providers this device keeps and the chats on them.
@@ -172,6 +187,7 @@ impl Sandboxes {
                 providers: Mutex::default(),
                 chats: Mutex::new(chats),
                 catalogs: catalog::Catalogs::open(data_dir),
+                following: AtomicBool::new(false),
             }),
         }
     }
@@ -232,8 +248,14 @@ impl Sandboxes {
                 name: p.name().to_owned(),
                 icon: p.icon().to_owned(),
                 ops: p.ops().names(),
+                account: p.account(),
             })
             .collect()
+    }
+
+    /// The provider with id `id`, as registered.
+    pub fn provider_named(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {
+        self.provider(id)
     }
 
     fn provider(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {
@@ -325,8 +347,16 @@ impl Sandboxes {
         }
         let sandboxes = self.clone();
         tokio::spawn(async move {
-            sandboxes.run_steps(&chat, provider, &host).await;
-            *lock(&chat.busy) = false;
+            sandboxes.run_steps(&chat, provider.clone(), &host).await;
+            let deleted = {
+                let mut busy = lock(&chat.busy);
+                *busy = false;
+                chat.deleted.load(Ordering::SeqCst)
+            };
+            if deleted {
+                chat.discard(Some(provider.as_ref()), host.auth.as_ref())
+                    .await;
+            }
         });
         Ok(())
     }
@@ -346,6 +376,9 @@ impl Sandboxes {
 
     async fn run_steps(&self, chat: &ChatSandbox, provider: Arc<dyn SandboxProvider>, host: &Host) {
         for step in Step::STARTING {
+            if chat.deleted.load(Ordering::SeqCst) {
+                return;
+            }
             if matches!(
                 chat.progress.borrow().state_of(step),
                 StepState::Done | StepState::Skipped
@@ -361,6 +394,9 @@ impl Sandboxes {
                     tracing::warn!(chat = %chat_id, ?step, %error, "sandbox step failed");
                     chat.update(|steps| steps.fail(step, error));
                     self.persist();
+                    // It failed because the sandbox was deleted outside Zeron.
+                    self.found_gone(chat, provider.as_ref(), host.auth.as_ref())
+                        .await;
                     return;
                 }
             }
@@ -472,7 +508,8 @@ impl Sandboxes {
             Step::Ready => {
                 if starts_zeron {
                     let lent = chat.lend(host, &record.steps.device_id).await?;
-                    let mut command = Command::new([ENGINE_PROGRAM, "headless"])
+                    // Under its watchdog, which restarts it when it stops.
+                    let mut command = Command::new([ENGINE_PROGRAM, "watchdog"])
                         .env(EDGE_URL_ENV, edge_url(host)?)
                         .env(DEVICE_ID_ENV, &record.steps.device_id)
                         .detached();
@@ -529,6 +566,8 @@ impl ChatSandbox {
             progress,
             busy: Mutex::new(false),
             lent: Mutex::new(None),
+            deleted: AtomicBool::new(false),
+            discarded: AtomicBool::new(false),
         }
     }
 
@@ -640,7 +679,30 @@ async fn get_code(
             return Err(format!("Couldn't clone {url}:\n{}", done.failure()));
         }
     }
-    let checkout = Command::new(["git", "-C", dir, "checkout", "-B", branch]);
+    // The chat's branch as it is here (Run again), else as it was pushed (a
+    // fresh sandbox: Start fresh), else new.
+    let has = async |reference: String| {
+        let probe = Command::new([
+            "git",
+            "-C",
+            dir,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            reference.as_str(),
+        ]);
+        run_to_end(provider, sandbox, probe)
+            .await
+            .is_ok_and(|done| done.exit.success())
+    };
+    let pushed = format!("refs/remotes/origin/{branch}");
+    let checkout = if has(format!("refs/heads/{branch}")).await {
+        Command::new(["git", "-C", dir, "checkout", branch])
+    } else if has(pushed.clone()).await {
+        Command::new(["git", "-C", dir, "checkout", "-B", branch, pushed.as_str()])
+    } else {
+        Command::new(["git", "-C", dir, "checkout", "-B", branch])
+    };
     let done = run_to_end(provider, sandbox, checkout)
         .await
         .map_err(|e| format!("Couldn't check out {branch}: {e}"))?;
