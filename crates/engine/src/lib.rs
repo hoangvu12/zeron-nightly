@@ -1155,6 +1155,14 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        // The built-in sandbox providers, on a device of the user's own (not
+        // in a sandbox or on a Cloud machine).
+        if !auth.is_lent() && !auth.is_runner() {
+            core.sandboxes
+                .register(Arc::new(sandboxes::docker::DockerProvider::new(
+                    sandboxes::KeySlot::open(&config.data_dir, sandboxes::docker::ID),
+                )));
+        }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).
         core.registry

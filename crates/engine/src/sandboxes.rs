@@ -10,13 +10,17 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
+pub mod docker;
+mod keys;
 mod provider;
 mod recovery;
 mod steps;
 
+pub use keys::KeySlot;
 pub use provider::{
-    Command, CreateSandbox, ErrorKind, Exit, Finished, Ops, Placement, ProviderError, RunEvent,
-    RunStream, SandboxProvider, SandboxStatus, Template, run_to_end,
+    Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,
+    Placement, ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
+    run_to_end,
 };
 pub use steps::{SandboxState, SandboxSteps, Step, StepProgress, StepState};
 
@@ -69,6 +73,8 @@ pub struct ProviderInfo {
     pub name: String,
     pub icon: String,
     pub ops: Vec<&'static str>,
+    /// The account it's connected to here; `None` until the user connects.
+    pub account: Option<Account>,
 }
 
 /// What `createChat` on a place answers: the chat's host and folder.
@@ -197,8 +203,14 @@ impl Sandboxes {
                 name: p.name().to_owned(),
                 icon: p.icon().to_owned(),
                 ops: p.ops().names(),
+                account: p.account(),
             })
             .collect()
+    }
+
+    /// The provider with id `id`, as registered.
+    pub fn provider_named(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {
+        self.provider(id)
     }
 
     fn provider(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {

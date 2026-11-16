@@ -16,7 +16,8 @@
 #   zeron-engine   lib + the integration tests named below (lent_sign_in: a sandbox
 #                  engine on a borrowed sign-in; sandbox_place: a chat on a sandbox
 #                  provider, its steps end to end; sandbox_recovery: deleting a
-#                  sandbox chat, a sandbox gone or full, Start fresh; plugin_services: the
+#                  sandbox chat, a sandbox gone or full, Start fresh; docker_sandbox:
+#                  the Docker Sandbox provider against a stub of Docker's APIs; plugin_services: the
 #                  plugin host's services, end to end; also on macOS in zgx-tests.yml). Engine has many other
 #                  integration binaries (live agents etc.) that no workflow ran, so
 #                  they are listed instead of globbed to avoid compiling them.
@@ -45,7 +46,7 @@ done
 # `misc` (harness, engine and preview): the small suites, one binary each.
 # The orb geometry tests live in zeron-orb's `geometry`. `restart_hook`
 # stays a binary of its own: the hook it checks is process-wide.
-for t in misc geometry session_publication restart_resume side_chats message_queue voice_runtime device_routing device_room plugin_services restart_hook lent_sign_in sandbox_place sandbox_recovery; do
+for t in misc geometry session_publication restart_resume side_chats message_queue voice_runtime device_routing device_room plugin_services restart_hook lent_sign_in sandbox_place sandbox_recovery docker_sandbox; do
   tests+=(--test "$t")
 done
 

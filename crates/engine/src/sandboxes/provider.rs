@@ -28,8 +28,12 @@ impl Ops {
     pub const RUN: Ops = Ops(1 << 4);
     pub const TEMPLATES: Ops = Ops(1 << 5);
     pub const SAVE_TEMPLATE: Ops = Ops(1 << 6);
-    /// Everything a full cloud (Docker Sandbox) supplies.
-    pub const ALL: Ops = Ops(0x7f);
+    /// The user connects an account to it ([`SandboxProvider::connect`]).
+    pub const CONNECT: Ops = Ops(1 << 7);
+    /// It can push a sandbox's time limit out ([`SandboxProvider::extend`]).
+    pub const EXTEND: Ops = Ops(1 << 8);
+    /// Every operation.
+    pub const ALL: Ops = Ops(0x1ff);
 
     pub const fn contains(self, other: Ops) -> bool {
         self.0 & other.0 == other.0
@@ -45,6 +49,8 @@ impl Ops {
             (Ops::RUN, "run"),
             (Ops::TEMPLATES, "templates"),
             (Ops::SAVE_TEMPLATE, "saveTemplate"),
+            (Ops::CONNECT, "connect"),
+            (Ops::EXTEND, "extend"),
         ]
         .into_iter()
         .filter(|(op, _)| self.contains(*op))
@@ -186,6 +192,56 @@ pub struct Template {
     pub name: String,
 }
 
+/// What the user gives to connect an account ([`SandboxProvider::connect`]).
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Credential {
+    /// A pasted API key or token.
+    Token(String),
+    /// A sign-in started with [`SandboxProvider::begin_connect`]: `connect`
+    /// waits until the user approves it on the provider's page (or it
+    /// expires).
+    DeviceCode(DeviceCode),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::Token(_) => f.write_str("Token(..)"),
+            Credential::DeviceCode(code) => write!(f, "DeviceCode({})", code.user_code),
+        }
+    }
+}
+
+/// A sign-in on the provider's own page (OAuth device flow): what to show
+/// the user, and the handle `connect` waits on.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCode {
+    /// The code the user checks on the page (`ABCD-EFGH`).
+    pub user_code: String,
+    /// The page to open.
+    pub verification_uri: String,
+    /// The page with the code filled in, when the provider has one.
+    pub verification_uri_complete: Option<String>,
+    /// How long the code lasts, in seconds.
+    pub expires_in: u64,
+    /// How often to ask whether it was approved, in seconds.
+    #[serde(skip)]
+    pub interval: u64,
+    /// What `connect` polls with. Stays on this device.
+    #[serde(skip)]
+    pub device_code: String,
+}
+
+/// The account a provider is connected to, as Settings shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    /// Its email, organization or other name the user knows it by.
+    pub name: String,
+}
+
 /// Where a sandbox is, as its provider sees it ([`SandboxProvider::status`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -289,6 +345,27 @@ pub trait SandboxProvider: Send + Sync + 'static {
     /// Save a sandbox as a new template named `name`.
     async fn save_template(&self, _sandbox: &str, _name: &str) -> Result<Template, ProviderError> {
         Err(ProviderError::unsupported("save templates"))
+    }
+    /// Check `credential` with the provider and keep it in the provider's
+    /// [`super::KeySlot`] on this device; the account it's for.
+    async fn connect(&self, _credential: Credential) -> Result<Account, ProviderError> {
+        Err(ProviderError::unsupported("connect accounts"))
+    }
+    /// Start connecting on the provider's own sign-in page (OAuth device
+    /// flow): the code to show; then [`Self::connect`] with
+    /// [`Credential::DeviceCode`]. `None`: it only takes a pasted credential.
+    async fn begin_connect(&self) -> Result<Option<DeviceCode>, ProviderError> {
+        Ok(None)
+    }
+    /// The account it's connected to on this device, if any.
+    fn account(&self) -> Option<Account> {
+        None
+    }
+    /// Set the sandbox's time limit to `ttl` from now. When it runs out the
+    /// sandbox stops (never deletes); the host device pushes it out while a
+    /// chat there is busy.
+    async fn extend(&self, _sandbox: &str, _ttl: Duration) -> Result<(), ProviderError> {
+        Err(ProviderError::unsupported("extend time limits"))
     }
 }
 
@@ -398,5 +475,13 @@ mod tests {
         assert!(!ops.contains(Ops::CREATE));
         assert!(Ops::ALL.contains(ops));
         assert_eq!(ops.names(), ["start", "run"]);
+        assert_eq!(Ops::ALL.names().len(), 9);
+        assert_eq!((Ops::CONNECT | Ops::EXTEND).names(), ["connect", "extend"]);
+    }
+
+    #[test]
+    fn a_credential_never_prints_its_secret() {
+        let shown = format!("{:?}", Credential::Token("bk_secret".into()));
+        assert!(!shown.contains("bk_secret"), "{shown}");
     }
 }

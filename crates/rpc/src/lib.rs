@@ -219,8 +219,15 @@ pub mod methods {
     // Places chats run on: sandbox providers built into the engine
     // (docs/design/cloud-byo.md). Answered by the device that keeps the
     // provider; relay-forwardable so the account's other devices ask it.
-    /// `{}` → `[{id, name, icon, ops}]`: the providers this device keeps.
+    /// `{}` → `[{id, name, icon, ops, account: {name} | null}]`: the
+    /// providers this device keeps, and who each is connected as.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
+    /// `{provider, token}` → `{account: {name}}`: connect with a pasted key.
+    /// `{provider}` → `{deviceCode: {userCode, verificationUri,
+    /// verificationUriComplete, expiresIn}}`: the user approves that code on
+    /// the provider's page; the account shows in `ListSandboxProviders` once
+    /// they have. The key stays on the device that answers.
+    pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
     /// state: starting|ready|failed|gone, step, since, error, diskFull,
     /// steps: [{step, state}]}`), or `null` for a chat not on a place this
