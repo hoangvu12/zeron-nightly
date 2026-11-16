@@ -251,6 +251,16 @@ no edge change.
   limit instead of stopping it.
 - **Save as template wipes Zeron's identity** (its device id and data). Otherwise every sandbox from
   the template shares one device id and they kick each other off the relay.
+  - The host device runs `zeron-engine forget-device` in the sandbox. It quiesces the engine
+    (busy: exit 75, nothing changed), writes `watchdog.stop` so the watchdog doesn't restart it,
+    stops it, and empties the data folder except `app`, `steps`, `worktrees`, `scratch`, `repos`
+    and the agent preferences. Then the provider saves, and the host device starts Zeron again on
+    the chat's device id.
+  - Docker saves with `SnapshotService/CreateSnapshot {sandbox: {id}, name, captureMode:
+    "CAPTURE_MODE_DISK"}`, an operation polled with `GetOperation` (~17 s for Blank, ~5 min for an
+    8 GB disk; the sandbox keeps running). Disk only: `CAPTURE_MODE_ALL` saves memory too, where the
+    lent sign-in lives. The template lists in `ListImages` under the same `tmpl_` id.
+    `ImageService/CreateImage` can't save a sandbox.
 - Stopped sandboxes aren't deleted on a schedule (none seen after 3 days; Docker's docs list none).
 
 ## Verified
