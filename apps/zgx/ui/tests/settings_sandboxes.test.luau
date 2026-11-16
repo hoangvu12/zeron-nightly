@@ -128,7 +128,7 @@ end
 
 -- What the page asked of the engine (the stub's log): "method@device".
 local function asked(app: any, entry: string): boolean
-	for _, c in (app:state("sandbox_settings_stub_calls") :: any) or {} do
+	for _, c in (app:state("sandbox_settings_stub_asked") :: any) or {} do
 		if c == entry then
 			return true
 		end

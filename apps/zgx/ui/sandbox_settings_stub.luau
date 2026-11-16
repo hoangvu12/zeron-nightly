@@ -9,14 +9,14 @@
 -- files on a device: devbox has three (one for every sandbox, one for
 -- Docker's, Borealis's own setup.sh).
 --
--- What was asked, in order, is `sandbox_settings_stub_calls` ("Method@device",
+-- What was asked, in order, is `sandbox_settings_stub_asked` ("Method@device",
 -- "" for this one). Commands:
 --   sandbox_settings_stub.connected  Docker connected, devbox its host device
 --   sandbox_settings_stub.approve    the Docker sign-in page's code approved
 
 local M = {}
 
-local calls = ui.state("sandbox_settings_stub_calls", {} :: { string })
+local calls = ui.state("sandbox_settings_stub_asked", {} :: { string })
 local last_write = ui.state("sandbox_settings_stub_last_write", "")
 local last_content = ui.state("sandbox_settings_stub_last_content", "")
 
