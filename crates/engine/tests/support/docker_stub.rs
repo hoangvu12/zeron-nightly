@@ -145,12 +145,13 @@ impl DockerStub {
     }
 
     async fn serve(&self, mut socket: TcpStream) {
-        if {
+        let reset = {
             let mut state = self.state();
             let reset = state.resets > 0;
             state.resets = state.resets.saturating_sub(1);
             reset
-        } {
+        };
+        if reset {
             return; // dropped: the client sees the connection close
         }
         let Some((method, path, headers, body)) = read_request(&mut socket).await else {
@@ -549,12 +550,15 @@ fn decode(s: &str) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(b) = escaped {
+            out.push(b);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
