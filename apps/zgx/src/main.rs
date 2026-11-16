@@ -29,7 +29,6 @@
 
 mod about;
 #[cfg(all(windows, feature = "beta"))]
-mod sandboxes;
 mod windows_install;
 mod acp_registry;
 mod agents;
@@ -62,6 +61,7 @@ mod plugins;
 mod previews;
 mod projects;
 mod relaunch;
+mod sandboxes;
 mod session_home;
 mod sessions;
 mod settings;
