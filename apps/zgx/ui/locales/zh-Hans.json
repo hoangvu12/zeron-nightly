@@ -657,6 +657,9 @@
         "capacity": "容量 {n} tokens",
         "waiting": "正在等待上下文用量",
         "unreported": "此智能体尚未报告上下文用量"
+      },
+      "template": {
+        "label": "Template"
       }
     },
     "markdown": {
@@ -2921,6 +2924,9 @@
       "blocked": {
         "project_gone": "该项目已不存在。请选择其他项目或不选择项目。",
         "cloud_needs_project": "Cloud 对话需要在项目中运行。请选择 Cloud 可以打开的项目。"
+      },
+      "template": {
+        "blank": "Blank"
       }
     },
     "composer": {
@@ -3068,6 +3074,24 @@
       "setup_summary": "已设置 Cloud 机器",
       "woke_summary": "已唤醒 Cloud 机器",
       "unreachable": "已中断——无法连接到{host}"
+    },
+    "sandbox": {
+      "step": {
+        "create": "Creating the sandbox",
+        "start": "Starting the sandbox",
+        "install": "Installing Zeron",
+        "sign_in": "Signing in",
+        "secrets": "Adding secrets",
+        "get_code": "Getting the code",
+        "setup": "Running setup",
+        "ready": "Starting Zeron",
+        "other": "Setting up the sandbox"
+      },
+      "starting": "{step} · {elapsed}",
+      "failed": "{step} failed",
+      "failed_because": "{step} failed: {error}",
+      "run_again": "Run again",
+      "run_again_failed": "Couldn't run the steps again."
     }
   },
   "panel": {

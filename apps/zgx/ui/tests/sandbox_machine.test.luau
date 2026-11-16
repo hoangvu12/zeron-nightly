@@ -100,13 +100,10 @@ end)
 
 -- ── On the composer ────────────────────────────────────────────────────────
 
-local function calls(app: any): { string }
-	return (app:state("sandbox_stub_calls") :: any) or {}
-end
-
+-- What the page asked of the host, as the fixture notes it.
 local function asked(app: any, entry: string): number
 	local n = 0
-	for _, c in calls(app) do
+	for c in string.gmatch((app:state("calls") :: any) or "", "[^,]+") do
 		if c == entry then
 			n += 1
 		end
@@ -125,15 +122,15 @@ local function open_deck(app: any)
 	app:frames(10)
 end
 
--- The chat fixture's s2 on the box (not this device), its sandbox as the
--- engine says `case`; the deck opened, if `open`.
+-- The chat fixture's s2 on a Docker sandbox, as the engine says `case`; the
+-- deck opened, if `open`.
 local function on_sandbox(case: string, open: boolean?): any
 	local app = mount("chat_fixture.luau")
 	app:resize(960, 760)
 	app:command("go_s2")
 	app:frames(30)
-	app:command("session_on_box")
-	app:command(`sandbox_stub.{case}`)
+	app:command("sandbox_stub.offer")
+	app:command(`sandbox_stub.steps.{case}`)
 	app:wait("#never-shown", { timeout_ms = 300 })
 	app:frames(30)
 	if open then
@@ -142,19 +139,11 @@ local function on_sandbox(case: string, open: boolean?): any
 	return app
 end
 
-test("opening a chat on another device follows its sandbox", function()
+test("a sandbox that's up raises nothing on the deck", function()
 	local app = on_sandbox("ready")
 	expect(asked(app, "follow:s2") >= 1).to_be(true)
-	-- A sandbox that's up raises nothing.
 	expect(app:has('role:button "Open Alerts"')).to_be(false)
 	expect(app:error()).to_be(nil)
-end)
-
-test("a chat hosted here is never asked about", function()
-	local app = mount("chat_fixture.luau")
-	app:command("go_s2")
-	app:frames(30)
-	expect(asked(app, "follow:s2")).to_be(0)
 end)
 
 test("deleted outside Zeron: the deck says where, and Start fresh starts one", function()
@@ -164,13 +153,13 @@ test("deleted outside Zeron: the deck says where, and Start fresh starts one", f
 	app:frames(30)
 	expect(asked(app, "fresh:s2")).to_be(1)
 	-- The engine starts it: the alert goes.
-	app:command("sandbox_stub.started")
+	app:command("sandbox_stub.steps.starting")
 	app:frames(30)
 	expect(app:has(in_deck('~"Sandbox deleted"'))).to_be(false)
 	expect(app:error()).to_be(nil)
 end)
 
-test("on a provider whose name isn't known, it's just deleted", function()
+test("on a provider this device doesn't list, it's just deleted", function()
 	local app = on_sandbox("gone_unnamed", true)
 	expect(app:has(in_deck('~"Sandbox deleted"'))).to_be(true)
 	expect(app:has(in_deck('~"Sandbox deleted in"'))).to_be(false)
@@ -178,7 +167,7 @@ end)
 
 test("Start fresh on its way: no second one asked", function()
 	local app = on_sandbox("gone", true)
-	app:command("sandbox_stub.hold_next")
+	app:command("sandbox_stub.fresh_holds")
 	app:click(in_deck('role:button "Start fresh"'))
 	app:frames(30)
 	expect(app:has(in_deck('role:button "Start fresh"'))).to_be(false)
@@ -187,10 +176,10 @@ end)
 
 test("a Start fresh that didn't go says why, and can be tried again", function()
 	local app = on_sandbox("gone", true)
-	app:command("sandbox_stub.fail_next")
+	app:command("sandbox_stub.fresh_fails")
 	app:click(in_deck('role:button "Start fresh"'))
 	app:frames(30)
-	expect(app:has(in_deck('~"Couldn\'t reach Zeron"'))).to_be(true)
+	expect(app:has(in_deck(`~"Couldn't reach Zeron"`))).to_be(true)
 	app:click(in_deck('role:button "Start fresh"'))
 	app:frames(30)
 	expect(asked(app, "fresh:s2")).to_be(2)
@@ -199,7 +188,7 @@ end)
 
 test("a full disk is said in the chat, with Start fresh", function()
 	local app = on_sandbox("disk_full", true)
-	expect(app:has(in_deck('~"Sandbox\'s disk is full"'))).to_be(true)
+	expect(app:has(in_deck(`~"Sandbox's disk is full"`))).to_be(true)
 	app:click(in_deck('role:button "Start fresh"'))
 	app:frames(30)
 	expect(asked(app, "fresh:s2")).to_be(1)

@@ -106,7 +106,9 @@ export type Project = { id: string, name: string, device: string, path: string, 
 -- shows nowhere).
 -- `cloud`: one of Cloud's (the account's, or a session's machine): never a
 -- device to pick.
-export type Device = { id: string, name: string, platform: string, here: boolean, online: boolean?, seen: number?, version: string?, cloud: boolean? }
+-- `sandbox`: the provider whose sandbox it is (an engine in one chat's
+-- sandbox, spec #37): never listed, its provider is.
+export type Device = { id: string, name: string, platform: string, here: boolean, online: boolean?, seen: number?, version: string?, cloud: boolean?, sandbox: string? }
 export type Section = { id: string, name: string, sessions: { string }, collapsed: boolean? }
 export type Places = { pinned: { string }, sections: { Section } }
 export type Now = {
@@ -255,14 +257,14 @@ function M.place(places: Places)
 	ui.invoke("sessions.places", places)
 end
 
--- Your own computers among the devices: not a Cloud session's machine (it
--- belongs to its session) and, with `computers_only`, not a phone. This
--- one first.
+-- Your own computers among the devices: not a Cloud session's machine nor
+-- a sandbox (each belongs to its chat; its provider is offered instead)
+-- and, with `computers_only`, not a phone. This one first.
 function M.computers(devices: { Device }?, computers_only: boolean?): { Device }
 	local out: { Device } = {}
 	for _, d in devices or {} do
 		local phone = d.platform == "ios" or d.platform == "android"
-		if not d.cloud and d.platform ~= "cloud" and not (computers_only and phone) then
+		if not d.cloud and d.platform ~= "cloud" and not d.sandbox and not (computers_only and phone) then
 			table.insert(out, if d.here then 1 else #out + 1, d)
 		end
 	end

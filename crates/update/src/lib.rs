@@ -1467,6 +1467,10 @@ fn in_service_cgroup(cgroups: &str, unit: &str) -> bool {
 /// sandbox provider starts again on resume.
 pub const CLOUD_SERVICE_UNIT: &str = "zeron-cloud.service";
 
+/// The engine in a sandbox of the user's own cloud that has systemd (Boat):
+/// a system unit too, which its environment names (`ZERON_SERVICE_UNIT`).
+pub const SANDBOX_SERVICE_UNIT: &str = "zeron-sandbox.service";
+
 /// The systemd unit this engine runs as. `ZERON_SERVICE_UNIT` names another, so
 /// a test install beside a real one can never restart the real one. A Cloud
 /// machine says so in its environment (`ZERON_DEVICE_PLATFORM=cloud`, written
@@ -1501,7 +1505,7 @@ pub enum ServiceScope {
 
 impl ServiceScope {
     pub fn of(unit: &str) -> Self {
-        if unit == CLOUD_SERVICE_UNIT {
+        if unit == CLOUD_SERVICE_UNIT || unit == SANDBOX_SERVICE_UNIT {
             Self::System
         } else {
             Self::User
@@ -3136,6 +3140,17 @@ mod tests {
             "zeron-test.service"
         );
         assert_eq!(resolve_service_unit(Some("  "), None), "zeron.service");
+    }
+
+    #[test]
+    fn a_sandbox_on_its_own_cloud_restarts_its_system_unit() {
+        let unit = resolve_service_unit(Some(SANDBOX_SERVICE_UNIT), None);
+        assert_eq!(ServiceScope::of(&unit), ServiceScope::System);
+        assert_eq!(systemctl_action(&unit).get_program(), "sudo");
+        assert!(in_service_cgroup(
+            "0::/system.slice/zeron-sandbox.service\n",
+            &unit
+        ));
     }
 
     /// Inside the unit, the restart kills the `systemctl` that asked for it.

@@ -1,8 +1,9 @@
 -- A chat's sandbox, on its composer's deck: tracked reads and the action,
 -- nothing drawn (as screens/chat/cloud_tray for Cloud). What's said is
--- screens/chat/sandbox_machine's.
+-- screens/chat/sandbox_machine's; the composer follows the chat's steps
+-- (account/sandboxes) while it's open.
 --
---   local sandbox = SandboxTray.bind { chat = fn, device = fn, here = fn }
+--   local sandbox = SandboxTray.bind { chat = fn }
 --   alerts: its alert, as the deck takes them; on_alert(id): its action
 
 local sandboxes = require("@account/sandboxes")
@@ -11,23 +12,22 @@ local logic = require("@app/screens/chat/sandbox_machine")
 local M = {}
 
 export type Bind = {
+	-- The open chat, while it runs on a sandbox; else nil.
 	chat: () -> string?,
-	-- The chat's host, and this device's: a chat hosted here isn't on a
-	-- sandbox, so it's never asked about.
-	device: () -> string?,
-	here: () -> string?,
 }
 
 function M.bind(c: Bind): any
 	local b: any = {}
-	ui.effect(function()
-		local chat, device = c.chat(), c.device()
-		if chat and device and device ~= c.here() then
-			sandboxes.follow(chat)
-		end
-	end)
+	-- Its steps, with its provider's name when this device lists it.
 	function b.steps(): any
-		return sandboxes.steps(c.chat())
+		local s = sandboxes.steps_of(c.chat())
+		if not s then
+			return nil
+		end
+		local p = sandboxes.provider(s.provider)
+		local out = table.clone(s) :: any
+		out.provider_name = if p then p.name else nil
+		return out
 	end
 	b.alert = ui.computed(function(): logic.Alert?
 		return logic.alert(b.steps())

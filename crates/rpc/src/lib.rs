@@ -222,6 +222,9 @@ pub mod methods {
     /// `{}` → `[{id, name, icon, ops, account: {name} | null}]`: the
     /// providers this device keeps, and who each is connected as.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
+    /// `{provider}` → `[{id, name}]`: its account's templates (the template
+    /// picker adds Blank, no template, itself).
+    pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
     /// `{provider, token}` → `{account: {name}, hostDeviceId}`: connect with
     /// a pasted key. `{provider}` → `{deviceCode: {userCode, verificationUri,
     /// verificationUriComplete, expiresIn}}`: the user approves that code on

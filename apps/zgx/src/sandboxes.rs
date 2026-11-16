@@ -1,228 +1,327 @@
-//! Chats on sandboxes (spec #37), as their composer shows them: how far each
-//! followed chat's sandbox got, from the engine that keeps its provider
-//! (`CheckSandbox`, then `WatchSandboxSteps`), and Start fresh. The engine
-//! runs every step; this only carries its answers.
+//! Places a chat runs on (spec #37, docs/design/cloud-byo.md): the sandbox
+//! providers this device's engine keeps, their accounts' templates, and how
+//! far a chat's sandbox got while it starts (the chat's progress line).
 //!
-//! What scripts see, `sandboxes`: chat id → its sandbox, for each chat
-//! followed whose sandbox this device keeps:
-//!   { state = "starting" | "ready" | "failed" | "gone", provider,
-//!     provider_name?, step?, error?, disk_full }
+//! ```text
+//! shared  sandboxes            { providers = { { id, name, icon }… } }
+//! shared  sandbox_steps        { [chat] = { state, step?, template?, since, error?,
+//!                              provider?, disk_full } }: `state` starting |
+//!                              ready | failed | gone (deleted outside Zeron),
+//!                              `step` the one it's on (or that failed),
+//!                              `since` when that began, in Unix seconds
+//! call    sandboxes.templates  provider → { { id, name }… } (Blank isn't one)
+//! invoke  sandboxes.follow     chat: keep its steps in `sandbox_steps`, and
+//!                              ask its provider whether it's still there
+//!                              (never waking it; again after a minute)
+//! invoke  sandboxes.unfollow   chat
+//! call    sandboxes.run_again  chat: a failed step, and the ones after it
+//! call    sandboxes.fresh      chat: Start fresh, a new sandbox with the
+//!                              chat's pushed work
+//! ```
 //!
-//!   sandboxes.follow(chat)   follow a chat's sandbox (an action; opening a
-//!                            chat). Asks the provider whether it's still
-//!                            there, never waking it, then hears each change.
-//!   sandboxes.fresh(chat)    Start fresh: a new sandbox, with the chat's
-//!                            pushed work. Rejects with an outcome word.
+//! Every call is the engine's (`ListSandboxProviders`, `ListSandboxTemplates`,
+//! `WatchSandboxSteps`, `CheckSandbox`, `RunSandboxStepsAgain`,
+//! `StartSandboxFresh`); a failure rejects with an
+//! outcome word, or the engine's sentence.
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap},
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
 use zgx_desktop::WindowContext;
 use zgx_script::{ScriptHost, Shared, Value};
 
 use crate::auth::text;
-use crate::engine::{self, rpc::Watch};
+use crate::engine;
+use crate::plugins::json_value;
 
-struct Sandboxes {
-    shared: RefCell<Vec<Shared>>,
-    /// The chats followed, and what's known of each one's sandbox.
-    followed: RefCell<BTreeSet<String>>,
-    steps: RefCell<BTreeMap<String, Json>>,
-    watches: RefCell<HashMap<String, Watch>>,
-    /// Provider id → its name, as the engine lists them.
-    names: RefCell<HashMap<String, String>>,
-    /// When each chat was last asked about: opened again after
-    /// [`ASK_AGAIN`], it's asked again (a reload within it isn't).
-    asked: RefCell<HashMap<String, Instant>>,
-    listening: Cell<bool>,
+#[derive(Default)]
+struct State {
+    /// Each window's `sandboxes` and `sandbox_steps`.
+    shared: Vec<(Rc<Shared>, Rc<Shared>)>,
+    providers: Json,
+    /// The chats followed, and their steps as last heard.
+    steps: BTreeMap<String, Json>,
+    watches: BTreeMap<String, engine::rpc::Watch>,
+    /// When each chat's provider was last asked whether its sandbox is still
+    /// there: opened again within [`ASK_AGAIN`], it isn't asked again.
+    asked: BTreeMap<String, Instant>,
 }
 
-/// How long an answer stands before opening the chat asks again.
 const ASK_AGAIN: Duration = Duration::from_secs(60);
 
 thread_local! {
-    static SANDBOXES: Rc<Sandboxes> = Rc::new(Sandboxes {
-        shared: RefCell::default(),
-        followed: RefCell::default(),
-        steps: RefCell::default(),
-        watches: RefCell::default(),
-        names: RefCell::default(),
-        asked: RefCell::default(),
-        listening: Cell::new(false),
+    static STATE: RefCell<State> = RefCell::new(State { providers: json!([]), ..State::default() });
+}
+
+fn publish() {
+    let (shared, providers, steps) = STATE.with(|s| {
+        let s = s.borrow();
+        let steps: serde_json::Map<String, Json> =
+            s.steps.iter().filter_map(|(chat, raw)| Some((chat.clone(), steps_json(raw)?))).collect();
+        (s.shared.clone(), providers_json(&s.providers), Json::Object(steps))
+    });
+    let (providers, steps) = (json_value(&json!({ "providers": providers })), json_value(&steps));
+    for (p, st) in shared {
+        p.set(providers.clone());
+        st.set(steps.clone());
+    }
+}
+
+/// The providers as the picker lists them.
+fn providers_json(listed: &Json) -> Json {
+    let providers: Vec<Json> = listed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let id = p["id"].as_str().filter(|id| !id.is_empty())?;
+            Some(json!({
+                "id": id,
+                "name": p["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(id),
+                "icon": p["icon"].as_str().unwrap_or_default(),
+            }))
+        })
+        .collect();
+    Json::Array(providers)
+}
+
+/// A chat's steps as its progress line reads them (`SandboxSteps`), or none
+/// for a chat not on a place this engine keeps.
+fn steps_json(steps: &Json) -> Option<Json> {
+    let state = steps["state"].as_str()?;
+    let mut out = json!({
+        "state": state,
+        "since": steps["since"].as_i64().unwrap_or_default() as f64 / 1000.0,
+    });
+    if let Some(step) = steps["step"].as_str() {
+        out["step"] = Json::from(step);
+    }
+    if let Some(template) = steps["template"].as_str().filter(|t| !t.is_empty()) {
+        out["template"] = Json::from(template);
+    }
+    if let Some(error) = steps["error"].as_str().filter(|e| !e.is_empty()) {
+        out["error"] = Json::from(error);
+    }
+    if let Some(provider) = steps["provider"].as_str().filter(|p| !p.is_empty()) {
+        out["provider"] = Json::from(provider);
+    }
+    out["disk_full"] = Json::from(steps["diskFull"].as_bool() == Some(true));
+    Some(out)
+}
+
+fn templates_json(listed: &Json) -> Json {
+    let templates: Vec<Json> = listed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let id = t["id"].as_str().filter(|id| !id.is_empty())?;
+            Some(json!({ "id": id, "name": t["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(id) }))
+        })
+        .collect();
+    Json::Array(templates)
+}
+
+fn follow(rpc: &engine::rpc::Rpc, chat: &str) -> engine::rpc::Watch {
+    let heard = chat.to_owned();
+    rpc.watch("WatchSandboxSteps", json!({ "chatId": chat }), move |item| {
+        STATE.with(|s| s.borrow_mut().steps.insert(heard.clone(), item));
+        publish();
+    })
+}
+
+/// Ask the provider whether `chat`'s sandbox is still there (a sandbox
+/// deleted outside Zeron reads as gone). Its answer is its steps, as the
+/// watch hears them too.
+fn check(chat: &str) {
+    let fresh = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let stale = s.asked.get(chat).is_none_or(|at| at.elapsed() >= ASK_AGAIN);
+        if stale {
+            s.asked.insert(chat.to_owned(), Instant::now());
+        }
+        stale
+    });
+    if !fresh {
+        return;
+    }
+    let chat = chat.to_owned();
+    engine::get().spawn(async move {
+        match call("CheckSandbox", json!({ "chatId": chat })).await {
+            Ok(steps) if steps.is_object() => {
+                let followed = STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let followed = s.steps.contains_key(&chat);
+                    if followed {
+                        s.steps.insert(chat, steps);
+                    }
+                    followed
+                });
+                if followed {
+                    publish();
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("zeron-zgx: sandboxes: couldn't check a sandbox: {error}"),
+        }
     });
 }
 
-pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
-    let sandboxes = SANDBOXES.with(Rc::clone);
-    sandboxes.shared.borrow_mut().push(host.shared("sandboxes", sandboxes.value()));
-    if !sandboxes.listening.replace(true) {
-        // A new connection: every followed chat asked again (its watches
-        // ended with the old one).
-        let s = sandboxes.clone();
-        engine::get().on_connect(move |_| {
-            let chats: Vec<String> = s.followed.borrow().iter().cloned().collect();
-            for chat in chats {
-                s.clone().ask(chat);
-            }
+async fn call(method: &str, params: Json) -> Result<Json, String> {
+    engine::get().call(method, params).await.map_err(|error| match engine::outcome(&error) {
+        "failed" => {
+            let words = error.trim().trim_start_matches("failed:").trim();
+            if words.is_empty() { "failed".into() } else { words.to_string() }
+        }
+        word => word.to_string(),
+    })
+}
+
+pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+    let providers = Rc::new(host.shared("sandboxes", json_value(&json!({ "providers": [] }))));
+    let steps = Rc::new(host.shared("sandbox_steps", json_value(&json!({}))));
+    let first = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.shared.push((providers.clone(), steps.clone()));
+        s.shared.len() == 1
+    });
+    let mine = Rc::downgrade(&providers);
+    cx.on_closed(move || {
+        STATE.with(|s| s.borrow_mut().shared.retain(|(p, _)| !std::ptr::eq(Rc::as_ptr(p), mine.as_ptr())));
+    });
+    publish();
+    if first {
+        // Each connection: the providers it keeps, once, and the chats
+        // followed watched again on it.
+        engine::get().on_connect(|rpc| {
+            let chats: Vec<String> = STATE.with(|s| s.borrow().steps.keys().cloned().collect());
+            let watches: BTreeMap<String, engine::rpc::Watch> =
+                chats.iter().map(|chat| (chat.clone(), follow(rpc, chat))).collect();
+            STATE.with(|s| s.borrow_mut().watches = watches);
+            let rpc = rpc.clone();
+            engine::get().spawn(async move {
+                match rpc.call("ListSandboxProviders", json!({})).await {
+                    Ok(listed) => {
+                        STATE.with(|s| s.borrow_mut().providers = listed);
+                        publish();
+                    }
+                    // (An engine from before places: none to offer.)
+                    Err(error) => eprintln!("zeron-zgx: sandboxes: no providers: {error}"),
+                }
+            });
         });
     }
-    let s = sandboxes.clone();
-    host.action("sandboxes.follow", move |chat| {
+    host.async_action("sandboxes.templates", |provider| {
+        let provider = text(&provider);
+        async move {
+            if provider.is_empty() {
+                return Err("invalid".into());
+            }
+            let listed = call("ListSandboxTemplates", json!({ "provider": provider })).await?;
+            Ok(json_value(&templates_json(&listed)))
+        }
+    });
+    host.action("sandboxes.follow", |chat| {
         let chat = text(&chat);
         if chat.is_empty() {
             return;
         }
-        let new = s.followed.borrow_mut().insert(chat.clone());
-        let stale = s.asked.borrow().get(&chat).is_none_or(|at| at.elapsed() >= ASK_AGAIN);
-        if new || stale {
-            s.clone().ask(chat);
+        check(&chat);
+        if STATE.with(|s| s.borrow().watches.contains_key(&chat)) {
+            return;
+        }
+        STATE.with(|s| {
+            s.borrow_mut().steps.entry(chat.clone()).or_insert(Json::Null);
+        });
+        if let Some(rpc) = engine::get().current() {
+            let watch = follow(&rpc, &chat);
+            STATE.with(|s| s.borrow_mut().watches.insert(chat, watch));
         }
     });
-    host.async_action("sandboxes.fresh", move |chat| {
+    host.action("sandboxes.unfollow", |chat| {
+        let chat = text(&chat);
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.watches.remove(&chat);
+            s.steps.remove(&chat);
+        });
+        publish();
+    });
+    host.async_action("sandboxes.fresh", |chat| {
         let chat = text(&chat);
         async move {
             crate::plugins::preview::refuse("sandboxes.fresh")?;
             if chat.is_empty() {
-                return Err("invalid".to_string());
+                return Err("invalid".into());
             }
             call("StartSandboxFresh", json!({ "chatId": chat })).await?;
-            Ok(Value::Bool(true))
+            Ok(Value::Nil)
+        }
+    });
+    host.async_action("sandboxes.run_again", |chat| {
+        let chat = text(&chat);
+        async move {
+            crate::plugins::preview::refuse("sandboxes.run_again")?;
+            call("RunSandboxStepsAgain", json!({ "chatId": chat })).await?;
+            Ok(Value::Nil)
         }
     });
 }
 
-impl Sandboxes {
-    /// Ask whether `chat`'s sandbox is still there, then hear its changes.
-    fn ask(self: Rc<Self>, chat: String) {
-        self.asked.borrow_mut().insert(chat.clone(), Instant::now());
-        engine::get().spawn(async move {
-            let Ok(checked) = call("CheckSandbox", json!({ "chatId": chat })).await else {
-                return;
-            };
-            if !checked.is_object() {
-                // Not on a sandbox this device keeps.
-                self.watches.borrow_mut().remove(&chat);
-                if self.steps.borrow_mut().remove(&chat).is_some() {
-                    self.publish();
-                }
-                return;
-            }
-            self.learn_names(&checked).await;
-            self.set(&chat, checked);
-            let Some(rpc) = engine::get().connection(Duration::ZERO).await else {
-                return;
-            };
-            let weak = Rc::downgrade(&self);
-            let id = chat.clone();
-            let watch = rpc.watch("WatchSandboxSteps", json!({ "chatId": chat }), move |item| {
-                if let Some(me) = weak.upgrade()
-                    && item.is_object()
-                {
-                    me.set(&id, item);
-                }
-            });
-            self.watches.borrow_mut().insert(chat, watch);
-        });
-    }
-
-    /// The provider's name, asked once.
-    async fn learn_names(&self, steps: &Json) {
-        let Some(provider) = steps["provider"].as_str() else {
-            return;
-        };
-        if self.names.borrow().contains_key(provider) {
-            return;
-        }
-        if let Ok(listed) = call("ListSandboxProviders", json!({})).await {
-            let mut names = self.names.borrow_mut();
-            for p in listed.as_array().into_iter().flatten() {
-                if let (Some(id), Some(name)) = (p["id"].as_str(), p["name"].as_str()) {
-                    names.insert(id.to_string(), name.to_string());
-                }
-            }
-        }
-    }
-
-    fn set(&self, chat: &str, steps: Json) {
-        let changed = self.steps.borrow().get(chat) != Some(&steps);
-        if changed {
-            self.steps.borrow_mut().insert(chat.to_string(), steps);
-            self.publish();
-        }
-    }
-
-    fn publish(&self) {
-        let value = self.value();
-        for shared in self.shared.borrow().iter() {
-            shared.set(value.clone());
-        }
-    }
-
-    fn value(&self) -> Value {
-        let names = self.names.borrow();
-        Value::record(
-            self.steps
-                .borrow()
-                .iter()
-                .map(|(chat, s)| (chat.clone(), steps_value(s, &names))),
-        )
-    }
-}
-
-/// A sandbox's steps as the scripts read them.
-fn steps_value(s: &Json, names: &HashMap<String, String>) -> Value {
-    let provider = s["provider"].as_str().unwrap_or_default();
-    let opt = |v: &Json| v.as_str().filter(|t| !t.is_empty()).map_or(Value::Nil, Value::from);
-    Value::record([
-        ("state", Value::from(s["state"].as_str().unwrap_or("starting"))),
-        ("provider", Value::from(provider)),
-        ("provider_name", names.get(provider).map_or(Value::Nil, |n| Value::from(n.as_str()))),
-        ("step", opt(&s["step"])),
-        ("error", opt(&s["error"])),
-        ("disk_full", Value::Bool(s["diskFull"].as_bool() == Some(true))),
-    ])
-}
-
-async fn call(method: &str, params: Json) -> Result<Json, String> {
-    engine::get().call(method, params).await.map_err(|error| {
-        if error.to_ascii_lowercase().contains("unknown method") {
-            "outdated".to_string()
-        } else {
-            eprintln!("zeron-zgx: sandboxes: {method} failed: {error}");
-            engine::outcome(&error).to_string()
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::json;
 
+    /// The progress line reads the step it's on and since when (seconds, as
+    /// the scripts' times are), and a failed step's error; a chat not on a
+    /// place this engine keeps has none.
     #[test]
-    fn steps_read_as_the_scripts_take_them() {
-        let names = HashMap::from([("docker".to_string(), "Docker Sandbox".to_string())]);
-        let gone = steps_value(
-            &json!({ "chatId": "c", "provider": "docker", "deviceId": "d", "state": "gone",
-                     "step": null, "since": 1, "error": "The sandbox was deleted outside Zeron.",
-                     "diskFull": false, "steps": [] }),
-            &names,
+    fn a_sandbox_s_steps_read_as_its_progress_line() {
+        let starting = json!({ "chatId": "c", "provider": "docker", "template": "zeron-dev", "deviceId": "d",
+                               "state": "starting", "step": "installZeron", "since": 1_700_000_012_000_i64,
+                               "error": null, "steps": [] });
+        assert_eq!(
+            super::steps_json(&starting),
+            Some(json!({ "state": "starting", "step": "installZeron", "template": "zeron-dev", "since": 1_700_000_012.0,
+                         "provider": "docker", "disk_full": false }))
         );
-        let Value::Map(_) = &gone else { panic!("a record") };
-        assert_eq!(gone.field("state").map(text).as_deref(), Some("gone"));
-        assert_eq!(gone.field("provider_name").map(text).as_deref(), Some("Docker Sandbox"));
-        assert!(matches!(gone.field("disk_full"), Some(Value::Bool(false))));
-        let full = steps_value(
-            &json!({ "provider": "fake", "state": "failed", "step": "getCode",
-                     "error": "The sandbox's disk is full.", "diskFull": true }),
-            &names,
+        let failed = json!({ "state": "failed", "step": "getCode", "since": 1000, "error": "Couldn't clone" });
+        assert_eq!(
+            super::steps_json(&failed),
+            Some(json!({ "state": "failed", "step": "getCode", "since": 1.0, "error": "Couldn't clone", "disk_full": false }))
         );
-        assert!(matches!(full.field("disk_full"), Some(Value::Bool(true))));
-        assert_eq!(full.field("step").map(text).as_deref(), Some("getCode"));
-        assert!(matches!(full.field("provider_name"), None | Some(Value::Nil)));
+        // Deleted outside Zeron, and a full disk, as the deck reads them.
+        let gone = json!({ "state": "gone", "provider": "docker", "since": 1000,
+                           "error": "The sandbox was deleted outside Zeron.", "diskFull": false });
+        assert_eq!(super::steps_json(&gone).unwrap()["state"], "gone");
+        let full = json!({ "state": "failed", "step": "getCode", "since": 1000, "diskFull": true,
+                           "error": "The sandbox's disk is full." });
+        assert_eq!(super::steps_json(&full).unwrap()["disk_full"], true);
+        assert_eq!(super::steps_json(&json!(null)), None);
+    }
+
+    /// One entry per provider, by its own name and icon; a provider with no
+    /// id isn't offered.
+    #[test]
+    fn providers_are_offered_by_their_own_name_and_icon() {
+        let listed = json!([
+            { "id": "docker", "name": "Docker Sandbox", "icon": "docker", "ops": ["create"] },
+            { "id": "boat", "icon": "boat" },
+            { "name": "nameless" },
+        ]);
+        assert_eq!(
+            super::providers_json(&listed),
+            json!([
+                { "id": "docker", "name": "Docker Sandbox", "icon": "docker" },
+                { "id": "boat", "name": "boat", "icon": "boat" },
+            ])
+        );
+        assert_eq!(
+            super::templates_json(&json!([{ "id": "zeron-dev", "name": "zeron-dev" }, { "id": "" }])),
+            json!([{ "id": "zeron-dev", "name": "zeron-dev" }])
+        );
     }
 }

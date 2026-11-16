@@ -11,6 +11,7 @@
 
 local ds = require("@ds")
 local sessions = require("@account/sessions")
+local sandboxes = require("@account/sandboxes")
 local project_calls = require("@account/projects")
 -- The project editor (screens/shell/project_editor, its emoji picker and
 -- the emoji's data): loaded as it's first opened, not with the window, and
@@ -245,18 +246,25 @@ ui.effect(function()
 	end
 end)
 
--- Device names, by id; this Mac's.
-local function devices(): ({ [string]: string }, string?)
+-- Device names, by id; this Mac's; and the glyphs of those that say more
+-- by one: a sandbox reads as its provider, by its name and icon.
+local function devices(): ({ [string]: string }, string?, { [string]: string })
 	local names: { [string]: string } = {}
+	local icons: { [string]: string } = {}
 	local here: string? = nil
 	local here_id = sessions.here:get()
 	for _, d in sessions.devices:get() do
 		names[d.id] = d.name
+		local provider = sandboxes.of_device(d)
+		if provider then
+			names[d.id] = sandboxes.name(provider)
+			icons[d.id] = sandboxes.icon(provider)
+		end
 		if d.here or d.id == here_id then
 			here = d.name
 		end
 	end
-	return names, here
+	return names, here, icons
 end
 
 -- A device's id by the name its group shows (ds.Sidebar groups by name):
@@ -346,7 +354,7 @@ end
 -- The Archived shelf's sessions (the most recently moved first), as the
 -- list's rows read them.
 local shelf = ui.computed(function(): { any }
-	local names = devices()
+	local names, _, icons = devices()
 	local out = {}
 	for _, c in sessions.archived:get() do
 		table.insert(out, {
@@ -358,6 +366,7 @@ local shelf = ui.computed(function(): { any }
 			harness = c.harness,
 			agent_icon = c.agent_icon,
 			device = names[c.device] or locale.s("shell.sidebar.unknown_device"),
+			device_icon = icons[c.device],
 			branch = c.branch,
 		})
 	end
@@ -475,7 +484,7 @@ local projects = ui.computed(function(): { ds.SidebarProject }
 	local asked = asks:get()
 	local only = narrow:get()
 	local just = only_project()
-	local names = devices()
+	local names, _, icons = devices()
 	local out: { ds.SidebarProject } = {}
 	local by: { [string]: ds.SidebarProject } = {}
 	-- One group for each repository, whichever device its clones are on: it stands
@@ -551,6 +560,7 @@ local projects = ui.computed(function(): { ds.SidebarProject }
 			created = c.created,
 			agent = c.agent :: any,
 			device = names[c.device] or locale.s("shell.sidebar.unknown_device"),
+			device_icon = icons[c.device],
 			branch = c.branch,
 			-- (Its side chats working count as its subagents do, as its
 			-- lanes' badge counts them: screens/chat/lanes.)

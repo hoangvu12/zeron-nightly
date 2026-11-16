@@ -657,6 +657,9 @@
         "capacity": "{n} token capacity",
         "waiting": "Waiting for context usage",
         "unreported": "Context usage not reported by this agent yet"
+      },
+      "template": {
+        "label": "Template"
       }
     },
     "markdown": {
@@ -2921,6 +2924,9 @@
       "blocked": {
         "project_gone": "That project is no longer there. Pick another, or none.",
         "cloud_needs_project": "Cloud chats work in a project. Pick one Cloud can open."
+      },
+      "template": {
+        "blank": "Blank"
       }
     },
     "composer": {
@@ -3068,6 +3074,24 @@
       "setup_summary": "Set up the Cloud machine",
       "woke_summary": "Woke the Cloud machine",
       "unreachable": "Interrupted — can't reach {host}"
+    },
+    "sandbox": {
+      "step": {
+        "create": "Creating the sandbox",
+        "start": "Starting the sandbox",
+        "install": "Installing Zeron",
+        "sign_in": "Signing in",
+        "secrets": "Adding secrets",
+        "get_code": "Getting the code",
+        "setup": "Running setup",
+        "ready": "Starting Zeron",
+        "other": "Setting up the sandbox"
+      },
+      "starting": "{step} · {elapsed}",
+      "failed": "{step} failed",
+      "failed_because": "{step} failed: {error}",
+      "run_again": "Run again",
+      "run_again_failed": "Couldn't run the steps again."
     }
   },
   "panel": {
