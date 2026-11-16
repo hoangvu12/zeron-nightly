@@ -12,7 +12,7 @@
 # printed. A borrowed `sbx` access token lasts 15 minutes; the run takes
 # about 10.
 set -euo pipefail
-: "${ZERON_LIVE_HOST_DIR:?the host engine's signed-in data dir}"
+: "${ZERON_LIVE_HOST_DIR:?the signed-in data dir of the host engine}"
 : "${DOCKER_TOKEN_FILE:?a file with a Docker access token}"
 ZERON_DOCKER_SMOKE_TOKEN=$(cat "$DOCKER_TOKEN_FILE")
 export ZERON_DOCKER_SMOKE_TOKEN ZERON_LIVE_HOST_DIR
