@@ -23,6 +23,16 @@ pub fn sandbox_provider<S: AsRef<str>>(capabilities: &[S]) -> Option<&str> {
     })
 }
 
+/// Whether a device is one chat's machine (a sandbox, or a Zeron Cloud
+/// session's): never listed or picked as a device, but still found by id
+/// for its chats.
+pub fn is_one_chats_machine<S: AsRef<str>>(capabilities: &[S]) -> bool {
+    sandbox_provider(capabilities).is_some()
+        || capabilities
+            .iter()
+            .any(|c| c.as_ref() == crate::CLOUD_SESSION_CAPABILITY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,6 +45,14 @@ mod tests {
         ];
         assert_eq!(caps[1], "sandbox:docker");
         assert_eq!(sandbox_provider(&caps), Some("docker"));
+    }
+
+    #[test]
+    fn a_machine_of_one_chats_is_a_sandbox_or_a_cloud_session() {
+        assert!(is_one_chats_machine(&["sandbox:docker"]));
+        assert!(is_one_chats_machine(&[crate::CLOUD_SESSION_CAPABILITY]));
+        assert!(!is_one_chats_machine(&["sandbox-host-v1", "sandbox:"]));
+        assert!(!is_one_chats_machine::<&str>(&[]));
     }
 
     #[test]
