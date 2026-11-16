@@ -2502,6 +2502,8 @@ fn forwardable(method: &str) -> bool {
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
+            | methods::CHECK_SANDBOX
+            | methods::START_SANDBOX_FRESH
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
@@ -4304,6 +4306,28 @@ impl RpcService for EngineRpc {
                         place.template.clone(),
                     ))
                     .await;
+                }
+                if let MutateParams::CreateChat {
+                    chat_id,
+                    space_id,
+                    device_id,
+                    config,
+                    parent_chat_id: Some(parent),
+                    child_kind,
+                    cloud: false,
+                    place: None,
+                    ..
+                } = &p
+                    && let Some(created) = self.create_chat_in_parents_sandbox(
+                        chat_id,
+                        space_id.as_deref(),
+                        device_id.as_deref(),
+                        config.clone(),
+                        parent,
+                        *child_kind,
+                    )
+                {
+                    return created;
                 }
                 if let MutateParams::CreateChat {
                     chat_id,

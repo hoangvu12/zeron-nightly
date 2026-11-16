@@ -13,7 +13,7 @@ use serde_json::json;
 use zeron_engine::sandboxes::docker::{DockerProvider, DockerUrls};
 use zeron_engine::sandboxes::{
     Command, CreateSandbox, Credential, ErrorKind, Exit, KeySlot, Ops, RunEvent, SandboxProvider,
-    run_to_end,
+    SandboxStatus, run_to_end,
 };
 
 struct Fixture {
@@ -318,6 +318,21 @@ async fn delete_is_done_even_when_its_already_gone() {
     fx.provider.delete("sbx_a").await.unwrap();
     assert!(fx.stub.state().boxes.is_empty());
     fx.provider.delete("sbx_a").await.unwrap();
+}
+
+#[tokio::test]
+async fn status_says_running_stopped_or_gone() {
+    let fx = Fixture::connected().await;
+    fx.stub.add_box("sbx_a", "SANDBOX_STATUS_RUNNING");
+    fx.stub.add_box("sbx_b", "SANDBOX_STATUS_STOPPED");
+    let p = &fx.provider;
+    assert_eq!(p.status("sbx_a").await.unwrap(), SandboxStatus::Running);
+    assert_eq!(p.status("sbx_b").await.unwrap(), SandboxStatus::Stopped);
+    // Deleted (in Docker's own app, say): `not_found`.
+    p.delete("sbx_a").await.unwrap();
+    assert_eq!(p.status("sbx_a").await.unwrap(), SandboxStatus::Gone);
+    let get = fx.stub.seen("GetSandbox").pop().unwrap();
+    assert_eq!(get.body, json!({"sandbox": {"id": "sbx_a"}}));
 }
 
 #[tokio::test]

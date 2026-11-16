@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use super::keys::KeySlot;
 use super::provider::{
     Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Ops,
-    ProviderError, RunEvent, RunStream, SandboxProvider, Template,
+    ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
 };
 
 /// Where Docker's services are.
@@ -1040,6 +1040,22 @@ impl SandboxProvider for DockerProvider {
             Err(e) if e.kind == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    async fn status(&self, sandbox: &str) -> Result<SandboxStatus, ProviderError> {
+        let found = match self.get_sandbox(sandbox).await {
+            Ok(found) => found,
+            // Docker answers `not_found` once it's deleted.
+            Err(e) if e.kind == ErrorKind::NotFound => return Ok(SandboxStatus::Gone),
+            Err(e) => return Err(e),
+        };
+        Ok(match found["core"]["status"].as_str().unwrap_or_default() {
+            "SANDBOX_STATUS_RUNNING" | "SANDBOX_STATUS_STARTING" | "SANDBOX_STATUS_CREATING" => {
+                SandboxStatus::Running
+            }
+            status if status.contains("DELET") => SandboxStatus::Gone,
+            _ => SandboxStatus::Stopped,
+        })
     }
 
     async fn extend(&self, sandbox: &str, ttl: Duration) -> Result<(), ProviderError> {

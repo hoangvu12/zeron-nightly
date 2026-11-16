@@ -538,6 +538,10 @@ impl EngineCore {
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
         self.plugins.attach_auth(auth.clone());
+        // A chat deleted on any device takes its sandbox (and the sign-in
+        // lent it) with it.
+        self.sandboxes
+            .follow_deletions(self.workspace.watch_chats(), auth.clone());
         *self
             .auth
             .lock()
