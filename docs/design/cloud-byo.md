@@ -1,10 +1,13 @@
 # Your own cloud
 
-Status: design. Decided in a grilling session on 2026-11-16. Terms are in
+Status: design. Decided in a grilling session on 2026-11-16; updated the same day (waking only on a
+queued send, providers built into the engine, Boat as a second provider). Terms are in
 [CONTEXT.md](../../CONTEXT.md) under "Cloud vocabulary". The sign-in choice is
-[ADR 0003](../adr/0003-sandboxes-borrow-the-host-devices-sign-in.md).
+[ADR 0003](../adr/0003-sandboxes-borrow-the-host-devices-sign-in.md); where providers live is
+[ADR 0004](../adr/0004-sandbox-providers-are-built-into-the-engine.md).
 
-A chat can run in the user's own cloud account. Docker Sandbox is the first provider. It works
+A chat can run in the user's own cloud account. Two providers are built in: **Docker Sandbox** and
+**Boat** (the user's own boat.dev account). It works
 like Zeron Cloud ([cloud-device.md](cloud-device.md)), except that the machines and the bill are
 the user's, and nothing on the edge or relay changes.
 
@@ -20,11 +23,12 @@ Device lists show one **Docker Sandbox** entry, never one device per sandbox.
 
 | | |
 |---|---|
-| Machines | The provider decides. Docker: **one sandbox per chat** |
+| Machines | The provider decides. Docker and Boat: **one sandbox per chat** |
+| Providers | Built into the engine in Rust (`crates/engine`): Docker Sandbox and Boat (ADR 0004). Third-party providers as plugins come later |
 | What runs in the sandbox | `zeron-engine headless`, a real engine, so **agents run in the sandbox** |
 | How devices reach it | The relay, as for any device. No SSH |
 | Who calls the provider | The **host device**: one always-on device that keeps the cloud account's key |
-| Other devices | Ask the host device through plugin service calls between the user's devices (`CallPluginService` → `ServePluginCall`, `crates/rpc/src/lib.rs:537-546`) |
+| Other devices | Ask the host device through the engine's existing request forwarding to a target device (`targetDeviceId`), not peer plugin calls (ADR 0004) |
 | Sign-in | **Borrowed**: the host device lends short-lived access tokens (ADR 0003) |
 | Server of our own | None. Revisit only if "no device of mine is on" really hurts |
 
@@ -91,6 +95,7 @@ That covers places that aren't sandboxes:
 | Place | Supplies |
 |---|---|
 | Docker Sandbox | everything |
+| Boat | everything except templates; has systemd, so Install Zeron reuses Zeron Cloud's install |
 | An SSH box | `run` only |
 | A PC at home | `start` (Wake-on-LAN). It already runs Zeron, so Install and Sign in are skipped |
 
@@ -192,15 +197,34 @@ the sandbox's DeviceRoom, the room queues the nudge and replays it to the next h
 
 So while a sandbox sleeps, the **host device stands in** for it: it joins the sandbox's DeviceRoom
 as host (the room checks only the user, `device-room.ts:161-165`), receives the replayed or new
-nudge, leaves it unacknowledged so the sandbox still gets it, wakes the sandbox, and leaves the
-room as the sandbox's engine comes back. That works for every sender, the phone and old builds
-included, with no edge change.
+nudge, wakes the sandbox **only if the chat has a queued send**, and leaves the room as the
+sandbox's engine comes back. That works for every sender, the phone and old builds included, with
+no edge change.
+
+- Nudges can't be left unacknowledged: the engine dials with `nudgeAck=1`, but the edge's front
+  worker rebuilds the query without it (`edge/src/device-link.ts:69-82`), so the room deletes each
+  nudge as it sends it.
+- Opening a chat whose host is away also nudges (rate limited). A nudge alone is not a send, so the
+  stand-in checks the chat for a queued send and ignores the nudge otherwise. Opening a chat never
+  wakes its sandbox.
+- Losing the nudge is fine: the woken engine drains the chat's queued sends when it reconnects.
 
 - The stand-in is the host device's own code, not a stock engine: a stock engine reconnects after
   the room closes a second host with 4409 (`crates/rpc/src/device_room.rs:389`).
 - It holds one quiet socket per sleeping sandbox.
 - While it holds the room, clients don't see `host_offline`; new clients show the sandbox's state
   from the host device instead.
+
+## Boat specifics
+
+- The user's **own** Boat account and API key, kept on the host device like Docker's key. Not Zeron
+  Cloud's operator account.
+- Mirrors the edge's Boat provider (`edge/src/cloud/providers/boat.ts`): REST JSON at
+  `https://boat.dev/api/v1`, create with `Idempotency-Key`, stop/resume, delete with
+  `X-Ascii-Confirm-Delete`, `PATCH` to extend the time limit, `POST …/commands` to run a command,
+  `noEnv: true` so nothing of the account leaks in. Same state and error mapping.
+- Boat machines have systemd, so Install Zeron reuses Zeron Cloud's install (the engine as a service
+  that restarts and self-updates) instead of the no-systemd watchdog.
 
 ## Docker specifics
 
@@ -257,6 +281,7 @@ included, with no edge change.
 
 ## Not now
 
+- Third-party providers as plugins (ADR 0004).
 - A hosted service of ours (vault, waking with no device on). Nightly is public, so it would serve
   and hold keys for every user.
 - A limit on awake sandboxes.
