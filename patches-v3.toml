@@ -115,18 +115,20 @@ note = "#1458 at a4e90bbf as a file: its own diff (from main f6a9bbfc), not a `p
 
 [[patch]]
 name = "child-reports-one-rule"
-enabled = false
 file = "patches/0014-child-reports-one-rule.patch"
 note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Goes after agent-device-commands (#1458), which it was rebased onto; needs child-reports-held-stop."
 
 [[patch]]
 name = "child-reports-holds-and-groups"
-enabled = false
 file = "patches/0015-child-reports-holds-and-groups.patch"
 note = "Child reports wake the parent less, and only with something new: a progress message can wait for its child's end (FYIs never wake alone); a report the parent's agent already read with read_chat isn't said again; a child that keeps coming back is paused after 20 reports until the person writes; while the person talks to the parent, its children's reports go with their next message (or after 5 quiet minutes); and create_chats notify:\"all\" hears from a group of children once, when all are done (30-minute fallback). Held reports are kept in the chat, and reports a restart caught after they reached the transcript but before the agent read them go again; one caught between the queue and the transcript is still lost, as any queued message is (a core queue follow-up). Applies on top of child-reports-one-rule."
 
 [[patch]]
 name = "child-reports-watch"
-enabled = false
 file = "patches/0016-child-reports-watch.patch"
 note = "The parent's device reports for a child whose device doesn't (an older Zeron, like Linux SG before this), or that updated after its turn and has been back online two minutes without reporting: once the child's chat, synced here, shows the very turn its registry row names, by the same rule and keys its own host would use, re-checked as the report is built. If the reply hasn't synced 10 minutes on and the outcome is this request's, the parent hears its status alone and the full report follows. A turn a shutdown cut is left for its host to revive. The parent's notes say when a child's device is offline or its status unconfirmed, and a subagent created on such a device is said to be reported for by the parent's watcher. Applies on top of child-reports-holds-and-groups."
+
+[[patch]]
+name = "child-reports-run-command"
+file = "patches/0017-child-reports-run-command.patch"
+note = "A command a child left running with run_command (agent-device-commands, #1458) never wakes it, so it no longer holds back the follow-up its runtime's own background work wakes it for. An end with only such commands lists them and lets no follow-up through, the parent's note no longer lists that child as still working for it, and a thanks answered under one stays quiet. Applies on top of child-reports-watch."

@@ -1,0 +1,218 @@
+From da485a045b238964318f2311013d97385d7e43a8 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 16 Nov 2026 19:41:41 +0700
+Subject: [PATCH] engine: a command left running with run_command doesn't hold
+ back a child's follow-up report
+
+Its end never wakes the agent, so it isn't background work that may: the
+follow-up its runtime's own work wakes it for still reports, an end with
+only such commands says so and lets no follow-up through, the parent's
+note no longer lists the child as still working for it, and a thanks
+answered under one stays quiet.
+---
+ crates/engine/src/session_reports.rs | 46 ++++++++++++----
+ crates/engine/src/sessions.rs        | 79 ++++++++++++++++++++++++++++
+ 2 files changed, 116 insertions(+), 9 deletions(-)
+
+diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
+index 0870898c5bba6aae44602a477cd28c919ac1c340..3019ce1a6ee1124bd949f71a9c204bc727ced808 100644
+--- a/crates/engine/src/session_reports.rs
++++ b/crates/engine/src/session_reports.rs
+@@ -40,6 +40,7 @@ use zeron_proto::agent_messages::{self, ReportStatus};
+ use zeron_proto::{Chat, Device, DoneStatus, Session, SessionStatus, ToolCall, WaitingKind, WaitingOn};
+ 
+ use super::lock;
++use crate::commands::CommandTask;
+ use crate::doc_host::{ChatDocHandle, DocHost};
+ use crate::now_ms;
+ use crate::run_journal::RunJournal;
+@@ -123,6 +124,10 @@ const FOLLOW_UP: &str =
+ /// only such an end can have a follow-up ([`classify_settled_turn`]).
+ const BACKGROUND: &str = "(Still running in its background: ";
+ 
++/// How an end report says the child left only commands running with
++/// `run_command`, whose end never wakes it: no follow-up after this end.
++const COMMANDS: &str = "(Left running with `run_command`, whose end doesn't wake it: ";
++
+ /// How long an exchange may be, each side, and still be a mere thanks.
+ const QUIET_CHARS: usize = 300;
+ 
+@@ -152,7 +157,8 @@ pub(super) struct SettledTurn<'a> {
+     pub stop: Option<&'a TurnStop>,
+     /// When it settled, on its host's clock.
+     pub settled_at: i64,
+-    /// The child still runs background work, or waits on some.
++    /// The child still runs background work that may wake it, or waits on
++    /// some ([`may_wake`]).
+     pub background: bool,
+ }
+ 
+@@ -357,7 +363,7 @@ pub(super) async fn report_checked_turn_end(
+     let background = host
+         .sessions()
+         .and_then(|engine| engine.local_sessions().into_iter().find(|s| s.chat_id == child))
+-        .is_some_and(|s| !s.background_tasks.is_empty() || s.waiting.is_some());
++        .is_some_and(|s| may_wake(&s));
+     let turn = SettledTurn {
+         entries: &entries,
+         commands: &commands,
+@@ -535,9 +541,16 @@ pub(super) async fn report_checked_turn_end(
+                     })
+                     .collect();
+                 let tasks = if tasks.is_empty() { "work it waits on".to_owned() } else { tasks.join("; ") };
+-                body.push_str(&format!(
+-                    "\n\n{BACKGROUND}{tasks}. Once it's done, if that wakes it, you hear of its next turn once, as a follow-up.)"
+-                ));
++                // Only commands it left running with `run_command`: they
++                // never wake it, so no follow-up is coming, and this end
++                // lets none through.
++                body.push_str(&if may_wake(&s) {
++                    format!(
++                        "\n\n{BACKGROUND}{tasks}. Once it's done, if that wakes it, you hear of its next turn once, as a follow-up.)"
++                    )
++                } else {
++                    format!("\n\n{COMMANDS}{tasks}.)")
++                });
+             }
+             body
+         }
+@@ -1986,8 +1999,9 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+                 return None;
+             }
+             if reported_done(host, parent, &child.id, &entries[at], session) {
+-                // Reported, but what it left running may wake it again.
+-                let tasks = session.map(|s| s.background_tasks.as_slice()).unwrap_or_default();
++                // Reported, but what it left running may wake it again (a
++                // command left running with `run_command` never does).
++                let tasks: Vec<_> = session.map(|s| wakers(s).collect()).unwrap_or_default();
+                 let oldest = tasks.iter().map(|t| t.started_at.timestamp_millis()).min()?;
+                 let first = tasks[0].description.as_deref().unwrap_or(&tasks[0].command);
+                 let more = if tasks.len() > 1 { format!(" and {} more", tasks.len() - 1) } else { String::new() };
+@@ -2531,11 +2545,24 @@ fn one_line(text: &str, max: usize) -> String {
+     }
+ }
+ 
+-/// `child` (hosted here) has no background work running.
++/// `child` (hosted here) has no background work running that may wake it.
+ fn background_free(host: &DocHost, child: &str) -> bool {
+     host.sessions()
+         .and_then(|engine| engine.local_sessions().into_iter().find(|s| s.chat_id == child))
+-        .is_none_or(|s| s.background_tasks.is_empty())
++        .is_none_or(|s| wakers(&s).next().is_none())
++}
++
++/// `session`'s background work that may wake its agent: its runtime's own
++/// processes. Not the commands it left running with Zeron's `run_command`
++/// (a dev server, a watcher): their end never wakes it.
++fn wakers(session: &Session) -> impl Iterator<Item = &zeron_proto::BackgroundTask> {
++    session.background_tasks.iter().filter(|t| CommandTask::parse(&t.id).is_none())
++}
++
++/// `session`'s agent may yet be woken by its background work ([`wakers`]),
++/// or by a wait it said it's on.
++fn may_wake(session: &Session) -> bool {
++    session.waiting.is_some() || wakers(session).next().is_some()
+ }
+ 
+ /// The child's turn on the parent's message `asked` only acknowledged a
+@@ -2898,6 +2925,7 @@ fn sent_here(commands: &[SessionCommandEntry], asked: &str, device: &str) -> Opt
+ /// it: where the rest is when it was cut, and the work it left running.
+ fn reported_reply(body: &str) -> &str {
+     let body = body.rsplit_once(&format!("\n\n{BACKGROUND}")).map_or(body, |(reply, _)| reply);
++    let body = body.rsplit_once(&format!("\n\n{COMMANDS}")).map_or(body, |(reply, _)| reply);
+     body.rsplit_once(CUT).map_or(body, |(reply, _)| reply).trim()
+ }
+ 
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 5b814496617c20a05bd80c870e7ddc0cc670fd49..9855be4aca14fdf6ec114e2c0bb4aef81c4672f9 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -9916,6 +9916,85 @@ mod tests {
+         rig.core.sessions.shutdown().await;
+     }
+ 
++    /// A dev server its agent left running with `run_command`.
++    fn dev_server() -> crate::commands::CommandTask {
++        crate::commands::CommandTask {
++            device: None,
++            id: "cmd-1".into(),
++            task: zeron_proto::BackgroundTask {
++                id: "cmd-1".into(),
++                command: "npm run dev".into(),
++                description: None,
++                started_at: chrono::Utc::now(),
++            },
++        }
++    }
++
++    /// A command left running with `run_command` never wakes the child: its
++    /// end says so, and it doesn't hold back the follow-up its runtime's
++    /// own background work wakes it for.
++    #[tokio::test]
++    async fn a_command_left_running_holds_back_no_follow_up() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Serve it and test it.")).await;
++        rig.until("it works", |r| r.core.sessions.session_status("kid-a").is_some_and(|s| s.status == SessionStatus::Working)).await;
++        rig.core.sessions.show_command("kid-a", dev_server());
++        kid.turn.set_background_processes(vec![background_task()]);
++        rig.until("both run", |r| r.status("kid-a").background_tasks.len() == 2).await;
++        kid.feed.send(text("Serving; tests running.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the end report", |r| r.heard().len() == 1).await;
++        let end = &rig.heard()[0].2;
++        assert!(end.contains("npm run dev") && end.contains("if that wakes it"), "{end}");
++        let roster = rig.roster();
++        assert!(roster.contains("its background still runs: the tests") && !roster.contains("npm run dev"), "{roster}");
++        kid.turn.set_background_processes(Vec::new());
++        rig.until("its tests are done", |r| r.status("kid-a").background_tasks.len() == 1).await;
++        assert!(!rig.roster().contains("Tests"), "{}", rig.roster());
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        kid.turn.note_wake();
++        rig.until("it works again", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        kid.feed.send(text("All 40 pass.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the follow-up", |r| r.heard().len() == 2).await;
++        assert!(rig.heard()[1].2.ends_with("All 40 pass."), "{:?}", rig.heard());
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// Only a command left running: the end lists it and promises no
++    /// follow-up, and a turn it starts on its own later (a timer) sends none.
++    #[tokio::test]
++    async fn an_end_with_only_a_command_running_promises_no_follow_up() {
++        let rig = family_rig().await;
++        let lead = rig.start("lead", "Hello.").await;
++        lead.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++        let kid = rig.start("kid-a", &from_lead("Serve it.")).await;
++        rig.until("it works", |r| r.core.sessions.session_status("kid-a").is_some_and(|s| s.status == SessionStatus::Working)).await;
++        rig.core.sessions.show_command("kid-a", dev_server());
++        rig.until("it serves", |r| !r.status("kid-a").background_tasks.is_empty()).await;
++        kid.feed.send(text("Serving on :3000.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("the end report", |r| r.heard().len() == 1).await;
++        let end = &rig.heard()[0].2;
++        assert!(end.contains("npm run dev") && end.contains("doesn't wake it"), "{end}");
++        assert!(!end.contains("follow-up"), "{end}");
++        // Nothing of it may wake it: it doesn't work for the lead.
++        assert!(!rig.roster().contains("Tests"), "{}", rig.roster());
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        kid.turn.note_wake();
++        rig.until("it works again", |r| r.status("kid-a").status == SessionStatus::Working).await;
++        kid.feed.send(text("Checked on it: still serving.")).unwrap();
++        kid.feed.send(done(DoneStatus::Completed)).unwrap();
++        rig.until("it rests", |r| r.status("kid-a").status != SessionStatus::Working).await;
++        rig.quiet().await;
++        assert_eq!(rig.heard().len(), 1, "{:?}", rig.heard());
++        rig.core.sessions.shutdown().await;
++    }
++
+     /// The person writes Tests after its report: that turn is theirs.
+     #[tokio::test]
+     async fn the_persons_turn_after_the_report_is_theirs() {
+-- 
+2.55.0.windows.2
+
