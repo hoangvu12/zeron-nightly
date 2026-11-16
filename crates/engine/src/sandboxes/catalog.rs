@@ -58,7 +58,9 @@ impl Catalogs {
     }
 
     pub(super) fn get(&self, provider: &str, template: Option<&str>) -> Option<PlaceCatalog> {
-        super::lock(&self.kept).get(&key(provider, template)).cloned()
+        super::lock(&self.kept)
+            .get(&key(provider, template))
+            .cloned()
     }
 
     pub(super) fn keep(&self, provider: &str, template: Option<&str>, catalog: PlaceCatalog) {

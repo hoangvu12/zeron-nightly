@@ -54,12 +54,18 @@ mod tests {
 
     #[test]
     fn place_targets_round_trip_with_or_without_a_template() {
-        assert_eq!(place_target("docker", Some("zeron-dev")), "place:docker:zeron-dev");
+        assert_eq!(
+            place_target("docker", Some("zeron-dev")),
+            "place:docker:zeron-dev"
+        );
         assert_eq!(
             parse_place_target("place:docker:docker/sandbox:claude"),
             Some(("docker", Some("docker/sandbox:claude")))
         );
-        assert_eq!(parse_place_target(&place_target("boat", None)), Some(("boat", None)));
+        assert_eq!(
+            parse_place_target(&place_target("boat", None)),
+            Some(("boat", None))
+        );
         assert_eq!(parse_place_target("place:"), None);
         assert_eq!(parse_place_target("device-1"), None);
     }

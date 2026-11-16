@@ -92,9 +92,7 @@ impl EngineRpc {
             });
         }
         let (provider, template) = match (named, &self.sandboxes) {
-            (Some((provider, template)), _) => {
-                (provider.to_owned(), template.map(str::to_owned))
-            }
+            (Some((provider, template)), _) => (provider.to_owned(), template.map(str::to_owned)),
             (None, Some(sandboxes)) => sandboxes.place_of_device(target)?,
             (None, None) => return None,
         };

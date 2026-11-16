@@ -127,14 +127,21 @@ async fn models_on(rpc: &RpcClient, target: Option<&str>, harness: &str) -> Valu
     if let Some(target) = target {
         params["targetDeviceId"] = json!(target);
     }
-    tokio::time::timeout(Duration::from_secs(30), rpc.call(methods::LIST_MODELS, params))
-        .await
-        .expect("answered")
-        .expect("ListModels")
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        rpc.call(methods::LIST_MODELS, params),
+    )
+    .await
+    .expect("answered")
+    .expect("ListModels")
 }
 
 /// The chat's transcript in its sandbox.
-fn transcript(provider: &FakeProvider, sandbox: &str, chat: &str) -> Vec<zeron_doc::SessionMessageEntry> {
+fn transcript(
+    provider: &FakeProvider,
+    sandbox: &str,
+    chat: &str,
+) -> Vec<zeron_doc::SessionMessageEntry> {
     provider
         .with_engine(sandbox, |core| {
             core.doc_host
@@ -261,7 +268,9 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
     let deadline = Instant::now() + Duration::from_secs(60);
     let refused = loop {
         let waiting = provider
-            .with_engine("chat-b", |core| core.doc_host.waiting_messages("chat-b").ok())
+            .with_engine("chat-b", |core| {
+                core.doc_host.waiting_messages("chat-b").ok()
+            })
             .flatten()
             .unwrap_or_default();
         if let Some(message) = waiting
@@ -326,11 +335,10 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
     }
     // Sent again, it no longer waits as refused.
     let waiting = provider
-        .with_engine("chat-b", |core| core.doc_host.waiting_messages("chat-b").ok())
+        .with_engine("chat-b", |core| {
+            core.doc_host.waiting_messages("chat-b").ok()
+        })
         .flatten()
         .unwrap_or_default();
-    assert!(
-        waiting.iter().all(|w| w.failure.is_none()),
-        "{waiting:#?}"
-    );
+    assert!(waiting.iter().all(|w| w.failure.is_none()), "{waiting:#?}");
 }

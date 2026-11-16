@@ -248,7 +248,11 @@ impl FakeProvider {
     }
 
     /// Start an engine in `sandbox`; the receiver fires once it's up.
-    fn spawn_engine(&self, sandbox: &str, config: EngineConfig) -> tokio::sync::oneshot::Receiver<()> {
+    fn spawn_engine(
+        &self,
+        sandbox: &str,
+        config: EngineConfig,
+    ) -> tokio::sync::oneshot::Receiver<()> {
         let state = self.state.clone();
         let sandbox = sandbox.to_owned();
         let agents = self.agents.clone();
