@@ -32,6 +32,7 @@ pub(super) fn handles(method: &str) -> bool {
             | methods::DELETE_STEP_SCRIPT
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
+            | methods::SAVE_SANDBOX_TEMPLATE
             | methods::WAKE_SANDBOX
             | methods::SANDBOX_HOST
             | methods::ADOPT_SANDBOX_PROVIDER
@@ -44,6 +45,13 @@ const ROUTED: &str = "routed";
 /// A device whose last presence beat is this recent is online (beats come
 /// every 15 s; the engine's own `PRESENCE_FRESH_MS`).
 const ONLINE_WITHIN_SECS: i64 = 45;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveTemplateParams {
+    chat_id: String,
+    name: String,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,6 +195,7 @@ impl EngineRpc {
                 | methods::RUN_SANDBOX_STEPS_AGAIN
                 | methods::CHECK_SANDBOX
                 | methods::START_SANDBOX_FRESH
+                | methods::SAVE_SANDBOX_TEMPLATE
                 | methods::WAKE_SANDBOX
         ) && !routed(&params)
         {
@@ -195,6 +204,19 @@ impl EngineRpc {
                 && let Some(keeper) = self.chat_keeper(&p.chat_id).await
             {
                 return self.forward(&keeper, method, route(params)).await;
+            }
+        }
+        // A provider's templates come from its host device.
+        if method == methods::LIST_SANDBOX_TEMPLATES && !routed(&params) {
+            let p: ProviderParams = parse_params(params.clone())?;
+            if !self.keeps(sandboxes, &p.provider)
+                && let Some(host) = self
+                    .workspace
+                    .sandbox_host(&p.provider)
+                    .map(|host| host.host_device_id)
+                    .filter(|host| host != self.this_device())
+            {
+                return self.forward(&host, method, route(params)).await;
             }
         }
         match method {
@@ -335,6 +357,14 @@ impl EngineRpc {
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SAVE_SANDBOX_TEMPLATE => {
+                let p: SaveTemplateParams = parse_params(params)?;
+                let template = sandboxes
+                    .save_template(self.sandbox_host(), &p.chat_id, &p.name)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "template": template }))
             }
             methods::WAKE_SANDBOX => {
                 let p: ChatParams = parse_params(params)?;

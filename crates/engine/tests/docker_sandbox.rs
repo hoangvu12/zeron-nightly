@@ -57,23 +57,11 @@ fn provider(stub: &DockerStub, dir: &std::path::Path) -> DockerProvider {
 }
 
 #[tokio::test]
-async fn it_names_itself_and_supplies_everything_but_save_template() {
+async fn it_names_itself_and_supplies_every_operation() {
     let fx = Fixture::new().await;
     let p = &fx.provider;
     assert_eq!((p.id(), p.name()), ("docker", "Docker Sandbox"));
-    for op in [
-        Ops::CREATE,
-        Ops::START,
-        Ops::STOP,
-        Ops::DELETE,
-        Ops::RUN,
-        Ops::TEMPLATES,
-        Ops::CONNECT,
-        Ops::EXTEND,
-    ] {
-        assert!(p.ops().contains(op), "{:?}", op.names());
-    }
-    assert!(!p.ops().contains(Ops::SAVE_TEMPLATE));
+    assert_eq!(p.ops(), Ops::ALL, "{:?}", p.ops().names());
     assert_eq!(p.workdir("chat-1"), "/home/agent/workspace");
     // Not connected: every call says so, as a Config error.
     assert_eq!(p.account(), None);
@@ -287,6 +275,57 @@ async fn a_template_keeps_its_own_size() {
     assert!(body.get("resources").is_none());
     assert!(body["cloud"].get("imageRef").is_none());
     assert_eq!(body["cloud"]["onTimeout"], "ON_TIMEOUT_STOP");
+}
+
+#[tokio::test]
+async fn save_template_snapshots_the_disk_and_the_template_is_listed() {
+    let fx = Fixture::connected().await;
+    fx.stub.add_box("sbx_a", "SANDBOX_STATUS_RUNNING");
+    // Docker takes a while: the operation is done after a few polls.
+    fx.stub.state().snapshot_polls = 3;
+    let saved = fx
+        .provider
+        .save_template("sbx_a", "reportly-dev")
+        .await
+        .unwrap();
+    assert_eq!(saved.name, "reportly-dev");
+    assert!(saved.id.starts_with("tmpl_"), "{}", saved.id);
+
+    let create = fx.stub.seen("SnapshotService/CreateSnapshot").pop().unwrap();
+    // The disk only: a memory capture would keep the running engine's lent
+    // sign-in, which lives in memory alone.
+    assert_eq!(
+        create.body,
+        json!({"sandbox": {"id": "sbx_a"}, "name": "reportly-dev",
+               "captureMode": "CAPTURE_MODE_DISK"})
+    );
+    assert!(fx.stub.seen("OperationService/GetOperation").len() >= 3);
+    // The sandbox keeps running.
+    assert_eq!(fx.stub.state().boxes["sbx_a"].status, "SANDBOX_STATUS_RUNNING");
+
+    // In the template picker.
+    let templates = fx.provider.templates().await.unwrap();
+    assert!(
+        templates.iter().any(|t| t.id == saved.id && t.name == "reportly-dev"),
+        "{templates:?}"
+    );
+
+    // A sandbox that's gone.
+    let err = fx
+        .provider
+        .save_template("sbx_gone", "x")
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NotFound, "{err}");
+
+    // Docker failing the snapshot says why.
+    fx.stub.state().snapshot_fails = Some("disk capture failed".into());
+    let err = fx
+        .provider
+        .save_template("sbx_a", "again")
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("disk capture failed"), "{err}");
 }
 
 #[tokio::test]

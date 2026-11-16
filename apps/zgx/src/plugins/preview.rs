@@ -103,6 +103,8 @@ pub const BLOCKED: &[&str] = &[
     "cloud.set_machine",
     // (A sandbox provider's key, its host device, the user's step scripts.)
     "sandbox_settings.change",
+    // (Restarts Zeron in a sandbox, and saves it at the provider.)
+    "sandbox_templates.save",
 ];
 
 pub fn blocked(action: &str) -> bool {
