@@ -33,6 +33,8 @@ export type Props = {
 	disabled: Props_disabled,
 	-- Its accessible name when it has no label to say it.
 	name: Label?,
+	-- Its words in the code font (a name a provider lists as typed, a path).
+	mono: boolean?,
 	-- A ref to the input itself, for what focuses or selects it from outside.
 	input_ref: Ref?,
 	inputmode: ("text" | "decimal" | "numeric" | "tel" | "search" | "email" | "url" | "none")?,
@@ -128,7 +130,7 @@ return ui.component(function(props: Props): Node
 	end
 
 	local function input(secure: boolean): Node
-		return ui.input(field.input({
+		local p = field.input({
 			ref = input_ref,
 			value = value,
 			-- (Named by its placeholder, as a plain or changing string, or a
@@ -158,7 +160,11 @@ return ui.component(function(props: Props): Node
 				end
 				return false
 			end,
-		}, size, focused))
+		}, size, focused)
+		if props.mono then
+			(p :: any).font = "$font.mono"
+		end
+		return ui.input(p)
 	end
 
 	local children: { any } = {}

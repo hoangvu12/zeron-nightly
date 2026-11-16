@@ -143,6 +143,10 @@ export type Props = {
 	-- caller's own rows.
 	head: Node?,
 	extra: Node?,
+	-- A title over the items, in their list (a submenu's "Templates"), and
+	-- a check at the chosen one's end besides its selected state.
+	list_heading: (string | Message)?,
+	check: boolean?,
 	-- The panel's width (232 by default).
 	width: number?,
 	-- The caller's own trigger in place of the chip (a row of another
@@ -1178,6 +1182,11 @@ return ui.component(function(props: Props): Node
 								then ui.div { self = "center", shrink = 0, color = "$warning", Icon { name = "wifi-off", size = 12 } }
 								else nil,
 							trailing(item),
+							if props.check
+								then ui.show(function(): boolean
+									return value:get() == item.value
+								end, ui.div { class = "dropdown-check", self = "center", shrink = 0, color = "$text.secondary", Icon { name = "check", size = 14 } })
+								else nil,
 							-- Folded, a chevron where the check is: it opens.
 							if props.expanded
 								then ui.show(function()
@@ -1301,7 +1310,14 @@ return ui.component(function(props: Props): Node
 				if listless then
 					-- (Nothing to list.)
 				elseif props.search == false then
-					table.insert(rows, gated(ui.column { w_full = true, p = "$space.1", gap = "$zeron.list.gap", table.unpack(items) }))
+					local column: { [any]: any } = { w_full = true, p = "$space.1", gap = "$zeron.list.gap" }
+					if props.list_heading then
+						table.insert(column, Menu.Heading { props.list_heading, first = true })
+					end
+					for _, node in items do
+						table.insert(column, node)
+					end
+					table.insert(rows, gated(ui.column(column)))
 				else
 					local list = ui.scroll {
 						w_full = true,
