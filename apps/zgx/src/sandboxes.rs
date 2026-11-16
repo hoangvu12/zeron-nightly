@@ -176,7 +176,9 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
         if chat.is_empty() || STATE.with(|s| s.borrow().watches.contains_key(&chat)) {
             return;
         }
-        STATE.with(|s| s.borrow_mut().steps.entry(chat.clone()).or_insert(Json::Null));
+        STATE.with(|s| {
+            s.borrow_mut().steps.entry(chat.clone()).or_insert(Json::Null);
+        });
         if let Some(rpc) = engine::get().current() {
             let watch = follow(&rpc, &chat);
             STATE.with(|s| s.borrow_mut().watches.insert(chat, watch));
