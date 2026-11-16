@@ -11,15 +11,15 @@
 //! the sandbox's engine when the sandbox is Ready.
 
 pub mod docker;
-mod keys;
 mod host_device;
+mod keys;
 mod provider;
 mod recovery;
 mod steps;
 
-pub use keys::KeySlot;
 pub(crate) use host_device::Handover;
 pub use host_device::pick_host;
+pub use keys::KeySlot;
 pub use provider::{
     Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,
     Placement, ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
