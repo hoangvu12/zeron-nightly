@@ -1,7 +1,8 @@
 -- What a chat on a place says while its sandbox starts (spec #37, screen
 -- 05): one compact line above the composer, the step it's on and how long
 -- it's been at it; a step that failed says so, with its error and Run again
--- (screen 12). Ready, or not on a place: nothing. Pure: `steps` as
+-- (screen 12); waking (#43) says how long. Ready, asleep (the deck's notice
+-- says that), or not on a place: nothing. Pure: `steps` as
 -- account/sandboxes has them (`{ state, step?, since, error? }`, `since`
 -- and `now` in Unix seconds), so tests read it without `ui`.
 
@@ -54,6 +55,14 @@ function M.line(steps: { state: string, step: string?, since: number?, error: st
 		local name = M.step_name(steps.step)
 		local took = M.elapsed(now - (steps.since or now))
 		return { text = say("starting", `{name} · {took}`, { step = name, elapsed = took }), spinner = true }
+	elseif steps.state == "waking" then
+		-- (#43, screens 09 and 11: woken by a send, or by Wake.)
+		local took = M.elapsed(now - (steps.since or now))
+		return { text = say("waking", `Waking the sandbox · {took}`, { elapsed = took }), spinner = true }
+	elseif steps.state == "failed" and steps.step == "wake" then
+		-- A wake that failed is its alert's to say, with Wake
+		-- (screens/chat/sandbox_machine).
+		return nil
 	elseif steps.state == "failed" then
 		local name = M.step_name(steps.step)
 		local text = if steps.error and steps.error ~= ""

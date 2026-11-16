@@ -66,6 +66,7 @@ local state = require("@app/screens/panel/state")
 -- Lanes seen as their tabs come to the front (the panel home's done checks).
 require("@app/screens/panel/lanes_seen")
 local Files = require("@app/screens/files")
+local Asleep = require("@app/screens/panel/asleep")
 local FilePaths = require("@app/screens/files/paths")
 -- The shell's layout (whether a session's panel is expanded), if it's there
 -- (a fixture mounts the panel alone).
@@ -1259,7 +1260,19 @@ M.Panel = ui.component(function(props: Props): Node
 	-- A tab's body: its kind's view, keyed by the tab (a real swap: another
 	-- tab is another view; each keeps its state outside, so coming back
 	-- finds it as it was).
+	local body_of: (k: string, tab: Tab) -> Node
+	-- (Files, Terminal and Diffs reach the chat's sandbox: while it's asleep,
+	-- they offer Wake in their place.)
 	local function body(k: string, tab: Tab): Node
+		local reaches = tab.kind == "files" or tab.kind == "terminal" or (tab.kind == "plugin" and tab.plugin == "git")
+		if reaches and string.sub(k, 1, 5) == "chat:" then
+			return Asleep.gate(string.sub(k, 6), function(): Node
+				return body_of(k, tab)
+			end)
+		end
+		return body_of(k, tab)
+	end
+	function body_of(k: string, tab: Tab): Node
 		if (tab.kind == "side_chat" or tab.kind == "subagent") and Lanes then
 			return Lanes.Tab { tab = tab }
 		end

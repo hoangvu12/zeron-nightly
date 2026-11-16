@@ -233,7 +233,8 @@ pub mod methods {
     /// there; the account shows in that device's `ListSandboxProviders`.
     pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
-    /// state: starting|ready|failed|gone, step, since, error, diskFull,
+    /// state: starting|ready|failed|gone|sleeping|asleep|waking, step,
+    /// since, error, diskFull,
     /// steps: [{step, state}], scripts: [{hook, step, name, script, for,
     /// state: running|failed, since, error}]}`), or `null` for a chat not on
     /// a place this device keeps. `scripts` holds the step script running
@@ -269,6 +270,10 @@ pub mod methods {
     /// `{chatId}` → `{ok}`: Start fresh, a new sandbox for the chat (the
     /// old one deleted, if it's still there) with the chat's pushed branch.
     pub const START_SANDBOX_FRESH: &str = "StartSandboxFresh";
+    /// `{chatId}` → `{ok}`: wake the chat's sleeping sandbox (Wake, in a
+    /// chat's Files, Terminal or Diffs); its steps read `waking`, then
+    /// `ready`. A send wakes it by itself; opening the chat never does.
+    pub const WAKE_SANDBOX: &str = "WakeSandbox";
     // The host device (spec #37): one of the user's devices keeps each
     // provider's key and does its calls; the others ask it. A chat's
     // Sandbox* methods and `createChat` on a place go to it
