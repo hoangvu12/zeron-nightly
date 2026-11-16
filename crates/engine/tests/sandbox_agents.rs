@@ -250,9 +250,11 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
         .workspace
         .rename_chat("chat-b", "Pre-titled")
         .unwrap();
+    // (Once it's up on its template's agents: the fake shapes its engine
+    // after boot, and a message waiting from before could be taken first.)
+    ready(&rpc, "chat-b").await;
     // The user picked Codex; the template doesn't have it.
     send(&rpc, "chat-b", &cwd, HarnessId::Codex, "m-1").await;
-    ready(&rpc, "chat-b").await;
 
     // The sandbox refuses it with a reason a client can show, and the
     // message waits to be sent again.
@@ -268,7 +270,24 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
         {
             break message;
         }
-        assert!(Instant::now() < deadline, "m-1 was never refused");
+        if Instant::now() >= deadline {
+            let commands = provider
+                .with_engine("chat-b", |core| {
+                    core.doc_host
+                        .open("chat-b")
+                        .ok()
+                        .and_then(|h| h.doc().read_commands().ok())
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|c| format!("{} {:?} {:?}", c.id, c.status, c.resolution))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            panic!(
+                "m-1 was never refused. Commands in the sandbox: {commands:#?}; transcript: {:#?}",
+                transcript(&provider, "chat-b", "chat-b")
+            );
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let failure = refused.failure.unwrap();
