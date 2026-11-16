@@ -596,3 +596,42 @@ async fn a_failed_clone_shows_its_error_and_runs_again() {
     );
     replied(&provider, "chat-c", "chat-c", Duration::from_secs(60)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_in_the_projects_origin_never_reaches_the_sandbox_or_its_error() {
+    const TOKEN: &str = "ghp_do-not-leak-0123456789";
+    let edge = ScriptedEdge::with_registry().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let host_dir = dirs.path().join("host");
+    let host = host_device(&host_dir, &edge).await;
+    let provider = FakeProvider::cloud(&dirs.path().join("cloud"));
+    host.core().sandboxes.register(provider.clone());
+    let rpc = memory_client(host.core().rpc_service());
+    // The project's origin carries a sign-in; nothing answers there.
+    let path = dirs.path().join("reportly");
+    std::fs::create_dir_all(&path).unwrap();
+    git(&path, &["init", "-q", "-b", "main"]);
+    let origin = format!("https://someone:{TOKEN}@127.0.0.1:9/acme/reportly.git");
+    git(&path, &["remote", "add", "origin", &origin]);
+    add_project(&rpc, &host, &path).await;
+
+    create_on_place(&rpc, "chat-t", "fake").await;
+    let failed = steps_until(&rpc, "chat-t", Duration::from_secs(60), |s| {
+        s["state"] == "failed"
+    })
+    .await;
+    assert_eq!(failed["step"], "getCode", "{failed:#}");
+    assert!(!failed.to_string().contains(TOKEN), "{failed:#}");
+    // The sandbox cloned the repository without it.
+    let calls = provider.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("git clone https://127.0.0.1:9/acme/reportly.git")),
+        "{calls:#?}"
+    );
+    assert!(calls.iter().all(|c| !c.contains(TOKEN)), "{calls:#?}");
+    // Nor is it kept in what this device remembers of the chat.
+    let kept = std::fs::read_to_string(host_dir.join("sandboxes.json")).unwrap();
+    assert!(!kept.contains(TOKEN));
+}

@@ -1035,13 +1035,38 @@ async fn repo_url(host: &Host, record: &Record) -> Option<String> {
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
             .filter(|url| !url.is_empty());
-        if origin.is_some() {
-            return origin;
+        if let Some(origin) = origin {
+            // GitHub access comes from the sandbox's secrets: a sign-in in
+            // the URL would land in its clone (and a saved template).
+            return Some(without_credentials(&origin));
         }
     }
     space
         .github_repo
         .map(|repo| format!("https://github.com/{repo}.git"))
+}
+
+/// `url` without a user and password (`https://user:token@host/…`): an
+/// HTTP(S) remote's sign-in. An SSH remote's user (`git@…`) is no secret
+/// and stays.
+fn without_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return url.to_owned();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
+/// What a step says went wrong, with anything secret-looking hidden: it's
+/// shown on every device and kept in `sandboxes.json`.
+fn said(error: String) -> String {
+    zeron_proto::redact::redact_output(&error)
 }
 
 /// Get the code: clone (unless a run before did) and check out the chat's
@@ -1065,9 +1090,9 @@ async fn get_code(
             .timeout(CLONE_TIMEOUT);
         let done = run_to_end(provider, sandbox, clone)
             .await
-            .map_err(|e| format!("Couldn't clone {url}: {e}"))?;
+            .map_err(|e| said(format!("Couldn't clone {url}: {e}")))?;
         if !done.exit.success() {
-            return Err(format!("Couldn't clone {url}:\n{}", done.failure()));
+            return Err(said(format!("Couldn't clone {url}:\n{}", done.failure())));
         }
     }
     // The chat's branch as it is here (Run again), else as it was pushed (a
@@ -1096,9 +1121,9 @@ async fn get_code(
     };
     let done = run_to_end(provider, sandbox, checkout)
         .await
-        .map_err(|e| format!("Couldn't check out {branch}: {e}"))?;
+        .map_err(|e| said(format!("Couldn't check out {branch}: {e}")))?;
     if !done.exit.success() {
-        return Err(format!("Couldn't check out {branch}:\n{}", done.failure()));
+        return Err(said(format!("Couldn't check out {branch}:\n{}", done.failure())));
     }
     Ok(())
 }
@@ -1480,6 +1505,33 @@ mod tests {
             Some("app")
         );
         assert_eq!(checkout_folder(&space("/", None)), None);
+    }
+
+    #[test]
+    fn a_remotes_sign_in_never_goes_to_the_sandbox() {
+        for (url, cloned) in [
+            (
+                "https://vu:ghp_secret@github.com/acme/reportly.git",
+                "https://github.com/acme/reportly.git",
+            ),
+            (
+                "https://x-access-token:tok@github.com:443/acme/r?x=1",
+                "https://github.com:443/acme/r?x=1",
+            ),
+            ("HTTP://tok@host/r", "HTTP://host/r"),
+            (
+                "https://github.com/acme/reportly.git",
+                "https://github.com/acme/reportly.git",
+            ),
+            // An `@` in the path isn't a sign-in.
+            ("https://host/a@b/r.git", "https://host/a@b/r.git"),
+            // SSH's user isn't a secret.
+            ("git@github.com:acme/reportly.git", "git@github.com:acme/reportly.git"),
+            ("ssh://git@github.com/acme/r.git", "ssh://git@github.com/acme/r.git"),
+            ("/home/u/origin.git", "/home/u/origin.git"),
+        ] {
+            assert_eq!(without_credentials(url), cloned, "{url}");
+        }
     }
 
     #[test]
