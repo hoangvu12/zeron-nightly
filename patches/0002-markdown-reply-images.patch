@@ -1,4 +1,4 @@
-From 7d959081e1b6193987158332b8b1ba0c2c2321ee Mon Sep 17 00:00:00 2001
+From 2e4d0e1fac5464e469f8ad06d669b0d5da948a95 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 5 Nov 2026 23:19:58 +0700
 Subject: [PATCH] Markdown images in replies: any local folder, kept when the
@@ -485,7 +485,7 @@ index 0000000000000000000000000000000000000000..ea93405787190af78ed48429e56cda7a
 +    }
 +}
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0feaf61099 100644
+index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe097d01a73 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -409,43 +409,20 @@ struct OpenTerminalParams {
@@ -540,7 +540,7 @@ index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0f
  }
  
  /// A cwd the user (or a project-less chat) meant as "host home", not a folder.
-@@ -1435,12 +1412,10 @@ impl EngineRpc {
+@@ -1459,12 +1436,10 @@ impl EngineRpc {
          self.file_search_root(p).await
      }
  
@@ -557,7 +557,7 @@ index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0f
          let refused = |why: &str| RpcError::BadParams(why.into());
          let chat = self
              .workspace
-@@ -1450,20 +1425,10 @@ impl EngineRpc {
+@@ -1474,20 +1449,10 @@ impl EngineRpc {
          if chat.device_id != self.doc_host.device_id() {
              return Err(refused("chat belongs to another device"));
          }
@@ -580,7 +580,7 @@ index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0f
      }
  
      /// Accept only a checkout already named by a local chat or contained in a
-@@ -5638,9 +5603,16 @@ impl RpcService for EngineRpc {
+@@ -5693,9 +5658,16 @@ impl RpcService for EngineRpc {
              }
              methods::READ_CHAT_IMAGE_CHUNK => {
                  let p: ReadChatImageChunkParams = parse_params(params)?;
@@ -599,7 +599,7 @@ index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0f
                  })
                  .await
                  .map_err(|e| RpcError::Failed(e.to_string()))?
-@@ -5650,7 +5622,7 @@ impl RpcService for EngineRpc {
+@@ -5705,7 +5677,7 @@ impl RpcService for EngineRpc {
              methods::READ_TOOL_OUTPUT => {
                  let p: ReadToolOutputParams = parse_params(params)?;
                  // Only the host has the journal; the same chat check as a
@@ -608,7 +608,7 @@ index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0f
                  // its root chat's.
                  let chat_id = crate::tool_output::journal_chat(&p.chat_id);
                  let chat = self
-@@ -6602,58 +6574,24 @@ mod tests {
+@@ -6669,58 +6641,24 @@ mod tests {
      }
  
      #[test]
@@ -677,10 +677,10 @@ index ebfc39d3d01fe65c61c8d5301953dc1c65c18ab4..79862336675232ebbab7505c99d9ba0f
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 635f646b701ad89bc219fe299f7e7b3c6d02c9f6..baeaf86eafae8f064299bf1960755e6dfe4b0f92 100644
+index 6f5f098d1f6b17f9658a4274295cb55c0097397c..50fb469d3965643e9d01ab397272afc15eb5d664 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -2761,6 +2761,27 @@ impl Inner {
+@@ -2905,6 +2905,27 @@ impl Inner {
          }
      }
  
@@ -708,7 +708,7 @@ index 635f646b701ad89bc219fe299f7e7b3c6d02c9f6..baeaf86eafae8f064299bf1960755e6d
      /// Record the chat's harness-native session id (and its cwd): live-process
      /// cache plus the durable workspace chat row — the row is what survives an
      /// engine restart (zeron sessions.ts:1039).
-@@ -4892,7 +4913,9 @@ async fn drive_run(
+@@ -5038,7 +5059,9 @@ async fn drive_run(
                          ) {
                              tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
                          }
@@ -719,7 +719,7 @@ index 635f646b701ad89bc219fe299f7e7b3c6d02c9f6..baeaf86eafae8f064299bf1960755e6d
                      }
                      folded.clear();
                      dirty = false;
-@@ -5447,7 +5470,9 @@ async fn drive_run(
+@@ -5593,7 +5616,9 @@ async fn drive_run(
              ) {
                  tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
              }
@@ -730,7 +730,7 @@ index 635f646b701ad89bc219fe299f7e7b3c6d02c9f6..baeaf86eafae8f064299bf1960755e6d
              folded.clear();
              dirty = false;
              entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
-@@ -5586,7 +5611,9 @@ async fn drive_run(
+@@ -5732,7 +5757,9 @@ async fn drive_run(
                  ) {
                      tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
                  }
@@ -742,7 +742,7 @@ index 635f646b701ad89bc219fe299f7e7b3c6d02c9f6..baeaf86eafae8f064299bf1960755e6d
              // The turn's session has now seen the transcript through its reply.
              if let Some((session_id, cwd)) = &run_session {
 diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
-index e2b87ffe57c3c6b4ed9ae1d3d57c2d538b659582..8841a081002f32020c2313bcd19d8d6b419561a9 100644
+index bd8aed720805287f66f1e32d48c560611f20acb1..58a2320887d41ac6eb37dcf8c3302e7135cb5cd7 100644
 --- a/crates/engine/src/uploads.rs
 +++ b/crates/engine/src/uploads.rs
 @@ -17,8 +17,8 @@
@@ -1033,10 +1033,10 @@ index e2b87ffe57c3c6b4ed9ae1d3d57c2d538b659582..8841a081002f32020c2313bcd19d8d6b
          Some(("png", "image/png"))
      } else if bytes.starts_with(b"\xff\xd8\xff") {
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 426fa5c5eabb8a6dfd4492c67d12f85cb0144611..0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2 100644
+index 4741290df41600828e0e829a291a5ac2d817607c..e9954e23be971c4ff23ea0c815ed9de422c51f82 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
-@@ -3837,11 +3837,11 @@ async fn publish_image_lands_in_the_live_turn() {
+@@ -3844,11 +3844,11 @@ async fn publish_image_lands_in_the_live_turn() {
      core.shutdown().await;
  }
  
@@ -1052,7 +1052,7 @@ index 426fa5c5eabb8a6dfd4492c67d12f85cb0144611..0e6b7ba1fc5713ed67a4d27a1fc412ff
      use base64::Engine as _;
      let dir = tempfile::tempdir().unwrap();
      let core = assemble(
-@@ -3867,14 +3867,6 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+@@ -3874,14 +3874,6 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
      let folder = |path: &std::path::Path| Some(path.to_string_lossy().into_owned());
      for (chat, device, cwd) in [
          ("ours", here.as_str(), folder(ours.path())),
@@ -1067,7 +1067,7 @@ index 426fa5c5eabb8a6dfd4492c67d12f85cb0144611..0e6b7ba1fc5713ed67a4d27a1fc412ff
          ("remote", "another-device", folder(ours.path())),
          (
              "scratch",
-@@ -3886,13 +3878,14 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+@@ -3893,13 +3885,14 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
              .create_chat(chat, None, Some(device), None, cwd)
              .unwrap();
      }
@@ -1084,7 +1084,7 @@ index 426fa5c5eabb8a6dfd4492c67d12f85cb0144611..0e6b7ba1fc5713ed67a4d27a1fc412ff
      let data = chunk["data"].as_str().unwrap();
      assert_eq!(
          base64::engine::general_purpose::STANDARD
-@@ -3901,29 +3894,116 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+@@ -3908,29 +3901,116 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
          png
      );
      assert_eq!(chunk["mimeType"], "image/png");
