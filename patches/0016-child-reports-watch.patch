@@ -1,4 +1,4 @@
-From 0dfd4f8b1720aed175610c1446eba30c028f7bf3 Mon Sep 17 00:00:00 2001
+From 7fffc506ce2c37279ae16b63c2c7d51be068d301 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 1/4] engine: the parent's host reports for children whose host
@@ -779,10 +779,10 @@ index 7d68e277083188a88a677bdd76821c68ad90bcd5..fd1d1f439301478a6ecc5084747791a4
              assert_eq!(report_key_parts(&key, child), Some((asked.to_owned(), stage.to_owned())), "{key}");
          }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 81b5e1bd73c594de239fac3cf84c064a9ae52358..26d2fd5ae4b0258ad06968018957bd234c0ee288 100644
+index 137b637a65672cb99bb3547b19ed0efe31900a2c..745d6316f86dc8ccf4df5a17dddbd9a3728bced1 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -520,6 +520,9 @@ impl SessionsEngine {
+@@ -527,6 +527,9 @@ impl SessionsEngine {
              let Some(host) = engine.inner.doc_host() else {
                  return;
              };
@@ -792,7 +792,7 @@ index 81b5e1bd73c594de239fac3cf84c064a9ae52358..26d2fd5ae4b0258ad06968018957bd23
              let floor = engine.inner.journal.child_reports_since(now_ms()) - reports::OWED_FLOOR_MARGIN_MS;
              let stopped = std::mem::take(&mut *lock(&engine.inner.boot_stops));
              // Revived, or on its way to it: it reports as it settles.
-@@ -537,6 +540,23 @@ impl SessionsEngine {
+@@ -544,6 +547,23 @@ impl SessionsEngine {
          });
      }
  
@@ -816,7 +816,7 @@ index 81b5e1bd73c594de239fac3cf84c064a9ae52358..26d2fd5ae4b0258ad06968018957bd23
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -7665,6 +7685,7 @@ mod tests {
+@@ -7789,6 +7809,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
          unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
@@ -824,7 +824,7 @@ index 81b5e1bd73c594de239fac3cf84c064a9ae52358..26d2fd5ae4b0258ad06968018957bd23
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9000,6 +9021,209 @@ mod tests {
+@@ -9124,6 +9145,209 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1071,7 +1071,7 @@ index cb296456f05e0f8c4f245004a1d6192cef51d611..442fb53a2fb5d2357e9533b1000a3ef5
 2.55.0.windows.2
 
 
-From 4f42dcb2c71956801f4827ede2b359f022a622ff Mon Sep 17 00:00:00 2001
+From 67d93f590306ecbd49ca987f90f12071fecdbb4a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
@@ -1082,10 +1082,10 @@ Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
  1 file changed, 71 insertions(+), 17 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a71359cb7 100644
+index 4c18701772a8c278927787cc657d02c6a8920bf4..d1d5eefa88aaf9a705e28ff60e86cd1dacb041ac 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1075,8 +1075,8 @@ impl Tools {
+@@ -1085,8 +1085,8 @@ impl Tools {
          };
          let joined = match &created {
              Err(_) => Joined::Failed,
@@ -1096,7 +1096,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
              Ok(created) if !created.reports => Joined::Out(chat_id.clone(), "its host's Zeron doesn't report back"),
              Ok(Created { asked: None, .. }) => Joined::Out(chat_id.clone(), "it was given no prompt, so it has nothing to report"),
              Ok(Created { asked: Some(asked), .. }) => {
-@@ -1568,12 +1568,13 @@ impl Tools {
+@@ -1581,12 +1581,13 @@ impl Tools {
          }
          // A child's host reports its turns back only from the version that
          // advertises it ([`Self::reports_back`]): the reply says so, and a
@@ -1113,7 +1113,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
              result["reportsBack"] = json!(warning);
          }
          let mut asked = None;
-@@ -1628,7 +1629,7 @@ impl Tools {
+@@ -1641,7 +1642,7 @@ impl Tools {
                      .await?;
              }
          }
@@ -1122,7 +1122,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
      }
  
      async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
-@@ -1717,9 +1718,9 @@ impl Tools {
+@@ -1730,9 +1731,9 @@ impl Tools {
              .await?;
          result["sent"] = delivered.receipt;
          // A request to a child of this chat's: its answer may not come back.
@@ -1135,7 +1135,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
          {
              result["reportsBack"] = json!(warning);
          }
-@@ -1950,20 +1951,41 @@ impl Tools {
+@@ -1963,20 +1964,41 @@ impl Tools {
          }
      }
  
@@ -1185,7 +1185,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
      }
  
      /// Whether `chat`'s host holds a child's FYI for its next wake
-@@ -2308,6 +2330,9 @@ mod tests {
+@@ -2321,6 +2343,9 @@ mod tests {
          fyi: bool,
          /// `dev-local` keeps groups of children (`child-reports-groups`).
          groups: bool,
@@ -1195,7 +1195,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
      }
  
      fn stream(item: Value) -> RpcReply {
-@@ -2349,6 +2374,7 @@ mod tests {
+@@ -2362,6 +2387,7 @@ mod tests {
                          Some("child-reports"),
                          self.fyi.then_some("child-reports-fyi"),
                          self.groups.then_some("child-reports-groups"),
@@ -1203,7 +1203,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
                      ]
                      .into_iter()
                      .flatten()
-@@ -3037,6 +3063,34 @@ mod tests {
+@@ -3050,6 +3076,34 @@ mod tests {
          assert!(alone.get("reportsBack").is_none(), "{alone}");
      }
  
@@ -1242,7 +1242,7 @@ index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a
 2.55.0.windows.2
 
 
-From 1d94658ce8270f14ed2d34ff10f2eb8252a79dba Mon Sep 17 00:00:00 2001
+From 048dbd3756a261a1e3e14efcc2c2469cd507049b Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 15:37:33 +0700
 Subject: [PATCH 3/4] engine: the parent's watch reports only the turn its
@@ -1713,10 +1713,10 @@ index fd1d1f439301478a6ecc5084747791a4f3fe605e..78bbf9426dba94d4a110f2649d9ae61a
          }
      };
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 26d2fd5ae4b0258ad06968018957bd234c0ee288..ea86638f6abe4fa7758763ea6da948498ea89a92 100644
+index 745d6316f86dc8ccf4df5a17dddbd9a3728bced1..f12a566e03d03087b1f5a1d939d557d0a67a2e06 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -7686,6 +7686,7 @@ mod tests {
+@@ -7810,6 +7810,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
          unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
          unsafe { std::env::set_var("ZERON_REPORT_UNSYNCED_MS", "3000") };
@@ -1724,7 +1724,7 @@ index 26d2fd5ae4b0258ad06968018957bd234c0ee288..ea86638f6abe4fa7758763ea6da94849
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9069,6 +9070,36 @@ mod tests {
+@@ -9193,6 +9194,36 @@ mod tests {
              self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
          }
  
@@ -1761,7 +1761,7 @@ index 26d2fd5ae4b0258ad06968018957bd234c0ee288..ea86638f6abe4fa7758763ea6da94849
          /// `kid-r`'s registry row from the laptop: `status`, its last turn
          /// having ended `outcome` `ago` ms ago, its last finished answer
          /// `completed`.
-@@ -9224,6 +9255,78 @@ mod tests {
+@@ -9348,6 +9379,78 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1844,7 +1844,7 @@ index 26d2fd5ae4b0258ad06968018957bd234c0ee288..ea86638f6abe4fa7758763ea6da94849
 2.55.0.windows.2
 
 
-From ff5a0befec0c4c484eaf447b3fc8bce22f8c5d89 Mon Sep 17 00:00:00 2001
+From 104ff56c7801cc7fde34c449d16758ebdd71f5ec Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 17:51:08 +0700
 Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
@@ -2138,10 +2138,10 @@ index 78bbf9426dba94d4a110f2649d9ae61a07a4ae99..0870898c5bba6aae44602a477cd28c91
      }
      let first = match *settled {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index ea86638f6abe4fa7758763ea6da948498ea89a92..298c4219ebdee13510496860b0c87058768cb479 100644
+index f12a566e03d03087b1f5a1d939d557d0a67a2e06..5b814496617c20a05bd80c870e7ddc0cc670fd49 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -9042,11 +9042,17 @@ mod tests {
+@@ -9166,11 +9166,17 @@ mod tests {
  
          /// The laptop's device row, its Zeron having `caps`, online.
          fn laptop(&self, caps: &[&str]) {
@@ -2160,7 +2160,7 @@ index ea86638f6abe4fa7758763ea6da948498ea89a92..298c4219ebdee13510496860b0c87058
                  created_at: None,
                  version: None,
                  cursor_sdk_version: None,
-@@ -9100,6 +9106,25 @@ mod tests {
+@@ -9224,6 +9230,25 @@ mod tests {
              self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
          }
  
@@ -2186,7 +2186,7 @@ index ea86638f6abe4fa7758763ea6da948498ea89a92..298c4219ebdee13510496860b0c87058
          /// `kid-r`'s registry row from the laptop: `status`, its last turn
          /// having ended `outcome` `ago` ms ago, its last finished answer
          /// `completed`.
-@@ -9327,6 +9352,83 @@ mod tests {
+@@ -9451,6 +9476,83 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  

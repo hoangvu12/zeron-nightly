@@ -1,4 +1,4 @@
-From c51ee3791da1fbf2f624080820a1db595f7d2b79 Mon Sep 17 00:00:00 2001
+From 557c31ad73ff3e2d0a748c8c13b0271fb09a95b2 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:52:16 +0700
 Subject: [PATCH 01/12] engine: a child's progress message can wait for its end
@@ -777,10 +777,10 @@ index 262153e3bc53a6aaf9b44360c4dff978c7631d8a..7421e157932bf7eea4b0d10f31dd7c71
  /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
  /// Why a Cloud chat's reply stopped when its machine lost its place.
 diff --git a/crates/engine/src/rpc/agent_gate.rs b/crates/engine/src/rpc/agent_gate.rs
-index 19151a587b9f4667b50215e2045a70ab720eb916..b197c23d8c0bf8e909b60127b8aaec2402da5a37 100644
+index 6ad41af3875beb4f74d2a713d6cd0e646567f10a..cab044b3786d8a7336b180a95e5940d9bfe3cea1 100644
 --- a/crates/engine/src/rpc/agent_gate.rs
 +++ b/crates/engine/src/rpc/agent_gate.rs
-@@ -123,7 +123,8 @@ impl EngineRpc {
+@@ -132,7 +132,8 @@ impl EngineRpc {
          }
          // A parent's message tells its child the reply comes back on its
          // own; a child's to its parent is a report, held and joined with
@@ -885,7 +885,7 @@ index 9fcdcb9825579c27b946bdd2f27b50221bb6ef3c..19e7983212a5d34b12b466e940a0b45f
      fn says_a_span_as_a_person_would() {
          assert_eq!(ago(42_000), "42 s");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index e3ae3f168847668a325db5be2a0771f99471cc04..f6aa0665e4579803beed639631e25d89c93f0d56 100644
+index ff658103d9ecb3d1ed02c0fbc9786b8e04fabe8d..2e16df22f95f891e5c8a8e2628be6e24d09ae8e6 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -898,7 +898,7 @@ index e3ae3f168847668a325db5be2a0771f99471cc04..f6aa0665e4579803beed639631e25d89
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
-@@ -7643,6 +7644,7 @@ mod tests {
+@@ -7767,6 +7768,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_WINDOW_MS", "1000") };
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_MESSAGE_HOLD_MS", "4000") };
@@ -906,7 +906,7 @@ index e3ae3f168847668a325db5be2a0771f99471cc04..f6aa0665e4579803beed639631e25d89
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -8344,6 +8346,113 @@ mod tests {
+@@ -8468,6 +8470,113 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1021,10 +1021,10 @@ index e3ae3f168847668a325db5be2a0771f99471cc04..f6aa0665e4579803beed639631e25d89
  
      /// A command the subagent runs, open until the test ends it.
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b4f52ce32 100644
+index ca271617c96493c8e1125659a447f9fbc64aeea4..084542d228c01cd55ed347cd51c2232f9b9b1425 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -169,12 +169,13 @@ fn catalog() -> Vec<ToolDef> {
+@@ -174,12 +174,13 @@ fn catalog() -> Vec<ToolDef> {
          },
          ToolDef {
              name: "send_message",
@@ -1040,7 +1040,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
              })),
          },
          ToolDef {
-@@ -703,6 +704,8 @@ struct SendArgs {
+@@ -709,6 +710,8 @@ struct SendArgs {
      #[serde(default)]
      wait: bool,
      timeout_secs: Option<u64>,
@@ -1049,7 +1049,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
  }
  
  #[derive(Deserialize)]
-@@ -1519,8 +1522,15 @@ impl Tools {
+@@ -1532,8 +1535,15 @@ impl Tools {
          // sibling's waiting there, so five children wake it once. Only an
          // explicit steer goes in at once.
          let to_parent = self.writes_to_own_parent(&chat).await;
@@ -1066,7 +1066,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
          let mut result = json!({
              "chatId": chat.id,
              "title": chat.title,
-@@ -1529,7 +1539,11 @@ impl Tools {
+@@ -1542,7 +1552,11 @@ impl Tools {
              .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
              .await?;
          result["sent"] = delivered.receipt;
@@ -1079,7 +1079,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
              result["note"] = json!(
                  "Your parent reads this when its current turn ends, with any other child's waiting. Your final reply reaches it on its own: don't send it again."
              );
-@@ -1739,11 +1753,22 @@ impl Tools {
+@@ -1752,11 +1766,22 @@ impl Tools {
          }
      }
  
@@ -1103,7 +1103,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
          let Some(origin_id) = self.zeron.origin().chat_id.as_deref() else {
              return text.to_owned();
          };
-@@ -1760,6 +1785,9 @@ impl Tools {
+@@ -1773,6 +1798,9 @@ impl Tools {
              }
              _ => short(origin_id).to_owned(),
          };
@@ -1113,7 +1113,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
          zeron_proto::agent_messages::agent_message(&label, origin_id, text)
      }
  
-@@ -2063,6 +2091,8 @@ mod tests {
+@@ -2076,6 +2104,8 @@ mod tests {
          reads: Mutex<Vec<(String, Value)>>,
          /// `DeviceStats` reply; absent = an engine without the method.
          stats: Option<Value>,
@@ -1122,7 +1122,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
      }
  
      fn stream(item: Value) -> RpcReply {
-@@ -2101,7 +2131,8 @@ mod tests {
+@@ -2114,7 +2144,8 @@ mod tests {
                  })),
                  methods::WATCH_DEVICES => stream(json!([{
                      "id": "dev-local", "name": "Laptop", "platform": "linux",
@@ -1132,7 +1132,7 @@ index 0546acb6ad553f1747d9d0d8cb125725a813263d..046f478a26113415ffe78eea4ee9d46b
                  }, {"id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null, "version": "1"}])),
                  methods::WATCH_SPACES => stream(json!([{
                      "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
-@@ -2487,6 +2518,53 @@ mod tests {
+@@ -2500,6 +2531,53 @@ mod tests {
          assert_eq!(params["command"]["request"]["model"], "opus");
      }
  
@@ -1566,7 +1566,7 @@ index 0f829bddce8b35426b8334cb12dca7cce46a3a41..a22878afb902f134bbc3b7201eb23781
 2.55.0.windows.2
 
 
-From 41579a8180498fc8894f5c95e515be2868a39fcb Mon Sep 17 00:00:00 2001
+From d732056c196131dfd7d58b5afb63db65d276b1fb Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:35:55 +0700
 Subject: [PATCH 02/12] engine: a report the parent's agent already read with
@@ -1925,7 +1925,7 @@ index 19e7983212a5d34b12b466e940a0b45f5ebdcb20..9840fbb2824d7358c01ff536458f1507
 +    }
  }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index f6aa0665e4579803beed639631e25d89c93f0d56..69ff152d1afa3acd2def5e3e5953725dc707269e 100644
+index 2e16df22f95f891e5c8a8e2628be6e24d09ae8e6..c98d10b3617be6062b14a3c9757874460526770e 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,7 @@ mod activity;
@@ -1937,7 +1937,7 @@ index f6aa0665e4579803beed639631e25d89c93f0d56..69ff152d1afa3acd2def5e3e5953725d
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -8243,6 +8243,103 @@ mod tests {
+@@ -8367,6 +8367,103 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -2066,7 +2066,7 @@ index a22878afb902f134bbc3b7201eb237817d88a9bb..dbc74eb5c8ed8fda72b6600c8eb3204f
 2.55.0.windows.2
 
 
-From a2475d8b20765e0e3ca8c97046094236cc812d59 Mon Sep 17 00:00:00 2001
+From 2b05efa1f99ab60605995555d5ae18ab06c6eb5e Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:39:25 +0700
 Subject: [PATCH 03/12] engine: a child that keeps coming back is paused after
@@ -2101,10 +2101,10 @@ index feaccfb78355124ab0075f13275a26c7fb489254..7f685918b7a7adcadc8c478dabd956f4
                      // Sent again (a restart, a retry): it's here already.
                      let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index dc0a092e021f0a2e9f0eda80e71d5c14782dd458..1111599c264e85a2c418eecdc7d388606a1fc459 100644
+index 17af5dcbb2514a4ae14819ce9e0185ca0d78bd7d..2dce3da2d8bc6bb4771e44befb0330f51e404e8a 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -339,6 +339,14 @@ impl EngineCore {
+@@ -343,6 +343,14 @@ impl EngineCore {
                  desktop_notify::post_for(&data_dir, &focus, source, &title, body, session).to_owned()
              });
          }
@@ -2527,7 +2527,7 @@ index 9840fbb2824d7358c01ff536458f15079a5dd2ad..88de26cf670a69d5667ddb4746d39fd4
 +    }
  }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 69ff152d1afa3acd2def5e3e5953725dc707269e..8eaadeec80737c448b0e6902071dc4eb8643546a 100644
+index c98d10b3617be6062b14a3c9757874460526770e..ecbffb1dfcf45de5aa60afb23ada3752a8c263a0 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -2540,7 +2540,7 @@ index 69ff152d1afa3acd2def5e3e5953725dc707269e..8eaadeec80737c448b0e6902071dc4eb
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -360,11 +361,17 @@ struct Inner {
+@@ -365,11 +366,17 @@ struct Inner {
      /// What each child chat hosted here has reported to its parent (see
      /// [`reports`]).
      reported: Arc<reports::Reported>,
@@ -2558,7 +2558,7 @@ index 69ff152d1afa3acd2def5e3e5953725dc707269e..8eaadeec80737c448b0e6902071dc4eb
  fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
      mutex.lock().unwrap_or_else(PoisonError::into_inner)
  }
-@@ -417,6 +424,7 @@ impl SessionsEngine {
+@@ -424,6 +431,7 @@ impl SessionsEngine {
                  turn_listener: OnceLock::new(),
                  plugins: OnceLock::new(),
                  reported: Arc::default(),
@@ -2566,7 +2566,7 @@ index 69ff152d1afa3acd2def5e3e5953725dc707269e..8eaadeec80737c448b0e6902071dc4eb
              }),
          }
      }
-@@ -487,6 +495,12 @@ impl SessionsEngine {
+@@ -494,6 +502,12 @@ impl SessionsEngine {
          let _ = self.inner.plugins.set(plugins);
      }
  
@@ -2579,7 +2579,7 @@ index 69ff152d1afa3acd2def5e3e5953725dc707269e..8eaadeec80737c448b0e6902071dc4eb
      /// On start, once revived turns are under way: each report a child chat
      /// here owed its parent when the engine went down goes now
      /// ([`reports::owed_on_boot`]). After [`Self::recover_stale`], on every
-@@ -9442,4 +9456,187 @@ mod tests {
+@@ -9566,4 +9580,187 @@ mod tests {
          assert!(body.contains("rejected the request"), "{body}");
          rig.core.sessions.shutdown().await;
      }
@@ -2792,7 +2792,7 @@ index dbc74eb5c8ed8fda72b6600c8eb3204f7fc2c902..bc6c25959faf1f455034c99dccd8bc8a
 2.55.0.windows.2
 
 
-From 45e7d9f45f893cc0ea06c51b7938e5337e4d2dfb Mon Sep 17 00:00:00 2001
+From 42a801977503d166c488fb6e8ddc473f19efb96e Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:34:37 +0700
 Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
@@ -2803,10 +2803,10 @@ Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
  1 file changed, 35 insertions(+), 14 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 046f478a26113415ffe78eea4ee9d46b4f52ce32..84711d729283cef459badb3eb0b258cf60227573 100644
+index 084542d228c01cd55ed347cd51c2232f9b9b1425..f42158555060eb0301b955f910d049bfb74a3989 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1390,17 +1390,10 @@ impl Tools {
+@@ -1403,17 +1403,10 @@ impl Tools {
                  "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
              ));
          }
@@ -2827,7 +2827,7 @@ index 046f478a26113415ffe78eea4ee9d46b4f52ce32..84711d729283cef459badb3eb0b258cf
          }
          if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
              // The row may not have folded into WatchChats yet; build the
-@@ -1539,6 +1532,13 @@ impl Tools {
+@@ -1552,6 +1545,13 @@ impl Tools {
              .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
              .await?;
          result["sent"] = delivered.receipt;
@@ -2841,7 +2841,7 @@ index 046f478a26113415ffe78eea4ee9d46b4f52ce32..84711d729283cef459badb3eb0b258cf
          if fyi {
              result["note"] = json!(
                  "An FYI: your parent reads it with whatever wakes it next (your end, another child's report), or in 30 min. Your final reply reaches it on its own: don't send it by message."
-@@ -1753,6 +1753,22 @@ impl Tools {
+@@ -1766,6 +1766,22 @@ impl Tools {
          }
      }
  
@@ -2864,7 +2864,7 @@ index 046f478a26113415ffe78eea4ee9d46b4f52ce32..84711d729283cef459badb3eb0b258cf
      /// Whether `chat`'s host holds a child's FYI for its next wake
      /// ([`zeron_proto::capabilities::CHILD_REPORTS_FYI`]). Unknown: no.
      async fn hosts_fyis(&self, chat: &Chat) -> bool {
-@@ -2762,9 +2778,9 @@ mod tests {
+@@ -2775,9 +2791,9 @@ mod tests {
          assert!(err.contains("no chat matches"), "{err}");
      }
  
@@ -2877,7 +2877,7 @@ index 046f478a26113415ffe78eea4ee9d46b4f52ce32..84711d729283cef459badb3eb0b258cf
      #[tokio::test]
      async fn a_subagent_on_a_host_that_doesnt_report_back_is_warned_of() {
          let world = Arc::new(World::default());
-@@ -2785,7 +2801,12 @@ mod tests {
+@@ -2798,7 +2814,12 @@ mod tests {
              .call("create_chat", json!({ "kind": "side", "device": "Worker" }))
              .await
              .unwrap();
@@ -2895,7 +2895,7 @@ index 046f478a26113415ffe78eea4ee9d46b4f52ce32..84711d729283cef459badb3eb0b258cf
 2.55.0.windows.2
 
 
-From d737b5e23a1b21c26ec51dc956e35d533ef1edc2 Mon Sep 17 00:00:00 2001
+From bcd4ddb5cf92f642db4bdd26cfeb8fa98a13de90 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:44:58 +0700
 Subject: [PATCH 05/12] engine: a child's FYIs never wake the parent alone, and
@@ -3210,7 +3210,7 @@ index 88de26cf670a69d5667ddb4746d39fd42dad0c14..fc57773b997ea3c479f298dceb080beb
      fn says_a_span_as_a_person_would() {
          assert_eq!(ago(42_000), "42 s");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 8eaadeec80737c448b0e6902071dc4eb8643546a..c40e57aef289944159a0731590ab6f94a729ad14 100644
+index ecbffb1dfcf45de5aa60afb23ada3752a8c263a0..4c966bbb7720eb4933b80a39bd19d968dc9f40ff 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -3223,7 +3223,7 @@ index 8eaadeec80737c448b0e6902071dc4eb8643546a..c40e57aef289944159a0731590ab6f94
      QUIET as REPORT_QUIET,
      WAITED as REPORT_WAITED,
  };
-@@ -8564,6 +8565,80 @@ mod tests {
+@@ -8688,6 +8689,80 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -3305,10 +3305,10 @@ index 8eaadeec80737c448b0e6902071dc4eb8643546a..c40e57aef289944159a0731590ab6f94
  
      /// A command the subagent runs, open until the test ends it.
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 84711d729283cef459badb3eb0b258cf60227573..2efc252d1cd70e354bd0ea7a85d218263e0e1d87 100644
+index f42158555060eb0301b955f910d049bfb74a3989..c5e386fd8b9e61ba83be82414a4f72d1ec6699b3 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1518,7 +1518,8 @@ impl Tools {
+@@ -1531,7 +1531,8 @@ impl Tools {
          // `wake: false` to its own parent: an FYI, which waits for whatever
          // wakes the parent next. Only a parent's host that holds FYIs gets
          // one; another would start a turn on it, so it gets a message.
@@ -3318,7 +3318,7 @@ index 84711d729283cef459badb3eb0b258cf60227573..2efc252d1cd70e354bd0ea7a85d21826
          if fyi && matches!(mode, "steer" | "queue") {
              anyhow::bail!("wake=false waits for your parent's next wake: use it with mode auto or run");
          }
-@@ -1543,10 +1544,23 @@ impl Tools {
+@@ -1556,10 +1557,23 @@ impl Tools {
              result["note"] = json!(
                  "An FYI: your parent reads it with whatever wakes it next (your end, another child's report), or in 30 min. Your final reply reaches it on its own: don't send it by message."
              );
@@ -3346,7 +3346,7 @@ index 84711d729283cef459badb3eb0b258cf60227573..2efc252d1cd70e354bd0ea7a85d21826
          }
          let pending = Arc::new(PendingTurn {
              baseline,
-@@ -2565,14 +2579,21 @@ mod tests {
+@@ -2578,14 +2592,21 @@ mod tests {
          let error = send(true, "chat-beta-2", "alpha", steer).await.unwrap_err();
          assert!(error.contains("wake=false"), "{error}");
  
@@ -3427,7 +3427,7 @@ index bc6c25959faf1f455034c99dccd8bc8a7ecd5679..ee4d4ddcb66bf65be0cb03cfe7e4bf26
 2.55.0.windows.2
 
 
-From 6f02b8a7f4306ebbc2cdc7fe55ab59743b6b758f Mon Sep 17 00:00:00 2001
+From fef1a367493177f09e8c60c1a36413a83c7559c5 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:53:13 +0700
 Subject: [PATCH 06/12] engine: while the person talks to the parent, its
@@ -3988,10 +3988,10 @@ index 6012d9086f98c38e075a6f29df4e067e8fd05bf8..10b9fc6f8d690c02007b9c7a87f16ea0
  
  /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index c40e57aef289944159a0731590ab6f94a729ad14..de14c76cb9a432fe6e713e7f007662da7af66fdd 100644
+index 4c966bbb7720eb4933b80a39bd19d968dc9f40ff..7e917133e6b3a7fdbbbb33fb519a4af775c2508e 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -7579,6 +7579,8 @@ mod tests {
+@@ -7703,6 +7703,8 @@ mod tests {
          _steers: Arc<Mutex<mpsc::Receiver<SteerMessage>>>,
          /// Where the engine stops the run's turn in place.
          turn: zeron_harness::TurnControl,
@@ -4000,7 +4000,7 @@ index c40e57aef289944159a0731590ab6f94a729ad14..de14c76cb9a432fe6e713e7f007662da
      }
  
      /// A harness running several chats at once, told apart by the origin
-@@ -7638,6 +7640,7 @@ mod tests {
+@@ -7762,6 +7764,7 @@ mod tests {
                      ask: Arc::from(controls.request_input),
                      _steers: Arc::new(Mutex::new(controls.steering)),
                      turn: controls.turn,
@@ -4008,7 +4008,7 @@ index c40e57aef289944159a0731590ab6f94a729ad14..de14c76cb9a432fe6e713e7f007662da
                  },
              );
              Ok(futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|e| e.map(Ok))).boxed())
-@@ -7660,6 +7663,7 @@ mod tests {
+@@ -7784,6 +7787,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_MESSAGE_HOLD_MS", "4000") };
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
@@ -4016,7 +4016,7 @@ index c40e57aef289944159a0731590ab6f94a729ad14..de14c76cb9a432fe6e713e7f007662da
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -8423,37 +8427,25 @@ mod tests {
+@@ -8547,37 +8551,25 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -4065,7 +4065,7 @@ index c40e57aef289944159a0731590ab6f94a729ad14..de14c76cb9a432fe6e713e7f007662da
          drop(b);
          rig.core.sessions.shutdown().await;
      }
-@@ -9714,4 +9706,199 @@ mod tests {
+@@ -9838,4 +9830,199 @@ mod tests {
          assert_eq!(rig.kept(), 0);
          rig.core.sessions.shutdown().await;
      }
@@ -4303,7 +4303,7 @@ index ee4d4ddcb66bf65be0cb03cfe7e4bf261fe5f2be..ed689748e3528cf3e95c73cc6ed6bb33
 2.55.0.windows.2
 
 
-From acfe7969e2abed9bf0952a3db3b291bd91595300 Mon Sep 17 00:00:00 2001
+From 9571c9f67e53f4fc90e99467d735b8a6336a4187 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:57:27 +0700
 Subject: [PATCH 07/12] engine: the parent's host decides a child's pause, by
@@ -5353,7 +5353,7 @@ index fc57773b997ea3c479f298dceb080bebe63ab52e..c8c79edb5ea4e272efbb010ec84a495a
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index de14c76cb9a432fe6e713e7f007662da7af66fdd..1a926e547fdda82d70090a69c9cf4d6858551b31 100644
+index 7e917133e6b3a7fdbbbb33fb519a4af775c2508e..fa6fe9748c802ca74f962dd3a3313c268038a593 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,9 +42,8 @@ mod activity;
@@ -5368,7 +5368,7 @@ index de14c76cb9a432fe6e713e7f007662da7af66fdd..1a926e547fdda82d70090a69c9cf4d68
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -363,7 +362,7 @@ struct Inner {
+@@ -368,7 +367,7 @@ struct Inner {
      /// [`reports`]).
      reported: Arc<reports::Reported>,
      /// Posts a desktop banner, as the engine's own are (absent in bare
@@ -5377,7 +5377,7 @@ index de14c76cb9a432fe6e713e7f007662da7af66fdd..1a926e547fdda82d70090a69c9cf4d68
      notifier: Mutex<Option<Notifier>>,
  }
  
-@@ -9537,13 +9536,20 @@ mod tests {
+@@ -9661,13 +9660,20 @@ mod tests {
              banners
          }
  
@@ -5403,7 +5403,7 @@ index de14c76cb9a432fe6e713e7f007662da7af66fdd..1a926e547fdda82d70090a69c9cf4d68
              for i in 0..20 {
                  let mut request = request();
                  request.prompt = zeron_proto::agent_messages::child_report("Tests (kid-a)", "kid-a", ReportStatus::Finished, "ok");
-@@ -9555,11 +9561,23 @@ mod tests {
+@@ -9679,11 +9685,23 @@ mod tests {
                      )
                      .unwrap();
              }
@@ -5429,7 +5429,7 @@ index de14c76cb9a432fe6e713e7f007662da7af66fdd..1a926e547fdda82d70090a69c9cf4d68
          }
  
          /// Zeron's note under the lead's next report saying Tests' reports
-@@ -9585,10 +9603,11 @@ mod tests {
+@@ -9709,10 +9727,11 @@ mod tests {
          let kid = rig.start("kid-a", &from_lead("Run the tests: do they pass?")).await;
          kid.feed.send(text("All 40 pass.")).unwrap();
          kid.feed.send(done(DoneStatus::Completed)).unwrap();
@@ -5443,7 +5443,7 @@ index de14c76cb9a432fe6e713e7f007662da7af66fdd..1a926e547fdda82d70090a69c9cf4d68
          // A row still saying it works (one from another device can lag):
          // its end is in, so the lead's wait lets it go.
          let mut row = rig.status("kid-a");
-@@ -9638,6 +9657,45 @@ mod tests {
+@@ -9762,6 +9781,45 @@ mod tests {
          assert_eq!((heard[0].0.as_str(), heard[0].1), ("kid-a", ReportStatus::Finished));
          assert_eq!(rig.kept(), 2);
          assert_eq!(lock(&banners).len(), 1);
@@ -5557,7 +5557,7 @@ index ed689748e3528cf3e95c73cc6ed6bb33a8fb62c2..a9fcd29560ce5a3fd44257723904ab37
 2.55.0.windows.2
 
 
-From be565f7001f74bd704c11dd84f791f1df0127eee Mon Sep 17 00:00:00 2001
+From e1e0e723b3f61e1537548ad3242b4c2d24ce9cf4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:05:23 +0700
 Subject: [PATCH 08/12] engine: a parent can ask to hear from a group of
@@ -6229,7 +6229,7 @@ index da791d8fd65f1d58bdaeee4612829caf610baac5..a971e50a26a5c29eb3ff4b63566c64de
  
  /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index d1bf8549ea57e8d9132e0bab6cf060cacebe6842..b01223031625f6d749293fc7362d8b2a70b11c9b 100644
+index 6cc302c02f0758991e297b4ac486ca31b6639e94..63ced4cd8abde0f291a9b60a1366dbdc3352b67e 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -340,6 +340,21 @@ struct AwaitBackgroundParams {
@@ -6254,7 +6254,7 @@ index d1bf8549ea57e8d9132e0bab6cf060cacebe6842..b01223031625f6d749293fc7362d8b2a
  #[derive(Debug, Deserialize)]
  #[serde(rename_all = "camelCase")]
  struct StopWaitingParams {
-@@ -3864,6 +3879,32 @@ impl RpcService for EngineRpc {
+@@ -4014,6 +4029,32 @@ impl RpcService for EngineRpc {
                      )),
                  }
              }
@@ -6288,10 +6288,10 @@ index d1bf8549ea57e8d9132e0bab6cf060cacebe6842..b01223031625f6d749293fc7362d8b2a
                  let p: StopWaitingParams = parse_params(params)?;
                  let stopped = self.sessions.stop_waiting(&p.chat_id);
 diff --git a/crates/engine/src/rpc/agent_gate.rs b/crates/engine/src/rpc/agent_gate.rs
-index b197c23d8c0bf8e909b60127b8aaec2402da5a37..9fb2e6301d63691f651f2ea9b464f95bbcc9a924 100644
+index cab044b3786d8a7336b180a95e5940d9bfe3cea1..7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d 100644
 --- a/crates/engine/src/rpc/agent_gate.rs
 +++ b/crates/engine/src/rpc/agent_gate.rs
-@@ -82,6 +82,14 @@ impl EngineRpc {
+@@ -87,6 +87,14 @@ impl EngineRpc {
              params["chatId"] = json!(chat);
              return Ok(params);
          }
@@ -6303,10 +6303,10 @@ index b197c23d8c0bf8e909b60127b8aaec2402da5a37..9fb2e6301d63691f651f2ea9b464f95b
 +            params["chatId"] = json!(chat);
 +            return Ok(params);
 +        }
-         if !matches!(method, methods::MUTATE | methods::QUEUE_MESSAGE | methods::QUEUE_COMMAND) {
-             return Ok(params);
-         }
-@@ -571,4 +579,25 @@ mod tests {
+         let command = matches!(
+             method,
+             methods::RUN_COMMAND | methods::READ_COMMAND_OUTPUT | methods::STOP_COMMAND | methods::LIST_BACKGROUND_COMMANDS
+@@ -766,4 +774,25 @@ mod tests {
          assert!(sleep.is_err(), "sleep is the person's to set");
          core.sessions.shutdown().await;
      }
@@ -6601,7 +6601,7 @@ index c8c79edb5ea4e272efbb010ec84a495a1b7df608..90d0a910616a6309cd763a2aaa820923
      fn back_once(i: usize, at: i64) -> SessionCommandEntry {
          let report = agent_messages::child_report("Tests (kid)", "kid", ReportStatus::Finished, "ok");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 1a926e547fdda82d70090a69c9cf4d6858551b31..370d6ef92f2cd67bffc0768c13f6600e69e0826c 100644
+index fa6fe9748c802ca74f962dd3a3313c268038a593..6801a4c2ccd5b124fabaa16dd22da7e2a7f68983 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,8 +42,8 @@ mod activity;
@@ -6615,7 +6615,7 @@ index 1a926e547fdda82d70090a69c9cf4d6858551b31..370d6ef92f2cd67bffc0768c13f6600e
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -7663,6 +7663,7 @@ mod tests {
+@@ -7787,6 +7787,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_MESSAGE_HOLD_MS", "4000") };
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
@@ -6623,7 +6623,7 @@ index 1a926e547fdda82d70090a69c9cf4d6858551b31..370d6ef92f2cd67bffc0768c13f6600e
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9959,4 +9960,233 @@ mod tests {
+@@ -10083,4 +10084,233 @@ mod tests {
          assert!(handle.doc().person_typed_at().is_some());
          rig.core.sessions.shutdown().await;
      }
@@ -6858,7 +6858,7 @@ index 1a926e547fdda82d70090a69c9cf4d6858551b31..370d6ef92f2cd67bffc0768c13f6600e
 +    }
  }
 diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
-index 00106303e3fc15e92dd1f1b00a812e020c496da6..463daec138d69671c9419dd0feb7fabd95905788 100644
+index 29428e06f7dd0f145c1e630533336b2bb1fdeb60..32a2f99dd6401401e6e4d4fae7bff7d143077cf9 100644
 --- a/crates/mcp/src/jsonrpc.rs
 +++ b/crates/mcp/src/jsonrpc.rs
 @@ -47,7 +47,9 @@ Chats you delegate to report back automatically when their turn ends, with a not
@@ -6873,10 +6873,10 @@ index 00106303e3fc15e92dd1f1b00a812e020c496da6..463daec138d69671c9419dd0feb7fabd
  `send_message` to your parent mid-task to ask something or share something it \
  needs now; it reads it when its own turn ends, with its other children's. \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320308e1694 100644
+index c5e386fd8b9e61ba83be82414a4f72d1ec6699b3..4c18701772a8c278927787cc657d02c6a8920bf4 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -220,7 +220,7 @@ fn catalog() -> Vec<ToolDef> {
+@@ -225,7 +225,7 @@ fn catalog() -> Vec<ToolDef> {
          (
              "create_chats",
              "create_chat",
@@ -6885,7 +6885,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
          ),
          (
              "send_messages",
-@@ -234,14 +234,19 @@ fn catalog() -> Vec<ToolDef> {
+@@ -239,14 +239,19 @@ fn catalog() -> Vec<ToolDef> {
              .unwrap()
              .input_schema
              .clone();
@@ -6912,7 +6912,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
      }
      tools.push(ToolDef {
          name: SHOW_VISUAL,
-@@ -588,6 +593,37 @@ struct ShowVisualArgs {
+@@ -594,6 +599,37 @@ struct ShowVisualArgs {
  #[derive(Deserialize)]
  struct BatchArgs {
      requests: Vec<Value>,
@@ -6950,7 +6950,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
  }
  
  #[derive(Deserialize)]
-@@ -913,29 +949,163 @@ impl Tools {
+@@ -923,29 +959,163 @@ impl Tools {
              (1..=MAX_BATCH).contains(&args.requests.len()),
              "requests must contain between 1 and {MAX_BATCH} items"
          );
@@ -7127,7 +7127,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
      }
  
      async fn whoami(&self) -> anyhow::Result<Value> {
-@@ -1136,6 +1306,13 @@ impl Tools {
+@@ -1149,6 +1319,13 @@ impl Tools {
      }
  
      async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
@@ -7141,7 +7141,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
          // Parent: the explicit `parent` argument, else the chat this server
          // speaks for. Resolved so a prefix/title works and a typo fails loud.
          let explicit_parent = args
-@@ -1288,7 +1465,6 @@ impl Tools {
+@@ -1301,7 +1478,6 @@ impl Tools {
              plan: args.plan,
          };
  
@@ -7149,7 +7149,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
          let mut mutate = json!({
              "op": "createChat",
              "chatId": chat_id,
-@@ -1390,11 +1566,17 @@ impl Tools {
+@@ -1403,11 +1579,17 @@ impl Tools {
                  "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
              ));
          }
@@ -7170,7 +7170,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
          if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
              // The row may not have folded into WatchChats yet; build the
              // chat locally from what we just wrote rather than re-reading.
-@@ -1429,6 +1611,7 @@ impl Tools {
+@@ -1442,6 +1624,7 @@ impl Tools {
                  .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
                  .await?;
              result["sent"] = delivered.receipt;
@@ -7178,7 +7178,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
              let pending = Arc::new(PendingTurn {
                  baseline: None,
                  start: TurnStart {
-@@ -1445,7 +1628,7 @@ impl Tools {
+@@ -1458,7 +1641,7 @@ impl Tools {
                      .await?;
              }
          }
@@ -7187,7 +7187,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
      }
  
      async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
-@@ -2123,6 +2306,8 @@ mod tests {
+@@ -2136,6 +2319,8 @@ mod tests {
          stats: Option<Value>,
          /// `dev-local` holds a child's FYIs (`child-reports-fyi`).
          fyi: bool,
@@ -7196,7 +7196,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
      }
  
      fn stream(item: Value) -> RpcReply {
-@@ -2159,11 +2344,21 @@ mod tests {
+@@ -2172,11 +2357,21 @@ mod tests {
                  methods::ENGINE_INFO => RpcReply::Value(json!({
                      "deviceId": "dev-local", "workspaceScope": "local"
                  })),
@@ -7223,7 +7223,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
                  methods::WATCH_SPACES => stream(json!([{
                      "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                      "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
-@@ -2252,6 +2447,18 @@ mod tests {
+@@ -2265,6 +2460,18 @@ mod tests {
                          .push((method.to_owned(), params.clone()));
                      RpcReply::Value(json!({ "id": "img:1", "name": params["name"] }))
                  }
@@ -7242,7 +7242,7 @@ index 2efc252d1cd70e354bd0ea7a85d218263e0e1d87..17e680c6bf1d1bb801fbf245e2484320
                  methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                      // A Cloud chat gets a machine of its own from the engine.
                      let cloud_create = method == methods::MUTATE
-@@ -2935,6 +3142,120 @@ mod tests {
+@@ -2948,6 +3155,120 @@ mod tests {
          assert!(world.writes.lock().unwrap().is_empty());
      }
  
@@ -7396,7 +7396,7 @@ index ee34ba7a7a6d747d749bcf03a1d0c9287ab534f5..cb296456f05e0f8c4f245004a1d6192c
                  ],
              })
 diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
-index d36e7988ca7689b1d30f76848fe362adae5fda94..0b7232d9196fcc5d7cc98a259591aa3fa88a9345 100644
+index 5ea779ac73f82f374b1fc4870722cc9488ced6c5..84b0907afea797ec09405a4b91c85ce14c6e76c3 100644
 --- a/crates/rpc/src/lib.rs
 +++ b/crates/rpc/src/lib.rs
 @@ -283,6 +283,14 @@ pub mod methods {
@@ -7414,10 +7414,10 @@ index d36e7988ca7689b1d30f76848fe362adae5fda94..0b7232d9196fcc5d7cc98a259591aa3f
      /// `{chatId}` → `{stopped}`: the person's Stop waiting: the processes the
      /// agent said it waits on no longer hold the chat (its background agents
      /// still do). Relay-forwardable, to the chat's host.
-@@ -792,6 +800,8 @@ pub fn agent_allowed(method: &str) -> bool {
-             | methods::PUBLISH_IMAGE
-             // Saying what the calling chat's agent waits on.
-             | methods::AWAIT_BACKGROUND
+@@ -819,6 +827,8 @@ pub fn agent_allowed(method: &str) -> bool {
+             | methods::READ_COMMAND_OUTPUT
+             | methods::STOP_COMMAND
+             | methods::LIST_BACKGROUND_COMMANDS
 +            // Grouping the calling chat's children's reports.
 +            | methods::REPORT_GROUP
              // Plugins: authoring, installing (lands waiting for the person),
@@ -7471,7 +7471,7 @@ index a9fcd29560ce5a3fd44257723904ab376f9f9312..375bea5f0983b2753803b350a21f0782
 2.55.0.windows.2
 
 
-From 637692119a8875be18118bd511a42aded654a6d2 Mon Sep 17 00:00:00 2001
+From 95b37b858808c551a1475e764603abefc40cade0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:15:30 +0700
 Subject: [PATCH 09/12] engine: report groups work with the person-active hold
@@ -7543,7 +7543,7 @@ index a971e50a26a5c29eb3ff4b63566c64de93346dc3..8cf1b1b6ff01792eab4dc40949e6c740
 2.55.0.windows.2
 
 
-From 23e1a35b4cf016dcd504089ca635bb5cb6f39c25 Mon Sep 17 00:00:00 2001
+From 973463f19441b14d921d63553aab5422712d613f Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:15:22 +0700
 Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
@@ -7554,10 +7554,10 @@ Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
  1 file changed, 3 insertions(+), 4 deletions(-)
 
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 370d6ef92f2cd67bffc0768c13f6600e69e0826c..94d484813acb68b1f49709a35602d8239a84f0df 100644
+index 6801a4c2ccd5b124fabaa16dd22da7e2a7f68983..d5050075f5a5339b74e7ee297800dd31ea7963e9 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -9773,7 +9773,6 @@ mod tests {
+@@ -9897,7 +9897,6 @@ mod tests {
              let lead = self.start("lead", "Get the tests run.").await;
              lead.feed.send(text("Asked Tests.")).unwrap();
              let kid = self.start("kid-a", &from_lead("Run the tests.")).await;
@@ -7565,7 +7565,7 @@ index 370d6ef92f2cd67bffc0768c13f6600e69e0826c..94d484813acb68b1f49709a35602d823
              lead.feed.send(done(DoneStatus::Completed)).unwrap();
              self.until("the lead rests", |r| r.status("lead").status != SessionStatus::Working).await;
              self.person_writes("lead", "What's the plan?", "p1");
-@@ -10033,7 +10032,7 @@ mod tests {
+@@ -10157,7 +10156,7 @@ mod tests {
              notes.iter().any(|n| n == "You asked to hear from Tests, Docs at once, when all are done. Done: Tests. Still out: Docs."),
              "{notes:?}"
          );
@@ -7574,7 +7574,7 @@ index 370d6ef92f2cd67bffc0768c13f6600e69e0826c..94d484813acb68b1f49709a35602d823
          woke.feed.send(done(DoneStatus::Completed)).unwrap();
          b.feed.send(text("Written.")).unwrap();
          b.feed.send(done(DoneStatus::Completed)).unwrap();
-@@ -10141,14 +10140,14 @@ mod tests {
+@@ -10265,14 +10264,14 @@ mod tests {
          a.feed.send(done(DoneStatus::Completed)).unwrap();
          rig.until("Tests' end is held", |r| r.queued("lead").len() == 1).await;
          rig.person_writes("lead", "Lint it too.", "l2");
@@ -7595,7 +7595,7 @@ index 370d6ef92f2cd67bffc0768c13f6600e69e0826c..94d484813acb68b1f49709a35602d823
 2.55.0.windows.2
 
 
-From e0e6dda8385dfa07a43d48384bf75162555c2fdb Mon Sep 17 00:00:00 2001
+From 1c2c0067df907a2b7ec1577bff151c1318f29da7 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:20:48 +0700
 Subject: [PATCH 11/12] engine: held reports survive a restart between the
@@ -7766,10 +7766,10 @@ index 90d0a910616a6309cd763a2aaa820923b189781c..9d4886bb5eed58de35a97167d4fd9a84
  /// sent after it started another turn: the one that ended its last turn.
  fn stop_after(commands: &[SessionCommandEntry], asked: &str) -> Option<String> {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 94d484813acb68b1f49709a35602d8239a84f0df..51ff68ff335d0a390fd7b1061c7347026260bf76 100644
+index d5050075f5a5339b74e7ee297800dd31ea7963e9..f3830277c8bde67b620c81791292d52b7d19bb7c 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -522,17 +522,18 @@ impl SessionsEngine {
+@@ -529,17 +529,18 @@ impl SessionsEngine {
              };
              let floor = engine.inner.journal.child_reports_since(now_ms()) - reports::OWED_FLOOR_MARGIN_MS;
              let stopped = std::mem::take(&mut *lock(&engine.inner.boot_stops));
@@ -7795,7 +7795,7 @@ index 94d484813acb68b1f49709a35602d8239a84f0df..51ff68ff335d0a390fd7b1061c734702
          });
      }
  
-@@ -9855,6 +9856,32 @@ mod tests {
+@@ -9979,6 +9980,32 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -7832,7 +7832,7 @@ index 94d484813acb68b1f49709a35602d8239a84f0df..51ff68ff335d0a390fd7b1061c734702
 2.55.0.windows.2
 
 
-From e545cb05fe94b6ad36eda5abda2150a059e5d49a Mon Sep 17 00:00:00 2001
+From 1188a4d84176a4428aaa1bf4b7fd566da49a9c4c Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:23:32 +0700
 Subject: [PATCH 12/12] engine: a group member's follow-up brings its held end
@@ -7905,10 +7905,10 @@ index 9d4886bb5eed58de35a97167d4fd9a84aea605b1..7d68e277083188a88a677bdd76821c68
      let ledger = host
          .open(parent)
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 51ff68ff335d0a390fd7b1061c7347026260bf76..81b5e1bd73c594de239fac3cf84c064a9ae52358 100644
+index f3830277c8bde67b620c81791292d52b7d19bb7c..137b637a65672cb99bb3547b19ed0efe31900a2c 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -10185,10 +10185,11 @@ mod tests {
+@@ -10309,10 +10309,11 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -7923,7 +7923,7 @@ index 51ff68ff335d0a390fd7b1061c7347026260bf76..81b5e1bd73c594de239fac3cf84c064a
          let rig = family_rig().await;
          let (_lead, kid, b) = rig.group_at_work().await;
          kid.turn.set_background_processes(vec![background_task()]);
-@@ -10204,14 +10205,17 @@ mod tests {
+@@ -10328,14 +10329,17 @@ mod tests {
          rig.until("Tests works again", |r| r.status("kid-a").status == SessionStatus::Working).await;
          kid.feed.send(text("Pushed abc123.")).unwrap();
          kid.feed.send(done(DoneStatus::Completed)).unwrap();
