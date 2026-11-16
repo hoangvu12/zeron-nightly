@@ -33,7 +33,7 @@ local control = require("@ds/control")
 local locale = require("@ds/locale")
 local ds_session_row = require("@ds/session_row")
 local activity = require("@app/screens/shell/activity")
-local sandbox_templates = require("@account/sandbox_templates")
+local template_saves = require("@account/sandbox_template_saves")
 
 export type Props = {
 	collapsed: State<boolean>,
@@ -1252,15 +1252,17 @@ local function menu(id: string): { any }?
 		if side or activity.on:peek() then false else { label = locale.s("shell.sidebar.menu.move_to"), icon = "folder-with-files", submenu = into },
 		sleep,
 		stop_waiting,
-		-- (A chat on a sandbox: saved for new chats to start from, Zeron's
-		-- identity left out, by the host device keeping it.)
-		if sandbox_templates.on_sandbox(id)
+		-- (A chat on a sandbox: saved as a sandbox template for new chats to
+		-- start from, Zeron's identity left out, by the host device keeping
+		-- it. A section of its own, screen 21.)
+		if template_saves.on_sandbox(id) then { separator = true } else false,
+		if template_saves.on_sandbox(id)
 			then {
-				label = locale.s("shell.sidebar.menu.save_template"),
+				label = locale.s("shell.sidebar.menu.save_sandbox_template"),
 				icon = "box",
-				disabled = if sandbox_templates.saving(id) then locale.s("shell.sidebar.save_template.saving", { name = sandbox_templates.saves:peek()[id].name }) else nil,
+				disabled = if template_saves.saving(id) then locale.s("shell.sidebar.save_sandbox_template.saving", { name = template_saves.saves:peek()[id].name }) else nil,
 				on_select = function()
-					M.save_template(id)
+					M.save_sandbox_template(id)
 				end,
 			}
 			else false,
@@ -1612,27 +1614,28 @@ local function rename_dialog(): Node
 	}
 end
 
--- Save as template's dialog: a name (as the provider lists it), then Save.
+-- Save as sandbox template's dialog (screen 22): a name (as the provider
+-- lists it, in the code font), then Save.
 local function template_dialog(): Node
 	local function done()
 		local id = templating:peek()
-		local name = sandbox_templates.trimmed(template_name:peek())
+		local name = template_saves.trimmed(template_name:peek())
 		if not id or name == "" then
 			return
 		end
 		templating:set(nil)
 		template_open:set(false)
-		sandbox_templates.save(id, name)
+		template_saves.save(id, name)
 	end
 	return ds.Dialog {
 		open = template_open,
-		title = ui.t("shell.sidebar.save_template.title") :: any,
-		body = ui.t("shell.sidebar.save_template.body") :: any,
+		title = ui.t("shell.sidebar.save_sandbox_template.title") :: any,
 		size = "sm",
-		confirm = { label = ui.t("shell.sidebar.save_template.save") :: any, on_click = done },
+		confirm = { label = ui.t("shell.sidebar.save_sandbox_template.save") :: any, on_click = done },
 		ds.TextField {
 			value = template_name,
-			label = ui.t("shell.sidebar.save_template.name"),
+			name = ui.t("shell.sidebar.save_sandbox_template.name"),
+			mono = true,
 			placeholder = function(): string
 				return "reportly-dev"
 			end,
@@ -1645,9 +1648,9 @@ local function template_dialog(): Node
 	}
 end
 
--- Save as template, from a session's menu: its name asked first.
-function M.save_template(id: string)
-	if not sandbox_templates.on_sandbox(id) or sandbox_templates.saving(id) then
+-- Save as sandbox template, from a session's menu: its name asked first.
+function M.save_sandbox_template(id: string)
+	if not template_saves.on_sandbox(id) or template_saves.saving(id) then
 		return
 	end
 	templating:set(id)
