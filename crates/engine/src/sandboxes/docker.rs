@@ -109,8 +109,8 @@ const TRIES: u32 = 3;
 /// How long a Hub token from a personal access token is used before it's
 /// exchanged again (Docker doesn't say; a refusal exchanges it sooner).
 const HUB_TOKEN_LIFE: Duration = Duration::from_secs(5 * 60);
-/// The watchdog's `$0`, so it's easy to find with `ps`.
-const WATCHDOG: &str = "zeron-watchdog";
+/// The detached launcher's `$0`, so it's easy to find with `ps`.
+const LAUNCHER: &str = "zeron-detach";
 /// How long a detached command's launcher may take.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -776,20 +776,22 @@ fn sandbox_name(key: &str) -> String {
         .to_owned()
 }
 
-/// Run `args` under a watchdog that starts it again whenever it exits (there
-/// is no systemd in a Docker sandbox), detached from the call. One watchdog
-/// per program name: starting it again replaces the old one (and its
-/// program), so a Run again starts on the new environment. Its output goes
-/// to `~/.zeron/run/<name>.log`.
-fn under_watchdog(args: &[String]) -> Vec<String> {
+/// Start `args` detached from the call, in a session of its own, so it keeps
+/// running after the process service's stream ends. Restarting it when it
+/// stops is the program's own job (Zeron's engine runs as `zeron-engine
+/// watchdog`; there is no systemd in a Docker sandbox). One per program
+/// name: starting it again ends the old one and everything it started, so a
+/// Run again starts on the new environment (a fresh lent sign-in). Its
+/// output goes to `~/.zeron/run/<name>.log`.
+fn detached(args: &[String]) -> Vec<String> {
+    // `pkill -g`: Debian's `dash` has no `kill -- -<group>`.
     const SCRIPT: &str = r#"name="$1"; shift
 dir="$HOME/.zeron/run"; mkdir -p "$dir"
 pid="$dir/$name.pid"; log="$dir/$name.log"
 if [ -s "$pid" ]; then pkill -TERM -g "$(cat "$pid")" 2>/dev/null || true; sleep 1; fi
-setsid sh -c 'echo $$ >"$0"; log="$1"; shift
-while :; do "$@" >>"$log" 2>&1; code=$?; echo "zeron-watchdog: $1 exited with $code; starting it again" >>"$log"; sleep 2; done' "$pid" "$log" "$@" </dev/null >/dev/null 2>&1 &
+setsid sh -c 'echo $$ >"$0"; log="$1"; shift; exec "$@" >>"$log" 2>&1' "$pid" "$log" "$@" </dev/null >/dev/null 2>&1 &
 sleep 1
-if kill -0 "$(cat "$pid" 2>/dev/null)" 2>/dev/null; then echo started; else echo "the watchdog didn't start" >&2; exit 1; fi"#;
+if kill -0 "$(cat "$pid" 2>/dev/null)" 2>/dev/null; then echo started; else echo "$name stopped as it started:" >&2; tail -n 20 "$log" >&2; exit 1; fi"#;
     let name: String = args
         .first()
         .map(|p| p.rsplit('/').next().unwrap_or(p))
@@ -801,7 +803,7 @@ if kill -0 "$(cat "$pid" 2>/dev/null)" 2>/dev/null; then echo started; else echo
         "sh".to_owned(),
         "-c".to_owned(),
         SCRIPT.to_owned(),
-        WATCHDOG.to_owned(),
+        LAUNCHER.to_owned(),
         name,
     ];
     wrapped.extend(args.iter().cloned());
@@ -1098,7 +1100,7 @@ impl SandboxProvider for DockerProvider {
             .to_owned();
         let (args, timeout) = if command.detach {
             (
-                under_watchdog(&command.args),
+                detached(&command.args),
                 Some(command.timeout.unwrap_or(LAUNCH_TIMEOUT)),
             )
         } else {
@@ -1155,15 +1157,15 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_gets_the_program_and_its_name() {
-        let args = under_watchdog(&["/usr/local/bin/zeron-engine".into(), "headless".into()]);
+    fn a_detached_program_gets_its_name() {
+        let args = detached(&["/usr/local/bin/zeron-engine".into(), "watchdog".into()]);
         assert_eq!(
             &args[3..],
             [
-                WATCHDOG,
+                LAUNCHER,
                 "zeron-engine",
                 "/usr/local/bin/zeron-engine",
-                "headless"
+                "watchdog"
             ]
         );
     }
@@ -1203,8 +1205,9 @@ mod tests {
 /// `ZERON_DOCKER_SMOKE_TOKEN` is a Docker access token; it's never printed.
 /// Makes one small Blank sandbox, runs commands, checks the network allows
 /// everything, installs Zeron from `ZERON_EDGE_URL` (default
-/// `https://edge.zeron.sh`) with the Install Zeron step's script, checks the
-/// watchdog restarts a program, extends, stops, starts (a suspend: the
+/// `https://edge.zeron.sh`) with the Install Zeron step's script, checks a
+/// detached program keeps running and is replaced by a rerun, extends,
+/// stops, starts (a suspend: the
 /// program survives) and deletes it. Costs a few cents.
 #[cfg(test)]
 mod smoke {
@@ -1253,17 +1256,18 @@ mod smoke {
             assert!(install.exit.success(), "install: {}", install.failure());
             eprintln!("smoke: installed {}", install.stdout.trim());
 
-            // The watchdog keeps a program running and starts it again.
-            let started = run_to_end(&p, &id, Command::new(["sleep", "600"]).detached())
-                .await
-                .unwrap();
+            // A detached program outlives its call, and starting it again
+            // replaces it.
+            let detach = || Command::new(["sleep", "600"]).detached();
+            let started = run_to_end(&p, &id, detach()).await.unwrap();
             assert!(started.exit.success(), "{}", started.failure());
-            let first = sh(&p, &id, "pgrep -x sleep | head -1").await.stdout;
-            sh(&p, &id, "pkill -x sleep; sleep 4").await;
-            let second = sh(&p, &id, "pgrep -x sleep | head -1").await.stdout;
+            let first = sh(&p, &id, "pgrep -x sleep").await.stdout;
+            assert_eq!(first.lines().count(), 1, "running: {first}");
+            run_to_end(&p, &id, detach()).await.unwrap();
+            let second = sh(&p, &id, "pgrep -x sleep").await.stdout;
             assert!(
-                !second.trim().is_empty() && second != first,
-                "restarted: {first} → {second}"
+                second.lines().count() == 1 && second != first,
+                "replaced: {first} → {second}"
             );
 
             p.extend(&id, TIME_LIMIT).await.unwrap();

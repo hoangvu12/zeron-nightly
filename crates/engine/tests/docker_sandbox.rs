@@ -427,7 +427,7 @@ async fn run_reads_dockers_exits_as_they_come() {
 }
 
 #[tokio::test]
-async fn a_detached_command_runs_under_a_watchdog() {
+async fn a_detached_command_outlives_the_call() {
     let fx = Fixture::connected().await;
     fx.stub.add_box("sbx_a", "SANDBOX_STATUS_RUNNING");
     fx.stub.script_run(vec![
@@ -436,18 +436,19 @@ async fn a_detached_command_runs_under_a_watchdog() {
         exit(None, "normal"),
         end(None),
     ]);
-    let command = Command::new(["zeron-engine", "headless"])
+    let command = Command::new(["zeron-engine", "watchdog"])
         .env("ZERON_EDGE_URL", "https://edge.example")
         .detached();
     let done = run_to_end(&fx.provider, "sbx_a", command).await.unwrap();
     assert!(done.exit.success());
     let body = fx.stub.seen("ProcessService/Start").pop().unwrap().body;
     let args: Vec<String> = serde_json::from_value(body["args"].clone()).unwrap();
-    // `sh -c <watchdog> <name> <program> <args>…`: restarts the program when
-    // it exits (no systemd on Docker), one watchdog per name.
+    // `sh -c <launcher> <$0> <name> <program> <args>…`: the program in a
+    // session of its own, one per name (a rerun replaces it). Restarting it
+    // is `zeron-engine watchdog`'s job.
     assert_eq!(&args[..2], ["sh", "-c"]);
-    assert!(args[2].contains("setsid") && args[2].contains("while"), "{}", args[2]);
-    assert_eq!(&args[3..], ["zeron-watchdog", "zeron-engine", "zeron-engine", "headless"]);
+    assert!(args[2].contains("setsid") && args[2].contains("pkill"), "{}", args[2]);
+    assert_eq!(&args[3..], ["zeron-detach", "zeron-engine", "zeron-engine", "watchdog"]);
     assert_eq!(body["env"]["ZERON_EDGE_URL"], "https://edge.example");
     assert!(body.get("timeoutSeconds").is_none_or(|t| t.as_i64() <= Some(60)));
 }
