@@ -299,10 +299,13 @@ fn refuse(status: u16) -> ErrorResponse {
         .unwrap()
 }
 
+/// A WebSocket upgrade's device id and query, as the handshake saw them.
+type Handshake = Option<(String, HashMap<String, String>)>;
+
 /// `/device/{id}/ws`: the DeviceRoom relay, admitting any unexpired bearer of
 /// the user (it checks nothing about the device or session that minted it).
 async fn serve_ws(stream: TcpStream, state: Arc<Mutex<EdgeState>>) {
-    let seen: Arc<Mutex<Option<(String, HashMap<String, String>)>>> = Arc::default();
+    let seen: Arc<Mutex<Handshake>> = Arc::default();
     let record = seen.clone();
     let gate = state.clone();
     let callback = move |request: &Request, response: Response| {
