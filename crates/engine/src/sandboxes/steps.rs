@@ -16,6 +16,12 @@ pub enum Step {
     GetCode,
     Setup,
     Ready,
+    /// Zeron's engine winds down, then the provider stops it (#43).
+    Sleep,
+    /// The provider starts it, then a fresh token (#43).
+    Wake,
+    /// Zeron stops lending, then the provider deletes it (#44).
+    Delete,
 }
 
 impl Step {
@@ -29,6 +35,21 @@ impl Step {
         Step::GetCode,
         Step::Setup,
         Step::Ready,
+    ];
+
+    /// Every step, as step scripts name them.
+    pub const ALL: [Step; 11] = [
+        Step::Create,
+        Step::Start,
+        Step::InstallZeron,
+        Step::SignIn,
+        Step::Secrets,
+        Step::GetCode,
+        Step::Setup,
+        Step::Ready,
+        Step::Sleep,
+        Step::Wake,
+        Step::Delete,
     ];
 }
 
@@ -55,6 +76,40 @@ pub enum SandboxState {
     /// The sandbox was deleted outside Zeron: the chat says "Sandbox
     /// deleted" and offers Start fresh.
     Gone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScriptState {
+    Running,
+    /// It failed; the chat says so and offers Run again. It holds nothing
+    /// up: the steps went on.
+    Failed,
+}
+
+/// A step script that is running, or failed: what the chat's line above
+/// the composer shows ("Running setup.sh", "Setup failed
+/// reportly/.zeron/setup.sh", Run again).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptRun {
+    /// Its moment's folder (`after-setup`), or `setup` for a repo's
+    /// `.zeron/setup.sh`.
+    pub hook: String,
+    /// The step that moment belongs to.
+    pub step: Step,
+    /// Its file name.
+    pub name: String,
+    /// Where it is, as the chat names it (`reportly/.zeron/setup.sh`).
+    pub script: String,
+    #[serde(rename = "for")]
+    pub scope: super::scripts::Scope,
+    pub state: ScriptState,
+    /// When it began, or failed, epoch ms.
+    pub since: i64,
+    /// What it said when it failed.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +148,9 @@ pub struct SandboxSteps {
     #[serde(default)]
     pub disk_full: bool,
     pub steps: Vec<StepProgress>,
+    /// The step script running now, and those that failed.
+    #[serde(default)]
+    pub scripts: Vec<ScriptRun>,
 }
 
 impl SandboxSteps {
@@ -120,6 +178,7 @@ impl SandboxSteps {
                     state: StepState::Pending,
                 })
                 .collect(),
+            scripts: Vec::new(),
         }
     }
 
@@ -205,6 +264,12 @@ impl SandboxSteps {
 
     /// After a restart: a step that was running when Zeron stopped failed.
     pub(crate) fn interrupted(&mut self) {
+        for script in &mut self.scripts {
+            if script.state == ScriptState::Running {
+                script.state = ScriptState::Failed;
+                script.error = Some("Zeron restarted while this script ran.".into());
+            }
+        }
         if self.state == SandboxState::Starting {
             let step = self
                 .steps
