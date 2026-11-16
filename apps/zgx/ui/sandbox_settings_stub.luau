@@ -42,6 +42,17 @@ local files: { [string]: { any } } = {
 	},
 }
 
+-- The picker's list (account/sandboxes, src/sandboxes.rs publishes it), as
+-- this device's engine has them.
+local shared = require("@account/sandboxes")
+if #shared.providers() == 0 then
+	local listed = {}
+	for _, p in providers do
+		table.insert(listed, { id = p.id, name = p.name, icon = p.icon })
+	end
+	shared.now:set({ providers = listed })
+end
+
 local function settled(value: any, word: string?): any
 	local p = { done = true }
 	function p.after(_self: any, ok: ((any) -> ())?, bad: ((any) -> ())?)

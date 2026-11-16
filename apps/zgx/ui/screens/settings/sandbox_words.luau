@@ -164,12 +164,10 @@ function M.for_label(scope: Scope, providers: { Provider }?, projects: { Project
 	return say("for.all", "All sandboxes"), "widget"
 end
 
--- A provider's glyph: its own where Zeron's icons have it (the inlined set,
--- ds/icon_svgs), else a cloud.
-local got, SVGS = pcall(require, "@ds/icon_svgs")
-local GLYPHS: { [string]: any } = if got and type(SVGS) == "table" then SVGS else { boat = true, cloud = true }
+-- A provider's glyph: the one it carries (the page's providers carry
+-- account/sandboxes' `icon(id)`, as the picker draws it), else a box.
 function M.icon_of(icon: string?): string
-	return if icon and GLYPHS[icon] then icon else "cloud"
+	return if icon and icon ~= "" then icon else "box"
 end
 
 -- A script's identity: one row each, whatever is renamed around it.

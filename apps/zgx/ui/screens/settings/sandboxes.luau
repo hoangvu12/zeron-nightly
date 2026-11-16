@@ -19,6 +19,7 @@ local ds = require("@ds")
 local Icon = require("@ds/icon")
 local Links = require("@ds/links")
 local toast = require("@ds/toast")
+local sandboxes = require("@account/sandboxes")
 local sessions = require("@account/sessions")
 local host = require("@app/screens/settings/host")
 local search = require("@app/screens/settings/search")
@@ -41,7 +42,36 @@ type Script = words.Script
 
 -- What the page shows: "loading", "ready", or "offline" (no engine).
 local phase = ui.state("settings_sandboxes_phase", "loading")
-local providers = ui.state("settings_sandboxes_providers", {} :: { Provider })
+-- What the engine says of each provider, by id: its host device, who it's
+-- connected as, and (one the picker doesn't list yet) its name and icon.
+type Said = { id: string?, name: string?, icon: string?, host: string?, account: { name: string }? }
+local said = ui.state("settings_sandboxes_said", {} :: { [string]: Said })
+
+-- The providers, as the picker lists them (account/sandboxes: their names,
+-- order and glyphs), each with what its engine says.
+local function merged(of: { [string]: Said }): { Provider }
+	local out: { Provider } = {}
+	local listed: { [string]: boolean } = {}
+	for _, p in sandboxes.providers() do
+		listed[p.id] = true
+		local s = of[p.id] or {}
+		table.insert(out, { id = p.id, name = p.name, icon = sandboxes.icon(p.id), host = s.host, account = s.account })
+	end
+	local rest: { Provider } = {}
+	for id, s in of do
+		if not listed[id] then
+			table.insert(rest, { id = id, name = s.name or id, icon = sandboxes.icon(s.icon or id), host = s.host, account = s.account })
+		end
+	end
+	table.sort(rest, function(a: Provider, b: Provider): boolean
+		return a.id < b.id
+	end)
+	table.move(rest, 1, #rest, #out + 1, out)
+	return out
+end
+local providers = ui.computed(function(): { Provider }
+	return merged(said:get())
+end)
 local scripts = ui.state("settings_sandboxes_scripts", {} :: { Script })
 -- The device the scripts listed are on.
 local scripts_on = ui.state("settings_sandboxes_scripts_on", "")
@@ -72,6 +102,8 @@ local delete_open = ui.state("settings_sandboxes_delete_open", false)
 -- Providers whose sign-in which providers have on their own page (OAuth
 -- device flow); the rest take a pasted key only.
 local SIGNS_IN_ON_PAGE: { [string]: boolean } = { docker = true }
+-- How often a sign-in on the provider's page is looked at while it waits.
+local POLL_MS = 2500
 
 local function here(): string?
 	for _, d in sessions.devices:peek() or {} do
@@ -139,32 +171,39 @@ local function load_scripts(device: string?)
 	end)
 end
 
--- Everything again: the providers, each one's host device and account,
--- then the scripts on the host device.
+-- Everything again: each provider's host device and account, then the
+-- scripts on the host device.
 local function load()
 	ask("ListSandboxProviders"):after(function(list: any)
-		local found: { Provider } = {}
+		local found: { [string]: Said } = {}
 		for _, p in (if type(list) == "table" then list else {}) do
-			table.insert(found, { id = p.id, name = p.name, icon = p.icon, account = p.account })
+			found[p.id] = { name = p.name, icon = p.icon, account = p.account }
 		end
-		local left = #found
+		for _, p in sandboxes.providers() do
+			found[p.id] = found[p.id] or {}
+		end
+		local left = 0
+		for _ in found do
+			left += 1
+		end
 		local function done()
 			left -= 1
 			if left > 0 then
 				return
 			end
 			ui.batch(function()
-				providers:set(found)
+				said:set(found)
 				phase:set("ready")
 			end)
-			load_scripts(words.scripts_device(found, here()))
+			load_scripts(words.scripts_device(merged(found), here()))
 		end
 		if left == 0 then
 			left = 1
 			done()
 			return
 		end
-		for _, p in found do
+		for id, p in found do
+			p.id = id
 			ask("SandboxHost", { provider = p.id }):after(function(named: any)
 				p.host = if type(named) == "table" then named.hostDeviceId else nil
 				-- Who it's connected as is the host device's to say.
@@ -261,22 +300,30 @@ local function connect_on_page()
 			Links.outside(url)
 		end
 		local until_at = os.time() + (tonumber(shown.expiresIn) or 900)
-		ui.every(3000, function(): boolean
-			if not connect_open:peek() or code:peek() ~= shown or os.time() > until_at then
-				return false
-			end
-			ask("SandboxHost", { provider = id }):after(function(named: any)
-				local device = if type(named) == "table" then named.hostDeviceId else nil
-				ask("ListSandboxProviders", {}, device):after(function(list: any)
-					for _, p in (if type(list) == "table" then list else {}) do
-						if p.id == id and p.account and code:peek() == shown then
-							connected()
+		-- (Only while this code shows: closed, approved or run out, it stops.)
+		local function waiting(): boolean
+			return connect_open:peek() and code:peek() == shown and os.time() <= until_at
+		end
+		local function look()
+			ui.after(POLL_MS, function()
+				if not waiting() then
+					return
+				end
+				ask("SandboxHost", { provider = id }):after(function(named: any)
+					local device = if type(named) == "table" then named.hostDeviceId else nil
+					ask("ListSandboxProviders", {}, device):after(function(list: any)
+						for _, p in (if type(list) == "table" then list else {}) do
+							if p.id == id and p.account and waiting() then
+								connected()
+								return
+							end
 						end
-					end
-				end)
+						look()
+					end, look)
+				end, look)
 			end)
-			return true
-		end)
+		end
+		look()
 	end, function(err: any)
 		connect_busy:set(false)
 		failed(ui.t("settings.sandboxes.couldnt_connect"):get())(err)
@@ -429,9 +476,10 @@ local function provider_card(_p: Provider, _i: number, now: State<Provider>): No
 			wrap = true,
 		},
 	}
-	return ui.column {
-		w_full = true,
-		ds.Settings.Group {
+	-- (One child: the rows that come and go bring their own hairlines.)
+	return ds.Settings.Group {
+		ui.column {
+			w_full = true,
 			ds.Settings.Row {
 				label = _p.name,
 				lead = ui.div { color = "$text.secondary", Icon { name = words.icon_of(_p.icon) :: any, size = 16 } },
@@ -577,10 +625,11 @@ local function script_row(_r: words.Row, _i: number, now: State<words.Row>): Nod
 			w = "36%",
 			min_w = 0,
 			ds.FadeText {
-				text = function(): string
+				function(): string
 					return now:get().name
 				end,
 				font = "$font.mono",
+				text_size = "$font.size.md",
 				color = "$text.primary",
 			},
 		},
@@ -588,9 +637,10 @@ local function script_row(_r: words.Row, _i: number, now: State<words.Row>): Nod
 			w = "28%",
 			min_w = 0,
 			ds.FadeText {
-				text = function(): string
+				function(): string
 					return now:get().when
 				end,
+				text_size = "$font.size.md",
 				color = "$text.secondary",
 			},
 		},
@@ -603,10 +653,11 @@ local function script_row(_r: words.Row, _i: number, now: State<words.Row>): Nod
 				return now:get().icon
 			end) :: any, size = 14 } },
 			ds.FadeText {
-				text = function(): string
+				function(): string
 					return now:get().whom
 				end,
 				grow = 1,
+				text_size = "$font.size.md",
 				color = "$text.secondary",
 			},
 		},
@@ -717,6 +768,19 @@ end
 
 function M.view(): Node
 	visits.once(M.ID, load)
+	-- (A provider added or gone on this device's engine: read again.)
+	local seen: string? = nil
+	ui.effect(function()
+		local ids = {}
+		for _, p in sandboxes.providers() do
+			table.insert(ids, p.id)
+		end
+		local now = table.concat(ids, ",")
+		if seen ~= nil and now ~= seen then
+			load()
+		end
+		seen = now
+	end)
 	local rows = ui.computed(function(): { words.Row }
 		return words.rows(scripts:get(), providers:get(), projects())
 	end)
@@ -814,10 +878,12 @@ function M.view(): Node
 						return ui.t("settings.sandboxes.sign_in_on_page", { name = if p then p.name else "" }):get()
 					end) :: any,
 					on_click = connect_on_page,
-					(function(): string
-						local p = connecting_provider()
-						return ui.t("settings.sandboxes.sign_in_on_page", { name = if p then p.name else "" }):get()
-					end) :: any,
+					ui.text {
+						function(): string
+							local p = connecting_provider()
+							return ui.t("settings.sandboxes.sign_in_on_page", { name = if p then p.name else "" }):get()
+						end,
+					},
 				}),
 				ui.show(function(): boolean
 					return code:get() ~= nil
