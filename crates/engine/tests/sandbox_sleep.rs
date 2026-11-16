@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload};
 use zeron_engine::EngineRuntime;
 use zeron_engine::sandboxes::SleepTimings;
-use zeron_proto::{AccessMode, HarnessId, RunRequest, SandboxLevel};
+use zeron_proto::{AccessMode, HarnessId, RunRequest, SandboxLevel, SessionStatus};
 use zeron_rpc::{RpcClient, memory_client, methods};
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -321,16 +321,32 @@ async fn a_busy_chat_keeps_its_sandbox_awake_and_a_stopped_sandbox_is_stood_in_f
         .await
         .expect("queue");
 
+    // The turn reached the sandbox and waits on the person.
+    eventually("the chat waits on the person", 2 * MINUTE, async || {
+        w.host
+            .core()
+            .workspace
+            .read_sessions()
+            .ok()?
+            .into_iter()
+            .find(|s| s.chat_id == "chat-busy" && s.status == SessionStatus::AwaitingInput)
+            .map(drop)
+    })
+    .await;
     // Busy: its time limit is pushed out, and it stays awake past its idle
     // time.
+    // (A time limit of 3 s: extended again each second it's busy.)
+    let before = w.provider.extends().len();
+    w.timings(SleepTimings {
+        time_limit: Duration::from_secs(3),
+        ..drowsy()
+    });
     eventually("the time limit is extended", MINUTE, async || {
-        w.provider
-            .extends()
-            .contains(&"chat-busy 1800".to_owned())
+        w.provider.extends()[before..]
+            .contains(&"chat-busy 3".to_owned())
             .then_some(())
     })
     .await;
-    w.timings(drowsy());
     tokio::time::sleep(Duration::from_secs(4)).await;
     let now = steps(&w.rpc, "chat-busy").await;
     assert_eq!(now["state"], "ready", "{now:#}");

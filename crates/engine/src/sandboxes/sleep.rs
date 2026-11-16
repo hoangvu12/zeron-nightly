@@ -663,17 +663,26 @@ impl RpcService for StandIn {
             let chat_id = params["chatId"].as_str().unwrap_or_default().to_owned();
             let entry: Option<SessionCommandEntry> =
                 serde_json::from_value(params["entry"].clone()).ok();
+            let (Some(chat), Some(host)) = (self.chat.upgrade(), self.host.upgrade()) else {
+                return Err(RpcError::Failed(ASLEEP.into()));
+            };
+            // A send: a Run or Steer still pending and unexpired, that this
+            // device didn't already hand to the sandbox (its escort tries
+            // again now and then, until the chat's room says it ran).
+            let now = chrono::Utc::now().timestamp_millis();
             let send = entry.is_some_and(|e| {
                 e.status == SessionCommandStatus::Pending
                     && matches!(
                         e.payload,
                         SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
                     )
+                    && e.effective_expiry() > now
+                    && !host.doc_host.delivered(&e.id)
             });
-            if send
-                && !chat_id.is_empty()
-                && let (Some(chat), Some(host)) = (self.chat.upgrade(), self.host.upgrade())
-            {
+            if !send {
+                return Err(RpcError::Failed(ASLEEP.into()));
+            }
+            if !chat_id.is_empty() {
                 lock(&chat.nudged).insert(chat_id.clone());
                 if chat.progress.borrow().stopped() {
                     tracing::info!(chat = %chat_id, "a send came to a sleeping sandbox; waking it");

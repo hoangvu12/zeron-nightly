@@ -5293,6 +5293,13 @@ impl DocHost {
         self.waiting_send(chat_id, &handle)
     }
 
+    /// Whether a host already took command `id` from this device (its relay
+    /// answered), or this device ran it. A relay of it again is no new send.
+    pub fn delivered(&self, id: &str) -> bool {
+        lock(&self.inner.relayed).contains(id)
+            || self.inner.store.is_processed(id).unwrap_or(false)
+    }
+
     fn waiting_send(&self, chat_id: &str, handle: &ChatDocHandle) -> bool {
         let Ok(commands) = handle.doc.read_commands() else {
             return false;
