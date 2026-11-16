@@ -10,7 +10,11 @@
 --                                   else a box (tracked)
 --   sandboxes.name(id)              its name, else its id (tracked)
 --   sandboxes.value(id) / .of(value)  the device picker's value for a provider
---                                   (`sandbox:<id>`), and back (nil: not one)
+--                                   (`place:<id>`), and back (nil: not one)
+--   sandboxes.target(id, template?) the agents' catalog target for a place
+--                                   (`place:<id>[:<template>]`, zeron_proto
+--                                   `places::place_target`): the device keeping
+--                                   the provider answers, never a sandbox
 --   sandboxes.of_device(device)     the provider a sandbox's device row names
 --   sandboxes.templates(provider)   a promise of { { id, name } }
 --   sandboxes.follow(chat) / .unfollow(chat)  keep its steps in `steps`
@@ -27,7 +31,9 @@ export type Provider = { id: string, name: string, icon: string }
 export type Template = { id: string, name: string }
 export type Steps = { state: string, step: string?, template: string?, since: number, error: string? }
 
-M.PREFIX = "sandbox:"
+-- (A place's own name for the engine, as zeron_proto `places` has it; not a
+-- device's `sandbox:<provider>` capability.)
+M.PREFIX = "place:"
 -- What a template picker's Blank is (no template: the provider's plain image).
 M.BLANK = ""
 
@@ -67,11 +73,21 @@ function M.value(id: string): string
 	return M.PREFIX .. id
 end
 
+-- The provider a picker value or catalog target names (a template after it
+-- dropped), else nil.
 function M.of(value: string?): string?
 	if value and string.sub(value, 1, #M.PREFIX) == M.PREFIX and #value > #M.PREFIX then
-		return string.sub(value, #M.PREFIX + 1)
+		local rest = string.sub(value, #M.PREFIX + 1)
+		return string.match(rest, "^([^:]+)") or rest
 	end
 	return nil
+end
+
+function M.target(id: string, template: string?): string
+	if template and template ~= M.BLANK then
+		return `{M.PREFIX}{id}:{template}`
+	end
+	return M.PREFIX .. id
 end
 
 function M.of_device(device: { sandbox: string? }?): string?

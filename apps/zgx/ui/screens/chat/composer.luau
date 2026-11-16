@@ -412,6 +412,12 @@ local function Composer(): Node
 			local p = route.project:get()
 			d = if p then p.device else nil
 		end
+		-- A new chat on a place: the agents its template offers, asked of the
+		-- device keeping the provider (`place:<provider>[:<template>]`).
+		local provider = if session_id:get() == nil then sandboxes.of(d) else nil
+		if provider then
+			return sandboxes.target(provider, template:get())
+		end
 		return d
 	end
 	-- Whether the catalog shown is `d`'s (one of this device's says none).
