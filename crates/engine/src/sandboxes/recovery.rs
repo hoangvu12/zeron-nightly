@@ -69,6 +69,7 @@ impl Sandboxes {
         };
         self.persist();
         chat.deleted.store(true, Ordering::SeqCst);
+        chat.leave_room();
         if *lock(&chat.busy) {
             // Lending stops now all the same; the steps delete the rest.
             stop_lending(&lock(&chat.record), host.auth.as_ref());
@@ -86,7 +87,7 @@ impl Sandboxes {
             let record = lock(&chat.record);
             let checks = matches!(
                 record.steps.state,
-                SandboxState::Ready | SandboxState::Failed
+                SandboxState::Ready | SandboxState::Failed | SandboxState::Asleep
             ) && record.steps.sandbox_id.is_some();
             (checks, record.steps.provider.clone())
         };
@@ -123,6 +124,7 @@ impl Sandboxes {
         }
         tracing::info!(%sandbox, "sandbox deleted outside Zeron");
         chat.update(SandboxSteps::gone);
+        chat.leave_room();
         stop_lending(&lock(&chat.record), auth);
         *lock(&chat.lent) = None;
         self.persist();
@@ -195,6 +197,15 @@ impl Sandboxes {
         *lock(&chat.lent) = None;
         self.persist();
         self.start(host, chat_id)
+    }
+}
+
+impl ChatSandbox {
+    /// This device stops holding its sandbox's room.
+    pub(super) fn leave_room(&self) {
+        if let Some(task) = lock(&self.stand_in).take() {
+            task.abort();
+        }
     }
 }
 

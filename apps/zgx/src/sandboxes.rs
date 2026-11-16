@@ -4,23 +4,33 @@
 //!
 //! ```text
 //! shared  sandboxes            { providers = { { id, name, icon }… } }
-//! shared  sandbox_steps        { [chat] = { state, step?, template?, since, error? } }:
-//!                              `state` starting | ready | failed, `step` the
-//!                              one it's on (or that failed), `since` when
-//!                              that began, in Unix seconds
+//! shared  sandbox_steps        { [chat] = { state, step?, template?, since, error?,
+//!                              provider?, disk_full } }: `state` starting |
+//!                              ready | failed | gone | sleeping | asleep |
+//!                              waking, `step` the one it's on (or that
+//!                              failed), `since` when that began, in Unix
+//!                              seconds
 //! call    sandboxes.templates  provider → { { id, name }… } (Blank isn't one)
-//! invoke  sandboxes.follow     chat: keep its steps in `sandbox_steps`
+//! invoke  sandboxes.follow     chat: keep its steps in `sandbox_steps`; first
+//!                              asks the provider whether it's still there,
+//!                              never waking it (again once [`ASK_AGAIN`] has
+//!                              passed)
 //! invoke  sandboxes.unfollow   chat
 //! call    sandboxes.run_again  chat: a failed step, and the ones after it
+//! call    sandboxes.fresh      chat: Start fresh, a new sandbox with what the
+//!                              chat pushed
+//! call    sandboxes.wake       chat: Wake a sandbox asleep (#43)
 //! ```
 //!
 //! Every call is the engine's (`ListSandboxProviders`, `ListSandboxTemplates`,
-//! `WatchSandboxSteps`, `RunSandboxStepsAgain`); a failure rejects with an
-//! outcome word, or the engine's sentence.
+//! `CheckSandbox`, `WatchSandboxSteps`, `RunSandboxStepsAgain`,
+//! `StartSandboxFresh`, `WakeSandbox`); a failure rejects with an outcome
+//! word, or the engine's sentence.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
 use zgx_desktop::WindowContext;
@@ -38,7 +48,13 @@ struct State {
     /// The chats followed, and their steps as last heard.
     steps: BTreeMap<String, Json>,
     watches: BTreeMap<String, engine::rpc::Watch>,
+    /// When each chat's provider was last asked whether it's still there.
+    asked: BTreeMap<String, Instant>,
 }
+
+/// How long an answer from the provider stands before opening the chat asks
+/// again (a reload within it doesn't).
+const ASK_AGAIN: Duration = Duration::from_secs(60);
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State { providers: json!([]), ..State::default() });
@@ -93,6 +109,10 @@ fn steps_json(steps: &Json) -> Option<Json> {
     if let Some(error) = steps["error"].as_str().filter(|e| !e.is_empty()) {
         out["error"] = Json::from(error);
     }
+    if let Some(provider) = steps["provider"].as_str().filter(|p| !p.is_empty()) {
+        out["provider"] = Json::from(provider);
+    }
+    out["disk_full"] = Json::Bool(steps["diskFull"].as_bool() == Some(true));
     Some(out)
 }
 
@@ -115,6 +135,22 @@ fn follow(rpc: &engine::rpc::Rpc, chat: &str) -> engine::rpc::Watch {
         STATE.with(|s| s.borrow_mut().steps.insert(heard.clone(), item));
         publish();
     })
+}
+
+/// Ask the provider whether `chat`'s sandbox is still there (deleted outside
+/// Zeron, its disk full), never waking it; what it says is the chat's steps
+/// until the watch says more.
+fn check(chat: String) {
+    STATE.with(|s| s.borrow_mut().asked.insert(chat.clone(), Instant::now()));
+    engine::get().spawn(async move {
+        let Ok(checked) = call("CheckSandbox", json!({ "chatId": chat })).await else {
+            return;
+        };
+        if checked.is_object() && STATE.with(|s| s.borrow().steps.contains_key(&chat)) {
+            STATE.with(|s| s.borrow_mut().steps.insert(chat, checked));
+            publish();
+        }
+    });
 }
 
 async fn call(method: &str, params: Json) -> Result<Json, String> {
@@ -173,15 +209,44 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     });
     host.action("sandboxes.follow", |chat| {
         let chat = text(&chat);
-        if chat.is_empty() || STATE.with(|s| s.borrow().watches.contains_key(&chat)) {
+        if chat.is_empty() {
             return;
         }
+        let stale = STATE.with(|s| s.borrow().asked.get(&chat).is_none_or(|at| at.elapsed() >= ASK_AGAIN));
         STATE.with(|s| {
             s.borrow_mut().steps.entry(chat.clone()).or_insert(Json::Null);
         });
+        if stale {
+            check(chat.clone());
+        }
+        if STATE.with(|s| s.borrow().watches.contains_key(&chat)) {
+            return;
+        }
         if let Some(rpc) = engine::get().current() {
             let watch = follow(&rpc, &chat);
             STATE.with(|s| s.borrow_mut().watches.insert(chat, watch));
+        }
+    });
+    host.async_action("sandboxes.fresh", |chat| {
+        let chat = text(&chat);
+        async move {
+            crate::plugins::preview::refuse("sandboxes.fresh")?;
+            if chat.is_empty() {
+                return Err("invalid".into());
+            }
+            call("StartSandboxFresh", json!({ "chatId": chat })).await?;
+            Ok(Value::Bool(true))
+        }
+    });
+    host.async_action("sandboxes.wake", |chat| {
+        let chat = text(&chat);
+        async move {
+            crate::plugins::preview::refuse("sandboxes.wake")?;
+            if chat.is_empty() {
+                return Err("invalid".into());
+            }
+            call("WakeSandbox", json!({ "chatId": chat })).await?;
+            Ok(Value::Bool(true))
         }
     });
     host.action("sandboxes.unfollow", |chat| {
@@ -217,14 +282,34 @@ mod tests {
                                "error": null, "steps": [] });
         assert_eq!(
             super::steps_json(&starting),
-            Some(json!({ "state": "starting", "step": "installZeron", "template": "zeron-dev", "since": 1_700_000_012.0 }))
+            Some(json!({ "state": "starting", "step": "installZeron", "template": "zeron-dev", "since": 1_700_000_012.0,
+                         "provider": "docker", "disk_full": false }))
         );
         let failed = json!({ "state": "failed", "step": "getCode", "since": 1000, "error": "Couldn't clone" });
         assert_eq!(
             super::steps_json(&failed),
-            Some(json!({ "state": "failed", "step": "getCode", "since": 1.0, "error": "Couldn't clone" }))
+            Some(json!({ "state": "failed", "step": "getCode", "since": 1.0, "error": "Couldn't clone", "disk_full": false }))
         );
         assert_eq!(super::steps_json(&json!(null)), None);
+    }
+
+    /// What its alerts read (#44): deleted outside Zeron, a full disk; and
+    /// asleep, or a wake that failed (#43).
+    #[test]
+    fn gone_a_full_disk_asleep_and_a_failed_wake_read_as_the_deck_takes_them() {
+        let gone = json!({ "provider": "docker", "state": "gone", "since": 0,
+                           "error": "The sandbox was deleted outside Zeron.", "diskFull": false });
+        let read = super::steps_json(&gone).unwrap();
+        assert_eq!(read["state"], "gone");
+        assert_eq!(read["provider"], "docker");
+        let full = json!({ "provider": "fake", "state": "failed", "step": "getCode", "since": 0, "diskFull": true });
+        assert_eq!(super::steps_json(&full).unwrap()["disk_full"], true);
+        let asleep = json!({ "provider": "docker", "state": "asleep", "step": null, "since": 0 });
+        let read = super::steps_json(&asleep).unwrap();
+        assert_eq!(read["state"], "asleep");
+        assert!(read.get("step").is_none());
+        let woke = json!({ "provider": "docker", "state": "failed", "step": "wake", "since": 0, "error": "It didn't start." });
+        assert_eq!(super::steps_json(&woke).unwrap()["step"], "wake");
     }
 
     /// One entry per provider, by its own name and icon; a provider with no

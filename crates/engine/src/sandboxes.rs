@@ -20,6 +20,7 @@ mod provider;
 mod recovery;
 mod save;
 pub mod scripts;
+mod sleep;
 mod steps;
 
 pub use boat::BoatProvider;
@@ -37,11 +38,12 @@ pub use provider::{
     run_to_end,
 };
 pub use scripts::{Hook, Timing};
+pub use sleep::SleepTimings;
 pub use steps::{
     SandboxState, SandboxSteps, ScriptRun, ScriptState, Step, StepProgress, StepState,
 };
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -155,12 +157,13 @@ pub(crate) struct Host {
 
 impl Host {
     /// One that doesn't keep the engine alive, for a task that outlives a
-    /// request (following chat deletions). Relay links aren't kept.
+    /// request (following chat deletions, looking after sandboxes).
     pub(crate) fn downgrade(&self) -> WeakHost {
         WeakHost {
             workspace: self.workspace.downgrade(),
             doc_host: self.doc_host.downgrade(),
             auth: self.auth.clone(),
+            links: self.links.clone(),
         }
     }
 }
@@ -171,6 +174,7 @@ pub(crate) struct WeakHost {
     workspace: crate::workspace_host::WeakWorkspaceHost,
     doc_host: crate::doc_host::WeakDocHost,
     auth: Option<Auth>,
+    links: Option<Arc<zeron_rpc::LinkCache>>,
 }
 
 impl WeakHost {
@@ -180,7 +184,7 @@ impl WeakHost {
             workspace: self.workspace.upgrade()?,
             doc_host: self.doc_host.upgrade()?,
             auth: self.auth.clone(),
-            links: None,
+            links: self.links.clone(),
         })
     }
 }
@@ -223,6 +227,18 @@ struct ChatSandbox {
     deleted: AtomicBool,
     /// What it left was discarded ([`ChatSandbox::discard`]).
     discarded: AtomicBool,
+    /// Since when it's been awake: an idle sandbox sleeps ([`sleep`]).
+    awake_since: Mutex<Instant>,
+    /// When its time limit was last pushed out.
+    extended_at: Mutex<Option<Instant>>,
+    /// This device holding its room while it's stopped.
+    stand_in: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The chats nudged in its room while this device held it: those
+    /// nudges are spent, so they're posted again once it's awake.
+    nudged: Mutex<BTreeSet<String>>,
+    /// A send came while it was going to sleep (or its steps ran): it
+    /// wakes as soon as that's done.
+    wake_wanted: AtomicBool,
 }
 
 #[derive(Default)]
@@ -235,6 +251,9 @@ struct Inner {
     catalogs: catalog::Catalogs,
     /// Chat deletions are followed ([`Sandboxes::follow_deletions`]).
     following: AtomicBool,
+    /// Sandboxes are looked after ([`Sandboxes::keep`]).
+    keeping: AtomicBool,
+    timings: Mutex<SleepTimings>,
 }
 
 /// The providers this device keeps and the chats on them.
@@ -281,6 +300,8 @@ impl Sandboxes {
                 chats: Mutex::new(chats),
                 catalogs: catalog::Catalogs::open(data_dir),
                 following: AtomicBool::new(false),
+                keeping: AtomicBool::new(false),
+                timings: Mutex::default(),
             }),
         }
     }
@@ -481,6 +502,10 @@ impl Sandboxes {
             .ok_or_else(|| "This chat doesn't run on a sandbox from this device.".to_string())?;
         if *lock(&chat.busy) {
             return Ok(());
+        }
+        // A wake that failed: wake it again.
+        if chat.progress.borrow().stopped() {
+            return self.wake_again(host, chat);
         }
         chat.update(|steps| {
             if steps.state == SandboxState::Failed {
@@ -847,10 +872,10 @@ impl Sandboxes {
             }
             Step::Ready => {
                 if starts_zeron {
-                    chat.start_zeron(provider, host, &record, &sandbox()?)
-                        .await?;
+                    self.start_engine(chat, provider, host, &record).await?;
                 }
                 answers(host, &record.steps.device_id).await?;
+                *lock(&chat.awake_since) = Instant::now();
                 self.read_catalog(host, &record);
                 // What waited for it goes now, not at the next retry.
                 if let Err(err) = host.doc_host.retry_delivery(&record.steps.chat_id) {
@@ -859,9 +884,45 @@ impl Sandboxes {
                 Ok(StepState::Done)
             }
             // Not starting steps: sleeping, waking and deleting run their
-            // own hooks (#43, #44).
+            // own hooks ([`sleep`], [`recovery`]).
             Step::Sleep | Step::Wake | Step::Delete => Ok(StepState::Skipped),
         }
+    }
+
+    /// Start Zeron's engine in the sandbox, under its watchdog (which
+    /// restarts it when it stops, and replaces one already running), signed
+    /// in on a lent token.
+    async fn start_engine(
+        &self,
+        chat: &ChatSandbox,
+        provider: &dyn SandboxProvider,
+        host: &Host,
+        record: &Record,
+    ) -> Result<(), String> {
+        let sandbox = record
+            .steps
+            .sandbox_id
+            .clone()
+            .ok_or_else(|| "The sandbox wasn't created.".to_string())?;
+        let lent = chat.lend(host, &record.steps.device_id).await?;
+        let mut command = Command::new([ENGINE_PROGRAM, "watchdog"])
+            .env(EDGE_URL_ENV, edge_url(host)?)
+            .env(DEVICE_ID_ENV, &record.steps.device_id)
+            .env(PROVIDER_ENV, provider.id())
+            .detached();
+        for (name, value) in lent.to_env() {
+            command = command.env(name, value);
+        }
+        let started = run_to_end(provider, &sandbox, command)
+            .await
+            .map_err(|e| format!("Couldn't start Zeron in the sandbox: {e}"))?;
+        if !started.exit.success() {
+            return Err(format!(
+                "Couldn't start Zeron in the sandbox: {}",
+                started.failure()
+            ));
+        }
+        Ok(())
     }
 
     fn persist(&self) {
@@ -895,6 +956,11 @@ impl ChatSandbox {
             lent: Mutex::new(None),
             deleted: AtomicBool::new(false),
             discarded: AtomicBool::new(false),
+            awake_since: Mutex::new(Instant::now()),
+            extended_at: Mutex::new(None),
+            stand_in: Mutex::new(None),
+            nudged: Mutex::new(BTreeSet::new()),
+            wake_wanted: AtomicBool::new(false),
         }
     }
 
@@ -905,36 +971,6 @@ impl ChatSandbox {
             record.steps.clone()
         };
         self.progress.send_replace(steps);
-    }
-
-    /// Start Zeron's engine in `sandbox`, under its watchdog (which restarts
-    /// it when it stops), on a lent sign-in and the chat's device id.
-    async fn start_zeron(
-        &self,
-        provider: &dyn SandboxProvider,
-        host: &Host,
-        record: &Record,
-        sandbox: &str,
-    ) -> Result<(), String> {
-        let lent = self.lend(host, &record.steps.device_id).await?;
-        let mut command = Command::new([ENGINE_PROGRAM, "watchdog"])
-            .env(EDGE_URL_ENV, edge_url(host)?)
-            .env(DEVICE_ID_ENV, &record.steps.device_id)
-            .env(PROVIDER_ENV, provider.id())
-            .detached();
-        for (name, value) in lent.to_env() {
-            command = command.env(name, value);
-        }
-        let started = run_to_end(provider, sandbox, command)
-            .await
-            .map_err(|e| format!("Couldn't start Zeron in the sandbox: {e}"))?;
-        if !started.exit.success() {
-            return Err(format!(
-                "Couldn't start Zeron in the sandbox: {}",
-                started.failure()
-            ));
-        }
-        Ok(())
     }
 
     /// The sign-in its engine starts on: lent once, again when stale.

@@ -100,6 +100,8 @@ struct State {
     /// Sandboxes made so far: each one's engine keeps its data apart.
     made: usize,
     saved: Vec<Saved>,
+    /// Time limits pushed out: `<box> <seconds>`.
+    extends: Vec<String>,
 }
 
 pub struct FakeProvider {
@@ -129,7 +131,8 @@ impl FakeProvider {
             | Ops::DELETE
             | Ops::RUN
             | Ops::TEMPLATES
-            | Ops::SAVE_TEMPLATE;
+            | Ops::SAVE_TEMPLATE
+            | Ops::EXTEND;
         Arc::new(Self::new("fake", ops, root))
     }
 
@@ -233,6 +236,11 @@ impl FakeProvider {
     /// `run <box>: <args>`.
     pub fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().calls.clone()
+    }
+
+    /// Each time limit pushed out, in order: `<box> <seconds>`.
+    pub fn extends(&self) -> Vec<String> {
+        self.state.lock().unwrap().extends.clone()
     }
 
     pub fn sandboxes(&self) -> Vec<String> {
@@ -408,6 +416,31 @@ impl FakeProvider {
             Ok(()) => futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed(),
             Err(err) => exit_with(1, &err.to_string()),
         }
+    }
+
+    /// `zeron-engine quiesce`: the engine winds down for a sleep; 75 when
+    /// it's busy (a turn running, a message waiting).
+    fn quiesce(&self, sandbox: &str) -> RunStream {
+        let doc_host = {
+            let state = self.state.lock().unwrap();
+            state
+                .boxes
+                .get(sandbox)
+                .and_then(|fake| fake.engine.as_ref())
+                .map(|engine| engine.core().doc_host.clone())
+        };
+        let Some(doc_host) = doc_host else {
+            return exit_with(1, "zeron-engine isn't running");
+        };
+        futures::stream::once(async move {
+            Ok(RunEvent::Exit(Exit::code(
+                match doc_host.quiesce_for_sleep().await {
+                    Ok(()) => 0,
+                    Err(_) => 75,
+                },
+            )))
+        })
+        .boxed()
     }
 
     /// Start an engine in `sandbox`; the receiver fires once it's up.
@@ -626,6 +659,14 @@ impl SandboxProvider for FakeProvider {
         }
     }
 
+    async fn extend(&self, sandbox: &str, ttl: std::time::Duration) -> Result<(), ProviderError> {
+        // Kept apart from `calls`: the host device extends whenever it
+        // finds a chat busy, in any test.
+        let extended = format!("{sandbox} {}", ttl.as_secs());
+        self.state.lock().unwrap().extends.push(extended);
+        self.dir(sandbox).map(drop)
+    }
+
     async fn status(&self, sandbox: &str) -> Result<SandboxStatus, ProviderError> {
         Ok(match self.state.lock().unwrap().boxes.get(sandbox) {
             None => SandboxStatus::Gone,
@@ -718,7 +759,21 @@ impl SandboxProvider for FakeProvider {
                 ])
                 .boxed(),
                 // Under its watchdog, as Zeron starts it, or bare.
-                Some("watchdog" | "headless") if command.detach => self.boot(sandbox, &command.env),
+                Some("watchdog" | "headless") if command.detach => {
+                    // A rerun replaces the engine already there.
+                    let old = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .boxes
+                        .get_mut(sandbox)
+                        .and_then(|fake| fake.engine.take());
+                    if let Some(old) = old {
+                        old.shutdown().await;
+                    }
+                    self.boot(sandbox, &command.env)
+                }
+                Some("quiesce") => self.quiesce(sandbox),
                 Some(zeron_engine::sandboxes::FORGET_DEVICE) => self.forget(sandbox).await,
                 _ => exit_with(127, "zeron-engine: not found"),
             });

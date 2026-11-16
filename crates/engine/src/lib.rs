@@ -604,6 +604,22 @@ impl EngineCore {
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
         self.doc_host.set_links(links.clone());
         self.plugins.set_links(links.clone());
+        // The sandboxes this device keeps sleep, wake and are stood in for
+        // through these links (not in a sandbox or on a Cloud machine).
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(auth) = auth.filter(|a| !a.is_lent() && !a.is_runner()) {
+            let host = sandboxes::Host {
+                workspace: self.workspace.clone(),
+                doc_host: self.doc_host.clone(),
+                auth: Some(auth),
+                links: Some(links.clone()),
+            };
+            self.sandboxes.keep(host.downgrade());
+        }
         *self
             .links
             .lock()

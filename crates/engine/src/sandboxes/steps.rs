@@ -76,6 +76,16 @@ pub enum SandboxState {
     /// The sandbox was deleted outside Zeron: the chat says "Sandbox
     /// deleted" and offers Start fresh.
     Gone,
+    /// Going to sleep: Zeron's engine winds down, then the provider stops
+    /// it (`step` is [`Step::Sleep`]).
+    Sleeping,
+    /// Stopped, its disk kept; the host device stands in for it. A send
+    /// wakes it; the chat offers Wake.
+    Asleep,
+    /// Waking: the provider starts it, then its engine with a fresh token
+    /// (`step` is [`Step::Wake`]). A failed wake reads [`Self::Failed`] at
+    /// that step, and Run again wakes it again.
+    Waking,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +252,39 @@ impl SandboxSteps {
         *self = fresh;
     }
 
+    /// Going to sleep.
+    pub(crate) fn sleeping(&mut self) {
+        self.state = SandboxState::Sleeping;
+        self.step = Some(Step::Sleep);
+        self.since = crate::now_ms();
+        self.error = None;
+    }
+
+    /// Asleep: stopped, its disk kept.
+    pub(crate) fn asleep(&mut self) {
+        self.state = SandboxState::Asleep;
+        self.step = None;
+        self.since = crate::now_ms();
+        self.error = None;
+        self.disk_full = false;
+    }
+
+    /// Waking up.
+    pub(crate) fn waking(&mut self) {
+        self.state = SandboxState::Waking;
+        self.step = Some(Step::Wake);
+        self.since = crate::now_ms();
+        self.error = None;
+        self.disk_full = false;
+    }
+
+    /// It's stopped (asleep, or a wake that failed): the host device holds
+    /// its room and a send wakes it.
+    pub fn stopped(&self) -> bool {
+        self.state == SandboxState::Asleep
+            || (self.state == SandboxState::Failed && self.step == Some(Step::Wake))
+    }
+
     pub(crate) fn ready(&mut self) {
         self.state = SandboxState::Ready;
         self.step = None;
@@ -269,6 +312,15 @@ impl SandboxSteps {
                 script.state = ScriptState::Failed;
                 script.error = Some("Zeron restarted while this script ran.".into());
             }
+        }
+        match self.state {
+            // Whether it got to stop is the provider's to say: the host
+            // device asks it ([`super::Sandboxes::keep`]).
+            SandboxState::Sleeping => self.ready(),
+            SandboxState::Waking => {
+                self.fail(Step::Wake, "Zeron restarted while this step ran.".into());
+            }
+            _ => {}
         }
         if self.state == SandboxState::Starting {
             let step = self
@@ -361,6 +413,26 @@ mod tests {
         ready.ready();
         ready.interrupted();
         assert_eq!(ready.state, SandboxState::Ready);
+    }
+
+    #[test]
+    fn a_sleep_or_wake_cut_off_by_a_restart_is_asked_again_or_run_again() {
+        let mut steps = SandboxSteps::new("chat", "fake", None, "device");
+        steps.ready();
+        steps.sleeping();
+        assert_eq!(serde_json::to_value(&steps).unwrap()["step"], "sleep");
+        steps.interrupted();
+        assert_eq!(steps.state, SandboxState::Ready);
+        steps.asleep();
+        assert!(steps.stopped());
+        assert_eq!(serde_json::to_value(&steps).unwrap()["state"], "asleep");
+        steps.interrupted();
+        assert_eq!(steps.state, SandboxState::Asleep);
+        steps.waking();
+        steps.interrupted();
+        assert_eq!(steps.state, SandboxState::Failed);
+        assert_eq!(steps.step, Some(Step::Wake));
+        assert!(steps.stopped(), "a failed wake still holds its room");
     }
 
     #[test]

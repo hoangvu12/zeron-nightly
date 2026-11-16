@@ -22,7 +22,7 @@ struct Busy<'a>(&'a ChatSandbox);
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        *lock(&self.0.busy) = false;
+        self.0.release();
     }
 }
 
@@ -57,18 +57,19 @@ impl Sandboxes {
         let sandbox = match (&record.steps.sandbox_id, record.steps.state) {
             (Some(sandbox), SandboxState::Ready) => sandbox.clone(),
             (_, SandboxState::Gone) => return Err("Its sandbox was deleted.".into()),
+            (_, SandboxState::Asleep | SandboxState::Sleeping | SandboxState::Waking) => {
+                return Err("Its sandbox is asleep. Wake it, then save it as a template.".into());
+            }
             _ => return Err("Its sandbox isn't ready yet.".into()),
         };
-        {
-            let mut busy = lock(&chat.busy);
-            if *busy {
-                return Err("Its sandbox is busy; try again in a moment.".into());
-            }
-            *busy = true;
+        // (Held while it saves: no steps, sleep or wake meanwhile.)
+        if !chat.claim() {
+            return Err("Its sandbox is busy; try again in a moment.".into());
         }
         let _busy = Busy(&chat);
 
-        // Asleep: woken to be wiped (the provider saves a running one).
+        // Stopped at the provider's time limit: started to be wiped (the
+        // provider saves a running one).
         if ops.contains(Ops::START)
             && let Ok(SandboxStatus::Stopped) = provider.status(&sandbox).await
         {
@@ -83,14 +84,14 @@ impl Sandboxes {
             .await
             .map_err(|e| format!("Couldn't save the template: {e}"));
         // Zeron goes on in the chat's sandbox whether or not it was saved.
-        let restarted = restart(&chat, provider.as_ref(), &host, &record, &sandbox).await;
-        let saved = saved?;
-        tracing::info!(chat = %chat_id, template = %saved.id, "sandbox saved as a template");
+        let restarted = self.restart(&chat, provider.as_ref(), &host, &record).await;
         if let Err(err) = restarted {
             tracing::warn!(chat = %chat_id, %err, "sandbox: Zeron didn't come back after the save");
             chat.update(|steps| steps.fail(super::Step::Ready, err));
             self.persist();
         }
+        let saved = saved?;
+        tracing::info!(chat = %chat_id, template = %saved.id, "sandbox saved as a template");
         Ok(saved)
     }
 }
@@ -129,20 +130,22 @@ async fn forget(provider: &dyn SandboxProvider, sandbox: &str) -> Result<(), Str
     }
 }
 
-/// Zeron started again in the sandbox, and answering, as Ready leaves it.
-async fn restart(
-    chat: &ChatSandbox,
-    provider: &dyn SandboxProvider,
-    host: &Host,
-    record: &Record,
-    sandbox: &str,
-) -> Result<(), String> {
-    chat.start_zeron(provider, host, record, sandbox).await?;
-    answers(host, &record.steps.device_id).await?;
-    if let Err(err) = host.doc_host.retry_delivery(&record.steps.chat_id) {
-        tracing::warn!(error = %err, "sandbox: couldn't hand the waiting messages over");
+impl Sandboxes {
+    /// Zeron started again in the sandbox, and answering, as Ready leaves it.
+    async fn restart(
+        &self,
+        chat: &ChatSandbox,
+        provider: &dyn SandboxProvider,
+        host: &Host,
+        record: &Record,
+    ) -> Result<(), String> {
+        self.start_engine(chat, provider, host, record).await?;
+        answers(host, &record.steps.device_id).await?;
+        if let Err(err) = host.doc_host.retry_delivery(&record.steps.chat_id) {
+            tracing::warn!(error = %err, "sandbox: couldn't hand the waiting messages over");
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]

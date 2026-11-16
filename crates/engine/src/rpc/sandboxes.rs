@@ -32,6 +32,7 @@ pub(super) fn handles(method: &str) -> bool {
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
             | methods::SAVE_SANDBOX_TEMPLATE
+            | methods::WAKE_SANDBOX
             | methods::SANDBOX_HOST
             | methods::ADOPT_SANDBOX_PROVIDER
             | methods::SET_SANDBOX_HOST
@@ -194,6 +195,7 @@ impl EngineRpc {
                 | methods::CHECK_SANDBOX
                 | methods::START_SANDBOX_FRESH
                 | methods::SAVE_SANDBOX_TEMPLATE
+                | methods::WAKE_SANDBOX
         ) && !routed(&params)
         {
             let p: ChatParams = parse_params(params.clone())?;
@@ -357,6 +359,13 @@ impl EngineRpc {
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "template": template }))
+            }
+            methods::WAKE_SANDBOX => {
+                let p: ChatParams = parse_params(params)?;
+                sandboxes
+                    .wake_chat(self.sandbox_host(), &p.chat_id)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }

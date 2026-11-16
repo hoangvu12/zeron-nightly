@@ -118,6 +118,8 @@ export type Alert = {
 	cells: { string }?,
 	trail: string?,
 	quiet: boolean?,
+	-- Its glyph in place of its tone's (a sandbox asleep: "moon").
+	icon: string?,
 }
 export type Props = {
 	queue: State<{ Queued }>?,
@@ -1324,6 +1326,10 @@ local function alert_row(a: Alert, row: State<Alert>, props: Props, height: numb
 				return row:get().spinner == true
 			end, status.StatusIcon { kind = "working", size = 14 }, Icon {
 				name = function(): Icon.Name
+					local own = row:get().icon
+					if own then
+						return own :: Icon.Name
+					end
 					return if row:get().tone == "info" then "info-circle" else "danger-triangle"
 				end,
 				size = 14,
@@ -1589,7 +1595,14 @@ local function build(props: Props): ({ Tab }, State<Tray?>, { [string]: number }
 				color = function(): string
 					return `$zeron.tone.{worst()}.ink`
 				end,
-				Icon { name = "danger-triangle", size = size },
+				Icon {
+					-- (One alone with its own glyph wears it.)
+					name = function(): Icon.Name
+						local list = alerts:get()
+						return if #list == 1 and list[1].icon then list[1].icon :: Icon.Name else "danger-triangle"
+					end,
+					size = size,
+				},
 			}
 		end
 		local body = ui.column {

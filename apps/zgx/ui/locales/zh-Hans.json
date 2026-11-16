@@ -3050,6 +3050,27 @@
       "outbox_uploading": "正在上传…",
       "outbox_failed": "未发送"
     },
+    "sandbox_machine": {
+      "asleep": "沙盒已休眠",
+      "wake": "唤醒",
+      "wake_failed_title": "沙盒未能唤醒",
+      "wake_failed_summary": "请再试一次唤醒",
+      "wake_failed_body": "此对话的沙盒未能唤醒。请稍后再试。",
+      "wake_failure_outdated": "此设备上的 Zeron 版本过旧，无法唤醒沙盒。请更新后再试。",
+      "wake_failure": "无法唤醒。请再试一次。",
+      "fresh": "Start fresh",
+      "gone_title_in": "Sandbox deleted in {place}",
+      "gone_title": "Sandbox deleted",
+      "gone_summary": "The conversation is kept",
+      "gone_body": "This chat's sandbox was deleted outside Zeron. The conversation is kept. Start fresh makes a new sandbox from its repository, on the chat's branch: what was pushed comes back, what wasn't is lost.",
+      "disk_title": "Sandbox's disk is full",
+      "disk_summary": "Free some space, or start fresh",
+      "disk_body": "This chat's sandbox ran out of disk. Free some space, or start fresh: a new sandbox with what was pushed.",
+      "failure_offline": "Couldn't reach Zeron on this device. Try again once it's back.",
+      "failure_outdated": "This device's Zeron is too old to start a sandbox fresh. Update it, then try again.",
+      "failure_signed_out": "Sign in again, then try again.",
+      "failure": "Couldn't start fresh. Try again."
+    },
     "turn_state": {
       "interrupted": "已中断",
       "waking": "正在唤醒 Cloud 机器…",
@@ -3084,6 +3105,7 @@
         "other": "Setting up the sandbox"
       },
       "starting": "{step} · {elapsed}",
+      "waking": "正在唤醒沙盒 · {elapsed}",
       "failed": "{step} failed",
       "failed_because": "{step} failed: {error}",
       "run_again": "Run again",
@@ -3091,6 +3113,13 @@
     }
   },
   "panel": {
+    "asleep": {
+      "title": "沙盒已休眠",
+      "body": "没有任务运行时它已进入休眠。唤醒它，或发送一条消息。",
+      "sleeping": "它正在进入休眠。唤醒它，或发送一条消息。",
+      "waking": "正在唤醒…",
+      "wake": "唤醒"
+    },
     "tab": {
       "plugin": "插件",
       "browser": "浏览器",
