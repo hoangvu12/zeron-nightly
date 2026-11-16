@@ -2503,6 +2503,7 @@ fn forwardable(method: &str) -> bool {
             | methods::QUEUE_COMMAND
             // Answered by the device that keeps the provider (the host device).
             | methods::LIST_SANDBOX_PROVIDERS
+            | methods::LIST_SANDBOX_TEMPLATES
             | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
@@ -2515,7 +2516,6 @@ fn forwardable(method: &str) -> bool {
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
             | methods::SAVE_SANDBOX_TEMPLATE
-            | methods::LIST_SANDBOX_TEMPLATES
             | methods::ADOPT_SANDBOX_PROVIDER
             | methods::SET_SANDBOX_HOST
             | methods::TAKE_PROJECT_ACTION_SETUP

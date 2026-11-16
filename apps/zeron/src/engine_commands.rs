@@ -21,6 +21,11 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                 {
                     zeron_engine::sandboxes::take_device_id(&config.data_dir, &device_id)?;
                 }
+                if config.lent_sign_in.is_some()
+                    && let Ok(provider) = std::env::var(zeron_engine::sandboxes::PROVIDER_ENV)
+                {
+                    zeron_engine::sandboxes::take_provider(&config.data_dir, &provider)?;
+                }
                 let engine = zeron_engine::Engine::new(config);
                 engine.run().await
             })

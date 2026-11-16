@@ -314,6 +314,10 @@ impl EngineCore {
                 local_only: matches!(profile.scope(), WorkspaceScope::Local),
             },
         )?;
+        // A sandbox's engine says whose sandbox it is (spec #37).
+        if let Some(provider) = sandboxes::provider_of(data_dir) {
+            workspace.advertise_sandbox(&provider);
+        }
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.follow_chat_deletions(workspace.watch_chats());
@@ -1182,6 +1186,9 @@ impl Engine {
                 .register(Arc::new(sandboxes::docker::DockerProvider::new(
                     sandboxes::KeySlot::open(&config.data_dir, sandboxes::docker::ID),
                 )));
+            core.sandboxes.register(Arc::new(sandboxes::BoatProvider::new(
+                sandboxes::KeySlot::open(&config.data_dir, sandboxes::boat::BOAT_ID),
+            )));
         }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).

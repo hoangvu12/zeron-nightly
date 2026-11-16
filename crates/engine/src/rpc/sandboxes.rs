@@ -20,6 +20,7 @@ pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_SANDBOX_PROVIDERS
+            | methods::LIST_SANDBOX_TEMPLATES
             | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
@@ -31,7 +32,6 @@ pub(super) fn handles(method: &str) -> bool {
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
             | methods::SAVE_SANDBOX_TEMPLATE
-            | methods::LIST_SANDBOX_TEMPLATES
             | methods::SANDBOX_HOST
             | methods::ADOPT_SANDBOX_PROVIDER
             | methods::SET_SANDBOX_HOST
@@ -218,6 +218,14 @@ impl EngineRpc {
         }
         match method {
             methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
+            methods::LIST_SANDBOX_TEMPLATES => {
+                let p: ProviderParams = parse_params(params)?;
+                let templates = sandboxes
+                    .templates(&p.provider)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&templates)
+            }
             methods::CONNECT_SANDBOX_PROVIDER => {
                 let p: ConnectParams = parse_params(params)?;
                 let provider = sandboxes.provider_named(&p.provider).ok_or_else(|| {
@@ -349,14 +357,6 @@ impl EngineRpc {
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "template": template }))
-            }
-            methods::LIST_SANDBOX_TEMPLATES => {
-                let p: ProviderParams = parse_params(params)?;
-                let templates = sandboxes
-                    .templates(&p.provider)
-                    .await
-                    .map_err(RpcError::Failed)?;
-                RpcReply::value(&templates)
             }
             _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }

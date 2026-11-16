@@ -93,17 +93,6 @@ impl Sandboxes {
         }
         Ok(saved)
     }
-
-    /// `ListSandboxTemplates`: `provider_id`'s templates (the picker's).
-    pub(crate) async fn templates(&self, provider_id: &str) -> Result<Vec<Template>, String> {
-        let provider = self
-            .provider(provider_id)
-            .ok_or_else(|| format!("{provider_id} isn't on this device."))?;
-        if !provider.ops().contains(Ops::TEMPLATES) {
-            return Ok(Vec::new());
-        }
-        provider.templates().await.map_err(|e| e.message)
-    }
 }
 
 /// The name as saved: trimmed; never blank, never a path.

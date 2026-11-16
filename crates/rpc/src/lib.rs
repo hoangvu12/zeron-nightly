@@ -222,6 +222,9 @@ pub mod methods {
     /// `{}` → `[{id, name, icon, ops, account: {name} | null}]`: the
     /// providers this device keeps, and who each is connected as.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
+    /// `{provider}` → `[{id, name}]`: its account's templates (the template
+    /// picker adds Blank, no template, itself).
+    pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
     /// `{provider, token}` → `{account: {name}, hostDeviceId}`: connect with
     /// a pasted key. `{provider}` → `{deviceCode: {userCode, verificationUri,
     /// verificationUriComplete, expiresIn}}`: the user approves that code on
@@ -272,9 +275,6 @@ pub mod methods {
     /// again on the chat's device id. Answers once saved (minutes, for a
     /// big disk). Refused, saving nothing, while the chat is working.
     pub const SAVE_SANDBOX_TEMPLATE: &str = "SaveSandboxTemplate";
-    /// `{provider}` → `[{id, name}]`: the provider's templates, for the
-    /// template picker (Docker: the account's finished images).
-    pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
     // The host device (spec #37): one of the user's devices keeps each
     // provider's key and does its calls; the others ask it. A chat's
     // Sandbox* methods and `createChat` on a place go to it

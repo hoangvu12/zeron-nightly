@@ -11,6 +11,7 @@
 
 local ds = require("@ds")
 local sessions = require("@account/sessions")
+local sandboxes = require("@account/sandboxes")
 local project_calls = require("@account/projects")
 -- The project editor (screens/shell/project_editor, its emoji picker and
 -- the emoji's data): loaded as it's first opened, not with the window, and
@@ -246,18 +247,25 @@ ui.effect(function()
 	end
 end)
 
--- Device names, by id; this Mac's.
-local function devices(): ({ [string]: string }, string?)
+-- Device names, by id; this Mac's; and the glyphs of those that say more
+-- by one: a sandbox reads as its provider, by its name and icon.
+local function devices(): ({ [string]: string }, string?, { [string]: string })
 	local names: { [string]: string } = {}
+	local icons: { [string]: string } = {}
 	local here: string? = nil
 	local here_id = sessions.here:get()
 	for _, d in sessions.devices:get() do
 		names[d.id] = d.name
+		local provider = sandboxes.of_device(d)
+		if provider then
+			names[d.id] = sandboxes.name(provider)
+			icons[d.id] = sandboxes.icon(provider)
+		end
 		if d.here or d.id == here_id then
 			here = d.name
 		end
 	end
-	return names, here
+	return names, here, icons
 end
 
 -- A device's id by the name its group shows (ds.Sidebar groups by name):
@@ -347,7 +355,7 @@ end
 -- The Archived shelf's sessions (the most recently moved first), as the
 -- list's rows read them.
 local shelf = ui.computed(function(): { any }
-	local names = devices()
+	local names, _, icons = devices()
 	local out = {}
 	for _, c in sessions.archived:get() do
 		table.insert(out, {
@@ -359,6 +367,7 @@ local shelf = ui.computed(function(): { any }
 			harness = c.harness,
 			agent_icon = c.agent_icon,
 			device = names[c.device] or locale.s("shell.sidebar.unknown_device"),
+			device_icon = icons[c.device],
 			branch = c.branch,
 		})
 	end
@@ -476,7 +485,7 @@ local projects = ui.computed(function(): { ds.SidebarProject }
 	local asked = asks:get()
 	local only = narrow:get()
 	local just = only_project()
-	local names = devices()
+	local names, _, icons = devices()
 	local out: { ds.SidebarProject } = {}
 	local by: { [string]: ds.SidebarProject } = {}
 	-- One group for each repository, whichever device its clones are on: it stands
@@ -552,6 +561,7 @@ local projects = ui.computed(function(): { ds.SidebarProject }
 			created = c.created,
 			agent = c.agent :: any,
 			device = names[c.device] or locale.s("shell.sidebar.unknown_device"),
+			device_icon = icons[c.device],
 			branch = c.branch,
 			-- (Its side chats working count as its subagents do, as its
 			-- lanes' badge counts them: screens/chat/lanes.)
@@ -990,11 +1000,6 @@ end)
 -- The sessions the list shows, in its order (those folded away, and those
 -- past a group's "Show N more", left out): ⌘1–9 go to its first nine.
 M.order = ui.state("shell_sidebar_order", {} :: { string })
--- Which of them run on a sandbox this device keeps (their menus offer Save
--- as template), asked as they're listed.
-ui.effect(function()
-	sandbox_templates.check(M.order:get())
-end)
 -- ⌘ held alone: those nine wear their keys (Zeron's jump hints): shown at
 -- once, as Zeron's are, kept through the ⌘1–9 they offer, and only while
 -- this window is the one typed in and no palette has the keys. Any other
@@ -1247,9 +1252,9 @@ local function menu(id: string): { any }?
 		if side or activity.on:peek() then false else { label = locale.s("shell.sidebar.menu.move_to"), icon = "folder-with-files", submenu = into },
 		sleep,
 		stop_waiting,
-		-- (A chat on a sandbox this device keeps: saved for new chats to
-		-- start from, Zeron's identity left out.)
-		if sandbox_templates.can_save(id)
+		-- (A chat on a sandbox: saved for new chats to start from, Zeron's
+		-- identity left out, by the host device keeping it.)
+		if sandbox_templates.on_sandbox(id)
 			then {
 				label = locale.s("shell.sidebar.menu.save_template"),
 				icon = "box",
@@ -1642,7 +1647,7 @@ end
 
 -- Save as template, from a session's menu: its name asked first.
 function M.save_template(id: string)
-	if not sandbox_templates.can_save(id) or sandbox_templates.saving(id) then
+	if not sandbox_templates.on_sandbox(id) or sandbox_templates.saving(id) then
 		return
 	end
 	templating:set(id)

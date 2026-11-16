@@ -61,13 +61,16 @@ local EditorMenu = require("@self/editor_menu")
 -- it and the window's size (either may be missing).
 export type Usage = context_usage.Usage
 
--- A device it can run on: its name; Cloud (a machine of its own), this
--- device ("You"), or one out of reach.
+-- A device it can run on: its name; Cloud (a machine of its own), a place
+-- (`sandbox`: a provider's sandbox of its own, its templates to pick; `icon`
+-- its glyph), this device ("You"), or one out of reach.
 -- `disabled`: shown but not to be picked, `description` saying why.
 export type Device = {
 	value: string,
 	label: string,
 	cloud: boolean?,
+	sandbox: string?,
+	icon: Icon.Name?,
 	you: boolean?,
 	offline: boolean?,
 	description: string?,
@@ -90,7 +93,9 @@ export type Notice = {
 }
 export type Answer = { values: { string }, text: string }
 -- Where an existing chat works (`branch_fixed`).
-export type Fixed = { device: string?, name: string?, worktree: boolean, project: string?, hue: string?, src: string?, emoji: string? }
+-- (`icon`: where it runs, as a glyph: a place's provider's; `template`: the
+-- one its sandbox started from.)
+export type Fixed = { device: string?, name: string?, worktree: boolean, project: string?, hue: string?, src: string?, emoji: string?, icon: Icon.Name?, template: string? }
 export type Props = {
 	value: State<string>,
 	placeholder: (string | Message)?,
@@ -156,6 +161,11 @@ export type Props = {
 	-- choosing the device and the checkout.
 	device: State<string?>?,
 	devices: ({ Device } | State<{ Device }> | () -> { Device })?,
+	-- On a place: the template picked ("" for Blank) and those to pick (its
+	-- account's, and Blank), a row of their own under the device's, opened
+	-- as the place is picked.
+	template: State<string?>?,
+	templates: ({ Dropdown.Item } | State<{ Dropdown.Item }> | () -> { Dropdown.Item })?,
 	checkout: State<string?>?,
 	branch: State<string?>?,
 	branches: ({ Dropdown.Item } | State<{ Dropdown.Item }> | () -> { Dropdown.Item })?,
@@ -494,7 +504,11 @@ local function submenu(
 	search: string?,
 	actions: { Dropdown.Action }?,
 	-- Choices named by the row but not listed (one an action picks).
-	unlisted: ({ Choice } | () -> { Choice })?
+	unlisted: ({ Choice } | () -> { Choice })?,
+	-- Told of each pick (the one already chosen too).
+	on_choose: ((value: string) -> ())?,
+	-- Handed its open state, as its row is made (to open it from elsewhere).
+	on_menu: ((open: State<boolean>) -> ())?
 ): Node
 	local function current(): Choice
 		local v = value:get()
@@ -519,6 +533,7 @@ local function submenu(
 	end
 	return Dropdown {
 		on_open = close_siblings,
+		on_choose = on_choose,
 		value = value,
 		items = choices,
 		actions = actions,
@@ -533,6 +548,9 @@ local function submenu(
 		trigger = function(menu: Dropdown.Menu): Node
 			own = menu.open
 			table.insert(siblings, menu.open)
+			if on_menu then
+				on_menu(menu.open)
+			end
 			return ui.menu_item(Menu.look {
 				label = label,
 				bg = function()
@@ -643,6 +661,21 @@ local function on_cloud(device: State<string?>?, devices: any): boolean
 	return false
 end
 
+-- Whether the device chosen is a place (a device row marked `sandbox`): a
+-- sandbox of its own, so no checkout to choose, and a template to.
+local function on_place(device: State<string?>?, devices: any): boolean
+	if not device or not devices then
+		return false
+	end
+	local chosen = device:get()
+	for _, d in list_of(devices) :: { Device } do
+		if d.value == chosen then
+			return d.sandbox ~= nil
+		end
+	end
+	return false
+end
+
 -- The head of where-it-works's panel: "Work in", then the device it runs
 -- on, the project there and the checkout, each a row opening its choices
 -- beside the panel (the project's with "New project" under them).
@@ -652,9 +685,14 @@ local function work_in(
 	on_new_project: (() -> ())?,
 	checkout: State<string?>?,
 	device: State<string?>?,
-	devices: ({ Device } | State<{ Device }> | () -> { Device })?
+	devices: ({ Device } | State<{ Device }> | () -> { Device })?,
+	template: State<string?>?,
+	templates: any
 ): Node
 	local siblings: { State<boolean> } = {}
+	-- The templates' row's open state, once it's made: picking a place
+	-- opens it, every time.
+	local templates_open: State<boolean>? = nil
 	local rows: { Node } = {
 		Menu.Heading { locale.t("ds.composer.work_in") },
 	}
@@ -663,7 +701,7 @@ local function work_in(
 		local function choices(): { Choice }
 			local out: { Choice } = {}
 			for _, d in list_of(devices) :: { Device } do
-				local icon: Icon.Name = if d.cloud then "cloud" else "monitor"
+				local icon: Icon.Name = d.icon or (if d.cloud then "cloud" else "monitor")
 				table.insert(out, {
 					value = d.value,
 					label = d.label,
@@ -680,7 +718,43 @@ local function work_in(
 			rows,
 			ui.show(function(): boolean
 				return #choices() > 0
-			end, submenu(siblings, locale.t("ds.composer.device.label"), device, choices, 1, locale.s("ds.composer.device.search")))
+			end, submenu(siblings, locale.t("ds.composer.device.label"), device, choices, 1, locale.s("ds.composer.device.search"), nil, nil, function(v: string)
+				-- A place: on to its templates (after this pick's panel closes).
+				for _, d in list_of(devices) :: { Device } do
+					if d.value == v and d.sandbox then
+						ui.after(0, function()
+							for _, open in siblings do
+								open:set(false)
+							end
+							if templates_open then
+								templates_open:set(true)
+							end
+						end)
+					end
+				end
+			end))
+		)
+	end
+	if template and templates and device and devices then
+		-- On a place, its templates (its account's, and Blank).
+		local function choices(): { Choice }
+			local out: { Choice } = {}
+			for _, t in list_of(templates) :: { any } do
+				table.insert(out, { value = t.value, label = t.label, icon = t.icon or "box" })
+			end
+			return out
+		end
+		table.insert(
+			rows,
+			ui.show(function(): boolean
+				return on_place(device, devices)
+			end, ui.div {
+				id = "composer-place-templates",
+				w_full = true,
+				submenu(siblings, locale.t("ds.composer.template.label"), template, choices, 1, nil, nil, nil, nil, function(open: State<boolean>)
+					templates_open = open
+				end),
+			})
 		)
 	end
 	if project and projects then
@@ -744,7 +818,7 @@ local function work_in(
 		table.insert(
 			rows,
 			ui.show(function(): boolean
-				return (project == nil or project:get() ~= NO_PROJECT) and not plain() and not on_cloud(device, devices)
+				return (project == nil or project:get() ~= NO_PROJECT) and not plain() and not on_cloud(device, devices) and not on_place(device, devices)
 			end, submenu(siblings, locale.t("ds.composer.checkout.label"), checkout, CHECKOUTS, 2))
 		)
 	end
@@ -795,6 +869,9 @@ end
 type Place = {
 	-- The device it runs on, by name (nil: none to say).
 	device: (() -> string?)?,
+	-- On a place, the template it starts from, by name, after the device
+	-- (provider › template › project › branch).
+	template: (() -> string?)?,
 	-- The project (nil: none named), and whether it works in one at all.
 	project: () -> Project?,
 	in_project: () -> boolean,
@@ -821,12 +898,18 @@ local function place_line(p: Place): { Child }
 	end
 	-- The name's and the branch's own widths, measured unseen: each keeps
 	-- its least of itself, or all of a shorter one (never padded out).
-	local natural, branch_natural, device_natural = ui.ref(), ui.ref(), ui.ref()
+	local natural, branch_natural, device_natural, template_natural = ui.ref(), ui.ref(), ui.ref(), ui.ref()
 	local function device_name(): string
 		return if p.device then p.device() or "" else ""
 	end
 	local function has_device(): boolean
 		return device_name() ~= ""
+	end
+	local function template_name(): string
+		return if p.template then p.template() or "" else ""
+	end
+	local function has_template(): boolean
+		return has_device() and template_name() ~= ""
 	end
 	local function branch_min(): number
 		return math.min(BRANCH_FLOOR, math.ceil(branch_natural.width or BRANCH_FLOOR))
@@ -839,7 +922,9 @@ local function place_line(p: Place): { Child }
 				on_measures(
 					if has_project() or not p.in_project() then name_w else 0,
 					if p.in_project() then branch_w else 0,
-					if has_device() then (device_natural.width or 0) + PLACE_CHEVRON else 0
+					if has_device()
+						then (device_natural.width or 0) + PLACE_CHEVRON + (if has_template() then (template_natural.width or 0) + PLACE_CHEVRON else 0)
+						else 0
 				)
 			end
 		end)
@@ -880,6 +965,16 @@ local function place_line(p: Place): { Child }
 			pointer_events = "none",
 			aria_hidden = true,
 		},
+		ui.text {
+			template_name,
+			ref = template_natural,
+			absolute = true,
+			left = 0,
+			top = 0,
+			opacity = 0,
+			pointer_events = "none",
+			aria_hidden = true,
+		},
 		ui.presence(lead, function(kind: string): Node
 			-- (Its kind named, for tests: "place-lead-worktree".)
 			return ui.div { class = `place-lead-{kind}`, Icon { name = kind :: Icon.Name, size = 12 } }
@@ -897,6 +992,31 @@ local function place_line(p: Place): { Child }
 				device_name,
 				roll = true,
 				id = "composer-place-device",
+				mb = LIFT,
+				max_w = DEVICE_MAX,
+				shrink = 1,
+				fade = 16,
+			},
+			ui.div {
+				shrink = 0,
+				color = "$text.disabled",
+				aria_hidden = true,
+				Icon { name = "alt-arrow-right-bold", size = 10 },
+			},
+		}),
+		ui.show(function(): boolean
+			return unfolded() and has_template()
+		end, ui.row {
+			shrink = 1,
+			min_w = function(): number
+				return PLACE_CHEVRON + math.min(DEVICE_MIN, math.ceil(template_natural.width or DEVICE_MIN))
+			end :: any,
+			gap = "$space.1",
+			items = "center",
+			FadeText {
+				template_name,
+				roll = true,
+				id = "composer-place-template",
 				mb = LIFT,
 				max_w = DEVICE_MAX,
 				shrink = 1,
@@ -2123,7 +2243,7 @@ return ui.component(function(props: Props): Node
 			-- Built for each chip it heads (a node lives in one place).
 			local function head_node(): Node?
 				return if checkout or props.device or props.project
-					then work_in(props.project, props.projects :: any, props.on_new_project, checkout, props.device, props.devices :: any)
+					then work_in(props.project, props.projects :: any, props.on_new_project, checkout, props.device, props.devices :: any, props.template, props.templates)
 					else nil
 			end
 			-- In a project, its refs: the branch chip, its search and its
@@ -2166,6 +2286,15 @@ return ui.component(function(props: Props): Node
 				if on_cloud(props.device, props.devices) then
 					return "cloud"
 				end
+				-- A place: its provider's glyph.
+				if on_place(props.device, props.devices) then
+					local v = props.device and props.device:get()
+					for _, d in list_of(props.devices) :: { Device } do
+						if d.value == v then
+							return d.icon or "box"
+						end
+					end
+				end
 				local chosen = chosen_project()
 				if chosen and chosen.plain then
 					return nil
@@ -2184,6 +2313,19 @@ return ui.component(function(props: Props): Node
 				for _, d in list_of(props.devices) :: { Device } do
 					if d.value == v then
 						return d.label
+					end
+				end
+				return nil
+			end
+			-- On a place, the template picked, by name.
+			local function chosen_template(): string?
+				if not props.template or not props.templates or not on_place(props.device, props.devices) then
+					return nil
+				end
+				local v = props.template:get()
+				for _, item in list_of(props.templates) :: { Dropdown.Item } do
+					if item.value == v then
+						return item.label :: any
 					end
 				end
 				return nil
@@ -2220,6 +2362,7 @@ return ui.component(function(props: Props): Node
 						on_click = menu.toggle,
 						table.unpack(place_line {
 							device = chosen_device,
+							template = chosen_template,
 							project = chosen_project,
 							in_project = in_project,
 							branch = branch_name,
@@ -2251,6 +2394,10 @@ return ui.component(function(props: Props): Node
 							local f = fixed()
 							return if f then f.device else nil
 						end,
+						template = function(): string?
+							local f = fixed()
+							return if f then f.template else nil
+						end,
 						project = function(): Project?
 							local f = fixed()
 							if f and f.project then
@@ -2267,6 +2414,9 @@ return ui.component(function(props: Props): Node
 						end,
 						glyph = function(): Icon.Name?
 							local f = fixed()
+							if f and f.icon then
+								return f.icon
+							end
 							return if f and f.worktree then "worktree" else nil
 						end,
 						folded = folded,
