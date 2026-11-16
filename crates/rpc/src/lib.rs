@@ -222,8 +222,12 @@ pub mod methods {
     /// `{}` → `[{id, name, icon, ops}]`: the providers this device keeps.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
-    /// state: starting|ready|failed, step, since, error, steps: [{step,
-    /// state}]}`), or `null` for a chat not on a place this device keeps.
+    /// state: starting|ready|failed|gone, step, since, error, diskFull,
+    /// steps: [{step, state}], scripts: [{hook, step, name, script, for,
+    /// state: running|failed, since, error}]}`), or `null` for a chat not on
+    /// a place this device keeps. `scripts` holds the step script running
+    /// now and those that failed (a failure holds nothing up; Run again
+    /// runs it again).
     pub const SANDBOX_STEPS: &str = "SandboxSteps";
     /// `{chatId}` → stream of `SandboxSteps` (current, then each change).
     pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
@@ -247,6 +251,13 @@ pub mod methods {
     pub const WRITE_STEP_SCRIPT: &str = "WriteStepScript";
     /// `{for, hook, name}` → `{ok}`.
     pub const DELETE_STEP_SCRIPT: &str = "DeleteStepScript";
+    /// `{chatId}` → `SandboxSteps`: ask the provider whether the chat's
+    /// sandbox is still there (a client opening a chat whose sandbox is
+    /// offline); a deleted one reads `state: "gone"`. Never wakes it.
+    pub const CHECK_SANDBOX: &str = "CheckSandbox";
+    /// `{chatId}` → `{ok}`: Start fresh, a new sandbox for the chat (the
+    /// old one deleted, if it's still there) with the chat's pushed branch.
+    pub const START_SANDBOX_FRESH: &str = "StartSandboxFresh";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run

@@ -14,184 +14,25 @@
 
 #[path = "support/fake_provider.rs"]
 mod fake_provider;
+#[path = "support/places.rs"]
+mod places;
 #[path = "support/scripted_edge.rs"]
 mod scripted_edge;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fake_provider::{FakeProvider, engine_config, start_engine};
-use scripted_edge::{ScriptedEdge, USER};
+use fake_provider::FakeProvider;
+use places::{SPACE, add_project, create_on_place, eventually, host_device, origin, project, ready, steps_until};
+use scripted_edge::ScriptedEdge;
 use serde_json::{Value, json};
-use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload};
-use zeron_engine::EngineRuntime;
+use zeron_doc::{MessageRole, MessageStatus};
 use zeron_engine::sandboxes::SandboxProvider;
-use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 use zeron_rpc::{RpcClient, memory_client, methods};
 
-const ORG: &str = "org_home";
-const SPACE: &str = "space-1";
-
-// ---------------------------------------------------------------------------
-// Fixtures (as in sandbox_place.rs)
-// ---------------------------------------------------------------------------
-
-async fn host_device(dir: &Path, edge: &ScriptedEdge) -> EngineRuntime {
-    std::fs::create_dir_all(dir).unwrap();
-    let session = json!({
-        "refreshToken": edge.seed_session(ORG),
-        "user": { "id": USER, "email": "u@example.com" },
-        "orgId": ORG,
-    });
-    std::fs::write(dir.join("session.json"), session.to_string()).unwrap();
-    start_engine(&engine_config(dir, &edge.url, None)).await
-}
-
-fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-fn origin(at: &Path) {
-    let seed = at.with_extension("seed");
-    std::fs::create_dir_all(&seed).unwrap();
-    git(&seed, &["init", "-q", "-b", "main"]);
-    std::fs::write(seed.join("README.md"), "reportly\n").unwrap();
-    git(&seed, &["add", "."]);
-    git(
-        &seed,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@example.com",
-            "commit",
-            "-qm",
-            "first",
-        ],
-    );
-    git(
-        at.parent().unwrap(),
-        &[
-            "clone",
-            "-q",
-            "--bare",
-            &seed.to_string_lossy(),
-            &at.to_string_lossy(),
-        ],
-    );
-}
-
-fn project(dir: &Path, origin_url: &Path) -> PathBuf {
-    let project = dir.join("reportly");
-    std::fs::create_dir_all(&project).unwrap();
-    git(&project, &["init", "-q", "-b", "main"]);
-    git(
-        &project,
-        &["remote", "add", "origin", &origin_url.to_string_lossy()],
-    );
-    project
-}
-
-async fn add_project(rpc: &RpcClient, host: &EngineRuntime, path: &Path) {
-    rpc.call(
-        methods::MUTATE,
-        json!({
-            "op": "createSpace",
-            "spaceId": SPACE,
-            "deviceId": host.core().device_id,
-            "path": path.to_string_lossy(),
-            "gitDetected": true,
-        }),
-    )
-    .await
-    .expect("createSpace");
-}
-
-async fn create_on_place(rpc: &RpcClient, chat: &str, provider: &str) -> Value {
-    rpc.call(
-        methods::MUTATE,
-        json!({
-            "op": "createChat",
-            "chatId": chat,
-            "spaceId": SPACE,
-            "place": { "provider": provider },
-        }),
-    )
-    .await
-    .expect("createChat on a place")
-}
-
+/// Send the chat's first message (`<chat>-first`).
 async fn send(rpc: &RpcClient, chat: &str, cwd: &str, prompt: &str) {
-    let command = serde_json::to_value(SessionCommandPayload::Run {
-        request: RunRequest {
-            mcp: None,
-            prompt: prompt.into(),
-            harness: Some(HarnessId::Mock),
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            cwd: cwd.into(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            access: Default::default(),
-            plan: false,
-            attachments: Vec::new(),
-            worktree: None,
-            resume: None,
-            env: Default::default(),
-            extra_mcp: Vec::new(),
-        },
-        message_id: format!("{chat}-first"),
-    })
-    .unwrap();
-    rpc.call(
-        methods::QUEUE_COMMAND,
-        json!({ "chatId": chat, "command": command }),
-    )
-    .await
-    .expect("queue the first message");
-}
-
-async fn steps(rpc: &RpcClient, chat: &str) -> Value {
-    rpc.call(methods::SANDBOX_STEPS, json!({ "chatId": chat }))
-        .await
-        .expect("SandboxSteps")
-}
-
-async fn steps_until(
-    rpc: &RpcClient,
-    chat: &str,
-    within: Duration,
-    done: impl Fn(&Value) -> bool,
-) -> Value {
-    let deadline = Instant::now() + within;
-    loop {
-        let now = steps(rpc, chat).await;
-        if done(&now) {
-            return now;
-        }
-        assert!(Instant::now() < deadline, "steps of {chat}: {now:#}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn ready(rpc: &RpcClient, chat: &str) -> Value {
-    steps_until(rpc, chat, Duration::from_secs(90), |s| {
-        assert_ne!(s["state"], "failed", "{s:#}");
-        s["state"] == "ready"
-    })
-    .await
+    places::send(rpc, chat, &format!("{chat}-first"), cwd, prompt).await;
 }
 
 fn expect_states(steps: &Value, expected: &[(&str, &str)]) {
@@ -407,7 +248,7 @@ async fn scripts_run_where_their_moment_says_in_name_order() {
         );
     }
     let start = call_at(&calls, "start chat-a");
-    let engine = call_at(&calls, "zeron-engine headless");
+    let engine = call_at(&calls, "zeron-engine watchdog");
     let mut last = start;
     for in_sandbox in [
         "after-start/c.sh",
@@ -435,6 +276,39 @@ async fn scripts_run_where_their_moment_says_in_name_order() {
     );
 
     replied(&provider, "chat-a", "chat-a", Duration::from_secs(60)).await;
+
+    // Deleting the chat: its delete scripts run on the host device, the
+    // one before it while the sandbox is still there to act on.
+    std::fs::remove_file(&log).unwrap();
+    script(
+        &steps_dir.join("before-delete/keep.sh"),
+        &format!(
+            "echo \"before-delete $ZERON_SANDBOX\" >> \"{log_sh}\"\n\
+             zeron-sandbox 'echo last words > last-words.txt' && echo sandbox-ok >> \"{log_sh}\""
+        ),
+    );
+    script(&steps_dir.join("after-delete/bye.sh"), &note("after-delete"));
+    rpc.call(
+        methods::MUTATE,
+        json!({ "op": "deleteChat", "chatId": "chat-a" }),
+    )
+    .await
+    .expect("deleteChat");
+    eventually("the delete scripts ran", Duration::from_secs(30), async || {
+        (lines(&log).len() == 3).then_some(())
+    })
+    .await;
+    assert_eq!(
+        lines(&log),
+        ["before-delete chat-a", "sandbox-ok", "after-delete"]
+    );
+    let calls = provider.calls();
+    let words = call_at(&calls, "last-words.txt");
+    let deleted = call_at(&calls, "delete chat-a");
+    assert!(words < deleted, "{calls:#?}");
+    for host_side in ["before-delete/keep.sh", "after-delete/bye.sh"] {
+        assert!(!calls.iter().any(|c| c.contains(host_side)), "{calls:#?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -505,7 +379,7 @@ async fn a_failing_script_opens_the_chat_with_its_error_and_runs_again() {
     assert_eq!(lines(&log), ["setup.sh", "ok", "setup.sh"]);
     let calls = provider.calls();
     assert_eq!(
-        calls.iter().filter(|c| c.contains("zeron-engine headless")).count(),
+        calls.iter().filter(|c| c.contains("zeron-engine watchdog")).count(),
         1,
         "{calls:#?}"
     );

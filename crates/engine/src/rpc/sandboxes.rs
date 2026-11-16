@@ -21,6 +21,8 @@ pub(super) fn handles(method: &str) -> bool {
             | methods::READ_STEP_SCRIPT
             | methods::WRITE_STEP_SCRIPT
             | methods::DELETE_STEP_SCRIPT
+            | methods::CHECK_SANDBOX
+            | methods::START_SANDBOX_FRESH
     )
 }
 
@@ -129,6 +131,18 @@ impl EngineRpc {
                 }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::CHECK_SANDBOX => {
+                let p: ChatParams = parse_params(params)?;
+                RpcReply::value(&sandboxes.check(self.auth.as_ref(), &p.chat_id).await)
+            }
+            methods::START_SANDBOX_FRESH => {
+                let p: ChatParams = parse_params(params)?;
+                sandboxes
+                    .start_fresh(self.sandbox_host(), &p.chat_id)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }
     }
@@ -159,6 +173,49 @@ impl EngineRpc {
             &p.name,
         )
         .map_err(RpcError::Failed)
+    }
+
+    /// A child (subagent, side chat) of a chat on a sandbox shares that
+    /// sandbox, its device and checkout, unless it asks for a place of its
+    /// own. `None`: the parent isn't on a sandbox; create as usual.
+    pub(super) fn create_chat_in_parents_sandbox(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        config: Option<ChatConfig>,
+        parent_chat_id: &str,
+        child_kind: Option<zeron_proto::ChildKind>,
+    ) -> Option<Result<RpcReply, RpcError>> {
+        let parent = self.workspace.chat(parent_chat_id).ok().flatten()?;
+        // This device keeps its sandbox, or this engine is that sandbox's.
+        let kept = self
+            .sandboxes
+            .as_ref()
+            .is_some_and(|s| s.hosts_device(&parent.device_id));
+        let here = self.auth.as_ref().is_some_and(crate::auth::Auth::is_lent)
+            && parent.device_id == self.doc_host.device_id();
+        if !kept && !here {
+            return None;
+        }
+        let created = self
+            .workspace
+            .create_chat_hosted(
+                chat_id,
+                space_id,
+                device_id,
+                Some(&parent.device_id),
+                config,
+                parent.cwd.clone(),
+                Some(parent_chat_id.to_owned()),
+                child_kind,
+            )
+            .map_err(|e| RpcError::Failed(e.to_string()));
+        Some(created.and_then(|_| {
+            RpcReply::value(&serde_json::json!({
+                "ok": true, "deviceId": parent.device_id, "cwd": parent.cwd,
+            }))
+        }))
     }
 
     /// `createChat` on a place: the chat's row names its sandbox's device and

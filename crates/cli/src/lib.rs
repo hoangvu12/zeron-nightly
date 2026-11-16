@@ -20,6 +20,7 @@ mod env;
 pub mod logging;
 pub mod paths;
 pub mod update_cli;
+pub mod watchdog;
 
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
@@ -107,6 +108,10 @@ enum Command {
     /// the old version just before it hands over.
     #[command(name = "update-watchdog", hide = true)]
     UpdateWatchdog,
+    /// Keep `headless` running, restarting it whenever it stops: Zeron's
+    /// engine in a sandbox, which has no service manager.
+    #[command(hide = true)]
+    Watchdog,
 }
 
 #[derive(Subcommand)]
@@ -320,6 +325,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
                 .and_then(|runtime| runtime.block_on(update_cli::update(&edge_url_from_env(), check))),
         ),
         Some(Command::UpdateWatchdog) => Launch::Done(zeron_update::transaction::run_watchdog()),
+        Some(Command::Watchdog) => Launch::Done(watchdog::run(&paths::data_dir())),
         Some(Command::Daemon { command }) => Launch::Done(match command {
             DaemonCommand::Install => daemon::install(&paths::data_dir()),
             DaemonCommand::Uninstall => daemon::uninstall(),
@@ -351,7 +357,7 @@ impl Command {
             | Self::Template { .. } => true,
             #[cfg(target_os = "linux")]
             Self::Appshot => false,
-            Self::Update { .. } | Self::UpdateWatchdog | Self::Daemon { .. } => false,
+            Self::Update { .. } | Self::UpdateWatchdog | Self::Watchdog | Self::Daemon { .. } => false,
         }
     }
 }
