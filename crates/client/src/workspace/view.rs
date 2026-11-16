@@ -918,4 +918,41 @@ mod tests {
         let machine = snapshot.device("cloud-s1").expect("a Cloud machine is still found by id");
         assert_eq!(machine.capabilities, ["cloud-session"]);
     }
+
+    #[test]
+    fn a_chats_sandbox_isnt_a_device_but_is_still_found_by_id() {
+        let state: WorkspaceState = serde_json::from_value(serde_json::json!({
+            "devices": [
+                {"id": "mac", "name": "Studio", "platform": "macos", "lastSeenAt": null},
+                {"id": "sbx-1", "name": "chat-a", "platform": "linux",
+                 "lastSeenAt": null, "capabilities": ["message-queue-v1", "sandbox:docker"]}
+            ],
+            "spaces": [],
+            "chats": [
+                {"id": "chat-a", "deviceId": "sbx-1", "archived": false,
+                 "createdAt": "2026-10-19T12:00:00Z"}
+            ],
+            "sessions": []
+        }))
+        .unwrap();
+        let presence = HashMap::new();
+        let snapshot = derive(
+            &state,
+            None,
+            &DeriveContext {
+                self_device_id: "mac",
+                now: Utc::now(),
+                presence: &presence,
+                change_requests: &[],
+                send_states: &HashMap::new(),
+                synced: true,
+                previous: None,
+            },
+        );
+        let devices: Vec<&str> = snapshot.devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(devices, ["mac"]);
+        assert!(snapshot.execution_devices().iter().all(|d| d.id != "sbx-1"));
+        let sandbox = snapshot.device("sbx-1").expect("a sandbox is still found by id");
+        assert_eq!(sandbox.capabilities, ["message-queue-v1", "sandbox:docker"]);
+    }
 }
