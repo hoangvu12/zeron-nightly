@@ -148,6 +148,7 @@ mod tests {
             last_seen_at: seen,
             created_at: None,
             version: version.map(str::to_string),
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
         }

@@ -45,8 +45,11 @@ pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
 /// A repository's name and icon, shared by its copies; see `repository_looks`.
 pub const KIND_REPOSITORY_LOOKS: &str = "repositoryLooks";
+/// Each sandbox provider's host device; see `sandbox_hosts`.
+pub const KIND_SANDBOX_HOSTS: &str = "sandboxHosts";
 mod repository_looks;
 mod row_cache;
+mod sandbox_hosts;
 mod sidebar_pins;
 mod sidebar_sections;
 
@@ -1354,6 +1357,7 @@ impl RegistryDoc {
             ),
             ("cursorSdkEngineVersion", opt_str(device.version.as_deref())),
             ("capabilities", json!(device.capabilities)),
+            ("onlineSince", opt_ms(device.online_since)),
         ]);
         self.write(KIND_DEVICES, &device.id.clone(), OpKind::Upsert, set);
         Ok(())

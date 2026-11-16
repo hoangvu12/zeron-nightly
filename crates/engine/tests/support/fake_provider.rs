@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use zeron_engine::sandboxes::{
-    Command, CreateSandbox, ErrorKind, Exit, Ops, Placement, ProviderError, RunEvent, RunStream,
-    SandboxProvider, SandboxStatus, Template,
+    Account, Command, CreateSandbox, Credential, ErrorKind, Exit, KeySlot, Ops, Placement,
+    ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
 };
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, HarnessId, LentSignIn};
 
@@ -111,8 +111,12 @@ pub struct FakeProvider {
     /// Every chat on this one place.
     shared: Option<String>,
     resident: Option<Resident>,
+    /// The agents its template has (`None`: whatever this computer has).
+    agents: Option<Vec<HarnessId>>,
     state: Arc<Mutex<State>>,
     hold: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// Where one device keeps the account's key ([`Self::on_device`]).
+    slot: Option<KeySlot>,
 }
 
 impl FakeProvider {
@@ -164,8 +168,51 @@ impl FakeProvider {
             has_zeron: true,
             shared: None,
             resident: None,
+            agents: None,
             state: Arc::default(),
             hold: Mutex::new(None),
+            slot: None,
+        }
+    }
+
+    /// The same cloud as one of the user's devices builds it in: connected
+    /// with a key kept in that device's data dir, as Docker Sandbox is.
+    pub fn on_device(&self, data_dir: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            id: self.id.clone(),
+            ops: self.ops | Ops::CONNECT,
+            root: self.root.clone(),
+            has_zeron: self.has_zeron,
+            shared: self.shared.clone(),
+            resident: None,
+            state: self.state.clone(),
+            hold: Mutex::new(None),
+            slot: Some(KeySlot::open(data_dir, &self.id)),
+            agents: self.agents.clone(),
+        })
+    }
+
+    /// A full cloud whose template has only `agents` on it: its engine
+    /// knows no other.
+    pub fn cloud_with_agents(root: &Path, agents: &[HarnessId]) -> Arc<Self> {
+        let mut provider = Self::new("fake", Ops::ALL, root);
+        provider.agents = Some(agents.to_vec());
+        Arc::new(provider)
+    }
+
+    /// The sandbox goes to sleep: its engine stops and nothing runs there
+    /// until it's started again.
+    pub async fn sleep(&self, sandbox: &str) {
+        let engine = {
+            let mut state = self.state.lock().unwrap();
+            let Some(fake) = state.boxes.get_mut(sandbox) else {
+                return;
+            };
+            fake.running = false;
+            fake.engine.take()
+        };
+        if let Some(engine) = engine {
+            engine.shutdown().await;
         }
     }
 
@@ -315,8 +362,16 @@ impl FakeProvider {
             zeron_engine::sandboxes::take_device_id(&data_dir, &device).unwrap();
         }
         let config = engine_config(&data_dir, &edge_url, Some(lent));
-        self.spawn_engine(sandbox, config);
-        futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed()
+        let up = self.spawn_engine(sandbox, config);
+        if self.agents.is_none() {
+            return futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed();
+        }
+        // A template's agents are there before anyone can ask its engine.
+        futures::stream::once(async move {
+            let _ = up.await;
+            Ok(RunEvent::Exit(Exit::code(0)))
+        })
+        .boxed()
     }
 
     /// `zeron-engine forget-device`: its engine quiesced and stopped, then
@@ -344,15 +399,27 @@ impl FakeProvider {
         }
     }
 
-    fn spawn_engine(&self, sandbox: &str, config: EngineConfig) {
+    /// Start an engine in `sandbox`; the receiver fires once it's up.
+    fn spawn_engine(
+        &self,
+        sandbox: &str,
+        config: EngineConfig,
+    ) -> tokio::sync::oneshot::Receiver<()> {
         let state = self.state.clone();
         let sandbox = sandbox.to_owned();
+        let agents = self.agents.clone();
+        let (up_tx, up) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let engine = start_engine(&config).await;
+            if let Some(agents) = agents {
+                engine.core().registry.retain(|id| agents.contains(&id));
+            }
             if let Some(fake) = state.lock().unwrap().boxes.get_mut(&sandbox) {
                 fake.engine = Some(engine);
             }
+            let _ = up_tx.send(());
         });
+        up
     }
 }
 
@@ -431,6 +498,49 @@ impl SandboxProvider for FakeProvider {
 
     fn ops(&self) -> Ops {
         self.ops
+    }
+
+    fn account(&self) -> Option<Account> {
+        self.slot.as_ref()?.get().map(|_| Account {
+            name: "fake-account".into(),
+        })
+    }
+
+    async fn connect(&self, credential: Credential) -> Result<Account, ProviderError> {
+        let Credential::Token(token) = credential else {
+            return Err(ProviderError::unsupported("sign in on a page"));
+        };
+        // The keys the fake cloud gives out start with `fake-`.
+        if !token.starts_with("fake-") {
+            return Err(ProviderError::new(
+                ErrorKind::Config,
+                "that isn't a fake cloud key",
+            ));
+        }
+        self.adopt_key(serde_json::json!({ "token": token }).to_string())
+            .await
+    }
+
+    fn export_key(&self) -> Option<String> {
+        self.slot.as_ref()?.get()
+    }
+
+    async fn adopt_key(&self, raw: String) -> Result<Account, ProviderError> {
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or_else(|| ProviderError::unsupported("keep a key"))?;
+        slot.set(&raw)
+            .map_err(|e| ProviderError::new(ErrorKind::Fatal, e.to_string()))?;
+        Ok(Account {
+            name: "fake-account".into(),
+        })
+    }
+
+    async fn forget_key(&self) {
+        if let Some(slot) = &self.slot {
+            slot.clear().unwrap();
+        }
     }
 
     fn placement(&self, _chat_id: &str) -> Placement {
@@ -524,7 +634,23 @@ impl SandboxProvider for FakeProvider {
             }
         };
         if let Some(config) = config {
-            self.spawn_engine(sandbox, config);
+            drop(self.spawn_engine(sandbox, config));
+        }
+        Ok(())
+    }
+
+    async fn stop(&self, sandbox: &str) -> Result<(), ProviderError> {
+        self.record(format!("stop {sandbox}"));
+        let engine = {
+            let mut state = self.state.lock().unwrap();
+            let fake = state.boxes.get_mut(sandbox).ok_or_else(|| {
+                ProviderError::new(ErrorKind::NotFound, format!("no sandbox {sandbox}"))
+            })?;
+            fake.running = false;
+            fake.engine.take()
+        };
+        if let Some(engine) = engine {
+            engine.shutdown().await;
         }
         Ok(())
     }
@@ -585,7 +711,12 @@ impl SandboxProvider for FakeProvider {
             ));
         }
         let cwd = command.cwd.map(PathBuf::from).unwrap_or(home.clone());
-        let mut child = tokio::process::Command::new(program);
+        // The sandbox's `sh` (step scripts): on Windows, Git's.
+        let mut child = if program == "sh" {
+            tokio::process::Command::from(zeron_engine::sandboxes::scripts::sh_command())
+        } else {
+            tokio::process::Command::new(program)
+        };
         child
             .args(&command.args[1..])
             .current_dir(&cwd)

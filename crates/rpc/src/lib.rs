@@ -222,21 +222,43 @@ pub mod methods {
     /// `{}` → `[{id, name, icon, ops, account: {name} | null}]`: the
     /// providers this device keeps, and who each is connected as.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
-    /// `{provider, token}` → `{account: {name}}`: connect with a pasted key.
-    /// `{provider}` → `{deviceCode: {userCode, verificationUri,
+    /// `{provider, token}` → `{account: {name}, hostDeviceId}`: connect with
+    /// a pasted key. `{provider}` → `{deviceCode: {userCode, verificationUri,
     /// verificationUriComplete, expiresIn}}`: the user approves that code on
-    /// the provider's page; the account shows in `ListSandboxProviders` once
-    /// they have. The key stays on the device that answers.
+    /// the provider's page. Once connected, the key goes to the provider's
+    /// host device (`SandboxHost`; picked if there's none yet) once and stays
+    /// there; the account shows in that device's `ListSandboxProviders`.
     pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
     /// state: starting|ready|failed|gone, step, since, error, diskFull,
-    /// steps: [{step, state}]}`), or `null` for a chat not on a place this
-    /// device keeps.
+    /// steps: [{step, state}], scripts: [{hook, step, name, script, for,
+    /// state: running|failed, since, error}]}`), or `null` for a chat not on
+    /// a place this device keeps. `scripts` holds the step script running
+    /// now and those that failed (a failure holds nothing up; Run again
+    /// runs it again).
     pub const SANDBOX_STEPS: &str = "SandboxSteps";
     /// `{chatId}` → stream of `SandboxSteps` (current, then each change).
     pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
     /// `{chatId}` → `{ok}`: run a failed step again, and the ones after it.
     pub const RUN_SANDBOX_STEPS_AGAIN: &str = "RunSandboxStepsAgain";
+    // Step scripts (docs/design/cloud-byo.md "Step scripts"): files on the
+    // device that keeps the provider (the host device). A script is named
+    // by `{for, hook, name}`: `for` is `{kind: "all"}`, `{kind: "provider",
+    // provider}` or `{kind: "project", spaceId}` (a project on that
+    // device); `hook` is `before-|after-|instead-of-` + a step
+    // (`create`, `start`, `install-zeron`, `sign-in`, `secrets`,
+    // `get-code`, `setup`, `ready`, `sleep`, `wake`, `delete`), or `setup`
+    // for a project's `.zeron/setup.sh` (`name` is then `setup.sh`).
+    /// `{}` → `[{for, hook, name, timing: before|after|insteadOf|step, step,
+    /// runsOn: sandbox|host, script, path}]`: every script there is, by
+    /// `for`, then hook, then name.
+    pub const LIST_STEP_SCRIPTS: &str = "ListStepScripts";
+    /// `{for, hook, name}` → `{content}`.
+    pub const READ_STEP_SCRIPT: &str = "ReadStepScript";
+    /// `{for, hook, name, content}` → `{ok, path}`: create or save it.
+    pub const WRITE_STEP_SCRIPT: &str = "WriteStepScript";
+    /// `{for, hook, name}` → `{ok}`.
+    pub const DELETE_STEP_SCRIPT: &str = "DeleteStepScript";
     /// `{chatId}` → `SandboxSteps`: ask the provider whether the chat's
     /// sandbox is still there (a client opening a chat whose sandbox is
     /// offline); a deleted one reads `state: "gone"`. Never wakes it.
@@ -253,6 +275,23 @@ pub mod methods {
     /// `{provider}` → `[{id, name}]`: the provider's templates, for the
     /// template picker (Docker: the account's finished images).
     pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
+    // The host device (spec #37): one of the user's devices keeps each
+    // provider's key and does its calls; the others ask it. A chat's
+    // Sandbox* methods and `createChat` on a place go to it
+    // by themselves from any device that doesn't keep the provider.
+    /// `{provider}` → `{provider, hostDeviceId, connectedOn?}` or `null`
+    /// (not connected): which device is the provider's host device, from the
+    /// registry.
+    pub const SANDBOX_HOST: &str = "SandboxHost";
+    /// Device to device: `{provider, key, connectedOn?, grants?, chats?}` →
+    /// `{ok, hostDeviceId}`: become `provider`'s host device, keeping its key
+    /// in the provider's key slot (never answered back), the sign-ins the last one lent its sandboxes, and
+    /// their chats. Needs `sandbox-host-v1`.
+    pub const ADOPT_SANDBOX_PROVIDER: &str = "AdoptSandboxProvider";
+    /// `{provider, deviceId}` → `{ok, hostDeviceId}`: move the host device.
+    /// The current one hands the key, its lent sign-ins and chats over;
+    /// running sandboxes keep going, their next token lent by `deviceId`.
+    pub const SET_SANDBOX_HOST: &str = "SetSandboxHost";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run
@@ -1458,6 +1497,9 @@ mod tests {
             methods::ACCESS_TOKEN,
             methods::STEP_UP,
             methods::LEND_TOKEN,
+            methods::CONNECT_SANDBOX_PROVIDER,
+            methods::ADOPT_SANDBOX_PROVIDER,
+            methods::SET_SANDBOX_HOST,
             methods::DELETE_ACCOUNT,
             methods::SIGN_IN,
             methods::COMPLETE_SIGN_IN,

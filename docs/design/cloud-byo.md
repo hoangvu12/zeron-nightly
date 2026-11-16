@@ -170,6 +170,18 @@ Opening a composer never creates or wakes a sandbox. If the picked agent isn't t
 says "Claude Code isn't on this template" and keeps the message, so the user can switch and
 resend. Zeron never swaps the agent.
 
+How it works (#46):
+- A composer asks `ListHarnesses` / `ListModels` with `targetDeviceId` set to a place target,
+  `place:<provider>[:<template>]` (`zeron_proto::places::place_target`), or, for an existing chat, to its
+  sandbox's device. The device keeping the provider answers itself and never forwards either call.
+- The cache: each time a sandbox reaches Ready, that device asks its engine for its agents and their
+  models, and keeps them per template in `{data}/place-catalogs.json`.
+- The sandbox's engine (on a lent sign-in) refuses a send whose agent it doesn't have before writing
+  anything. The command is Rejected with `agent_not_on_template:<harness>: <Agent> isn't on this
+  template`, and `WaitingMessages` lists it with that `failure` until a send with the same message id
+  follows. zgx shows the words as a warning, puts the message back in the composer, and sends it again
+  as the same message with the agent the user picks.
+
 ## Lifecycle
 
 | When | Then |

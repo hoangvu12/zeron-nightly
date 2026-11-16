@@ -367,6 +367,18 @@ pub trait SandboxProvider: Send + Sync + 'static {
     async fn extend(&self, _sandbox: &str, _ttl: Duration) -> Result<(), ProviderError> {
         Err(ProviderError::unsupported("extend time limits"))
     }
+    /// What its key slot holds, for the next host device (spec #37): moved
+    /// over the relay once, never logged. `None`: not connected here.
+    fn export_key(&self) -> Option<String> {
+        None
+    }
+    /// Keep `raw`, what another host device's [`Self::export_key`] gave, as
+    /// this device's sign-in; the account it's for.
+    async fn adopt_key(&self, _raw: String) -> Result<Account, ProviderError> {
+        Err(ProviderError::unsupported("move to another device"))
+    }
+    /// Let go of the sign-in on this device: another device keeps it now.
+    async fn forget_key(&self) {}
 }
 
 /// A command that ran to its end: its exit and its output.

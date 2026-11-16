@@ -985,6 +985,38 @@ impl SandboxProvider for DockerProvider {
         }
     }
 
+    fn export_key(&self) -> Option<String> {
+        lock(&self.kept)
+            .as_ref()
+            .and_then(|kept| serde_json::to_string(kept).ok())
+    }
+
+    async fn adopt_key(&self, raw: String) -> Result<Account, ProviderError> {
+        let kept: Kept = serde_json::from_str(&raw).map_err(|_| {
+            err(
+                ErrorKind::Config,
+                "The Docker sign-in from the other device couldn't be read; connect again",
+            )
+        })?;
+        let account = Account {
+            name: kept.account(),
+        };
+        // A token in use belonged to the sign-in this replaces.
+        let mut session = self.session.lock().await;
+        self.keep(kept)?;
+        *session = None;
+        Ok(account)
+    }
+
+    async fn forget_key(&self) {
+        let mut session = self.session.lock().await;
+        if let Err(e) = self.slot.clear() {
+            tracing::warn!(error = %e, "docker: couldn't remove the sign-in from its key slot");
+        }
+        *lock(&self.kept) = None;
+        *session = None;
+    }
+
     async fn create(&self, request: CreateSandbox) -> Result<String, ProviderError> {
         let secrets = self.secret_names().await?;
         let mut cloud = json!({
@@ -1254,6 +1286,32 @@ mod tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"username":"vu"}"#)
         );
         assert_eq!(account_name(claims(&jwt).as_ref()), "vu");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_moves_to_another_device_and_leaves_this_one() {
+        let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let laptop = DockerProvider::new(KeySlot::open(here.path(), ID));
+        assert_eq!(laptop.export_key(), None);
+        laptop
+            .keep(Kept::Pat {
+                username: "vu".into(),
+                token: "dckr_pat_not-a-real-one".into(),
+            })
+            .unwrap();
+        let raw = laptop.export_key().expect("connected");
+
+        let server = DockerProvider::new(KeySlot::open(there.path(), ID));
+        let account = server.adopt_key(raw).await.unwrap();
+        assert_eq!(account.name, "vu");
+        // Kept on the server's disk: it's still connected after a restart.
+        let restarted = DockerProvider::new(KeySlot::open(there.path(), ID));
+        assert_eq!(restarted.account().map(|a| a.name).as_deref(), Some("vu"));
+
+        laptop.forget_key().await;
+        assert_eq!(laptop.account(), None);
+        assert_eq!(KeySlot::open(here.path(), ID).get(), None);
+        assert!(server.adopt_key("garbage".into()).await.is_err());
     }
 }
 
