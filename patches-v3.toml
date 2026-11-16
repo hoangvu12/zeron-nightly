@@ -122,3 +122,11 @@ note = "The parent's device reports for a child whose device doesn't (an older Z
 name = "child-reports-run-command"
 file = "patches/0017-child-reports-run-command.patch"
 note = "A command a child left running with run_command (agent-device-commands, #1458) never wakes it, so it no longer holds back the follow-up its runtime's own background work wakes it for. An end with only such commands lists them and lets no follow-up through, the parent's note no longer lists that child as still working for it, and a thanks answered under one stays quiet. Applies on top of child-reports-watch."
+
+# Docker Sandbox, spec #37 (parked: Vu approved the entry, not a build yet).
+
+[[patch]]
+name = "docker-sandbox"
+file = "patches/0019-docker-sandbox.patch"
+enabled = false
+note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's key kept by a host device, with templates, sleep and wake, recovery and Start fresh. Desktop only. work/docker-sandbox-e2e at b53b39c2a (based on the frozen zeron/zgx c1539061b) merged onto everything above as one file, with what that merge needed (both sides of 13 files kept, sandboxes.wake blocked in plugin previews, zeron-v2's .base.json in step). Parked until Vu says build."
