@@ -196,7 +196,8 @@ impl Sandboxes {
     /// Keep what agents the sandbox's engine has, as its template's (it's
     /// awake now: it just answered).
     fn read_catalog(&self, host: &Host, record: &Record) {
-        let Some(links) = host.links.clone() else {
+        // (A PC at home isn't a template: it answers for itself.)
+        let Some(links) = host.links.clone().filter(|_| !record.resident) else {
             return;
         };
         let catalogs = self.clone();
