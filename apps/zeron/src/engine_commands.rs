@@ -12,7 +12,16 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
         EngineCommand::Headless => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
-                let engine = zeron_engine::Engine::new(engine_config_from_env());
+                let config = engine_config_from_env();
+                // A sandbox's first start: the device id its host device
+                // minted for it, so its chat named it from the start.
+                if config.lent_sign_in.is_some()
+                    && let Ok(device_id) = std::env::var(zeron_engine::sandboxes::DEVICE_ID_ENV)
+                    && !device_id.trim().is_empty()
+                {
+                    zeron_engine::sandboxes::take_device_id(&config.data_dir, &device_id)?;
+                }
+                let engine = zeron_engine::Engine::new(config);
                 engine.run().await
             })
         }
