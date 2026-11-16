@@ -191,6 +191,20 @@ async fn ready(rpc: &RpcClient, chat: &str) -> Value {
     done.unwrap_or_else(|| panic!("{chat} never got ready"))
 }
 
+/// Wait until the token `auth` holds now has expired (by its own `exp`).
+async fn token_runs_out(auth: &zeron_engine::Auth) {
+    // (Between two tokens it may hold none for a moment.)
+    let exp = eventually(Duration::from_secs(30), async || {
+        auth.access_token_with_expiry().await.ok()?.1
+    })
+    .await
+    .expect("a token that says when it runs out");
+    let left = exp + 1 - scripted_edge::now_secs();
+    if left > 0 {
+        tokio::time::sleep(Duration::from_secs(left as u64)).await;
+    }
+}
+
 /// Whether `sandbox`'s engine answers through its device room, asked by
 /// `rpc`'s device.
 async fn answers(engine: &EngineRuntime, sandbox: &str) -> bool {
@@ -330,9 +344,15 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     assert!(laptop.core().sandboxes.steps("chat-a").is_some());
     assert!(server.core().sandboxes.steps("chat-a").is_none());
 
-    // Two token lifetimes later the sandbox is still online: its tokens came
+    // Two of its tokens later the sandbox is still online: its tokens came
     // from the laptop, since the server lends it none any more.
-    tokio::time::sleep(Duration::from_secs(2 * ttl as u64)).await;
+    for _ in 0..2 {
+        let auth = cloud
+            .provider
+            .with_engine("chat-a", |core| core.auth())
+            .expect("the sandbox's engine");
+        token_runs_out(&auth).await;
+    }
     edge.drop_room(&sandbox);
     let back = eventually(Duration::from_secs(15), async || {
         answers(&server, &sandbox).await.then_some(())

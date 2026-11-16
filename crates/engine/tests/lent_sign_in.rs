@@ -114,6 +114,20 @@ async fn reaches(phone: &Arc<LinkCache>, device: &str, within: Duration) -> bool
     .is_some()
 }
 
+/// Wait until the token `engine` holds now has expired (by its own `exp`).
+async fn token_runs_out(engine: &EngineRuntime) {
+    // (Between two tokens it may hold none for a moment.)
+    let exp = eventually(Duration::from_secs(30), async || {
+        engine.core().auth().access_token_with_expiry().await.ok()?.1
+    })
+    .await
+    .expect("a token that says when it runs out");
+    let left = exp + 1 - scripted_edge::now_secs();
+    if left > 0 {
+        tokio::time::sleep(Duration::from_secs(left as u64)).await;
+    }
+}
+
 /// Every file under `dir`, with its bytes.
 fn files(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     let mut out = Vec::new();
@@ -208,7 +222,8 @@ async fn a_sandbox_on_a_lent_token_hosts_its_room_and_serves_the_users_devices()
     assert!(!edge.plugin_key_devices().contains(&device));
 
     // Nothing long-lived on its disk: no session, no key, no lending key.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // (Stopped first: what it writes is all written.)
+    sandbox.shutdown().await;
     for (path, bytes) in files(&sandbox_dir) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
@@ -257,7 +272,8 @@ async fn lent_tokens_keep_coming_and_stay_in_the_sandboxs_org() {
                 .await
                 .expect("the host device switches org");
         }
-        tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
+        // The token it holds now runs out: any dial after that needs a newer one.
+        token_runs_out(&sandbox).await;
         // Every socket closed: the sandbox must dial again with a live token.
         edge.drop_room(&device);
         phone.invalidate(&device);
@@ -309,11 +325,15 @@ async fn a_sandbox_goes_dark_within_a_token_lifetime_once_lending_stops() {
     );
     assert!(engine_info(&phone, &device).await.is_err());
 
-    // It stays dark, never dialing on an expired token or signing in another way.
-    let dials = edge.host_dials(&device).len();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // It stays dark: it holds no live token to dial with, and every dial it
+    // made presented a live one; nor can it sign in another way.
+    assert!(
+        sandbox.core().auth().access_token().await.is_err(),
+        "the sandbox still has a token to dial with"
+    );
     assert!(!edge.host_connected(&device));
-    assert_eq!(edge.host_dials(&device).len(), dials);
+    let dials = edge.host_dials(&device);
+    assert!(dials.iter().all(|d| d.admitted), "{dials:?}");
     let local = memory_client(sandbox.core().rpc_service());
     assert!(local.call(methods::SIGN_IN, json!({})).await.is_err());
 }
