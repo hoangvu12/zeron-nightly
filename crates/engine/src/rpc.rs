@@ -3527,12 +3527,12 @@ impl RpcService for EngineRpc {
             }
             methods::RELAY_COMMAND => {
                 let p: RelayCommandParams = parse_params(params)?;
-                let outcome = self
+                let (outcome, resolution) = self
                     .doc_host
-                    .ingest_relayed_command(&p.chat_id, p.entry)
+                    .ingest_relayed_command_with_reason(&p.chat_id, p.entry)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "outcome": outcome }))
+                RpcReply::value(&serde_json::json!({ "outcome": outcome, "resolution": resolution }))
             }
             methods::FORK_SIDE_CHAT => {
                 #[derive(Deserialize)]

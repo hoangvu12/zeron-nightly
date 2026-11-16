@@ -273,7 +273,8 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
     deliver();
 
     // The sandbox refuses it with a reason a client can show, and the
-    // message waits to be sent again.
+    // message waits to be sent again, on the device the user sent from
+    // (what its clients read).
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut polls = 0;
     let refused = loop {
@@ -281,11 +282,10 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
         if polls % 10 == 0 {
             deliver();
         }
-        let waiting = provider
-            .with_engine("chat-b", |core| {
-                core.doc_host.waiting_messages("chat-b").ok()
-            })
-            .flatten()
+        let waiting = host
+            .core()
+            .doc_host
+            .waiting_messages("chat-b")
             .unwrap_or_default();
         if let Some(message) = waiting
             .into_iter()
@@ -294,20 +294,18 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
             break message;
         }
         if Instant::now() >= deadline {
-            let commands = provider
-                .with_engine("chat-b", |core| {
-                    core.doc_host
-                        .open("chat-b")
-                        .ok()
-                        .and_then(|h| h.doc().read_commands().ok())
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|c| format!("{} {:?} {:?}", c.id, c.status, c.resolution))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let commands = host
+                .core()
+                .doc_host
+                .open("chat-b")
+                .ok()
+                .and_then(|h| h.doc().read_commands().ok())
+                .unwrap_or_default()
+                .iter()
+                .map(|c| format!("{} {:?} {:?}", c.id, c.status, c.resolution))
+                .collect::<Vec<_>>();
             panic!(
-                "m-1 was never refused. Commands in the sandbox: {commands:#?}; transcript: {:#?}",
+                "m-1 was never refused. Commands here: {commands:#?}; transcript: {:#?}",
                 transcript(&provider, "chat-b", "chat-b")
             );
         }
@@ -353,11 +351,10 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     // Sent again, it no longer waits as refused.
-    let waiting = provider
-        .with_engine("chat-b", |core| {
-            core.doc_host.waiting_messages("chat-b").ok()
-        })
-        .flatten()
+    let waiting = host
+        .core()
+        .doc_host
+        .waiting_messages("chat-b")
         .unwrap_or_default();
     assert!(waiting.iter().all(|w| w.failure.is_none()), "{waiting:#?}");
 }
