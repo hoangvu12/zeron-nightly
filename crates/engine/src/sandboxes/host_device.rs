@@ -167,7 +167,11 @@ impl Sandboxes {
                 .collect();
             ids.iter()
                 .filter_map(|id| chats.remove(id))
-                .map(|chat| lock(&chat.record).clone())
+                .map(|chat| {
+                    // The next host device stands in for it now.
+                    chat.leave_room();
+                    lock(&chat.record).clone()
+                })
                 .collect()
         };
         if let Some(auth) = auth {

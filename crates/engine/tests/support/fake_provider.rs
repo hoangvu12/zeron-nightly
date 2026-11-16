@@ -66,6 +66,8 @@ struct FakeBox {
     engine: Option<EngineRuntime>,
     /// The key of the sign-in its engine was lent.
     lent_key: Option<String>,
+    /// Its engine's data, kept across stops and starts like its disk.
+    data_dir: Option<PathBuf>,
 }
 
 impl FakeBox {
@@ -75,6 +77,7 @@ impl FakeBox {
             running,
             engine: None,
             lent_key: None,
+            data_dir: None,
         }
     }
 }
@@ -89,6 +92,8 @@ struct State {
     disk_full: bool,
     /// Sandboxes made so far: each one's engine keeps its data apart.
     made: usize,
+    /// Time limits pushed out: `<box> <seconds>`.
+    extends: Vec<String>,
 }
 
 pub struct FakeProvider {
@@ -118,7 +123,8 @@ impl FakeProvider {
             | Ops::DELETE
             | Ops::RUN
             | Ops::TEMPLATES
-            | Ops::SAVE_TEMPLATE;
+            | Ops::SAVE_TEMPLATE
+            | Ops::EXTEND;
         Arc::new(Self::new("fake", ops, root))
     }
 
@@ -224,6 +230,11 @@ impl FakeProvider {
         self.state.lock().unwrap().calls.clone()
     }
 
+    /// Each time limit pushed out, in order: `<box> <seconds>`.
+    pub fn extends(&self) -> Vec<String> {
+        self.state.lock().unwrap().extends.clone()
+    }
+
     pub fn sandboxes(&self) -> Vec<String> {
         self.state.lock().unwrap().boxes.keys().cloned().collect()
     }
@@ -318,7 +329,13 @@ impl FakeProvider {
                 return exit_with(1, "the sandbox is gone");
             };
             fake.lent_key = Some(lent.key.clone());
-            dir.join(format!("zeron-data-{}", state.made))
+            let made = state.made;
+            let Some(fake) = state.boxes.get_mut(sandbox) else {
+                return exit_with(1, "the sandbox is gone");
+            };
+            fake.data_dir
+                .get_or_insert_with(|| dir.join(format!("zeron-data-{made}")))
+                .clone()
         };
         std::fs::create_dir_all(&data_dir).unwrap();
         if let Some(device) = var(zeron_engine::sandboxes::DEVICE_ID_ENV) {
@@ -336,6 +353,31 @@ impl FakeProvider {
         futures::stream::once(async move {
             let _ = up.await;
             Ok(RunEvent::Exit(Exit::code(0)))
+        })
+        .boxed()
+    }
+
+    /// `zeron-engine quiesce`: the engine winds down for a sleep; 75 when
+    /// it's busy (a turn running, a message waiting).
+    fn quiesce(&self, sandbox: &str) -> RunStream {
+        let doc_host = {
+            let state = self.state.lock().unwrap();
+            state
+                .boxes
+                .get(sandbox)
+                .and_then(|fake| fake.engine.as_ref())
+                .map(|engine| engine.core().doc_host.clone())
+        };
+        let Some(doc_host) = doc_host else {
+            return exit_with(1, "zeron-engine isn't running");
+        };
+        futures::stream::once(async move {
+            Ok(RunEvent::Exit(Exit::code(
+                match doc_host.quiesce_for_sleep().await {
+                    Ok(()) => 0,
+                    Err(_) => 75,
+                },
+            )))
         })
         .boxed()
     }
@@ -507,6 +549,14 @@ impl SandboxProvider for FakeProvider {
         }
     }
 
+    async fn extend(&self, sandbox: &str, ttl: std::time::Duration) -> Result<(), ProviderError> {
+        // Kept apart from `calls`: the host device extends whenever it
+        // finds a chat busy, in any test.
+        let extended = format!("{sandbox} {}", ttl.as_secs());
+        self.state.lock().unwrap().extends.push(extended);
+        self.dir(sandbox).map(drop)
+    }
+
     async fn status(&self, sandbox: &str) -> Result<SandboxStatus, ProviderError> {
         Ok(match self.state.lock().unwrap().boxes.get(sandbox) {
             None => SandboxStatus::Gone,
@@ -578,8 +628,20 @@ impl SandboxProvider for FakeProvider {
                 .boxed(),
                 // Under its watchdog, as Zeron starts it, or bare.
                 Some("watchdog" | "headless") if command.detach => {
+                    // A rerun replaces the engine already there.
+                    let old = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .boxes
+                        .get_mut(sandbox)
+                        .and_then(|fake| fake.engine.take());
+                    if let Some(old) = old {
+                        old.shutdown().await;
+                    }
                     self.boot(sandbox, &dir, &command.env)
                 }
+                Some("quiesce") => self.quiesce(sandbox),
                 _ => exit_with(127, "zeron-engine: not found"),
             });
         }

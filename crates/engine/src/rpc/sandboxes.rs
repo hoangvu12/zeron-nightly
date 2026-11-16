@@ -32,6 +32,7 @@ pub(super) fn handles(method: &str) -> bool {
             | methods::DELETE_STEP_SCRIPT
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
+            | methods::WAKE_SANDBOX
             | methods::SANDBOX_HOST
             | methods::ADOPT_SANDBOX_PROVIDER
             | methods::SET_SANDBOX_HOST
@@ -186,6 +187,7 @@ impl EngineRpc {
                 | methods::RUN_SANDBOX_STEPS_AGAIN
                 | methods::CHECK_SANDBOX
                 | methods::START_SANDBOX_FRESH
+                | methods::WAKE_SANDBOX
         ) && !routed(&params)
         {
             let p: ChatParams = parse_params(params.clone())?;
@@ -331,6 +333,13 @@ impl EngineRpc {
                 sandboxes
                     .start_fresh(self.sandbox_host(), &p.chat_id)
                     .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::WAKE_SANDBOX => {
+                let p: ChatParams = parse_params(params)?;
+                sandboxes
+                    .wake_chat(self.sandbox_host(), &p.chat_id)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }

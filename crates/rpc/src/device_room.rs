@@ -738,6 +738,82 @@ async fn handle_host_frame(
 }
 
 // ---------------------------------------------------------------------------
+// Stand-in host
+// ---------------------------------------------------------------------------
+
+/// The close code the DeviceRoom sends a host socket another host joined
+/// over ("superseded by new host connection").
+pub const SUPERSEDED_CLOSE: u16 = 4409;
+
+/// How a [`stand_in_session`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandInEnd {
+    /// Another host joined the room (close 4409): the device itself is
+    /// back, or another stand-in. Never rejoin blindly: that would fight it.
+    Superseded,
+    /// The socket closed or failed some other way (a deploy, silence).
+    Closed(String),
+}
+
+/// One session as a stand-in host of another device's room (a sleeping
+/// sandbox's, held by the device that keeps it): `service` answers its
+/// clients and `on_nudge` hears its nudges, as [`HostRelay`] would. Unlike
+/// it, this joins once and says how it ended, so a 4409 is never fought.
+/// It never acknowledges a nudge.
+pub async fn stand_in_session(
+    edge_url: &str,
+    device_id: &str,
+    token: &str,
+    service: Arc<dyn RpcService>,
+    on_nudge: NudgeHandler,
+    on_connected: impl FnOnce(),
+) -> StandInEnd {
+    use futures::{SinkExt, StreamExt};
+    let url = device_room_ws_url(edge_url, device_id, "host", None, token);
+    let ws = match zeron_sync::dial::connect_ws(&url).await {
+        Ok(ws) => ws,
+        Err(err) => return StandInEnd::Closed(format!("device room unreachable: {err}")),
+    };
+    on_connected();
+    let (mut sink, mut stream) = ws.socket.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let mut conns: HashMap<String, VirtualConn> = HashMap::new();
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            read = tokio::time::timeout(SILENCE_LEASE, stream.next()) => match read {
+                Err(_) => return StandInEnd::Closed("silent past its lease".into()),
+                Ok(None) => return StandInEnd::Closed("socket ended".into()),
+                Ok(Some(Err(err))) => return StandInEnd::Closed(err.to_string()),
+                Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                    return match frame {
+                        Some(frame) if u16::from(frame.code) == SUPERSEDED_CLOSE => {
+                            StandInEnd::Superseded
+                        }
+                        frame => StandInEnd::Closed(format!("closed: {frame:?}")),
+                    };
+                }
+                Ok(Some(Ok(WsMessage::Binary(bytes)))) => {
+                    handle_host_frame(&bytes, &mut conns, &service, &out_tx, &on_nudge).await;
+                }
+                Ok(Some(Ok(_))) => {}
+            },
+            Some(frame) = out_rx.recv() => {
+                if let Err(err) = sink.send(WsMessage::Binary(frame)).await {
+                    return StandInEnd::Closed(err.to_string());
+                }
+            }
+            _ = ping.tick() => {
+                if let Err(err) = sink.send(WsMessage::Text("ping".into())).await {
+                    return StandInEnd::Closed(err.to_string());
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Client link
 // ---------------------------------------------------------------------------
 

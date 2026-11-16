@@ -90,8 +90,10 @@ export type Notice = {
 	-- Worth knowing, not worth raising: read with the deck's alerts once
 	-- they're open, never putting up the pill on its own.
 	quiet: boolean?,
+	-- Its glyph in place of its tone's (ds/composer_dock's Alert `icon`).
+	icon: string?,
 }
-export type Answer = { values: { string }, text: string }
+export type Answer ={ values: { string }, text: string }
 -- Where an existing chat works (`branch_fixed`).
 -- (`icon`: where it runs, as a glyph: a place's provider's; `template`: the
 -- one its sandbox started from.)
@@ -2524,6 +2526,7 @@ return ui.component(function(props: Props): Node
 					spinner = n.spinner,
 					dismissable = n.dismissable == true,
 					quiet = n.quiet == true,
+					icon = n.icon,
 				})
 			end
 			if props.alerts then

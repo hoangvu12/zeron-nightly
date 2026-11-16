@@ -787,7 +787,8 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         // Cloud choice.
         cloud::install(cx, &host);
         // Places a chat runs on (src/sandboxes.rs): the device picker's
-        // providers and templates, a sandbox chat's progress line.
+        // providers and templates, a sandbox chat's progress line, what goes
+        // wrong with it (Start fresh) and Wake.
         sandboxes::install(cx, &host);
         // The sessions behind the main window (src/sessions.rs).
         sessions::install(cx, &host);

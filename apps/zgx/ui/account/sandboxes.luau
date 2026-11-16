@@ -20,6 +20,10 @@
 --   sandboxes.follow(chat) / .unfollow(chat)  keep its steps in `steps`
 --   sandboxes.steps_of(chat)        { state, step?, since, error? } (tracked)
 --   sandboxes.run_again(chat)       a promise: the failed step runs again
+--   sandboxes.machine(chat)         its sandbox as screens/chat/sandbox_machine
+--                                   reads it (tracked)
+--   sandboxes.fresh(chat) / .fresh_state(chat)  Start fresh, { busy?, failure? }
+--   sandboxes.wake(chat) / .wake_state(chat)    Wake (#43), the same
 --
 -- The host's calls are fields (`ask_*`), so a fixture answers in its place.
 
@@ -126,6 +130,79 @@ function M.follow(chat: string)
 end
 function M.unfollow(chat: string)
 	M.ask_unfollow(chat)
+end
+
+-- ── What goes wrong, and Wake (#44, #43) ───────────────────────────────────
+-- What's said of it is screens/chat/sandbox_machine's: these are its reads
+-- and its actions.
+
+function M.ask_fresh(chat: string): any
+	return ui.call("sandboxes.fresh", chat)
+end
+function M.ask_wake(chat: string): any
+	return ui.call("sandboxes.wake", chat)
+end
+-- (Read through here, so a fixture can stand in for the host's.)
+function M.read(): { [string]: any }
+	return M.steps:get() or {}
+end
+
+-- A chat's sandbox as screens/chat/sandbox_machine reads it (tracked):
+-- { state, provider, provider_name?, step?, error?, disk_full }, nil for a
+-- chat not on a place this device keeps.
+function M.machine(chat: string?): any
+	if not chat then
+		return nil
+	end
+	local s = M.read()[chat]
+	if not s then
+		return nil
+	end
+	local out = table.clone(s)
+	local p = M.provider(s.provider)
+	out.provider_name = out.provider_name or (if p then p.name else nil)
+	out.disk_full = s.disk_full == true
+	return out
+end
+
+M.fresh_states = ui.state("account_sandboxes_fresh", {} :: { [string]: { busy: boolean?, failure: string? } })
+M.wake_states = ui.state("account_sandboxes_wake", {} :: { [string]: { busy: boolean?, failure: string? } })
+
+-- An action asked of the host for a chat, its { busy?, failure? } kept in
+-- `states` meanwhile.
+local function ask(states: any, chat: string, call: (string) -> any)
+	local now = states:peek()[chat]
+	if now and now.busy then
+		return
+	end
+	states:set_key(chat, { busy = true } :: any)
+	call(chat):after(function()
+		states:set_key(chat, nil :: any)
+	end, function(e: any)
+		local word = if type(e) == "table" and type(e.message) == "string" then e.message else "failed"
+		states:set_key(chat, { failure = word } :: any)
+	end)
+end
+
+-- Start fresh: a new sandbox, the chat's pushed work with it.
+function M.fresh(chat: string)
+	ask(M.fresh_states, chat, function(c: string): any
+		return M.ask_fresh(c)
+	end)
+end
+function M.fresh_state(chat: string?): { busy: boolean?, failure: string? }
+	return (chat and M.fresh_states:get()[chat]) or {}
+end
+
+-- Wake: its sandbox started again, its engine with it. (A send wakes it
+-- too, on the engine's side.)
+function M.wake(chat: string)
+	ask(M.wake_states, chat, function(c: string): any
+		return M.ask_wake(c)
+	end)
+end
+function M.wake_state(chat: string?): { busy: boolean?, failure: string? }
+	return (chat and M.wake_states:get()[chat]) or {}
 end
 
 return M

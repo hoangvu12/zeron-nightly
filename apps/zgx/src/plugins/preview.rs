@@ -99,6 +99,7 @@ pub const BLOCKED: &[&str] = &[
     "sandboxes.run_again",
     "cloud.sleep",
     "cloud.retry",
+    "sandboxes.fresh",
     "cloud.set_machine",
     // (A sandbox provider's key, its host device, the user's step scripts.)
     "sandbox_settings.change",

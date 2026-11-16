@@ -15,6 +15,8 @@ local sessions = require("@account/sessions")
 local files = require("@app/screens/files/api")
 -- Cloud for the new chat's Work in (none until `cloud_stub.offer`).
 require("./cloud_stub")
+-- Chats on sandboxes (none until a `sandbox_stub.*` command).
+require("./sandbox_stub")
 
 local EFFORT = {
 	{ value = "low", label = "Low" },
@@ -1196,8 +1198,11 @@ do
 		note(`templates:{provider}`)
 		return settled({ { id = "zeron-dev", name = "zeron-dev" }, { id = "zgx-dev", name = "zgx-dev" } })
 	end
+	-- (sandbox_stub's notes it too, for its own tests.)
+	local stub_follow = sandboxes.ask_follow
 	sandboxes.ask_follow = function(chat: string)
 		note(`follow:{chat}`)
+		stub_follow(chat)
 	end
 	sandboxes.ask_unfollow = function(_chat: string) end
 	sandboxes.ask_run_again = function(chat: string): any
