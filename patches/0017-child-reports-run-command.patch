@@ -1,4 +1,4 @@
-From da485a045b238964318f2311013d97385d7e43a8 Mon Sep 17 00:00:00 2001
+From b565a42276f2f0adf28f365c7cc3754c4fe778db Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 19:41:41 +0700
 Subject: [PATCH] engine: a command left running with run_command doesn't hold
@@ -15,7 +15,7 @@ answered under one stays quiet.
  2 files changed, 116 insertions(+), 9 deletions(-)
 
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 0870898c5bba6aae44602a477cd28c919ac1c340..3019ce1a6ee1124bd949f71a9c204bc727ced808 100644
+index b32ff234ea8f5e44d709ce0a7b65d6e5d0e5b053..bda9c3c9333c5eb817819ad7cf187beafaed004f 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -40,6 +40,7 @@ use zeron_proto::agent_messages::{self, ReportStatus};
@@ -124,10 +124,10 @@ index 0870898c5bba6aae44602a477cd28c919ac1c340..3019ce1a6ee1124bd949f71a9c204bc7
  }
  
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 5b814496617c20a05bd80c870e7ddc0cc670fd49..9855be4aca14fdf6ec114e2c0bb4aef81c4672f9 100644
+index f6155626a4b1c8355d4e4464913c1ad4dffe6d79..efd6c980dc944b77c954d1f96054757af8b6ea3a 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -9916,6 +9916,85 @@ mod tests {
+@@ -10269,6 +10269,85 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -214,5 +214,5 @@ index 5b814496617c20a05bd80c870e7ddc0cc670fd49..9855be4aca14fdf6ec114e2c0bb4aef8
      #[tokio::test]
      async fn the_persons_turn_after_the_report_is_theirs() {
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

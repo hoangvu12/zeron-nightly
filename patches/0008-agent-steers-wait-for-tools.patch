@@ -1,4 +1,4 @@
-From 2c10adb3045dc6ebb7788f615877f5b68680dc85 Mon Sep 17 00:00:00 2001
+From f61cf5227adac5dc47ec0605ed9e619f1a0591f8 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 9 Nov 2026 11:46:29 +0700
 Subject: [PATCH] An agent's message to a busy chat waits for the command it
@@ -30,29 +30,29 @@ after it; an at-once steer's note), the MCP send's `atOnce`, the payload's
 default, and in the Claude harness a message sent while a command runs is
 written `next`, with no interrupt before it.
 ---
- crates/client/src/demo/mod.rs                |  2 +-
- crates/client/src/session/mod.rs             |  3 +
- crates/client/tests/cloud_attachments.rs     |  1 +
- crates/doc/examples/gen_fixture.rs           |  1 +
- crates/doc/src/commands.rs                   | 34 +++++++
- crates/doc/src/schema.rs                     |  3 +-
- crates/engine/src/doc_host.rs                | 32 +++++--
- crates/engine/src/doc_host_attachments.rs    |  2 +-
- crates/engine/src/plugin_agents.rs           |  2 +-
- crates/engine/src/sessions.rs                | 99 +++++++++++++++++---
- crates/engine/tests/acp_lifecycle.rs         |  2 +
- crates/engine/tests/cursor_live.rs           |  2 +-
- crates/engine/tests/e2e.rs                   |  4 +
- crates/engine/tests/message_queue.rs         |  3 +
- crates/engine/tests/queue_order_live.rs      |  1 +
- crates/engine/tests/restart_resume.rs        |  1 +
- crates/engine/tests/steer_now.rs             | 74 ++++++++++++++-
- crates/engine/tests/steering_live.rs         |  2 +-
- crates/harness/tests/claude.rs               | 47 ++++++++++
- crates/harness/tests/fixtures/fake-claude.sh | 18 ++++
- crates/mcp/src/tools.rs                      | 15 ++-
- docs/mcp.md                                  | 11 ++-
- 22 files changed, 327 insertions(+), 32 deletions(-)
+ crates/client/src/demo/mod.rs                |   2 +-
+ crates/client/src/session/mod.rs             |   3 +
+ crates/client/tests/cloud_attachments.rs     |   1 +
+ crates/doc/examples/gen_fixture.rs           |   1 +
+ crates/doc/src/commands.rs                   |  34 ++++++
+ crates/doc/src/schema.rs                     |   3 +-
+ crates/engine/src/doc_host.rs                |  32 ++++--
+ crates/engine/src/doc_host_attachments.rs    |   2 +-
+ crates/engine/src/plugin_agents.rs           |   2 +-
+ crates/engine/src/sessions.rs                | 112 +++++++++++++++----
+ crates/engine/tests/acp_lifecycle.rs         |   2 +
+ crates/engine/tests/cursor_live.rs           |   2 +-
+ crates/engine/tests/e2e.rs                   |   4 +
+ crates/engine/tests/message_queue.rs         |   3 +
+ crates/engine/tests/queue_order_live.rs      |   1 +
+ crates/engine/tests/restart_resume.rs        |   1 +
+ crates/engine/tests/steer_now.rs             |  80 ++++++++++++-
+ crates/engine/tests/steering_live.rs         |   2 +-
+ crates/harness/tests/claude.rs               |  47 ++++++++
+ crates/harness/tests/fixtures/fake-claude.sh |  18 +++
+ crates/mcp/src/tools.rs                      |  15 ++-
+ docs/mcp.md                                  |  11 +-
+ 22 files changed, 335 insertions(+), 43 deletions(-)
 
 diff --git a/crates/client/src/demo/mod.rs b/crates/client/src/demo/mod.rs
 index 553afd3e37dd14a479b2788c2ff908e750d7eca4..94c5137dbd16ce5a49f85d929120fbcf23e5b1d8 100644
@@ -68,7 +68,7 @@ index 553afd3e37dd14a479b2788c2ff908e750d7eca4..94c5137dbd16ce5a49f85d929120fbcf
                      let steps = self.reply_for(&prompt);
                      let id = message_id.unwrap_or_else(crate::new_id);
 diff --git a/crates/client/src/session/mod.rs b/crates/client/src/session/mod.rs
-index e2bf64d70131f2bc57adf797eb433225bcbb801a..8d9e3e710ff92e230118ef8dda78fb5521651367 100644
+index c2e4114a1d2d88fec209185eb0e2f7b27d754ad3..06d92e14fe6264ec968686eef78ad569567f3b43 100644
 --- a/crates/client/src/session/mod.rs
 +++ b/crates/client/src/session/mod.rs
 @@ -977,6 +977,7 @@ fn derive_pending(
@@ -79,7 +79,7 @@ index e2bf64d70131f2bc57adf797eb433225bcbb801a..8d9e3e710ff92e230118ef8dda78fb55
              } => (message_id, prompt, PendingKind::Steer),
              _ => continue,
          };
-@@ -1476,6 +1477,7 @@ impl SessionHandle {
+@@ -1477,6 +1478,7 @@ impl SessionHandle {
                      SessionCommandPayload::Steer {
                          prompt: content,
                          message_id: Some(message_id.clone()),
@@ -87,7 +87,7 @@ index e2bf64d70131f2bc57adf797eb433225bcbb801a..8d9e3e710ff92e230118ef8dda78fb55
                      },
                      &refs,
                      via_store,
-@@ -2182,6 +2184,7 @@ mod setup_placeholder_tests {
+@@ -2183,6 +2185,7 @@ mod setup_placeholder_tests {
              payload: SessionCommandPayload::Steer {
                  prompt: "read the readme".into(),
                  message_id: Some("m1".into()),
@@ -108,10 +108,10 @@ index 5a1b39ceabbd9fdafd3338945aad2b8a3c962cbb..58c91b184c495f0e1c3500d5877019bf
              },
              uploads: Vec::new(),
 diff --git a/crates/doc/examples/gen_fixture.rs b/crates/doc/examples/gen_fixture.rs
-index 7678b31ae2e8fc40ca5ba941e91d6646a9549a71..bc82b62ae7c0563ca04600fcabc1d35f1a87f516 100644
+index c98ec7f7ca45b722e4eaf8c8e83d05914c973c09..59569e4f5ed56c1b286c774ff4c0388aff0bef46 100644
 --- a/crates/doc/examples/gen_fixture.rs
 +++ b/crates/doc/examples/gen_fixture.rs
-@@ -74,6 +74,7 @@ fn main() {
+@@ -76,6 +76,7 @@ fn main() {
          payload: SessionCommandPayload::Steer {
              prompt: "also run clippy".into(),
              message_id: None,
@@ -197,10 +197,10 @@ index c7d4d900440360a32be59336dbbd1dd6736b6369..1fbfa3d88407ab017ac788c0257b7aa3
      fn composer_cancel_rules() {
          let e = steer("c1", 1_000);
 diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
-index 725b6df65bd0a43668e8d39adf896e862cc8eec8..55015f97d6b0ca4170b160ecbcd0995f68623212 100644
+index 66f854351d41f7b275862e687111216a81093f15..e65121cd565e1674c94ca20f61c8ac36b2c8e2d5 100644
 --- a/crates/doc/src/schema.rs
 +++ b/crates/doc/src/schema.rs
-@@ -2588,7 +2588,7 @@ mod tests {
+@@ -2622,7 +2622,7 @@ mod tests {
          for n in 0..3 {
              doc.queue_command(&SessionCommandEntry {
                  id: format!("c{n}"),
@@ -209,7 +209,7 @@ index 725b6df65bd0a43668e8d39adf896e862cc8eec8..55015f97d6b0ca4170b160ecbcd0995f
                  issued_by: "dev".into(),
                  issued_at: n,
                  based_on: None,
-@@ -3501,6 +3501,7 @@ mod tests {
+@@ -3582,6 +3582,7 @@ mod tests {
              payload: SessionCommandPayload::Steer {
                  prompt: "focus".into(),
                  message_id: None,
@@ -321,7 +321,7 @@ index ca1151e20bac3f346ee0c7747268a38be790b29f..17cb028762bb9247bf26aa4d98a8cc87
                  Ok(id)
              }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index baeaf86eafae8f064299bf1960755e6dfe4b0f92..5138305ec839f5547203dc42105260e88ddb5922 100644
+index 50fb469d3965643e9d01ab397272afc15eb5d664..e7efdca4822aaa6eec95810821e99e7c121ec352 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -167,6 +167,9 @@ struct RunHandle {
@@ -376,22 +376,35 @@ index baeaf86eafae8f064299bf1960755e6dfe4b0f92..5138305ec839f5547203dc42105260e8
          // A steer runs on the configuration live now; record it with the
          // message so a re-dispatch keeps it.
          let sent_with = self.last_request(chat_id).map(|mut request| {
-@@ -1655,6 +1679,10 @@ impl SessionsEngine {
-     /// under their own ids. Otherwise, or when the stop doesn't settle, it
+@@ -1656,10 +1680,15 @@ impl SessionsEngine {
      /// is an ordinary steer ([`Self::steer_at`]), read at the next step
      /// boundary. Nothing here tears a runtime down.
+     ///
+-    /// A message from another chat never stops the turn: Claude Code words
+-    /// every interrupt as the person rejecting the tool call and telling the
+-    /// agent to stop and wait, so the agent would take the other chat's
+-    /// message as an order to stop. It waits for the step boundary instead.
++    /// An agent's ordinary message from another chat never comes here: it is
++    /// a steer with `at_once: false` ([`Self::steer_at`]), since Claude Code
++    /// words every interrupt as the person rejecting the tool call and
++    /// telling the agent to stop and wait. Only the person's steer and an
++    /// agent's explicit `mode: "steer"` stop the command.
 +    ///
-+    /// The stop reaches the agent as its call refused ("the user doesn't
++    /// A stop reaches the agent as its call refused ("the user doesn't
 +    /// want to proceed"), so the prompt it reads after says what happened
 +    /// ([`stopped_calls_note`]).
      pub(crate) async fn steer_now(
          &self,
          chat_id: &str,
-@@ -1663,7 +1691,17 @@ impl SessionsEngine {
+@@ -1668,11 +1697,17 @@ impl SessionsEngine {
          message_id: Option<String>,
          issued_at: i64,
      ) -> Result<SteerOutcome, EngineError> {
--        if self.steer_stops_tool(chat_id) && self.stop_turn_keeping_runtime(chat_id).await {
+-        let from_another_chat = zeron_proto::agent_messages::agent_message_sender(prompt).is_some();
+-        if !from_another_chat
+-            && self.steer_stops_tool(chat_id)
+-            && self.stop_turn_keeping_runtime(chat_id).await
+-        {
 +        let mut note = None;
 +        if self.steer_stops_tool(chat_id) {
 +            let calls = lock(&self.inner.runs)
@@ -406,7 +419,7 @@ index baeaf86eafae8f064299bf1960755e6dfe4b0f92..5138305ec839f5547203dc42105260e8
              let earlier = lock(&self.inner.runs)
                  .get(chat_id)
                  .map(|h| std::mem::take(&mut *lock(&h.redeliver)))
-@@ -1688,7 +1726,7 @@ impl SessionsEngine {
+@@ -1697,7 +1732,7 @@ impl SessionsEngine {
                  }
              }
          }
@@ -415,7 +428,7 @@ index baeaf86eafae8f064299bf1960755e6dfe4b0f92..5138305ec839f5547203dc42105260e8
              .await
      }
  
-@@ -3534,6 +3572,42 @@ fn revival_prompt(original: &str) -> String {
+@@ -3678,6 +3713,42 @@ fn revival_prompt(original: &str) -> String {
  /// The note a turn the engine's own shutdown cut off ends with.
  const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
  
@@ -458,7 +471,7 @@ index baeaf86eafae8f064299bf1960755e6dfe4b0f92..5138305ec839f5547203dc42105260e8
  /// The note a reply opens with when the provider no longer had the session
  /// the run asked to resume.
  const FRESH_START_NOTICE: &str = "The provider no longer has this chat's earlier session, \
-@@ -4146,18 +4220,19 @@ async fn drive_run(
+@@ -4292,18 +4363,19 @@ async fn drive_run(
      // folding the echo would mint an orphan chip mid-text in the NEXT
      // segment — the mid-word transcript splits.
      let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -484,7 +497,7 @@ index baeaf86eafae8f064299bf1960755e6dfe4b0f92..5138305ec839f5547203dc42105260e8
      };
      let mut seen_images = std::collections::HashSet::new();
      for entry in doc_ref.read_entries().unwrap_or_default() {
-@@ -5319,16 +5394,18 @@ async fn drive_run(
+@@ -5465,16 +5537,18 @@ async fn drive_run(
              _ => {}
          }
          match &event {
@@ -540,10 +553,10 @@ index 0030a3e41b00954db90ef103b213b42d6d4dc5ae..84827365453d1e7b4832fea6470ce37a
              based_on: None, expires_at: None, status: zeron_doc::SessionCommandStatus::Pending, resolution: None,
          }).unwrap();
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2..74470d4379147e1a51b39b1701c87ea466d3a4f7 100644
+index e9954e23be971c4ff23ea0c815ed9de422c51f82..6d5e7ce239ff611657dd2327249d3b6a031dfc83 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
-@@ -305,6 +305,7 @@ async fn update_deferred_steering_preserves_the_active_turn_and_queued_prompt()
+@@ -307,6 +307,7 @@ async fn update_deferred_steering_preserves_the_active_turn_and_queued_prompt()
          SessionCommandPayload::Steer {
              prompt: "follow up".into(),
              message_id: Some("follow-up".into()),
@@ -551,7 +564,7 @@ index 0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2..74470d4379147e1a51b39b1701c87ea4
          },
      );
      wait_for(
-@@ -936,6 +937,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
+@@ -938,6 +939,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
          SessionCommandPayload::Steer {
              prompt: "also do this".into(),
              message_id: Some("m-2".into()),
@@ -559,7 +572,7 @@ index 0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2..74470d4379147e1a51b39b1701c87ea4
          },
      );
      wait_for(
-@@ -1059,6 +1061,7 @@ async fn steer_into_unsteerable_live_turn_holds_instead_of_interrupting() {
+@@ -1061,6 +1063,7 @@ async fn steer_into_unsteerable_live_turn_holds_instead_of_interrupting() {
          SessionCommandPayload::Steer {
              prompt: "also do this".into(),
              message_id: Some("m-2".into()),
@@ -567,7 +580,7 @@ index 0e6b7ba1fc5713ed67a4d27a1fc412ff4b17d9d2..74470d4379147e1a51b39b1701c87ea4
          },
      );
      wait_for(
-@@ -3015,6 +3018,7 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
+@@ -3020,6 +3023,7 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
          SessionCommandPayload::Steer {
              prompt: "next".into(),
              message_id: Some("m-2".into()),
@@ -628,21 +641,22 @@ index f2aa86932b02993fb134da0ed207a559bb7813e8..55acf9026bd514ff90ea306f7bff9301
          )
          .expect("queue steer command");
 diff --git a/crates/engine/tests/steer_now.rs b/crates/engine/tests/steer_now.rs
-index 806c1a18e9c1e5cbfee4d2562dc0814d9085a57b..34aba352cc14eb5485dbbc94903f2474671c8a16 100644
+index 042bd21c9341fd5ea2742498a89b3e0a9b933f04..810cbc610ffc8c828350de61bdd036a4d7e44793 100644
 --- a/crates/engine/tests/steer_now.rs
 +++ b/crates/engine/tests/steer_now.rs
-@@ -4,7 +4,9 @@
+@@ -4,8 +4,9 @@
  //! first: the command ends, the runtime and its background work stay, and
  //! the steer starts the next turn in that same runtime. Steers sent before
  //! it, which the stop cancels, go again first. Agents that haven't opted
--//! in (`Harness::steer_stops_tool`) keep the step-boundary wait.
+-//! in (`Harness::steer_stops_tool`) keep the step-boundary wait, and so does
+-//! a message from another chat.
 +//! in (`Harness::steer_stops_tool`) keep the step-boundary wait. So does
 +//! an agent's ordinary send (`Steer { at_once: false }`): stopping the
 +//! command reads to the agent as its call declined.
  
  use std::sync::atomic::{AtomicUsize, Ordering};
  use std::sync::{Arc, Mutex};
-@@ -265,11 +267,22 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
+@@ -268,11 +269,22 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
      }
  }
  
@@ -666,7 +680,7 @@ index 806c1a18e9c1e5cbfee4d2562dc0814d9085a57b..34aba352cc14eb5485dbbc94903f2474
      rig.core
          .doc_host
          .queue_command(
-@@ -277,6 +290,7 @@ fn steer(rig: &Rig, prompt: &str, id: &str) {
+@@ -280,6 +292,7 @@ fn steer(rig: &Rig, prompt: &str, id: &str) {
              SessionCommandPayload::Steer {
                  prompt: prompt.into(),
                  message_id: Some(id.into()),
@@ -674,7 +688,7 @@ index 806c1a18e9c1e5cbfee4d2562dc0814d9085a57b..34aba352cc14eb5485dbbc94903f2474
              },
          )
          .unwrap();
-@@ -344,6 +358,62 @@ async fn a_steer_during_a_command_is_read_at_once_and_keeps_the_runtime() {
+@@ -347,6 +360,62 @@ async fn a_steer_during_a_command_is_read_at_once_and_keeps_the_runtime() {
          1,
          "the steer is in the transcript once"
      );
@@ -737,6 +751,25 @@ index 806c1a18e9c1e5cbfee4d2562dc0814d9085a57b..34aba352cc14eb5485dbbc94903f2474
      rig.core.sessions.shutdown().await;
  }
  
+@@ -444,7 +513,8 @@ async fn a_steer_with_no_command_running_stops_nothing() {
+ /// Claude Code tells the agent the person rejected the call and to stop and
+ /// wait whenever a turn is interrupted, so a message from another chat that
+ /// stopped the command would read as an order to stop. It waits for the
+-/// command instead, as `send_message` promises.
++/// command instead, as `send_message` promises: it comes as an agent's
++/// ordinary send does, `at_once: false`.
+ #[tokio::test]
+ async fn a_message_from_another_chat_never_stops_the_command() {
+     let rig = rig(true);
+@@ -456,7 +526,7 @@ async fn a_message_from_another_chat_never_stops_the_command() {
+     .await;
+     let message =
+         zeron_proto::agent_messages::agent_message("Coordinator (139d8682)", "139d8682", "status?");
+-    steer(&rig, &message, "m-agent");
++    send(&rig, &message, "m-agent", false);
+     tokio::time::sleep(Duration::from_millis(300)).await;
+     assert_eq!(read(&rig).len(), 1, "it waits for the command");
+     assert_eq!(
 diff --git a/crates/engine/tests/steering_live.rs b/crates/engine/tests/steering_live.rs
 index 665fc649afe8caa3786461746ef649f07872b0d9..f8ecabdc18bfd3b3297c01f3c316469e0d2d02b3 100644
 --- a/crates/engine/tests/steering_live.rs
@@ -751,10 +784,10 @@ index 665fc649afe8caa3786461746ef649f07872b0d9..f8ecabdc18bfd3b3297c01f3c316469e
      // Regular queued messages must remain held until the steered work finishes.
      for i in 0..2 {
 diff --git a/crates/harness/tests/claude.rs b/crates/harness/tests/claude.rs
-index d2e54ae9d2cdf28ce5851537fbbadb8e5c5a7898..a32faa3be413f5695eb3db8bf226326212bc2030 100644
+index 4dd6d978b1873bb10c37b04d5aabe7e946fb874e..1a8f937dbb4c30555217b97ba6363dbd7483cd30 100644
 --- a/crates/harness/tests/claude.rs
 +++ b/crates/harness/tests/claude.rs
-@@ -1550,6 +1550,53 @@ async fn a_typed_fork_settles_before_a_message_waiting_on_it_splits_the_turn() {
+@@ -1556,6 +1556,53 @@ async fn a_typed_fork_settles_before_a_message_waiting_on_it_splits_the_turn() {
      );
  }
  

@@ -1,4 +1,4 @@
-From 7fffc506ce2c37279ae16b63c2c7d51be068d301 Mon Sep 17 00:00:00 2001
+From 5fe82055782a15b65fd410c972dc63224f71dae4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 1/4] engine: the parent's host reports for children whose host
@@ -187,7 +187,7 @@ index e5b91a29a328e0b8b1e93f7644b0f75c80b17b28..fd978a46601e38d1a843c83a7df82054
          now_ms
      }
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 7d68e277083188a88a677bdd76821c68ad90bcd5..fd1d1f439301478a6ecc5084747791a4f3fe605e 100644
+index 7e6aaad3713ccd898a8cc037bb73f8330eccaa42..4ad7623055ee7299cb6839ea9a2c30cbcd5eed7c 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -26,20 +26,24 @@
@@ -769,7 +769,7 @@ index 7d68e277083188a88a677bdd76821c68ad90bcd5..fd1d1f439301478a6ecc5084747791a4
          .into_iter()
          .filter_map(|stage| Some((rest.strip_suffix(stage)?.strip_suffix('-')?, stage.to_owned())))
          .collect();
-@@ -2723,7 +3187,7 @@ mod tests {
+@@ -2724,7 +3188,7 @@ mod tests {
      #[test]
      fn a_reports_key_reads_from_both_ends() {
          let (child, asked) = ("kid-a-0b1c", "5f0e7a3c-9d2b-4c1e-8a6f-1b2c3d4e5f60");
@@ -779,7 +779,7 @@ index 7d68e277083188a88a677bdd76821c68ad90bcd5..fd1d1f439301478a6ecc5084747791a4
              assert_eq!(report_key_parts(&key, child), Some((asked.to_owned(), stage.to_owned())), "{key}");
          }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 137b637a65672cb99bb3547b19ed0efe31900a2c..745d6316f86dc8ccf4df5a17dddbd9a3728bced1 100644
+index cc6704dfd6d29eb9eb2857860425751f7f63a032..2d2704b620adbffc1a5113f6985b51bb08ae66a5 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -527,6 +527,9 @@ impl SessionsEngine {
@@ -816,7 +816,7 @@ index 137b637a65672cb99bb3547b19ed0efe31900a2c..745d6316f86dc8ccf4df5a17dddbd9a3
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -7789,6 +7809,7 @@ mod tests {
+@@ -8136,6 +8156,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
          unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
@@ -824,7 +824,7 @@ index 137b637a65672cb99bb3547b19ed0efe31900a2c..745d6316f86dc8ccf4df5a17dddbd9a3
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9124,6 +9145,209 @@ mod tests {
+@@ -9477,6 +9498,209 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1068,10 +1068,10 @@ index cb296456f05e0f8c4f245004a1d6192cef51d611..442fb53a2fb5d2357e9533b1000a3ef5
                  ],
              })
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 
 
-From 67d93f590306ecbd49ca987f90f12071fecdbb4a Mon Sep 17 00:00:00 2001
+From 3d74229d4fab9db119f28b107d05a87448fee110 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
@@ -1239,10 +1239,10 @@ index 4c18701772a8c278927787cc657d02c6a8920bf4..d1d5eefa88aaf9a705e28ff60e86cd1d
      async fn wait_on_an_idle_chat_returns_immediately() {
          let world = Arc::new(World::default());
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 
 
-From 048dbd3756a261a1e3e14efcc2c2469cd507049b Mon Sep 17 00:00:00 2001
+From ebf544d861b0b21d5247b6a2db6158d19cfe2d3d Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 15:37:33 +0700
 Subject: [PATCH 3/4] engine: the parent's watch reports only the turn its
@@ -1308,7 +1308,7 @@ index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e
                  };
                  let kept: Vec<&str> =
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index fd1d1f439301478a6ecc5084747791a4f3fe605e..78bbf9426dba94d4a110f2649d9ae61a07a4ae99 100644
+index 4ad7623055ee7299cb6839ea9a2c30cbcd5eed7c..46c4a4fc888e05f5fa76e294b0c9d35b569b55d8 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -730,10 +730,85 @@ const WATCH_IDLE_MS: i64 = 5 * 60 * 1000;
@@ -1713,10 +1713,10 @@ index fd1d1f439301478a6ecc5084747791a4f3fe605e..78bbf9426dba94d4a110f2649d9ae61a
          }
      };
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 745d6316f86dc8ccf4df5a17dddbd9a3728bced1..f12a566e03d03087b1f5a1d939d557d0a67a2e06 100644
+index 2d2704b620adbffc1a5113f6985b51bb08ae66a5..effbe6c19667dfc5e01c8899b28e71c0577e1fbd 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -7810,6 +7810,7 @@ mod tests {
+@@ -8157,6 +8157,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
          unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
          unsafe { std::env::set_var("ZERON_REPORT_UNSYNCED_MS", "3000") };
@@ -1724,7 +1724,7 @@ index 745d6316f86dc8ccf4df5a17dddbd9a3728bced1..f12a566e03d03087b1f5a1d939d557d0
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9193,6 +9194,36 @@ mod tests {
+@@ -9546,6 +9547,36 @@ mod tests {
              self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
          }
  
@@ -1761,7 +1761,7 @@ index 745d6316f86dc8ccf4df5a17dddbd9a3728bced1..f12a566e03d03087b1f5a1d939d557d0
          /// `kid-r`'s registry row from the laptop: `status`, its last turn
          /// having ended `outcome` `ago` ms ago, its last finished answer
          /// `completed`.
-@@ -9348,6 +9379,78 @@ mod tests {
+@@ -9701,6 +9732,78 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1841,10 +1841,10 @@ index 745d6316f86dc8ccf4df5a17dddbd9a3728bced1..f12a566e03d03087b1f5a1d939d557d0
          /// The person stops `chat` (no agent's Stop).
          fn person_stops(&self, chat: &str) {
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 
 
-From 104ff56c7801cc7fde34c449d16758ebdd71f5ec Mon Sep 17 00:00:00 2001
+From 0e4d5263edd481b1ea8a115501f8c76bbb174fe4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 17:51:08 +0700
 Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
@@ -1856,7 +1856,7 @@ Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
  2 files changed, 224 insertions(+), 29 deletions(-)
 
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 78bbf9426dba94d4a110f2649d9ae61a07a4ae99..0870898c5bba6aae44602a477cd28c919ac1c340 100644
+index 46c4a4fc888e05f5fa76e294b0c9d35b569b55d8..b32ff234ea8f5e44d709ce0a7b65d6e5d0e5b053 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -297,22 +297,41 @@ pub(super) async fn report_turn_end(
@@ -2138,10 +2138,10 @@ index 78bbf9426dba94d4a110f2649d9ae61a07a4ae99..0870898c5bba6aae44602a477cd28c91
      }
      let first = match *settled {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index f12a566e03d03087b1f5a1d939d557d0a67a2e06..5b814496617c20a05bd80c870e7ddc0cc670fd49 100644
+index effbe6c19667dfc5e01c8899b28e71c0577e1fbd..f6155626a4b1c8355d4e4464913c1ad4dffe6d79 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -9166,11 +9166,17 @@ mod tests {
+@@ -9519,11 +9519,17 @@ mod tests {
  
          /// The laptop's device row, its Zeron having `caps`, online.
          fn laptop(&self, caps: &[&str]) {
@@ -2160,7 +2160,7 @@ index f12a566e03d03087b1f5a1d939d557d0a67a2e06..5b814496617c20a05bd80c870e7ddc0c
                  created_at: None,
                  version: None,
                  cursor_sdk_version: None,
-@@ -9224,6 +9230,25 @@ mod tests {
+@@ -9577,6 +9583,25 @@ mod tests {
              self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
          }
  
@@ -2186,7 +2186,7 @@ index f12a566e03d03087b1f5a1d939d557d0a67a2e06..5b814496617c20a05bd80c870e7ddc0c
          /// `kid-r`'s registry row from the laptop: `status`, its last turn
          /// having ended `outcome` `ago` ms ago, its last finished answer
          /// `completed`.
-@@ -9451,6 +9476,83 @@ mod tests {
+@@ -9804,6 +9829,83 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -2271,5 +2271,5 @@ index f12a566e03d03087b1f5a1d939d557d0a67a2e06..5b814496617c20a05bd80c870e7ddc0c
          /// The person stops `chat` (no agent's Stop).
          fn person_stops(&self, chat: &str) {
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

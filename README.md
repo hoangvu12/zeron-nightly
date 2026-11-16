@@ -1,12 +1,14 @@
 # Zeron nightly
 
 Nightly Windows builds of [Zeron](https://github.com/zeronsh/zeron) v3, the
-zgx interface (`apps/zgx`): upstream's `zeron/zgx` branch plus a short list of
-patches that aren't (yet) upstream. Installed nightlies update themselves from
-this repo's releases.
+zgx interface (`apps/zgx`): upstream's `main` plus a short list of patches
+that aren't (yet) upstream. Installed nightlies update themselves from this
+repo's releases.
 
-The v2 nightly (upstream `main`, the `crates/ui` interface) is no longer
-built. Its old releases stay up, but get no updates.
+Upstream merged its `zeron/zgx` branch into `main` (0.3.0) and has shipped
+the zgx app from `main` since, so the nightly follows `main`; `zeron/zgx` is
+frozen. The v2 nightly (the `crates/ui` interface) is no longer built. Its
+old releases stay up, but get no updates.
 
 - `main` (this branch) holds only the tooling: `patches-v3.toml`, `patches/`,
   `rerere/`, `scripts/` and the workflow.
@@ -18,7 +20,7 @@ built. Its old releases stay up, but get no updates.
 `.github/workflows/nightly-v3.yml` runs at 19:30 UTC (02:30 in Vietnam) and
 on demand (Actions → nightly-v3 → Run workflow).
 
-1. `scripts/assemble.py` resets the tree to upstream `zeron/zgx` and applies
+1. `scripts/assemble.py` resets the tree to upstream `main` and applies
    each enabled `[[patch]]` in `patches-v3.toml` in order: upstream PRs at a
    pinned commit, patch files with `git am -3`, or branches of this repo.
 2. A patch that no longer applies is **dropped from that build** and listed in
@@ -27,7 +29,7 @@ on demand (Actions → nightly-v3 → Run workflow).
    update to every release. Conflicts resolved once replay from `rerere/`.
 3. Upstream's own `.github/workflows` are removed (they belong to
    zeronsh/zeron), and the version becomes the next patch release's
-   prerelease: upstream `0.2.139` → `0.2.140-v3.YYYYMMDDHHMM`.
+   prerelease: upstream `0.3.7` → `0.3.8-v3.YYYYMMDDHHMM`.
 4. If upstream and the patch list are unchanged since the last release, the
    run stops there. Otherwise `scripts/package-v3-windows.ps1` builds
    `zeron-zgx` with its `beta` feature (production sign-in, Zeron's own data)
@@ -57,8 +59,9 @@ branch = "work/bigger"    # a branch pushed to this repo
 
 Set `enabled = false` to park an entry. The release notes say when a pinned
 PR has new commits, is in upstream (then delete the entry) or was closed. A
-PR merged into `main` is no help yet: it stays applied at its pin until
-`zeron/zgx` takes it, and the notes say so.
+PR whose base is another branch (such as the frozen `zeron/zgx`) can conflict
+with `main`: carry it as a patch file merged onto `main` instead
+(`design-plugin-apis` says how).
 
 Make patch files with `git format-patch --full-index`: CI's clone has no
 blobs to fall back on, so `git am -3` needs the full ids.

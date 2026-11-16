@@ -1,4 +1,4 @@
-From 22938454b5775e2c9f4079bea656a9543ea66491 Mon Sep 17 00:00:00 2001
+From e40f29371f05dd9d27b1d33408d00411660f9a28 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 09:39:39 +0700
 Subject: [PATCH] engine: child reports cover follow-up turns, thanks and
@@ -286,7 +286,7 @@ index 6a64539f0e0d84386223feb723d51ed4e2ba7b11..19151a587b9f4667b50215e2045a70ab
      /// mark is pinned to the one its MCP server runs in; one that runs in
      /// none can't mark any. Sleep is the person's: no agent sets it.
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..c69f47695d34ab46d1f04fa62ca52a869aeb7a9a 100644
+index 02dd5b9281bc5aa8e5df002e7ba13e1ecd2fb72f..18758900173613fa428e81c28817cef637a176af 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -47,9 +47,14 @@ const REPORT_CAP: usize = 16 * 1024;
@@ -886,7 +886,7 @@ index 6292ed6c9f812a8bf86765b84cee1845a14d4d74..c69f47695d34ab46d1f04fa62ca52a86
          "{}\n\n[Cut at 16 KB. Read the whole reply with the Zeron `read_chat` tool, chat {child}.]",
          body[..end].trim_end()
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41d8ed47a0 100644
+index 2e617b8647f23b9a7feb50b2faa7c9230fa9c979..dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -41,7 +41,7 @@ use crate::doc_host::{ChatDocHandle, DocHost};
@@ -898,7 +898,7 @@ index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
  use crate::{EngineError, new_id, now_ms};
-@@ -8496,7 +8496,7 @@ mod tests {
+@@ -8847,7 +8847,7 @@ mod tests {
              (
                  "kid-a".into(),
                  ReportStatus::Stopped,
@@ -907,7 +907,7 @@ index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41
              ),
              ("kid-a".into(), ReportStatus::Finished, "Rebased.".into()),
          ];
-@@ -8552,7 +8552,7 @@ mod tests {
+@@ -8903,7 +8903,7 @@ mod tests {
              (
                  "kid-a".into(),
                  ReportStatus::Stopped,
@@ -916,7 +916,7 @@ index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41
              ),
          ];
          // (The finished one says the next turn's reply, whatever it is.)
-@@ -8658,7 +8658,7 @@ mod tests {
+@@ -9009,7 +9009,7 @@ mod tests {
              .doc_host
              .queue_command("kid-r", zeron_doc::SessionCommandPayload::Run { request: ask, message_id: "r-m1".into() })
              .unwrap();
@@ -925,7 +925,7 @@ index 895736179511e0f4ef2fe158aa523a619757b543..fdfa9d22e54f0bbd5df45582214ddd41
          // Its host ran it and reported; this copy of its doc never caught up.
          let mut report = request();
          report.prompt = zeron_proto::agent_messages::child_report("Remote (kid-r)", "kid-r", ReportStatus::Finished, "LGTM.");
-@@ -8672,4 +8672,164 @@ mod tests {
+@@ -9023,4 +9023,164 @@ mod tests {
          assert_eq!(rig.roster(), "No child is working for you now.");
          rig.core.sessions.shutdown().await;
      }
@@ -1107,10 +1107,10 @@ index 4cdf51d0f58b99dce813122e97965d6e49cef814..3b2c9449da364cede93a5a04edfafa06
          Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
      }
 diff --git a/crates/harness/src/pi/mod.rs b/crates/harness/src/pi/mod.rs
-index eb25fb038b4910a6536921a6b00309b9c10c1f4f..a7e1f76e882ad88bf38c6546964ebdf073dbfea3 100644
+index a22fb610b33b70b4bdf22a82084347b1d3b5e593..93279b88d571d0ab88af827493454943bd84937a 100644
 --- a/crates/harness/src/pi/mod.rs
 +++ b/crates/harness/src/pi/mod.rs
-@@ -1042,11 +1042,19 @@ impl Runner {
+@@ -1046,11 +1046,19 @@ impl Runner {
              self.process
                  .dialogs
                  .request(self.process.transport.client.clone(), &frame);

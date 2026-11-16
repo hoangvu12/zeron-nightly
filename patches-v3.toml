@@ -1,12 +1,13 @@
 # What goes into Zeron v3 nightly: the zgx interface (apps/zgx) on top of
-# upstream's zeron/zgx branch (.github/workflows/nightly-v3.yml).
+# upstream's main (.github/workflows/nightly-v3.yml).
 #
-# v2 (upstream main and crates/ui) is no longer built: this is the only list.
-# A PR merged into main stays applied at its pin until zeron/zgx takes it.
+# Upstream merged its zeron/zgx branch into main (0.3.0, 2026-11-12) and
+# ships the zgx app from main since; zeron/zgx is frozen at c1539061b. The
+# v2 interface (crates/ui) is no longer built: this is the only list.
 
 [upstream]
 repo = "zeronsh/zeron"
-branch = "zeron/zgx"
+branch = "main"
 
 [nightly]
 repo = "hoangvu12/zeron-nightly"
@@ -17,7 +18,7 @@ label = "v3"
 name = "windows-prerelease-versions"
 file = "patches/0001-windows-prerelease-versions-zgx.patch"
 required = true
-note = "The updater part of 0001, for zeron/zgx: the Windows updater takes prerelease versions (0.2.137-v3.N), not only a beta's. zeron/zgx rewrote the lines 0001 changes (valid_version, package-windows.ps1, zeron.iss), so one file can't apply on both lists; v3 packages with its own script and installer, so it needs no packaging part."
+note = "The updater part of 0001, for the zgx line (zeron/zgx, now main): the Windows updater takes prerelease versions (0.3.8-v3.N), not only a beta's. v3 packages with its own script and installer, so it needs no packaging part."
 
 [[patch]]
 name = "v3-windows-install-layout"
@@ -42,7 +43,7 @@ name = "warm-chats-parked-cap"
 pr = 1101
 enabled = false
 sha = "d17965e8273b473f59114e2620a3a98a6ca9f648"
-note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min. Off since 2026-11-11: it conflicts with zeron/zgx's background waits in sessions.rs (rerere/ no longer replays it); turn it back on once re-resolved."
+note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle ones after 5 min. Off since 2026-11-11: it conflicts with zeron/zgx's background waits in sessions.rs, which main has too (rerere/ no longer replays it); turn it back on once re-resolved."
 
 [[patch]]
 name = "markdown-reply-images"
@@ -57,7 +58,7 @@ note = "Images from a chat on another device load in a few relay round trips. Ap
 [[patch]]
 name = "agent-steers-wait-for-tools"
 file = "patches/0008-agent-steers-wait-for-tools.patch"
-note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it lands at the next step. mode 'steer' and the person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. v3 only: it conflicts with main's plugin_agents.rs."
+note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it goes by the mailbox (Steer at_once false) and lands at the next step. The person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. Rebased onto main, which has upstream's own fix for the same bug (d071ed2db: a steer with the from-another-chat header never stops a command). This patch replaces that guard in steer_now with its own at_once flag, so an agent's explicit mode 'steer' still stops the command (with the note), as child-chats-report-back's tests expect; upstream's test sends at_once false, as an agent's ordinary send does. A steer from a peer without this patch (a Cloud machine on upstream Zeron) has no at_once and is read at once, as before d071ed2db."
 
 [[patch]]
 name = "child-chats-report-back"
@@ -79,44 +80,33 @@ name = "reply-long-page-picture"
 file = "patches/0011-reply-long-page-picture.patch"
 note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its top across its frame at its own shape, not blown up with its middle cropped: its `ui.image` took its pixels' own height as a flex item, and `cover` filled that. Not yet a PR upstream."
 
-# The Design plugin's plugin-API PRs (pure-Luau Design plugin, developed
-# against this nightly until upstream merges them). Move a `sha` when its PR
-# gets new commits; delete the entry once the release notes say it's in.
+# The Design plugin's plugin-API PR (pure-Luau Design plugin, developed
+# against this nightly until upstream merges it).
 
 [[patch]]
 name = "design-plugin-apis"
-pr = 1392
-sha = "58444b48ad3d97e6e88475632c450453303188e9"
-note = "The Design plugin's plugin APIs as one PR (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 \"fonts\", #1379 fetch bytes in base64, #1380 a service's zeron.db, with its close-before-forget fix, #1398 zeron.write_file and \"files.write\"). Its last commit points the app and the engine at the combined zgx PR (#2110's head rebased on zgx main, 41ffcef3); zgx-nightly-design, below, moves them to hoangvu12/zgx nightly-design-export."
-
-[[patch]]
-name = "plugin-window-memory"
-file = "patches/0013-plugin-window-memory.patch"
-note = "A plugin's window gets the memory its manifest asks for its service (service_memory_mb, at most 512 MB), by zgx's ScriptHost::plugin_memory; the Design plugin's window stopped on a large design (\"not enough memory\"). 00d1f31e7 (branch window-memory, on #1392's c52121b51), not yet in #1392: cherry-picked onto the assembly as a file. Needs the zgx setter (aff65ee94, in nightly-design-export); goes after design-plugin-apis and before zgx-nightly-design."
-
-[[patch]]
-name = "zgx-nightly-design"
-file = "patches/0012-zgx-nightly-design.patch"
-note = "The app's and the engine's zgx from hoangvu12/zgx's nightly-design-export branch (1890c055) instead of #1392's combined zgx PR (#2110, 41ffcef3, on zgx main): zeron/zgx's pinned zgx 06c6d56 with the same zgx PRs cherry-picked onto it: #2074, #2095, #2096 (fonts, decode_image, file bytes), #2080 (render_canvas), #2076, #2081, #2082 (text spacing, c:image, c:shadow), #2094 (zgx-text), #2097, #2098 (text order, clips, transforms, with the fast path), gradients, #2100, #2101 (raster pan and zoom), #2103 (a view canvas draws its text into its raster), #2110's Canvas::layers fix, #2115-#2118 (ui.zip, JPEG/WebP, write_file append, render_canvas to a file), #2119 (canvas glyph and layout cache, with the fonts-key fix) and the canvas culling, zoom-job and backdrop work, and canvas tiles (256-px tiles made off the frame on pan and zoom, uploaded within about 4 ms a frame, kept in one atlas, at most 12 uploads a frame, the atlas kept while a window rests, a changed drawing's old tiles shown while its own are made, against the first-zoom and load-time hitches), a plugin's own heap limit (ScriptHost::plugin_memory), and full-size export (zip:add_canvas, render_canvas append). Every zgx line of apps/zgx/Cargo.toml and crates/engine/Cargo.toml and both lockfiles move. Goes after design-plugin-apis."
-# Another zgx PR: cherry-pick it onto nightly-design (a new commit, never a
-# force-push), run its tests, push. Then in a checkout assembled up to here,
-# replace the old rev with the new one in those two Cargo.toml files and both
-# Cargo.lock files, check `cargo metadata --locked` in the root and in
-# apps/zgx, commit, and regenerate this file with
-# `git format-patch --full-index`. When zeron/zgx moves its zgx pin, rebuild
-# the branch from the new pin (a new branch, e.g. nightly-design-<rev>) and
-# do the same. Once a PR is in zeron/zgx's pin, drop its commit there too;
-# once all are, delete this entry.
+file = "patches/0018-design-plugin-apis.patch"
+note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's plugin APIs (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 fonts, #1379 fetch bytes in base64, #1380 a service's zeron.db, #1398 zeron.write_file and files.write, and a plugin window's memory from its manifest, which was 0013). #1392's base is still the frozen zeron/zgx, and main moved the same Cargo.toml lines (its zgx pin) and the consent fixture, so a `pr` entry conflicts. Its zgx is hoangvu12/zgx 24b35872 (#2110, the combined zgx PR, rebased on zgx main d98f954d), kept on branch nightly-design-24b35872 so a force-push of #2110 can't take it away; main pins zeronsh/zgx d391ea72, which d98f954d is 92 commits ahead of. It carries everything 0012's nightly-design-export (1890c055) did, so that patch is gone. The consent fixture lists both main's draft and #1392's fonts; both lockfiles are regenerated."
+# When #1392 moves: in a checkout assembled up to here minus this entry, merge
+# the new head, take main's side of apps/zgx/Cargo.toml with each zgx rev
+# moved to #1392's (and the comment above `zgx =`), union the consent
+# fixture's permission lists, take main's apps/zgx/Cargo.lock and let
+# `cargo metadata` (root and apps/zgx) update both locks, check both with
+# `cargo metadata --locked`, then regenerate this file as one commit with
+# `git format-patch --full-index`. Keep a new zgx rev on a branch of its own
+# on hoangvu12/zgx (never a force-pushed one), as nightly-design-24b35872 is.
+# Once #1392 is retargeted to main upstream, make this a `pr` entry again.
 
 [[patch]]
 name = "agent-device-commands"
-file = "patches/0014-agent-device-commands.patch"
-note = "#1458 at a4e90bbf as a file: its own diff (from main f6a9bbfc), not a `pr` entry, since its head carries 127 commits of main that zeron/zgx lacks. Agents run shell commands on any online device (Zeron MCP's run_command, command_output, stop_command, list_commands), with background ones in the chat's background band; Cloud chats reach every device (the edge part only takes effect once upstream deploys it). zgx doesn't have main's PowerShell terminal picker, so agent commands get it as terminals::command_shell (PowerShell on Windows, as the PR's Windows tests expect) while terminal tabs keep zgx's %COMSPEC%; the plugin preview blocks agents.cloud_key only (main's agents.add_key and agents.rename aren't in zgx). Both devices need this build: the command runs on the target's engine. Applied last; regenerate it when #1458 gets new commits."
+pr = 1458
+sha = "a4e90bbf0ffa842425831d151abdd6e2b1e92ad6"
+note = "Agents run shell commands on any online device (Zeron MCP's run_command, command_output, stop_command, list_commands), with background ones in the chat's background band; Cloud chats reach every device (the edge part only takes effect once upstream deploys it). A `pr` entry now that the base is main (#1458 is on main f6a9bbfc): the PR as written, with main's terminal picker and plugin-preview list, not the zgx-adapted file it was (0014-agent-device-commands). Both devices need this build: the command runs on the target's engine. The child-reports patches below go after it."
 
 [[patch]]
 name = "child-reports-one-rule"
 file = "patches/0014-child-reports-one-rule.patch"
-note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Goes after agent-device-commands (#1458), which it was rebased onto; needs child-reports-held-stop."
+note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Goes after agent-device-commands (#1458); needs child-reports-held-stop."
 
 [[patch]]
 name = "child-reports-holds-and-groups"

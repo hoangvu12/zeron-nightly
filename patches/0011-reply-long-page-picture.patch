@@ -1,4 +1,4 @@
-From e62fdc72a6eae1ec05e2ec6ff8b41a5370163077 Mon Sep 17 00:00:00 2001
+From 1c66590d2e99da4266b5afc65b526caa04992698 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 15:50:23 +0700
 Subject: [PATCH] zgx: a long page in a reply shows its top, not a blown-up
@@ -15,10 +15,10 @@ said from the frame's width, so it spans the frame at its own shape.
  2 files changed, 18 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/ui/ds/reply_picture.luau b/apps/zgx/ui/ds/reply_picture.luau
-index 003addf8be6b8383575328f88e0a43c5d3f71054..849bab5ec4164969ee498e546991aabb470a35d3 100644
+index a0efcfab55ef2749fff29507bc8a38c4d116d3b7..e2ef8802b14ff4ecc8537d81a297f4bb0f760018 100644
 --- a/apps/zgx/ui/ds/reply_picture.luau
 +++ b/apps/zgx/ui/ds/reply_picture.luau
-@@ -444,10 +444,14 @@ local Frame = ui.component(function(props: FrameProps): Node
+@@ -449,10 +449,14 @@ local Frame = ui.component(function(props: FrameProps): Node
  					on_error = broke,
  					on_load = landed,
  					w_full = true,

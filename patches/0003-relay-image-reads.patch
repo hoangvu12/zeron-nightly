@@ -1,4 +1,4 @@
-From ee5fdbb4197888b883e96df7cde19c5df7425625 Mon Sep 17 00:00:00 2001
+From c1d0214e45383591da5d3d7c06f03c8d5a2dd433 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:03:38 +0700
 Subject: [PATCH] Images from another device load in a few round trips, not one
@@ -47,7 +47,7 @@ index ea93405787190af78ed48429e56cda7aca54d3ac..b66dfd94d15995abbf791a887601650d
  }
  
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 79862336675232ebbab7505c99d9ba0feaf61099..b183212f7951d41402e271f8f0dec1548ec15ae7 100644
+index a59bedfe9dd180e1f0c72bccd4695fe097d01a73..210c85a10e556059aa75587786c5ee461a868352 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -37,10 +37,10 @@
@@ -65,7 +65,7 @@ index 79862336675232ebbab7505c99d9ba0feaf61099..b183212f7951d41402e271f8f0dec154
  //!   (`{text, nextOffset, done, bytes, lines, trimmed, exitCode?}`): one command's
  //!   whole output from this host's run journal, redacted as the doc's tail is
 diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
-index 8841a081002f32020c2313bcd19d8d6b419561a9..10c91f9c9a0f0f92034e648b1bbe4e90e447269a 100644
+index 58a2320887d41ac6eb37dcf8c3302e7135cb5cd7..c3c78fcfe35ca6ef229fbf789f41b903583d428b 100644
 --- a/crates/engine/src/uploads.rs
 +++ b/crates/engine/src/uploads.rs
 @@ -157,6 +157,9 @@ pub struct AttachmentChunk {
@@ -87,10 +87,10 @@ index 8841a081002f32020c2313bcd19d8d6b419561a9..10c91f9c9a0f0f92034e648b1bbe4e90
      }
  
 diff --git a/crates/engine/tests/device_routing.rs b/crates/engine/tests/device_routing.rs
-index 15c3dd02862a28252a66e46043df9c8dfa0f764f..c71dbd5025afda4da40c7b865815a4e5f422e525 100644
+index cab6a1cc368a830f62577e311fb1af1dbf31db05..4b087f9b8aa51372b896572acc73c948dc8e8f1a 100644
 --- a/crates/engine/tests/device_routing.rs
 +++ b/crates/engine/tests/device_routing.rs
-@@ -878,6 +878,8 @@ async fn target_device_id_routes_over_the_relay() {
+@@ -890,6 +890,8 @@ async fn target_device_id_routes_over_the_relay() {
          .unwrap();
      assert_eq!(remote_picture, local_picture);
      assert_eq!(remote_picture["mimeType"], "image/png");

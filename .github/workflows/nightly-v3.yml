@@ -1,6 +1,6 @@
 name: nightly-v3
 
-# Zeron v3 (the zgx interface, apps/zgx): upstream's zeron/zgx branch +
+# Zeron v3 (the zgx interface, apps/zgx): upstream's main +
 # patches-v3.toml, assembled from scratch (scripts/assemble.py), built for
 # Windows (scripts/package-v3-windows.ps1) and published as a prerelease that
 # is never the latest. v2 installs follow releases/latest, so they never see
@@ -27,7 +27,7 @@ concurrency:
 
 env:
   UPSTREAM: https://github.com/zeronsh/zeron.git
-  # v3 releases are the ones whose tag has this prerelease (v0.2.137-v3.N).
+  # v3 releases are the ones whose tag has this prerelease (v0.3.8-v3.N).
   # (A bracket, not a backslash: it goes into jq string literals.)
   TAG_MATCH: '-v3[.]'
   # The fixed release v3 installs update from.

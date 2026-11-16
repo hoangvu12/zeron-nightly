@@ -1,4 +1,4 @@
-From 3a05d6e1521b5304f051fc642074084a3b2d7d17 Mon Sep 17 00:00:00 2001
+From 9cc936c3d4a1fd8f9641cd735b66e7ed26d9d0ae Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 15 Nov 2026 20:53:51 +0700
 Subject: [PATCH 1/2] engine: child reports follow one rule: the first turn
@@ -204,7 +204,7 @@ index 43dcd248ad042c5df95d0cda3610b0a0220b6057..e5b91a29a328e0b8b1e93f7644b0f75c
      /// crash-revive-crash cycles exhaust it.
      pub fn clear_resume_attempts(&self, chat_id: &str) {
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index a47926857e537a66fa49d0deffa89454d95a33f9..9fcdcb9825579c27b946bdd2f27b50221bb6ef3c 100644
+index 7c3491b7512c20d0252ade9464bd306709bbe180..a27d38cfe7a0fa71db760720ef3b98a486d064b1 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -5,9 +5,10 @@
@@ -1363,7 +1363,7 @@ index a47926857e537a66fa49d0deffa89454d95a33f9..9fcdcb9825579c27b946bdd2f27b5022
  }
  
  /// `body` cut to [`REPORT_CAP`] on a character boundary, saying where the
-@@ -1427,6 +1735,44 @@ mod tests {
+@@ -1428,6 +1736,44 @@ mod tests {
          }
      }
  
@@ -1409,7 +1409,7 @@ index a47926857e537a66fa49d0deffa89454d95a33f9..9fcdcb9825579c27b946bdd2f27b5022
      fn a_turn_answers_the_parents_latest_message() {
          let asked = agent_messages::agent_message("Lead (parent00)", "parent", "Run the tests.");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f99471cc04 100644
+index 09fed3529fb773cc53b12e616043ce6d8460a748..092ae8a9bb77c6027cee43950429c17c54af26ca 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -41,7 +41,9 @@ use crate::doc_host::{ChatDocHandle, DocHost};
@@ -1423,7 +1423,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
  use crate::{EngineError, new_id, now_ms};
-@@ -284,10 +286,16 @@ struct Inner {
+@@ -289,10 +291,16 @@ struct Inner {
      /// while no run was live (between the failed run and its retry) found
      /// nothing to stop, and still ends the turn.
      user_stops: Mutex<HashMap<String, u64>>,
@@ -1444,7 +1444,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
      /// Chats whose turn a steer is stopping to be read at once
      /// ([`SessionsEngine::steer_now`]), until that turn settles: its end is
      /// the steer's turn starting, no Stop of anyone's.
-@@ -383,6 +391,7 @@ impl SessionsEngine {
+@@ -390,6 +398,7 @@ impl SessionsEngine {
                  cancelled_sends: Mutex::new(HashMap::new()),
                  user_stops: Mutex::new(HashMap::new()),
                  stopped_at: Mutex::new(HashMap::new()),
@@ -1452,7 +1452,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
                  steer_stops: Mutex::new(std::collections::HashSet::new()),
                  ipc_port: std::sync::atomic::AtomicU16::new(0),
                  ipc_ready: tokio::sync::Notify::new(),
-@@ -479,7 +488,8 @@ impl SessionsEngine {
+@@ -486,7 +495,8 @@ impl SessionsEngine {
  
      /// On start, once revived turns are under way: each report a child chat
      /// here owed its parent when the engine went down goes now
@@ -1462,7 +1462,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
      pub fn report_owed(&self) {
          let Ok(runtime) = tokio::runtime::Handle::try_current() else {
              return;
-@@ -495,9 +505,18 @@ impl SessionsEngine {
+@@ -502,9 +512,18 @@ impl SessionsEngine {
              let Some(host) = engine.inner.doc_host() else {
                  return;
              };
@@ -1483,7 +1483,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              }
          });
      }
-@@ -1875,7 +1894,13 @@ impl SessionsEngine {
+@@ -1957,7 +1976,13 @@ impl SessionsEngine {
      /// A Stop ends the chat's turn, however it settles: a child chat reports
      /// it stopped (see `Inner::stopped_at`). A steer's stop isn't one.
      fn note_stopped(&self, chat_id: &str) {
@@ -1498,7 +1498,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
      }
  
      /// End the in-flight turn so another prompt can take its place ("send
-@@ -2081,6 +2106,9 @@ impl SessionsEngine {
+@@ -2163,6 +2188,9 @@ impl SessionsEngine {
              // stopped run closed its journal.
              let stopped = self.inner.journal.user_stopped(&chat_id);
              self.inner.journal.clear_user_stop(&chat_id);
@@ -1508,7 +1508,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              let handle = self.doc_handle(&chat_id)?;
              // Harness continuity first: the crashed run's session id may only
              // exist in the journal (the debounced workspace-row write may
-@@ -2729,9 +2757,16 @@ impl Inner {
+@@ -2967,9 +2995,16 @@ impl Inner {
          if status == SessionStatus::Working && was != status {
              lock(&self.stopped_at).remove(chat_id);
          }
@@ -1528,7 +1528,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          // A turn a steer stopped to be read at once settles here, and the
          // steer's turn goes on from it: nothing ended. (A stop too slow for
          // the steer leaves the mark to the turn's own end.)
-@@ -2739,6 +2774,14 @@ impl Inner {
+@@ -2977,6 +3012,14 @@ impl Inner {
          let settled = match status {
              SessionStatus::Idle if finished && stopped => Some(ReportStatus::Stopped),
              SessionStatus::Idle if finished => Some(ReportStatus::Finished),
@@ -1543,7 +1543,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              SessionStatus::Idle if outcome == Some(DoneStatus::Interrupted) && !replaced => {
                  Some(ReportStatus::Stopped)
              }
-@@ -2755,13 +2798,14 @@ impl Inner {
+@@ -2993,13 +3036,14 @@ impl Inner {
              host.retry_unread_reports(chat_id);
          }
          if let Some(settled) = settled {
@@ -1561,7 +1561,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          let Some(host) = self.doc_host() else {
              return;
          };
-@@ -2774,6 +2818,7 @@ impl Inner {
+@@ -3012,6 +3056,7 @@ impl Inner {
              self.reported.clone(),
              chat_id.to_owned(),
              status,
@@ -1569,7 +1569,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              now_ms(),
          ));
      }
-@@ -7597,7 +7642,7 @@ mod tests {
+@@ -8068,7 +8113,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_WAKE_GRACE_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_WINDOW_MS", "1000") };
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
@@ -1578,7 +1578,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -7873,7 +7918,8 @@ mod tests {
+@@ -8346,7 +8391,8 @@ mod tests {
          let (sender, status, body) = read(&rig.reports("lead")[0]).remove(0);
          assert_eq!((sender.as_str(), status), ("kid-a", zeron_proto::agent_messages::ReportStatus::NeedsInput));
          assert!(body.starts_with("Which branch do I ship?\nOptions: main · release"), "{body}");
@@ -1588,7 +1588,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          rig.core.sessions.shutdown().await;
      }
  
-@@ -8042,13 +8088,14 @@ mod tests {
+@@ -8515,13 +8561,14 @@ mod tests {
          rig.until("the lead hears back", |r| !r.reports("lead").is_empty()).await;
          // As an engine restarting would: no memory of what it sent; the
          // parent's ledger already has it.
@@ -1604,7 +1604,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              now_ms(),
          )
          .await;
-@@ -8086,21 +8133,25 @@ mod tests {
+@@ -8559,21 +8606,25 @@ mod tests {
          assert!(rig.reports("lead").is_empty());
          // The next start finds it owed (the parent's ledger hasn't it), and
          // sends it, with a memory as fresh as a new engine's.
@@ -1633,7 +1633,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          rig.core.sessions.shutdown().await;
      }
  
-@@ -8208,7 +8259,7 @@ mod tests {
+@@ -8681,7 +8732,7 @@ mod tests {
      }
  
      #[tokio::test]
@@ -1642,7 +1642,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          use zeron_proto::agent_messages::ReportStatus;
          use zeron_rpc::RpcService;
          let rig = family_rig().await;
-@@ -8227,11 +8278,21 @@ mod tests {
+@@ -8700,11 +8751,21 @@ mod tests {
          rig.quiet().await;
          assert!(rig.reports("lead").is_empty());
          assert!(rig.queued("lead").is_empty());
@@ -1668,7 +1668,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          rig.core.sessions.shutdown().await;
      }
  
-@@ -8440,10 +8501,10 @@ mod tests {
+@@ -8915,10 +8976,10 @@ mod tests {
      }
  
      /// The person stops Tests, and the lead writes it straight after: the
@@ -1682,7 +1682,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          let rig = family_rig().await;
          let lead = rig.start("lead", "Hello.").await;
          lead.feed.send(done(DoneStatus::Completed)).unwrap();
-@@ -8463,27 +8524,22 @@ mod tests {
+@@ -8938,27 +8999,22 @@ mod tests {
          })
          .await;
          let next = lock(&rig.harness.runs).get("kid-a").cloned().unwrap();
@@ -1719,7 +1719,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
      #[tokio::test]
      async fn a_stops_report_made_late_is_on_the_message_its_turn_was_on() {
          let rig = family_rig().await;
-@@ -8497,7 +8553,7 @@ mod tests {
+@@ -8972,7 +9028,7 @@ mod tests {
          reports::FAIL_QUEUE.with(|left| left.set(1));
          rig.core
              .doc_host
@@ -1728,7 +1728,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              .unwrap();
          rig.lead_writes("kid-a", "Rebase on main.", "lead-m2", false);
          rig.until("Tests' next run", |r| {
-@@ -8511,30 +8567,37 @@ mod tests {
+@@ -8986,30 +9042,37 @@ mod tests {
          tokio::time::sleep(std::time::Duration::from_millis(400)).await;
          assert!(rig.heard().is_empty());
          // Tried again now, the next message's turn streaming.
@@ -1774,7 +1774,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
                  && (heard[1].0.as_str(), heard[1].1) == ("kid-a", ReportStatus::Finished)
          };
          rig.until("the lead hears both", heard_both).await;
-@@ -8606,6 +8669,7 @@ mod tests {
+@@ -9081,6 +9144,7 @@ mod tests {
              rig.core.sessions.inner.reported.clone(),
              "kid-a".into(),
              ReportStatus::Finished,
@@ -1782,7 +1782,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
              now_ms(),
          )
          .await;
-@@ -8686,35 +8750,26 @@ mod tests {
+@@ -9161,35 +9225,26 @@ mod tests {
      }
  
      /// The person stops Tests, which runs the wrong suite, and tells it what
@@ -1824,7 +1824,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          assert!(rig.heard().is_empty(), "{:?}", rig.heard());
          assert_eq!(rig.on(), ["kid-a", "kid-b"]);
  
-@@ -8729,40 +8784,55 @@ mod tests {
+@@ -9204,40 +9259,55 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1906,7 +1906,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          drop(b);
          rig.core.sessions.shutdown().await;
      }
-@@ -8815,6 +8885,16 @@ mod tests {
+@@ -9290,6 +9360,16 @@ mod tests {
          }
      }
  
@@ -1923,7 +1923,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
      /// A child that ends its turn while its tests build, and later finishes
      /// in a turn its runtime starts on its own: the lead hears that too, as
      /// a follow-up, once. (It used to be lost: one report per message.)
-@@ -8825,12 +8905,17 @@ mod tests {
+@@ -9300,12 +9380,17 @@ mod tests {
          lead.feed.send(done(DoneStatus::Completed)).unwrap();
          rig.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
          let kid = rig.start("kid-a", &from_lead("Push once the tests pass.")).await;
@@ -1941,7 +1941,7 @@ index 7cc284f23db4a49bbc6d6f87a20931859a5969df..e3ae3f168847668a325db5be2a0771f9
          kid.turn.note_wake();
          rig.until("Tests works again", |r| r.status("kid-a").status == SessionStatus::Working).await;
          kid.feed.send(text("Pushed abc123.")).unwrap();
-@@ -8924,6 +9009,212 @@ mod tests {
+@@ -9399,6 +9484,212 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -2267,10 +2267,10 @@ index 53453f39460e6068d1c831337f971a07bc40c230..0f829bddce8b35426b8334cb12dca7cc
  stay paused.
  
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 
 
-From c0f8f04195e2a218c53b2bb1a5fa82627b8355a4 Mon Sep 17 00:00:00 2001
+From 8f5a7994146ea9b23f0182719e8cf240bb72a6cb Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:23:23 +0700
 Subject: [PATCH 2/2] mcp: a subagent on a host that won't report back says so
@@ -2281,10 +2281,10 @@ Subject: [PATCH 2/2] mcp: a subagent on a host that won't report back says so
  1 file changed, 40 insertions(+), 2 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 0e73d14cdadfcd72b0e40aed00668740858132cb..0546acb6ad553f1747d9d0d8cb125725a813263d 100644
+index a3b94d5addbfcc5a7e89357248cfab7b9e9832af..ca271617c96493c8e1125659a447f9fbc64aeea4 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1387,6 +1387,18 @@ impl Tools {
+@@ -1400,6 +1400,18 @@ impl Tools {
                  "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
              ));
          }
@@ -2303,7 +2303,7 @@ index 0e73d14cdadfcd72b0e40aed00668740858132cb..0546acb6ad553f1747d9d0d8cb125725
          if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
              // The row may not have folded into WatchChats yet; build the
              // chat locally from what we just wrote rather than re-reading.
-@@ -2089,8 +2101,8 @@ mod tests {
+@@ -2102,8 +2114,8 @@ mod tests {
                  })),
                  methods::WATCH_DEVICES => stream(json!([{
                      "id": "dev-local", "name": "Laptop", "platform": "linux",
@@ -2314,7 +2314,7 @@ index 0e73d14cdadfcd72b0e40aed00668740858132cb..0546acb6ad553f1747d9d0d8cb125725
                  methods::WATCH_SPACES => stream(json!([{
                      "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                      "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
-@@ -2672,6 +2684,32 @@ mod tests {
+@@ -2685,6 +2697,32 @@ mod tests {
          assert!(err.contains("no chat matches"), "{err}");
      }
  
@@ -2348,5 +2348,5 @@ index 0e73d14cdadfcd72b0e40aed00668740858132cb..0546acb6ad553f1747d9d0d8cb125725
      async fn wait_on_an_idle_chat_returns_immediately() {
          let world = Arc::new(World::default());
 -- 
-2.55.0.windows.2
+2.52.0.windows.1
 

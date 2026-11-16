@@ -115,7 +115,8 @@ def stamp_version(src: Path, stamp: str, label: str) -> str:
     # A prerelease of the next patch sorts above the release it was built on.
     version = f"{major}.{minor}.{patch + 1}-{label}.{stamp}"
     line_start = text.rfind("\n", 0, found.end()) + 1
-    cargo.write_text(text[:line_start] + f'version = "{version}"' + text[found.end():], encoding="utf-8")
+    # (newline="": on Windows, write the line endings it had, not CRLF.)
+    cargo.write_text(text[:line_start] + f'version = "{version}"' + text[found.end():], encoding="utf-8", newline="")
     subprocess.run(["cargo", "update", "--workspace", "--quiet"], cwd=src, check=True)
     git(src, "add", "Cargo.toml", "Cargo.lock")
     # apps/zgx is a workspace of its own whose lock records the root's crates
