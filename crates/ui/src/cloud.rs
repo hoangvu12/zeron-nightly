@@ -54,10 +54,11 @@ pub fn is_cloud_session_device(device: &Device) -> bool {
         .any(|c| c == zeron_proto::CLOUD_SESSION_CAPABILITY)
 }
 
-/// Whether a device belongs in device lists and pickers: everything but the
-/// per-session machines, which the logical Cloud device stands for.
+/// Whether a device belongs in device lists and pickers: everything but one
+/// chat's machines (Cloud's per-session ones, which the logical Cloud device
+/// stands for, and sandboxes, which their provider stands for).
 pub fn is_listed(device: &Device) -> bool {
-    !is_cloud_session_device(device)
+    !zeron_proto::is_one_chats_machine(&device.capabilities)
 }
 
 /// The glyph for a device row, chip or crumb.
@@ -581,6 +582,8 @@ mod tests {
         assert!(is_listed(&account) && is_cloud_account(&account));
         assert!(!is_listed(&machine) && is_cloud_session_device(&machine));
         assert!(is_listed(&laptop) && !is_cloud(&laptop));
+        let sandbox = device("sbx", "linux", Some("sandbox:docker"));
+        assert!(!is_listed(&sandbox));
         assert_eq!(device_glyph("cloud-a", "cloud"), icons::CLOUD);
         assert_eq!(device_glyph("abc", "macos"), icons::LAPTOP);
         assert_eq!(device_glyph("abc", "ios"), icons::SMARTPHONE);

@@ -67,6 +67,37 @@ fn write_plugin(plugins_dir: &Path, id: &str, extra: serde_json::Value, key: Opt
 }
 
 #[tokio::test]
+async fn a_plugin_of_yours_needing_a_signing_key_doesnt_run_where_there_is_none() {
+    let f = fixture();
+    let made = call(
+        &f.plugins,
+        methods::NEW_PLUGIN,
+        serde_json::json!({ "id": "hello", "name": "Hello" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made["status"], "on", "{made}");
+    // Someone else's, signed by them, needs no key of this device's.
+    let (theirs, _) = SigningKey::generate().unwrap();
+    write_plugin(f.plugins.plugins_dir(), "theirs", serde_json::json!({}), Some(&theirs));
+    let before = item(&f.plugins, "theirs").await;
+
+    // A sandbox (a lent sign-in): no signing key.
+    f.plugins.inner.keyless.store(true, Ordering::SeqCst);
+    f.plugins.rescan().await;
+    let hello = item(&f.plugins, "hello").await;
+    assert_ne!(hello["status"], "on", "{hello}");
+    assert_eq!(hello["allowed"], serde_json::json!([]), "{hello}");
+    assert!(hello["snapshot"].is_null(), "{hello}");
+    assert!(
+        hello["error"].as_str().is_some_and(|e| e.contains("signing key")),
+        "{hello}"
+    );
+    let after = item(&f.plugins, "theirs").await;
+    assert_eq!(after["status"], before["status"], "{after}");
+}
+
+#[tokio::test]
 async fn plugins_new_plugin_scaffolds_signs_and_is_on() {
     let f = fixture();
     let made = call(

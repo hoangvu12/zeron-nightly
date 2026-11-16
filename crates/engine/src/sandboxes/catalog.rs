@@ -46,7 +46,7 @@ impl Catalogs {
             .and_then(|bytes| match serde_json::from_slice(&bytes) {
                 Ok(kept) => Some(kept),
                 Err(err) => {
-                    tracing::warn!(error = %err, "sandboxes: unreadable {FILE}; starting empty");
+                    tracing::warn!(error = %err, file = FILE, "sandboxes: unreadable; starting empty");
                     None
                 }
             })
@@ -64,21 +64,48 @@ impl Catalogs {
     }
 
     pub(super) fn keep(&self, provider: &str, template: Option<&str>, catalog: PlaceCatalog) {
-        let bytes = {
+        super::lock(&self.kept).insert(key(provider, template), catalog);
+        self.save();
+    }
+
+    /// Every template of `provider`'s, by its key (to hand over).
+    pub(super) fn of_provider(&self, provider: &str) -> BTreeMap<String, PlaceCatalog> {
+        let prefix = key(provider, Some(""));
+        super::lock(&self.kept)
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, catalog)| (key.clone(), catalog.clone()))
+            .collect()
+    }
+
+    /// Take `provider`'s catalogs another device kept (handed over): each
+    /// replaces one read before it here. Other providers' are left alone.
+    pub(super) fn take(&self, provider: &str, taken: BTreeMap<String, PlaceCatalog>) {
+        let prefix = key(provider, Some(""));
+        {
             let mut kept = super::lock(&self.kept);
-            kept.insert(key(provider, template), catalog);
-            serde_json::to_vec_pretty(&*kept)
-        };
+            for (key, catalog) in taken {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                if kept.get(&key).is_none_or(|here| here.at <= catalog.at) {
+                    kept.insert(key, catalog);
+                }
+            }
+        }
+        self.save();
+    }
+
+    fn save(&self) {
+        let bytes = serde_json::to_vec_pretty(&*super::lock(&self.kept));
         let Some(path) = &self.path else {
             return;
         };
-        let outcome = bytes.map_err(std::io::Error::other).and_then(|bytes| {
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, bytes)?;
-            std::fs::rename(&tmp, path)
+        let outcome = bytes.map_err(|e| e.to_string()).and_then(|bytes| {
+            crate::runner::write_private_atomic(path, &bytes).map_err(|e| e.to_string())
         });
         if let Err(err) = outcome {
-            tracing::warn!(error = %err, "sandboxes: couldn't save {FILE}");
+            tracing::warn!(error = %err, file = FILE, "sandboxes: couldn't save");
         }
     }
 }
@@ -134,4 +161,27 @@ pub(super) async fn read(
         models,
         at: crate::now_ms(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_a_template_had_is_kept_across_a_restart_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        Catalogs::open(dir.path()).keep("docker", Some("dev"), PlaceCatalog::default());
+        let again = Catalogs::open(dir.path());
+        assert!(again.get("docker", Some("dev")).is_some());
+        assert!(again.get("docker", None).is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 }

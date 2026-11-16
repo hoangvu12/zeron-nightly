@@ -116,13 +116,25 @@ impl Sandboxes {
         });
     }
 
-    /// One look at every sandbox.
+    /// One look at every sandbox. A chat deleted while this device was away
+    /// (its row synced in gone, so no deletion was seen) takes its sandbox
+    /// with it now: once its provider is here to delete it.
     async fn look(&self, host: &Host) {
-        let chats: Vec<Arc<ChatSandbox>> = lock(&self.inner.chats).values().cloned().collect();
-        for chat in chats {
+        let chats: Vec<(String, Arc<ChatSandbox>)> = lock(&self.inner.chats)
+            .iter()
+            .map(|(id, chat)| (id.clone(), chat.clone()))
+            .collect();
+        for (chat_id, chat) in chats {
             let Some(provider) = self.provider(&lock(&chat.record).steps.provider) else {
                 continue;
             };
+            if host.workspace.chat_deleted(&chat_id) {
+                tracing::info!(chat = %chat_id, "chat deleted while away; deleting its sandbox");
+                let sandboxes = self.clone();
+                let host = host.clone();
+                tokio::spawn(async move { sandboxes.delete(&chat_id, &host).await });
+                continue;
+            }
             match self.look_at(&chat, provider.as_ref(), host).await {
                 Look::Nothing => {}
                 Look::StandIn => self.stand_in(&chat, host),

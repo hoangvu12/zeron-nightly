@@ -102,6 +102,8 @@ struct State {
     saved: Vec<Saved>,
     /// Time limits pushed out: `<box> <seconds>`.
     extends: Vec<String>,
+    /// Times it was asked how a sandbox is.
+    statuses: usize,
 }
 
 pub struct FakeProvider {
@@ -241,6 +243,12 @@ impl FakeProvider {
     /// Each time limit pushed out, in order: `<box> <seconds>`.
     pub fn extends(&self) -> Vec<String> {
         self.state.lock().unwrap().extends.clone()
+    }
+
+    /// How many times it was asked how a sandbox is (kept apart from
+    /// `calls`: the host device asks each time it looks at a sandbox).
+    pub fn statuses(&self) -> usize {
+        self.state.lock().unwrap().statuses
     }
 
     pub fn sandboxes(&self) -> Vec<String> {
@@ -668,7 +676,9 @@ impl SandboxProvider for FakeProvider {
     }
 
     async fn status(&self, sandbox: &str) -> Result<SandboxStatus, ProviderError> {
-        Ok(match self.state.lock().unwrap().boxes.get(sandbox) {
+        let mut state = self.state.lock().unwrap();
+        state.statuses += 1;
+        Ok(match state.boxes.get(sandbox) {
             None => SandboxStatus::Gone,
             Some(fake) if fake.running => SandboxStatus::Running,
             Some(_) => SandboxStatus::Stopped,

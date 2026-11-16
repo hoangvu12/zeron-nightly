@@ -333,6 +333,75 @@ pub fn path_of(
     })
 }
 
+/// Save a script, making its folders: its owner's only, and runnable where
+/// that means something.
+pub fn write(path: &Path, content: &str) -> Result<(), String> {
+    crate::runner::write_private_atomic(path, content.as_bytes()).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A script as one host device hands it to the next.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptFile {
+    #[serde(rename = "for")]
+    pub scope: Scope,
+    pub hook: String,
+    pub name: String,
+    pub content: String,
+}
+
+/// The scripts under `steps_dir` that `provider`'s sandboxes run: every
+/// sandbox's and its own. (A project's travel with its folder.)
+pub fn for_provider(steps_dir: &Path, provider: &str) -> Vec<ScriptFile> {
+    all(steps_dir, &[])
+        .into_iter()
+        .filter(|script| match &script.scope {
+            Scope::All => true,
+            Scope::Provider { provider: theirs } => theirs == provider,
+            Scope::Project { .. } => false,
+        })
+        .filter_map(|script| {
+            Some(ScriptFile {
+                content: std::fs::read_to_string(&script.path).ok()?,
+                scope: script.scope,
+                hook: script.hook,
+                name: script.name,
+            })
+        })
+        .collect()
+}
+
+/// The folder of `provider`'s own scripts.
+pub fn provider_dir(steps_dir: &Path, provider: &str) -> Result<PathBuf, String> {
+    if !valid_name(provider) || Hook::parse(provider).is_some() {
+        return Err(format!("“{provider}” isn't a provider."));
+    }
+    Ok(steps_dir.join(provider))
+}
+
+/// Keep `scripts` under `steps_dir` (handed over), each where its scope
+/// says; one that names a place a script can't be is left out.
+pub fn take(steps_dir: &Path, scripts: &[ScriptFile]) -> Result<(), String> {
+    for script in scripts {
+        if matches!(script.scope, Scope::Project { .. }) {
+            continue;
+        }
+        let Ok(path) = path_of(steps_dir, None, &script.scope, &script.hook, &script.name) else {
+            tracing::warn!(hook = %script.hook, name = %script.name, "sandboxes: a handed-over script names no place for a script");
+            continue;
+        };
+        write(&path, &script.content).map_err(|e| format!("Couldn't keep {}: {e}", script.name))?;
+    }
+    Ok(())
+}
+
 /// A single plain file or folder name.
 fn valid_name(name: &str) -> bool {
     !name.is_empty()

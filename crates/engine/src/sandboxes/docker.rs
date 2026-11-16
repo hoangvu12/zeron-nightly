@@ -931,6 +931,7 @@ impl SandboxProvider for DockerProvider {
             | Ops::CONNECT
             | Ops::EXTEND
             | Ops::SAVE_TEMPLATE
+            | Ops::SIGN_IN_PAGE
     }
 
     fn workdir(&self, _chat_id: &str) -> String {

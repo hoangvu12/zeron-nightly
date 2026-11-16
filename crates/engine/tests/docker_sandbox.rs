@@ -62,6 +62,8 @@ async fn it_names_itself_and_supplies_every_operation() {
     let p = &fx.provider;
     assert_eq!((p.id(), p.name()), ("docker", "Docker Sandbox"));
     assert_eq!(p.ops(), Ops::ALL, "{:?}", p.ops().names());
+    // Its connect opens Docker's own sign-in page (a device code).
+    assert!(p.ops().names().contains(&"signInPage"));
     assert_eq!(p.workdir("chat-1"), "/home/agent/workspace");
     // Not connected: every call says so, as a Config error.
     assert_eq!(p.account(), None);
@@ -124,20 +126,18 @@ async fn an_expired_device_code_says_to_connect_again() {
 #[tokio::test]
 async fn access_tokens_refresh_with_rotating_refresh_tokens() {
     let fx = Fixture::connected().await;
-    // Tokens that are already stale: every call needs a fresh one.
-    fx.stub.state().token_life = 1;
     fx.provider.templates().await.unwrap(); // access-1 still good (900 s)
     assert_eq!(fx.stub.state().refreshes, 0);
 
-    // Expire it: the stub stops taking access-1.
+    // Docker stops taking it: refreshed, then asked again.
     fx.stub.state().access.remove("access-1");
     fx.provider.templates().await.unwrap(); // 401 → refresh → retry
     assert_eq!(fx.stub.state().refreshes, 1);
     assert!(fx.slot().unwrap().contains("refresh-2"));
 
-    // Many calls at once with a stale token refresh once: a rotating refresh
-    // token used twice would be refused (and sign the user out).
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Many calls at once with a refused token refresh once: a rotating
+    // refresh token used twice would be refused (and sign the user out).
+    fx.stub.state().access.clear();
     let calls = (0..6).map(|_| fx.provider.templates());
     for result in futures::future::join_all(calls).await {
         result.unwrap();
@@ -146,9 +146,17 @@ async fn access_tokens_refresh_with_rotating_refresh_tokens() {
     let kept = fx.slot().unwrap();
     assert!(kept.contains("refresh-3"), "{kept}");
 
+    // A token that's already stale when it comes (`expires_in: 0`) is
+    // renewed before the next call, without Docker refusing it first.
+    fx.stub.state().token_life = 0;
+    fx.stub.state().access.clear();
+    fx.provider.templates().await.unwrap(); // 401 → refresh (a stale one)
+    assert_eq!(fx.stub.state().refreshes, 3);
+    fx.provider.templates().await.unwrap(); // stale → refresh first
+    assert_eq!(fx.stub.state().refreshes, 4);
+
     // A refresh token Docker no longer takes: connect again (Config).
     fx.stub.state().refresh = Some("someone-else".into());
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let err = fx.provider.templates().await.unwrap_err();
     assert_eq!(err.kind, ErrorKind::Config, "{err}");
 }

@@ -221,9 +221,10 @@ pub struct WorkspaceSnapshot {
     pub pull_requests: PullRequestGroups,
     pub archived: Vec<Arc<SessionRow>>,
     pub devices: Vec<DeviceView>,
-    /// Cloud's per-session machines: never listed, but a chat hosted on one
-    /// still needs its version and capabilities.
-    cloud_machines: Vec<DeviceView>,
+    /// One chat's machines (Cloud's per-session ones, sandboxes): never
+    /// listed, but a chat hosted on one still needs its version and
+    /// capabilities.
+    chat_machines: Vec<DeviceView>,
     /// Every chat row (archived and children included), by id.
     pub sessions: HashMap<String, Arc<SessionRow>>,
     children: HashMap<String, Vec<Arc<SessionRow>>>,
@@ -239,11 +240,11 @@ impl WorkspaceSnapshot {
         self.projects.iter().find(|p| p.id == space_id)
     }
 
-    /// Any device by id, a Cloud session machine included.
+    /// Any device by id, a Cloud session machine or sandbox included.
     pub fn device(&self, device_id: &str) -> Option<&DeviceView> {
         self.devices
             .iter()
-            .chain(&self.cloud_machines)
+            .chain(&self.chat_machines)
             .find(|d| d.id == device_id)
     }
 
@@ -741,7 +742,7 @@ pub(crate) fn derive(
         }
     }
 
-    let (cloud_machines, mut devices): (Vec<DeviceView>, Vec<DeviceView>) = state
+    let (chat_machines, mut devices): (Vec<DeviceView>, Vec<DeviceView>) = state
         .devices
         .iter()
         .map(|device| DeviceView {
@@ -760,14 +761,9 @@ pub(crate) fn derive(
             is_self: device.id == cx.self_device_id,
             session_count: active.iter().filter(|c| c.device_id == device.id).count() as u32,
         })
-        // Cloud's per-session machines aren't devices to pick or list; Cloud
-        // is offered on its own.
-        .partition(|device| {
-            device
-                .capabilities
-                .iter()
-                .any(|c| c == zeron_proto::CLOUD_SESSION_CAPABILITY)
-        });
+        // One chat's machines aren't devices to pick or list; Cloud and
+        // each sandbox provider are offered on their own.
+        .partition(|device| zeron_proto::is_one_chats_machine(&device.capabilities));
     devices.sort_by(|a, b| {
         b.is_execution_host
             .cmp(&a.is_execution_host)
@@ -790,7 +786,7 @@ pub(crate) fn derive(
         pull_requests,
         archived,
         devices,
-        cloud_machines,
+        chat_machines,
         sessions: rows,
         children,
         content_hash: 0,
@@ -833,7 +829,7 @@ fn snapshot_hash(s: &WorkspaceSnapshot) -> u64 {
     }
     ids(&mut h, &s.projectless);
     ids(&mut h, &s.archived);
-    for device in s.devices.iter().chain(&s.cloud_machines) {
+    for device in s.devices.iter().chain(&s.chat_machines) {
         device.hash(&mut h);
     }
     let mut all: Vec<(&String, u64)> = s.sessions.iter().map(|(k, v)| (k, v.revision)).collect();
@@ -917,5 +913,42 @@ mod tests {
         // Unlisted, but its chats still read what it can do.
         let machine = snapshot.device("cloud-s1").expect("a Cloud machine is still found by id");
         assert_eq!(machine.capabilities, ["cloud-session"]);
+    }
+
+    #[test]
+    fn a_chats_sandbox_isnt_a_device_but_is_still_found_by_id() {
+        let state: WorkspaceState = serde_json::from_value(serde_json::json!({
+            "devices": [
+                {"id": "mac", "name": "Studio", "platform": "macos", "lastSeenAt": null},
+                {"id": "sbx-1", "name": "chat-a", "platform": "linux",
+                 "lastSeenAt": null, "capabilities": ["message-queue-v1", "sandbox:docker"]}
+            ],
+            "spaces": [],
+            "chats": [
+                {"id": "chat-a", "deviceId": "sbx-1", "archived": false,
+                 "createdAt": "2026-10-19T12:00:00Z"}
+            ],
+            "sessions": []
+        }))
+        .unwrap();
+        let presence = HashMap::new();
+        let snapshot = derive(
+            &state,
+            None,
+            &DeriveContext {
+                self_device_id: "mac",
+                now: Utc::now(),
+                presence: &presence,
+                change_requests: &[],
+                send_states: &HashMap::new(),
+                synced: true,
+                previous: None,
+            },
+        );
+        let devices: Vec<&str> = snapshot.devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(devices, ["mac"]);
+        assert!(snapshot.execution_devices().iter().all(|d| d.id != "sbx-1"));
+        let sandbox = snapshot.device("sbx-1").expect("a sandbox is still found by id");
+        assert_eq!(sandbox.capabilities, ["message-queue-v1", "sandbox:docker"]);
     }
 }
