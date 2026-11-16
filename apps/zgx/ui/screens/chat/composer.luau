@@ -30,6 +30,7 @@ local sessions = require("@account/sessions")
 local LinkNotice = require("@app/screens/chat/link_notice")
 local CloudTray = require("@app/screens/chat/cloud_tray")
 local SandboxTray = require("@app/screens/chat/sandbox_tray")
+local sandbox_templates = require("@account/sandbox_templates")
 local Held = require("@app/screens/chat/held")
 local CloudMachine = require("@app/screens/chat/cloud_machine")
 local Where = require("@app/screens/chat/where")
@@ -790,6 +791,11 @@ local function Composer(): Node
 				return said
 			end
 			return mine
+		end
+		-- Its sandbox saved as a template (or saving, or why it wasn't).
+		local saved = sandbox_templates.notice(session_id:get())
+		if saved then
+			return saved
 		end
 		-- A new chat that can't start where it's set to: why.
 		local why = where.blocked:get()
@@ -1582,7 +1588,11 @@ local function Composer(): Node
 			on_deny = asks.on_deny,
 			notice = notice,
 			on_dismiss_notice = function()
-				own_notice:set(nil)
+				if own_notice:peek() then
+					own_notice:set(nil)
+				else
+					sandbox_templates.dismiss(session_id:peek())
+				end
 			end,
 			-- (The notices with an action: a sleeping machine's Wake, a
 			-- sandbox asleep's Wake, and a sandbox's failed step's Run again.)

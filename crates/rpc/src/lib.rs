@@ -270,6 +270,12 @@ pub mod methods {
     /// `{chatId}` → `{ok}`: Start fresh, a new sandbox for the chat (the
     /// old one deleted, if it's still there) with the chat's pushed branch.
     pub const START_SANDBOX_FRESH: &str = "StartSandboxFresh";
+    /// `{chatId, name}` → `{template: {id, name}}`: Save as template. Zeron
+    /// in the sandbox stops and wipes its identity (device id and data),
+    /// the provider saves the sandbox under `name`, then Zeron starts there
+    /// again on the chat's device id. Answers once saved (minutes, for a
+    /// big disk). Refused, saving nothing, while the chat is working.
+    pub const SAVE_SANDBOX_TEMPLATE: &str = "SaveSandboxTemplate";
     /// `{chatId}` → `{ok}`: wake the chat's sleeping sandbox (Wake, in a
     /// chat's Files, Terminal or Diffs); its steps read `waking`, then
     /// `ready`. A send wakes it by itself; opening the chat never does.

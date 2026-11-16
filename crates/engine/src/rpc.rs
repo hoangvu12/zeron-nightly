@@ -2515,6 +2515,7 @@ fn forwardable(method: &str) -> bool {
             | methods::DELETE_STEP_SCRIPT
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
+            | methods::SAVE_SANDBOX_TEMPLATE
             | methods::WAKE_SANDBOX
             | methods::ADOPT_SANDBOX_PROVIDER
             | methods::SET_SANDBOX_HOST

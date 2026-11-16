@@ -61,6 +61,7 @@ mod plugins;
 mod previews;
 mod projects;
 mod relaunch;
+mod sandbox_templates;
 mod sandboxes;
 mod session_home;
 mod sessions;
@@ -799,6 +800,8 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         files::install(cx, &host);
         // The composer's `/` commands and `$` skills, from the engine.
         completion::install(&host);
+        // Save as template: a chat's sandbox saved through its provider.
+        sandbox_templates::install(&host);
         // What a tool row opens to: its whole output or diff, fetched.
         tool_details::install(&host);
         // Appshots: the frontmost window, captured on its shortcut.

@@ -2390,7 +2390,8 @@
         "delete": "Delete…",
         "rename": "Rename…",
         "remove": "Remove…",
-        "edit_project": "Edit project…"
+        "edit_project": "Edit project…",
+        "save_template": "Save as template"
       },
       "project": {
         "rename_title": "Rename project",
@@ -2465,6 +2466,15 @@
         "rename_title": "Rename session",
         "name": "Name",
         "name_placeholder": "Session name"
+      },
+      "save_template": {
+        "title": "Save as template",
+        "name": "Template name",
+        "body": "Saves this chat's sandbox so new chats can start from it. Zeron's identity and sign-in are left out.",
+        "save": "Save",
+        "saving": "Saving “{name}” as a template…",
+        "couldnt": "Couldn’t save the template",
+        "saved": "Saved as template {name}"
       }
     },
     "boundary": {

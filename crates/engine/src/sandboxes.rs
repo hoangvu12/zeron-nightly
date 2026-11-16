@@ -13,16 +13,22 @@
 pub mod boat;
 mod catalog;
 pub mod docker;
+mod forget;
 mod host_device;
 mod keys;
 mod provider;
 mod recovery;
+mod save;
 pub mod scripts;
 mod sleep;
 mod steps;
 
 pub use boat::BoatProvider;
 pub use catalog::PlaceCatalog;
+pub use forget::{
+    FORGET_BUSY_EXIT, FORGET_DEVICE, Forgot, KEEP, WATCHDOG_STOP_FILE, forget_device,
+    forget_device_files,
+};
 pub(crate) use host_device::Handover;
 pub use host_device::pick_host;
 pub use keys::KeySlot;
