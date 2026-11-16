@@ -92,7 +92,8 @@ return ui.component(function(props: Props): Node
 	end
 	-- Whether any option has an icon, or a line under its name; and whether
 	-- the menu opens over the button (short and one line each).
-	local shape = ui.computed(function(): { icons: boolean, tall: boolean, over: boolean }
+	-- (`short`: a few rows dropped below, as tall as they are, no scroll.)
+	local shape = ui.computed(function(): { icons: boolean, tall: boolean, over: boolean, short: boolean }
 		local list = options()
 		local icons, tall, grouped, ruled = false, false, false, false
 		for _, o in list do
@@ -102,7 +103,8 @@ return ui.component(function(props: Props): Node
 			ruled = ruled or o.rule == true
 		end
 		local below = props.below == true or fit or ruled
-		return { icons = icons, tall = tall, over = not tall and not grouped and not below and #list <= OVER_MOST }
+		local few = not tall and not grouped and #list <= OVER_MOST
+		return { icons = icons, tall = tall, over = few and not below, short = few and below }
 	end)
 	local function invalid(): boolean
 		local e = control.read(props.error)
@@ -333,7 +335,7 @@ return ui.component(function(props: Props): Node
 				end,
 				table.unpack(items),
 			}
-			if over or tall then
+			if over or tall or now.short then
 				return list
 			end
 			return ui.scroll { w_full = true, max_h = VIEW, offset = offset, fade = { 12, 12 }, fade_overflow = true, list }
