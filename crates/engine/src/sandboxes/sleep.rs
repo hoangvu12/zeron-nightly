@@ -379,7 +379,8 @@ impl Sandboxes {
             task.abort();
         }
         let timings = self.timings();
-        if let Some(sandbox) = lock(&chat.record).steps.sandbox_id.clone() {
+        let sandbox = lock(&chat.record).steps.sandbox_id.clone();
+        if let Some(sandbox) = sandbox {
             self.extend(&chat, provider.as_ref(), &sandbox, timings).await;
         }
         self.handed_over(&chat, &host);
