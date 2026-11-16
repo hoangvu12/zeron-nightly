@@ -24,6 +24,7 @@
 
 - **Cloud account** — The user's connection to one provider, such as their Docker account. Avoid: connection, holder.
 - **Sandbox** — A machine a provider makes so chats can run on it. While it runs it is one of the user's devices, signed in as them, and the chats' agents run on it. Avoid: machine (in the UI), session device.
+- **Provider** — A kind of cloud that makes sandboxes. Two are built into the engine: Docker Sandbox and Boat. Avoid: plugin (providers are not plugins yet).
 - **Host device** — The one device that keeps a cloud account's key and asks the provider for sandboxes on behalf of the user's other devices.
 - **Template** — A saved sandbox that new sandboxes start from. It belongs to the cloud account, and the user picks one each time they start a sandbox chat. What a sandbox has beyond Zeron itself (agents, their logins, tools) comes from its template or step scripts.
 - **Step** — One stage every sandbox goes through, the same for every provider: create, start, install Zeron, sign in, get the code, setup, sleep, wake, delete. A provider supplies only the steps that need it; Zeron does the rest.
