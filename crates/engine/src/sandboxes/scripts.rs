@@ -475,7 +475,8 @@ mod tests {
             repo_setup(&repo).map(|s| s.shown).as_deref(),
             Some("reportly/.zeron/setup.sh")
         );
-        assert_eq!(all(&steps, std::slice::from_ref(&repo)).len(), 8);
+        // Every one but the hidden file and the editor's leftover.
+        assert_eq!(all(&steps, std::slice::from_ref(&repo)).len(), 7);
     }
 
     #[test]

@@ -272,6 +272,20 @@ fn call_at(calls: &[String], needle: &str) -> usize {
         .unwrap_or_else(|| panic!("no call with {needle:?}: {calls:#?}"))
 }
 
+/// Save a script through `WriteStepScript`, as Settings does.
+async fn write(
+    rpc: &RpcClient,
+    scope: Value,
+    hook: &str,
+    name: &str,
+    content: &str,
+) -> Result<Value, String> {
+    let params = json!({ "for": scope, "hook": hook, "name": name, "content": content });
+    rpc.call(methods::WRITE_STEP_SCRIPT, params)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -516,15 +530,11 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         .unwrap();
     assert_eq!(none, json!([]));
 
-    let write = |scope: Value, hook: &str, name: &str, content: &str| {
-        let rpc = rpc.clone();
-        let params = json!({ "for": scope, "hook": hook, "name": name, "content": content });
-        async move { rpc.call(methods::WRITE_STEP_SCRIPT, params).await }
-    };
-    write(json!({"kind": "all"}), "after-setup", "fleet-sync.sh", "fleet sync\n")
+    write(&rpc, json!({"kind": "all"}), "after-setup", "fleet-sync.sh", "fleet sync\n")
         .await
         .expect("all sandboxes");
     write(
+        &rpc,
         json!({"kind": "provider", "provider": "docker"}),
         "after-wake",
         "git-fetch.sh",
@@ -533,6 +543,7 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
     .await
     .expect("one provider");
     write(
+        &rpc,
         json!({"kind": "project", "spaceId": SPACE}),
         "setup",
         "setup.sh",
@@ -541,6 +552,7 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
     .await
     .expect("one project");
     write(
+        &rpc,
         json!({"kind": "all"}),
         "before-delete",
         "backup.sh",
@@ -602,7 +614,7 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         .await
         .unwrap();
     assert_eq!(read["content"], "fleet sync\n");
-    write(json!({"kind": "all"}), "after-setup", "fleet-sync.sh", "fleet sync --all\n")
+    write(&rpc, json!({"kind": "all"}), "after-setup", "fleet-sync.sh", "fleet sync --all\n")
         .await
         .unwrap();
     let read = rpc
@@ -638,7 +650,7 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         (json!({"kind": "project", "spaceId": "nope"}), "after-setup", "x.sh"),
         (json!({"kind": "project", "spaceId": SPACE}), "setup", "other.sh"),
     ] {
-        let refused = write(scope.clone(), hook, name, "x").await;
+        let refused = write(&rpc, scope.clone(), hook, name, "x").await;
         assert!(refused.is_err(), "{scope} {hook} {name}");
     }
     assert!(!dirs.path().join("escape.sh").exists());
