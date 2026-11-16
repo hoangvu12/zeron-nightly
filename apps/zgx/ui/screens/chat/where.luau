@@ -29,6 +29,11 @@
 --   the refs never came). A folder with no git runs in place, whichever
 --   checkout was picked. On Cloud, the chat is made there (`cloud`) and runs
 --   in its machine's checkout.
+-- - Places (spec #37): one entry per sandbox provider this device keeps
+--   (account/sandboxes), by its own name and icon; never the sandboxes
+--   themselves. Picking one opens its account's templates, plus Blank; the
+--   chat is made there (`place`) with the template picked, cloning the
+--   project picked (any with git), and runs in its sandbox's checkout.
 --
 -- `Where.bind { device, project, checkout, branch, active, slot?, remember? }`
 -- (in a component): the composer's choices, and while `active` (a new chat,
@@ -37,6 +42,7 @@
 
 local sessions = require("@account/sessions")
 local cloud = require("@account/cloud")
+local sandboxes = require("@account/sandboxes")
 local route = require("@app/screens/shell/route")
 local cloud_projects = require("@app/screens/shell/cloud_projects")
 local store = require("@app/screens/chat/store")
@@ -70,6 +76,9 @@ export type Choices = {
 	-- Whether its device and project are remembered for the next new chat
 	-- (the chat page's are; a side chat's, made where its parent is, aren't).
 	remember: boolean?,
+	-- On a place: the template picked (`sandboxes.BLANK`: none). Nil: no
+	-- template picker (a side chat's).
+	template: State<string?>?,
 }
 
 -- What a send does: where the chat is made (createChat), and where and how
@@ -86,6 +95,9 @@ export type Plan = {
 	worktree: boolean,
 	-- On a Cloud machine of its own, cloning the project's repository.
 	cloud: boolean?,
+	-- On a sandbox of its own from this provider, from this template (nil:
+	-- Blank), cloning the project's repository.
+	place: { provider: string, template: string? }?,
 }
 
 -- How long ago, in words ("2 min ago").
@@ -176,11 +188,22 @@ function M.bind(c: Choices)
 	local function on_cloud(): boolean
 		return c.device:get() == M.CLOUD
 	end
+	-- The provider picked, while a place is (`sandbox:<provider>`), and one
+	-- this device's engine still keeps.
+	local function place_of(device: string?): string?
+		local provider = sandboxes.of(device)
+		return if provider and sandboxes.provider(provider) then provider else nil
+	end
 	local function on_device(device: string?): { sessions.Project }
 		local out = {}
 		for _, p in sessions.projects:get() do
 			-- (On Cloud: those it can open, on whichever device.)
-			if if device == M.CLOUD then cloud_repo(p) ~= nil else p.device == device then
+			-- (On a place: any with git, cloned there from its repository.)
+			local here = if device == M.CLOUD
+				then cloud_repo(p) ~= nil
+				elseif sandboxes.of(device) then p.git == true and not lives_on_cloud(p)
+				else p.device == device
+			if here then
 				table.insert(out, p)
 			end
 		end
@@ -215,6 +238,11 @@ function M.bind(c: Choices)
 		end
 		if cloud_offered() then
 			table.insert(out, { value = M.CLOUD, label = "Cloud", cloud = true })
+		end
+		-- One entry per provider, never its sandboxes: picking it opens its
+		-- templates.
+		for _, p in sandboxes.providers() do
+			table.insert(out, { value = sandboxes.value(p.id), label = p.name, icon = sandboxes.icon(p.id), sandbox = p.id })
 		end
 		return out
 	end)
@@ -296,8 +324,12 @@ function M.bind(c: Choices)
 			end
 			return
 		end
-		-- (On Cloud, a project Cloud can open stays there.)
+		-- (On Cloud, a project Cloud can open stays there; on a place, one
+		-- with git, or none.)
 		if c.device:peek() == M.CLOUD and cloud_repo(p) then
+			return
+		end
+		if place_of(c.device:peek()) and (p == nil or p.git) then
 			return
 		end
 		if p and p.device ~= c.device:peek() and device_row(p.device) then
@@ -321,7 +353,7 @@ function M.bind(c: Choices)
 			return
 		end
 		local d = c.device:get()
-		if d and (device_row(d) or d == M.CLOUD) then
+		if d and (device_row(d) or d == M.CLOUD or place_of(d)) then
 			return
 		end
 		local last = M.remembered:peek().device
@@ -397,12 +429,12 @@ function M.bind(c: Choices)
 			return
 		end
 		local r = M.remembered:peek()
-		-- (Cloud is chosen afresh each time; the project used there is kept,
-		-- for the next time it's picked.)
-		if d == M.CLOUD then
-			if p and p ~= M.NO_PROJECT and project_row(p) and r.projects[M.CLOUD] ~= p then
+		-- (Cloud and places are chosen afresh each time; the project used
+		-- there is kept, for the next time it's picked.)
+		if d == M.CLOUD or sandboxes.of(d) then
+			if p and p ~= M.NO_PROJECT and project_row(p) and r.projects[d] ~= p then
 				local next = table.clone(r.projects)
-				next[M.CLOUD] = p
+				next[d] = p
 				M.remembered:set { device = r.device, projects = next }
 			end
 			return
@@ -579,6 +611,24 @@ function M.bind(c: Choices)
 	-- What a send does, from the choices as they stand.
 	local function plan(): Plan
 		local p = project_row(c.project:peek())
+		-- On a place: made there, from the template picked, run in its
+		-- sandbox's checkout of the project (its folder comes back as the
+		-- chat is made).
+		local provider = place_of(c.device:peek())
+		if provider then
+			local template = if c.template then c.template:peek() else nil
+			if template == sandboxes.BLANK then
+				template = nil
+			end
+			return {
+				project = if p then p.id else nil,
+				device = nil,
+				branch = if p then c.branch:peek() else nil,
+				cwd = nil,
+				worktree = false,
+				place = { provider = provider, template = template },
+			}
+		end
 		if not p then
 			return { project = nil, device = c.device:peek(), branch = nil, cwd = nil, worktree = false }
 		end
@@ -603,6 +653,54 @@ function M.bind(c: Choices)
 		return { project = p.id, device = p.device, branch = name, cwd = p.path, worktree = false }
 	end
 
+	-- A place's templates: its account's, then Blank (its plain image),
+	-- loaded as another provider is picked; the one picked afresh (Blank
+	-- until one is).
+	local templates_of = ui.state(
+		if c.slot then `chat_where_templates.{c.slot}` else "chat_where_templates",
+		{ provider = "", state = "idle", list = {} } :: { provider: string, state: string, list: { sandboxes.Template } }
+	)
+	local provider_was: string? = nil
+	ui.effect(function()
+		local provider = place_of(c.device:get())
+		if not c.active() or provider == provider_was then
+			return
+		end
+		provider_was = provider
+		if c.template and c.template:peek() ~= sandboxes.BLANK then
+			c.template:set(sandboxes.BLANK)
+		end
+		if not provider then
+			return
+		end
+		local was = templates_of:peek()
+		if was.provider == provider and was.state == "ready" then
+			return
+		end
+		templates_of:set { provider = provider, state = "loading", list = {} }
+		sandboxes.templates(provider):after(function(list: any)
+			if templates_of:peek().provider == provider then
+				templates_of:set { provider = provider, state = "ready", list = list or {} }
+			end
+		end, function()
+			if templates_of:peek().provider == provider then
+				templates_of:set { provider = provider, state = "error", list = {} }
+			end
+		end)
+	end)
+	local templates = ui.computed(function(): { any }
+		local out = {}
+		local t = templates_of:get()
+		if t.provider ~= place_of(c.device:get()) then
+			return out
+		end
+		for _, template in t.list do
+			table.insert(out, { value = template.id, label = template.name, icon = "box" })
+		end
+		table.insert(out, { value = sandboxes.BLANK, label = ui.t("chat.where.template.blank"):get(), icon = "plus" })
+		return out
+	end)
+
 	return {
 		devices = devices,
 		projects = projects,
@@ -611,6 +709,7 @@ function M.bind(c: Choices)
 		blocked = blocked,
 		plan = plan,
 		refs = refs,
+		templates = templates,
 	}
 end
 
