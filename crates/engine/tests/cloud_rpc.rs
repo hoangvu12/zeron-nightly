@@ -672,6 +672,7 @@ async fn catalogs_for_cloud_devices_are_answered_here() {
         last_seen_at: None,
         created_at: None,
         version: None,
+        online_since: None,
         cursor_sdk_version: None,
         capabilities: vec![zeron_proto::CLOUD_ACCOUNT_CAPABILITY.into()],
     });

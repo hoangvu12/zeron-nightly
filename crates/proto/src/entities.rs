@@ -94,12 +94,31 @@ pub struct Device {
     /// this device row. Missing on older builds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// When the device's engine started this run: of the online devices, the
+    /// one online longest is picked as host device first (spec #37). Older
+    /// engines don't say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_since: Option<DateTime<Utc>>,
 }
 
 impl Device {
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
     }
+}
+
+/// Which of the user's devices keeps a sandbox provider's key and does its
+/// calls (spec #37, the host device), as every device reads it from the
+/// registry. Other devices ask that one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxHost {
+    /// The provider (`docker`, `boat`, …).
+    pub provider: String,
+    pub host_device_id: String,
+    /// The device the user connected the provider on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_on: Option<String>,
 }
 
 /// A synced (device, folder) pair — the unit of organization in the sidebar.

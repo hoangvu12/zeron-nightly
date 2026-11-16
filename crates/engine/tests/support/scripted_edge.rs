@@ -81,6 +81,7 @@ struct EdgeState {
     /// Live WorkOS refresh tokens and the org each is scoped to (single-use).
     refresh_tokens: HashMap<String, String>,
     minted: usize,
+    seeded: usize,
     /// Access-token lifetime per org (seconds); 3600 otherwise.
     ttl: HashMap<String, i64>,
     dials: Vec<Dial>,
@@ -138,14 +139,16 @@ impl ScriptedEdge {
         }
     }
 
-    /// A signed-in session for the lender's disk, scoped to `org`.
+    /// A signed-in session for a device's disk, scoped to `org`: each device
+    /// seeded gets its own (refresh tokens are single-use).
     pub fn seed_session(&self, org: &str) -> String {
-        let token = "refresh-secret-seed".to_string();
-        self.state
-            .lock()
-            .unwrap()
-            .refresh_tokens
-            .insert(token.clone(), org.into());
+        let mut state = self.state.lock().unwrap();
+        state.seeded += 1;
+        let token = match state.seeded {
+            1 => "refresh-secret-seed".to_string(),
+            n => format!("refresh-secret-seed-{n}"),
+        };
+        state.refresh_tokens.insert(token.clone(), org.into());
         token
     }
 

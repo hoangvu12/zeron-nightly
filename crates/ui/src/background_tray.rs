@@ -853,6 +853,7 @@ mod tests {
                 last_seen_at: Some(chrono::Utc::now()),
                 created_at: None,
                 version: None,
+                online_since: None,
                 cursor_sdk_version: None,
                 capabilities: if capable {
                     vec![zeron_proto::capabilities::BACKGROUND_TASKS_V1.into()]

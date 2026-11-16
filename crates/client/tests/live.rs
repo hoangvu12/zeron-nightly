@@ -44,6 +44,7 @@ fn host_rows(now: chrono::DateTime<Utc>) -> (Device, Space, Chat) {
         last_seen_at: Some(now),
         created_at: Some(now),
         version: Some(env!("CARGO_PKG_VERSION").into()),
+        online_since: None,
         cursor_sdk_version: None,
         capabilities: zeron_client::rpc::capability::ALL_QUEUE
             .iter()

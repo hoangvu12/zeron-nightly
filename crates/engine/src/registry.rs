@@ -413,9 +413,15 @@ impl HarnessRegistry {
         self.slots().contains_key(&id)
     }
 
+    /// Whether `id` can run here: registered, and its CLI present.
+    pub fn has_agent(&self, id: HarnessId) -> bool {
+        self.is_registered(id) && self.installed_for(id)
+    }
+
     /// Drop every slot `keep` rejects. Lazy slots are dropped unresolved, so
-    /// a removed harness is never probed.
-    fn retain(&self, keep: impl Fn(HarnessId) -> bool) {
+    /// a removed harness is never probed. (A Cloud machine's few agents; a
+    /// test's sandbox template with only some.)
+    pub fn retain(&self, keep: impl Fn(HarnessId) -> bool) {
         self.slots().retain(|id, _| keep(*id));
         self.order().retain(|id| keep(*id));
     }

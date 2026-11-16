@@ -325,8 +325,34 @@ ui.command {
 		SEND_FAILS:set(true)
 	end,
 }
+-- The open session's last send refused by its sandbox (#46): the agent
+-- picked, Codex, isn't on its template. The host's `refused`, the chat as
+-- it ran with Codex.
+local REFUSED = { id = "c9", message = "m9", agent = "codex", words = "Codex isn't on this template", text = "Add a landing page for reportly" }
+ui.command {
+	id = "refused_codex",
+	title = "The sandbox refuses the last send: Codex isn't on its template",
+	run = function()
+		local s = store.session:peek()
+		if s and s.id then
+			publish(s.id, { harness = "codex", model = "gpt", refused = REFUSED })
+		end
+	end,
+}
+-- The message ids sent, in order (`sent_ids`).
+local sent_ids = ui.state("sent_ids", "")
 stub.send = function(req: any)
 	note(`send:{req.session or "new"}:{req.text}`)
+	sent_ids:set(sent_ids:peek() .. `{req.message_id or "-"},`)
+	-- Sent again as the refused message: no longer refused, as the host's
+	-- waiting list says once the new run is in.
+	local m = req.session and META[req.session]
+	if m and m.refused and m.refused.message == req.message_id then
+		local s = table.clone(m)
+		s.refused = nil
+		META[req.session] = s
+		store.session:set(s)
+	end
 	-- A send carries no time of its own: the host starts its clock when it
 	-- gets it (a message held back goes with its week starting then).
 	if req.at or req.issued_at or req.sent_at or req.expires_at then
