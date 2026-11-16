@@ -3034,6 +3034,20 @@
       "outbox_uploading": "Uploading…",
       "outbox_failed": "Didn't send"
     },
+    "sandbox_machine": {
+      "fresh": "Start fresh",
+      "gone_title_in": "Sandbox deleted in {place}",
+      "gone_title": "Sandbox deleted",
+      "gone_summary": "The conversation is kept",
+      "gone_body": "This chat's sandbox was deleted outside Zeron. The conversation is kept. Start fresh makes a new sandbox from its repository, on the chat's branch: what was pushed comes back, what wasn't is lost.",
+      "disk_title": "Sandbox's disk is full",
+      "disk_summary": "Free some space, or start fresh",
+      "disk_body": "This chat's sandbox ran out of disk. Free some space, or start fresh: a new sandbox with what was pushed.",
+      "failure_offline": "Couldn't reach Zeron on this device. Try again once it's back.",
+      "failure_outdated": "This device's Zeron is too old to start a sandbox fresh. Update it, then try again.",
+      "failure_signed_out": "Sign in again, then try again.",
+      "failure": "Couldn't start fresh. Try again."
+    },
     "turn_state": {
       "interrupted": "Interrupted",
       "waking": "Waking its Cloud machine…",
