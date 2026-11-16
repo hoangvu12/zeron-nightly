@@ -28,8 +28,12 @@ impl Ops {
     pub const RUN: Ops = Ops(1 << 4);
     pub const TEMPLATES: Ops = Ops(1 << 5);
     pub const SAVE_TEMPLATE: Ops = Ops(1 << 6);
-    /// Everything a full cloud (Docker Sandbox) supplies.
-    pub const ALL: Ops = Ops(0x7f);
+    /// The user connects an account to it ([`SandboxProvider::connect`]).
+    pub const CONNECT: Ops = Ops(1 << 7);
+    /// It can push a sandbox's time limit out ([`SandboxProvider::extend`]).
+    pub const EXTEND: Ops = Ops(1 << 8);
+    /// Every operation.
+    pub const ALL: Ops = Ops(0x1ff);
 
     pub const fn contains(self, other: Ops) -> bool {
         self.0 & other.0 == other.0
@@ -45,6 +49,8 @@ impl Ops {
             (Ops::RUN, "run"),
             (Ops::TEMPLATES, "templates"),
             (Ops::SAVE_TEMPLATE, "saveTemplate"),
+            (Ops::CONNECT, "connect"),
+            (Ops::EXTEND, "extend"),
         ]
         .into_iter()
         .filter(|(op, _)| self.contains(*op))
@@ -186,6 +192,30 @@ pub struct Template {
     pub name: String,
 }
 
+/// What the user gives to connect an account ([`SandboxProvider::connect`]).
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Credential {
+    /// A pasted API key or token.
+    Token(String),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::Token(_) => f.write_str("Token(..)"),
+        }
+    }
+}
+
+/// The account a provider is connected to, as Settings shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    /// Its email, organization or other name the user knows it by.
+    pub name: String,
+}
+
 /// What kind of failure, so steps can say and decide what to do alike for
 /// every provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -273,6 +303,17 @@ pub trait SandboxProvider: Send + Sync + 'static {
     /// Save a sandbox as a new template named `name`.
     async fn save_template(&self, _sandbox: &str, _name: &str) -> Result<Template, ProviderError> {
         Err(ProviderError::unsupported("save templates"))
+    }
+    /// Check `credential` with the provider and keep it in the provider's
+    /// [`super::KeySlot`] on this device; the account it's for.
+    async fn connect(&self, _credential: Credential) -> Result<Account, ProviderError> {
+        Err(ProviderError::unsupported("connect accounts"))
+    }
+    /// Set the sandbox's time limit to `ttl` from now. When it runs out the
+    /// sandbox stops (never deletes); the host device pushes it out while a
+    /// chat there is busy.
+    async fn extend(&self, _sandbox: &str, _ttl: Duration) -> Result<(), ProviderError> {
+        Err(ProviderError::unsupported("extend time limits"))
     }
 }
 
@@ -382,5 +423,13 @@ mod tests {
         assert!(!ops.contains(Ops::CREATE));
         assert!(Ops::ALL.contains(ops));
         assert_eq!(ops.names(), ["start", "run"]);
+        assert_eq!(Ops::ALL.names().len(), 9);
+        assert_eq!((Ops::CONNECT | Ops::EXTEND).names(), ["connect", "extend"]);
+    }
+
+    #[test]
+    fn a_credential_never_prints_its_secret() {
+        let shown = format!("{:?}", Credential::Token("bk_secret".into()));
+        assert!(!shown.contains("bk_secret"), "{shown}");
     }
 }

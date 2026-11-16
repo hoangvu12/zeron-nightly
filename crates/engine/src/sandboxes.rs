@@ -10,12 +10,14 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
+mod keys;
 mod provider;
 mod steps;
 
+pub use keys::KeySlot;
 pub use provider::{
-    Command, CreateSandbox, ErrorKind, Exit, Finished, Ops, Placement, ProviderError, RunEvent,
-    RunStream, SandboxProvider, Template, run_to_end,
+    Account, Command, CreateSandbox, Credential, ErrorKind, Exit, Finished, Ops, Placement,
+    ProviderError, RunEvent, RunStream, SandboxProvider, Template, run_to_end,
 };
 pub use steps::{SandboxState, SandboxSteps, Step, StepProgress, StepState};
 
