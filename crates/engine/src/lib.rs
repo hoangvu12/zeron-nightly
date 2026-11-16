@@ -90,7 +90,7 @@ mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{
-    Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions,
+    Auth, AuthConfig, AuthState, AuthUser, LentSignIn, OrgMembership, ScreenHint, SignInOptions,
 };
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
@@ -170,6 +170,9 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
+    /// A sandbox's engine: signed in on tokens another of the user's devices
+    /// lends (ADR 0003), never with a session of its own. Wins over WorkOS.
+    pub lent_sign_in: Option<LentSignIn>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -554,6 +557,25 @@ impl EngineCore {
         .clone()
     }
 
+    /// Lend a sandbox this device's sign-in (ADR 0003), pinned to `org_id`:
+    /// what its engine starts with ([`LentSignIn::to_env`]). The sandbox
+    /// asks this device for each next token through the relay until
+    /// [`Self::stop_lending`].
+    pub async fn lend_sign_in(&self, sandbox: &str, org_id: &str) -> Result<LentSignIn, EngineError> {
+        let (key, token) = self.auth().lend(sandbox, org_id).await?;
+        Ok(LentSignIn {
+            lender: self.device_id.clone(),
+            key,
+            token,
+        })
+    }
+
+    /// Stop lending `sandbox` tokens: it goes offline when the one it holds
+    /// runs out (an hour at most).
+    pub fn stop_lending(&self, sandbox: &str) {
+        self.auth().stop_lending(sandbox);
+    }
+
     /// Attach the peer link cache — enables `targetDeviceId` routing,
     /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
@@ -923,6 +945,12 @@ impl Engine {
             Ok(None) => {}
             Err(err) => tracing::error!(error = %err, "runner identity unusable; ignoring it"),
         }
+        // A sandbox borrows the host device's sign-in (ADR 0003).
+        if let Some(lent) = &config.lent_sign_in {
+            tracing::info!(lender = %lent.lender, "auth: a sandbox on lent tokens");
+            let auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
+            return Auth::new_lent(auth_config, lent.clone());
+        }
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
         if let Ok(base) = std::env::var("ZERON_WORKOS_API_BASE")
@@ -944,8 +972,9 @@ impl Engine {
 
     /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
     pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
-        if auth.is_runner() {
-            // A Cloud runner is always synced for its enrolled {org, user}.
+        if auth.is_runner() || auth.is_lent() {
+            // A Cloud runner is always synced for its enrolled {org, user},
+            // a sandbox for the user and org it was lent.
             WorkspaceScope::Synced
         } else if !auth.workos_enabled() {
             WorkspaceScope::Development
@@ -1317,6 +1346,9 @@ impl Engine {
                 Some(zeron_rpc::CallerProof { device: proof_device.clone(), key, signature })
             }));
             let links = zeron_rpc::LinkCache::new(link_config);
+            // A sandbox asks the device lending it tokens for the next one
+            // through these links.
+            auth.attach_lender_links(links.clone());
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {

@@ -101,6 +101,8 @@ pub const BUILTIN_AUTHOR: &str = "zeron";
 /// `keys::CACHE_TTL_SECS` are looked up again (a key revoked elsewhere
 /// stops counting within the hour).
 const NEW_KEYS_EVERY: Duration = Duration::from_secs(15 * 60);
+/// Why something needing this device's signing key is refused on a sandbox.
+const NO_SIGNING_KEY: &str = "A sandbox has no signing key (it can't confirm it's you), so plugins that need one can't be made or signed here";
 /// A peer's word (`CheckPluginKey`) looks this device's key up at most this often.
 const OWN_KEY_CHECK_APART: Duration = Duration::from_secs(5);
 /// Until those checks can run (auth not ready, the edge not answering).
@@ -230,6 +232,9 @@ struct Inner {
     lookups: Mutex<HashSet<String>>,
     entries: Mutex<Vec<Entry>>,
     scanned: AtomicBool,
+    /// No signing key here, ever: a sandbox on lent tokens has no step-up
+    /// to register one with (ADR 0003). What needs one is refused.
+    keyless: AtomicBool,
     list_tx: watch::Sender<serde_json::Value>,
     tools_tx: watch::Sender<serde_json::Value>,
     scan_lock: tokio::sync::Mutex<()>,
@@ -517,6 +522,7 @@ impl Plugins {
                 lookups: Mutex::new(HashSet::new()),
                 entries: Mutex::new(Vec::new()),
                 scanned: AtomicBool::new(false),
+                keyless: AtomicBool::new(false),
                 list_tx,
                 tools_tx,
                 scan_lock: tokio::sync::Mutex::new(()),
@@ -612,6 +618,10 @@ impl Plugins {
     /// Follow `auth`: the account for lookups, and on every sign-in change a
     /// key registration and a rescan.
     pub fn attach_auth(&self, auth: crate::Auth) {
+        // Before an account is set: nothing registers a key here first.
+        if auth.is_lent() {
+            self.inner.keyless.store(true, Ordering::SeqCst);
+        }
         let for_account = auth.clone();
         self.set_account(move || for_account.user_id());
         let for_step_up = auth.clone();
@@ -939,8 +949,20 @@ impl Plugins {
         }
     }
 
+    /// This device's signing key, made if there's none yet; refused where
+    /// there's no step-up to register one with (a sandbox).
+    fn signing_key(&self) -> Result<SigningKey, String> {
+        if self.inner.keyless.load(Ordering::SeqCst) {
+            return Err(NO_SIGNING_KEY.into());
+        }
+        signing::load_or_create_key(&self.inner.data_dir)
+    }
+
     /// Register this device's key for `account` through `directory`.
     async fn register_key_through(&self, directory: &dyn KeyDirectory, account: &str) {
+        if self.inner.keyless.load(Ordering::SeqCst) {
+            return;
+        }
         let account = account.to_owned();
         let step_up = lock(&self.inner.step_up).clone().and_then(|f| f());
         match keys::ensure_registered(
@@ -1070,7 +1092,7 @@ impl Plugins {
         });
         let this = self.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if signing::load_or_create_key(&this.inner.data_dir).is_ok() {
+            if this.signing_key().is_ok() {
                 this.resign_all_own();
             }
         })
@@ -1831,6 +1853,9 @@ impl Plugins {
             }
             methods::NEW_PLUGIN => {
                 let p: NewParams = parse_params(params)?;
+                if self.inner.keyless.load(Ordering::SeqCst) {
+                    return Err(failed(NO_SIGNING_KEY));
+                }
                 manifest::check_id(&p.id).map_err(failed)?;
                 if p.name.trim().is_empty() {
                     return Err(failed("It needs a name"));
@@ -1864,7 +1889,7 @@ impl Plugins {
                         guides::plugin_readme(p.name.trim(), &guide),
                     );
                     // Own before it's signed: the watcher's re-sign sees it as own.
-                    let key = signing::load_or_create_key(&this.inner.data_dir)?;
+                    let key = this.signing_key()?;
                     this.update_state(|state| {
                         state.own.insert(id.clone());
                     })
@@ -1926,7 +1951,7 @@ impl Plugins {
                 let id_for_sign = id.clone();
                 let dir_for_sign = dir.clone();
                 let files = tokio::task::spawn_blocking(move || -> Result<usize, String> {
-                    let key = signing::load_or_create_key(&this.inner.data_dir)?;
+                    let key = this.signing_key()?;
                     if let Some(id) = &id_for_sign {
                         let own = lock(&this.inner.state).own.contains(id);
                         if !own {
@@ -2240,7 +2265,7 @@ impl Plugins {
                                     path
                                 }
                             };
-                            let key = signing::load_or_create_key(&this.inner.data_dir)?;
+                            let key = this.signing_key()?;
                             template_packages::export(&dir, id, &path, &key)
                         }
                         methods::IMPORT_TEMPLATE => {
@@ -2380,9 +2405,9 @@ impl Plugins {
                 } else {
                     None
                 };
-                let data_dir = self.inner.data_dir.clone();
+                let this = self.clone();
                 let key =
-                    tokio::task::spawn_blocking(move || signing::load_or_create_key(&data_dir))
+                    tokio::task::spawn_blocking(move || this.signing_key())
                         .await
                         .map_err(|_| failed("Couldn't read this device's signing key"))?
                         .map_err(failed)?;

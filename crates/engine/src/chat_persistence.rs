@@ -1190,7 +1190,9 @@ mod tests {
     /// Live-like load, before and after: the real 49 MB chat streaming a
     /// token every 120 ms (an agent writing) beside 14 small chats edited
     /// every 2 s, through the real 1 s persister, 60 s per mode. "Before"
-    /// refuses deltas, so every save is whole, as it was.
+    /// refuses deltas, so every save is whole, as it was. Unix only: it reads
+    /// CPU time with `getrusage`, which Windows lacks.
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires ZERON_DELTA_WHALE; 2 minutes; prints bytes/min and CPU"]
     fn live_like_bytes_and_cpu_before_and_after() {

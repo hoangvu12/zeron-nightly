@@ -2977,6 +2977,7 @@ impl AuthRpc {
                 | methods::SIGN_OUT
                 | methods::ACCESS_TOKEN
                 | methods::STEP_UP
+                | methods::LEND_TOKEN
                 | methods::DELETE_ACCOUNT
                 | methods::LIST_ORGS
                 | methods::CREATE_ORG
@@ -3025,6 +3026,21 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }
+            // A sandbox's engine asking for its next token, over the relay
+            // (ADR 0003). The key is the grant; nothing else is trusted.
+            methods::LEND_TOKEN => {
+                #[derive(Deserialize)]
+                struct P {
+                    key: String,
+                }
+                let p: P = parse_params(params)?;
+                let (token, left) = self
+                    .auth
+                    .lent_token(&p.key)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "token": token, "expiresIn": left.as_secs() }))
+            }
             methods::DELETE_ACCOUNT => {
                 #[derive(Deserialize)]
                 struct P {
@@ -3050,6 +3066,9 @@ impl RpcService for AuthRpc {
                 }
             }
             methods::SIGN_IN_HEADLESS => {
+                self.auth
+                    .refuse_if_lent()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let url = self.auth.start_headless_sign_in();
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }

@@ -43,6 +43,8 @@ pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
         // Real auth against production by default; see
         // `workos_client_id_from_env` for the dev-mode escape hatches.
         workos_client_id: workos_client_id_from_env(&edge_token),
+        // A sandbox in the user's own cloud: started with a lent sign-in.
+        lent_sign_in: zeron_engine::LentSignIn::from_env(),
         edge_token,
     }
 }
