@@ -75,6 +75,24 @@ file = "patches/0010-child-reports-held-stop.patch"
 note = "The person's Stop on a child is held for two minutes: what they write to it meanwhile corrects the parent's task, so the parent hears nothing until the child's normal finished report, and the child stays on its wait. A Stop left standing reports once the hold is out; an agent's Stop or a Zeron restart still reports at once. Once the person writes to a child otherwise, it is theirs and its ends no longer report. Applies on top of child-reports-follow-ups."
 
 [[patch]]
+name = "child-reports-one-rule"
+enabled = false
+file = "patches/0014-child-reports-one-rule.patch"
+note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Applies on top of child-reports-held-stop."
+
+[[patch]]
+name = "child-reports-holds-and-groups"
+enabled = false
+file = "patches/0015-child-reports-holds-and-groups.patch"
+note = "Child reports wake the parent less, and only with something new: a progress message can wait for its child's end (FYIs never wake alone); a report the parent's agent already read with read_chat isn't said again; a child that keeps coming back is paused after 20 reports until the person writes; while the person talks to the parent, its children's reports go with their next message (or after 5 quiet minutes); and create_chats notify:\"all\" hears from a group of children once, when all are done (30-minute fallback). Held reports are kept in the chat, and reports a restart caught after they reached the transcript but before the agent read them go again; one caught between the queue and the transcript is still lost, as any queued message is (a core queue follow-up). Applies on top of child-reports-one-rule."
+
+[[patch]]
+name = "child-reports-watch"
+enabled = false
+file = "patches/0016-child-reports-watch.patch"
+note = "The parent's device reports for a child whose device doesn't (an older Zeron, like Linux SG before this), or that updated after its turn and has been back online two minutes without reporting: once the child's chat, synced here, shows the very turn its registry row names, by the same rule and keys its own host would use, re-checked as the report is built. If the reply hasn't synced 10 minutes on and the outcome is this request's, the parent hears its status alone and the full report follows. A turn a shutdown cut is left for its host to revive. The parent's notes say when a child's device is offline or its status unconfirmed, and a subagent created on such a device is said to be reported for by the parent's watcher. Applies on top of child-reports-holds-and-groups."
+
+[[patch]]
 name = "reply-long-page-picture"
 file = "patches/0011-reply-long-page-picture.patch"
 note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its top across its frame at its own shape, not blown up with its middle cropped: its `ui.image` took its pixels' own height as a flex item, and `cover` filled that. Not yet a PR upstream."

@@ -1,0 +1,2275 @@
+From 0dfd4f8b1720aed175610c1446eba30c028f7bf3 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 16 Nov 2026 14:59:05 +0700
+Subject: [PATCH 1/4] engine: the parent's host reports for children whose host
+ doesn't, once their chat shows the turn
+
+A parent's host now watches children hosted on a device without child-reports: once the child's registry row says its turn settled and its doc, synced here, shows that turn, it files the child's report under the same key a pushing host would. If the answer stays away 10 minutes on a row that answers this request, the parent hears its status alone (stage unsynced, no end anywhere), and the full end once it syncs. The still-working note says when such a child's status is unconfirmed, or when a reporting child's device is offline. A report kept from the agent under -waited or -quiet now wins over the same one held plain. Advertised as child-reports-watch.
+---
+ crates/engine/src/doc_host.rs        |  98 ++++++
+ crates/engine/src/run_journal.rs     |  15 +-
+ crates/engine/src/session_reports.rs | 488 ++++++++++++++++++++++++++-
+ crates/engine/src/sessions.rs        | 224 ++++++++++++
+ crates/proto/src/workspace.rs        |   8 +
+ 5 files changed, 819 insertions(+), 14 deletions(-)
+
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -254,6 +254,26 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
+     }
+ }
+ 
++/// Whether a parent's ledger (`commands`) has the report `held` (filed
++/// under `key`) kept from its agent already under another mark: another
++/// pusher's `-waited` or `-quiet` of it, by its structured `(child, asked,
++/// stage)`. Never a `stopped` (see [`DocHost::drop_kept`]), nor a report
++/// whose key says nothing of what it's on.
++fn kept_already(commands: &[SessionCommandEntry], held: &HeldReport, key: &str) -> bool {
++    held.stage != "stopped"
++        && !held.asked.is_empty()
++        && commands.iter().any(|c| match &c.payload {
++            SessionCommandPayload::Run { message_id, .. } => {
++                message_id != key
++                    && (message_id.ends_with(crate::sessions::REPORT_WAITED)
++                        || message_id.ends_with(crate::sessions::REPORT_QUIET))
++                    && crate::sessions::report_key_parts(message_id, &held.child)
++                        .is_some_and(|(asked, stage)| asked == held.asked && stage == held.stage)
++            }
++            _ => false,
++        })
++}
++
+ /// This engine run, as a [`ReportGroup`] says which one opened it.
+ pub(crate) fn this_run() -> &'static str {
+     static RUN: OnceLock<String> = OnceLock::new();
+@@ -1194,6 +1214,14 @@ impl ChatDocHandle {
+         &self.doc
+     }
+ 
++    /// Every change to the doc, local or synced in, as a count; seen as of
++    /// now, so the first `changed()` is the next change.
++    pub(crate) fn changes(&self) -> watch::Receiver<u64> {
++        let mut changes = self.changes.clone();
++        let _ = changes.borrow_and_update();
++        changes
++    }
++
+     pub fn writer(&self) -> DocWriter {
+         self.writers.fetch_add(1, Ordering::AcqRel);
+         DocWriter {
+@@ -6941,12 +6969,16 @@ impl DocHost {
+                 if report {
+                     // Its wait call returned the reply: kept in the ledger,
+                     // so the child knows it was heard, but never read again.
++                    // Either way it wins over the same report held plain,
++                    // from another pusher ([`Self::drop_kept`]).
+                     if message_id.ends_with(crate::sessions::REPORT_WAITED) {
++                        self.drop_kept(handle, message_id, &request.prompt)?;
+                         return Ok((SessionCommandStatus::Applied, Some("its wait returned it".into())));
+                     }
+                     // A thanks answered: the child's chat keeps it, the agent
+                     // here needn't read it.
+                     if message_id.ends_with(crate::sessions::REPORT_QUIET) {
++                        self.drop_kept(handle, message_id, &request.prompt)?;
+                         return Ok((SessionCommandStatus::Applied, Some("an answer to a thanks".into())));
+                     }
+                     // Sent again (a restart, a retry): it's here already.
+@@ -7325,6 +7357,12 @@ impl DocHost {
+             (None, None) => return Ok(()),
+         };
+         let mut held = held_report(kind, &child, message_id, held_at);
++        // The same report kept from the agent already, under another mark
++        // (another pusher's `-waited` or `-quiet`): that one wins.
++        if kind == HeldKind::Report && kept_already(&handle.doc.read_commands()?, &held, message_id) {
++            tracing::info!(chat = %handle.chat_id, child = %held.child, stage = %held.stage, "a report kept from the agent already: not held");
++            return Ok(());
++        }
+         // A member's end waits for the rest of its group; a failure doesn't.
+         if status == Some(zeron_proto::agent_messages::ReportStatus::Finished) {
+             held.group = group_of_end(&handle.doc.report_groups(), &held);
+@@ -7352,6 +7390,66 @@ impl DocHost {
+         Ok(())
+     }
+ 
++    /// A report kept from the agent (keyed `key`, `-waited` or `-quiet`:
++    /// its wait returned it, or a thanks was answered) wins over the same
++    /// report held plain from another pusher, matched by its structured
++    /// `(child, asked, stage)`: let go unsaid, alone in its row, or as its
++    /// child's one block in a merged one (one it can't single out stays).
++    /// Never a `stopped`: the person's, kept quiet, leaves another agent's
++    /// Stop on the same message to report.
++    fn drop_kept(&self, handle: &Arc<ChatDocHandle>, key: &str, prompt: &str) -> Result<(), EngineError> {
++        let Some(child) = zeron_proto::agent_messages::child_reports(prompt)
++            .and_then(|reports| reports.first().map(|r| r.sender.chat_id.clone()))
++        else {
++            return Ok(());
++        };
++        let Some((asked, stage)) = crate::sessions::report_key_parts(key, &child) else {
++            return Ok(());
++        };
++        if stage == "stopped" {
++            return Ok(());
++        }
++        let same = |h: &HeldReport| h.kind == HeldKind::Report && h.child == child && h.asked == asked && h.stage == stage;
++        let mut dropped = false;
++        for row in handle.doc.read_queue()?.into_iter().filter(|row| held_report_row(row)) {
++            let held = held_of(&row);
++            if !held.iter().any(|h| same(h)) {
++                continue;
++            }
++            let rest: Vec<HeldReport> = held.iter().filter(|h| !same(*h)).cloned().collect();
++            if rest.is_empty() {
++                handle.doc.take_queued(&row.id)?;
++                lock(&handle.held_sends).remove(&row.id);
++            } else {
++                let (Some(reports), Some(blocks)) = (
++                    zeron_proto::agent_messages::child_reports(&row.text),
++                    zeron_proto::agent_messages::report_blocks(&row.text),
++                ) else {
++                    continue;
++                };
++                let theirs: Vec<usize> =
++                    reports.iter().enumerate().filter(|(_, r)| r.sender.chat_id == child).map(|(i, _)| i).collect();
++                let [one] = theirs.as_slice() else {
++                    continue;
++                };
++                let kept: Vec<&str> =
++                    blocks.iter().enumerate().filter(|(i, _)| i != one).map(|(_, block)| *block).collect();
++                let text = zeron_proto::agent_messages::merge_reports(&kept);
++                handle.doc.set_queued_text(&row.id, &text, now_ms())?;
++                handle.doc.set_queued_held(&row.id, &rest)?;
++                if let Some(held) = lock(&handle.held_sends).get_mut(&row.id) {
++                    held.prompt = text;
++                }
++            }
++            dropped = true;
++            tracing::info!(chat = %handle.chat_id, %child, %stage, "a report held plain, kept from the agent under another mark: let go");
++        }
++        if dropped {
++            handle.publish_queue();
++        }
++        Ok(())
++    }
++
+     /// `held`, a child's report on the message its group holds its end for
+     /// (a follow-up to that end): the child leaves the group, and its end is
+     /// filed as any report held ([`Self::let_go`]) before `held` is, so the
+diff --git a/crates/engine/src/run_journal.rs b/crates/engine/src/run_journal.rs
+index e5b91a29a328e0b8b1e93f7644b0f75c80b17b28..fd978a46601e38d1a843c83a7df82054b49c0332 100644
+--- a/crates/engine/src/run_journal.rs
++++ b/crates/engine/src/run_journal.rs
+@@ -171,12 +171,23 @@ impl RunJournal {
+     /// follow now (epoch millis), kept beside the journals: the first call
+     /// stamps `now_ms`. A report owed from before it is history.
+     pub fn child_reports_since(&self, now_ms: i64) -> i64 {
+-        let path = self.dir.join("child-reports.since");
++        self.since("child-reports.since", now_ms)
++    }
++
++    /// When this device first watched for the reports of children whose
++    /// hosts don't report by themselves (epoch millis), stamped like
++    /// [`Self::child_reports_since`]: a request from before it is history.
++    pub fn child_reports_watch_since(&self, now_ms: i64) -> i64 {
++        self.since("child-reports-watch.since", now_ms)
++    }
++
++    fn since(&self, name: &str, now_ms: i64) -> i64 {
++        let path = self.dir.join(name);
+         if let Some(at) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()) {
+             return at;
+         }
+         if let Err(err) = std::fs::write(&path, now_ms.to_string()) {
+-            tracing::warn!(error = %err, "child-reports start mark write failed");
++            tracing::warn!(error = %err, mark = name, "child-reports start mark write failed");
+         }
+         now_ms
+     }
+diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
+index 7d68e277083188a88a677bdd76821c68ad90bcd5..fd1d1f439301478a6ecc5084747791a4f3fe605e 100644
+--- a/crates/engine/src/session_reports.rs
++++ b/crates/engine/src/session_reports.rs
+@@ -26,20 +26,24 @@
+ //! the parent's wait ([`children_on`]) and the notes.
+ 
+ use std::collections::{HashMap, HashSet};
+-use std::sync::{Arc, Mutex};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex, Weak};
+ 
+ use chrono::Utc;
+ use serde_json::Value;
++use tokio::sync::watch;
+ use zeron_doc::{
+     GroupMember, HeldReport, MessagePart, MessageRole, MessageStatus, QueuedMessage, ReportGroup, SessionCommandEntry,
+     SessionCommandPayload, SessionCommandStatus, SessionMessageEntry,
+ };
+ use zeron_proto::agent_messages::{self, ReportStatus};
+-use zeron_proto::{Chat, Session, SessionStatus, ToolCall, WaitingKind, WaitingOn};
++use zeron_proto::{Chat, Device, DoneStatus, Session, SessionStatus, ToolCall, WaitingKind, WaitingOn};
+ 
+ use super::lock;
+-use crate::doc_host::DocHost;
++use crate::doc_host::{ChatDocHandle, DocHost};
++use crate::now_ms;
+ use crate::run_journal::RunJournal;
++use crate::workspace_host::WorkspaceHost;
+ 
+ /// The most of a reply a report carries; past it, the report says where the
+ /// rest is.
+@@ -51,15 +55,22 @@ const REPORT_CAP: usize = 16 * 1024;
+ /// writes; this is what makes it one report. Also, by parent, the children
+ /// its last note named as still working ([`roster`]), so an unchanged list
+ /// isn't spelled out again, and those it said were paused ([`PAUSE_AT`]), so
+-/// a pause is said once.
++/// a pause is said once. And whether this engine watches for the children
++/// whose hosts don't report by themselves yet ([`watch_children`]).
+ #[derive(Default)]
+ pub(super) struct Reported(
+     Mutex<HashMap<String, (String, HashSet<String>)>>,
+     Mutex<HashMap<String, Vec<String>>>,
+     Mutex<HashMap<String, Vec<String>>>,
++    AtomicBool,
+ );
+ 
+ impl Reported {
++    /// Note the watch ([`watch_children`]) begun: whether it had already.
++    pub(super) fn watching(&self) -> bool {
++        self.3.swap(true, Ordering::AcqRel)
++    }
++
+     /// Claim `stage` of the report on `message` for `child`: false when it
+     /// was already claimed.
+     pub(super) fn claim(&self, child: &str, message: &str, stage: &str) -> bool {
+@@ -404,7 +415,7 @@ pub(super) async fn report_turn_end(
+     // What the child sent its parent itself on the way, with `send_message`.
+     // An FYI (`wake: false`) waits for a wake, maybe this very end: it may
+     // be unread yet, so it's no reason to leave words out.
+-    let sent: Vec<String> = with_inputs(&journal, &child, after.to_vec())
++    let mut sent: Vec<String> = with_inputs(&journal, &child, after.to_vec())
+         .iter()
+         .flat_map(|e| &e.parts)
+         .filter_map(|p| match p {
+@@ -415,6 +426,12 @@ pub(super) async fn report_turn_end(
+         .filter(|m| m.wake && agent_messages::resolve_chat_key(&m.chat, &keys) == Some(parent.as_str()))
+         .map(|m| m.text)
+         .collect();
++    // A child hosted elsewhere, its report filed by this host's watch
++    // ([`watch_children`]): its own host's journal isn't here, but what it
++    // sent the parent is, in the parent's ledger.
++    if row.device_id != host.device_id() {
++        sent.extend(messages_in_ledger(&host, &parent, &child, entries[at].created_at));
++    }
+     let body = match status {
+         ReportStatus::NeedsInput => question_body(after, &child),
+         // What it wrote is from before the stop, however sure of itself it
+@@ -675,6 +692,412 @@ pub(super) fn parents_on_boot(host: &DocHost, running: impl Fn(&str) -> bool) ->
+     parents
+ }
+ 
++// ---- The parent's watch: children whose hosts don't report (2b) ----
++
++/// How long after this host first saw a watched child's turn settled on
++/// the parent's message, what its chat says of it still not synced here,
++/// the parent hears it ended anyway, the reply to follow ([`UNSYNCED`]).
++/// `ZERON_REPORT_UNSYNCED_MS` sets it for tests.
++const UNSYNCED_AFTER_MS: i64 = 10 * 60 * 1000;
++
++fn unsynced_after_ms() -> i64 {
++    std::env::var("ZERON_REPORT_UNSYNCED_MS")
++        .ok()
++        .and_then(|ms| ms.parse().ok())
++        .unwrap_or(UNSYNCED_AFTER_MS)
++}
++
++/// The stage of a watched child's status-only report ([`file_unsynced`]).
++/// None of an end's or a stop's names, so it's no end anywhere (not
++/// [`delivered`]'s, [`answered`]'s, a group's, a pause's): the request stays
++/// open, and its full end still goes, once, when its chat syncs.
++pub(super) const UNSYNCED: &str = "unsynced";
++
++/// How long before its row says a watched child's turn finished, its
++/// failed or cut-off last answer may have ended (both on its host's clock).
++const FAILED_WITHIN_MS: i64 = 60_000;
++
++/// How long a device unheard from is offline (the Devices page's window).
++const OFFLINE_AFTER_MS: i64 = 70_000;
++
++/// When the watch looks again at a doc it waits on with nothing new: this
++/// long at first, twice as long each time, up to the second.
++const WATCH_RETRY_MS: (i64, i64) = (1_000, 30_000);
++
++/// When the watch looks again with nothing to wait on.
++const WATCH_IDLE_MS: i64 = 5 * 60 * 1000;
++
++/// A doc that changed is looked at once it has been still this long.
++const WATCH_SETTLE_MS: u64 = 250;
++
++/// What the watch keeps between looks: by child, the outcome its row says
++/// its turn settled with (when it finished, on its host's clock) and when
++/// this host first saw it so (its own clock).
++type Seen = HashMap<String, (i64, i64)>;
++
++/// What one look found: the docs of children whose end hasn't synced here
++/// yet, looked at again as they change, and when a status-only report next
++/// falls due.
++#[derive(Default)]
++struct Look {
++    waiting: Vec<Arc<ChatDocHandle>>,
++    due: Option<i64>,
++}
++
++/// The parent's side of a child whose host doesn't report its turns by
++/// itself (its device lacks `child-reports`: an older Zeron). This host,
++/// hosting the parent, files the child's report as the child's host would:
++/// by the same rule ([`classify_settled_turn`]), under the same key, once
++/// the child's registry row says its turn settled and its doc, synced here,
++/// shows that very turn ([`reconcile`]). A child whose host reports too
++/// (it updated meanwhile) is no harm: both check the ledger first, and the
++/// parent's host files a key once.
++///
++/// It looks at every such child on start, whenever the registry's session
++/// rows or chats change, when a device's capabilities change or it comes
++/// back, as a doc it waits on changes, and every while. As long as its
++/// engine runs.
++pub(super) async fn watch_children(inner: Weak<super::Inner>, ws: WorkspaceHost) {
++    let mut rows = ws.watch_session_rows();
++    let mut chats = ws.watch_chats();
++    let mut devices = ws.watch_devices();
++    let mut known = device_marks(&devices.borrow_and_update());
++    let mut seen = Seen::new();
++    let mut retry = WATCH_RETRY_MS.0;
++    loop {
++        let _ = rows.borrow_and_update();
++        let _ = chats.borrow_and_update();
++        let look = {
++            let Some(inner) = inner.upgrade() else {
++                return;
++            };
++            let Some(host) = inner.doc_host() else {
++                return;
++            };
++            let floor = inner.journal.child_reports_watch_since(now_ms()) - OWED_FLOOR_MARGIN_MS;
++            look(&host, &inner.journal, &inner.reported, floor, &mut seen).await
++        };
++        let now = now_ms();
++        let next = now + if look.waiting.is_empty() { WATCH_IDLE_MS } else { retry };
++        let next = look.due.map_or(next, |due| due.min(next));
++        let deadline =
++            tokio::time::Instant::now() + std::time::Duration::from_millis(u64::try_from(next - now).unwrap_or(0));
++        let mut docs: Vec<watch::Receiver<u64>> = look.waiting.iter().map(|handle| handle.changes()).collect();
++        loop {
++            tokio::select! {
++                changed = rows.changed() => {
++                    if changed.is_err() {
++                        return;
++                    }
++                    retry = WATCH_RETRY_MS.0;
++                    break;
++                }
++                changed = chats.changed() => {
++                    if changed.is_err() {
++                        return;
++                    }
++                    retry = WATCH_RETRY_MS.0;
++                    break;
++                }
++                changed = devices.changed() => {
++                    if changed.is_err() {
++                        return;
++                    }
++                    let now_known = device_marks(&devices.borrow_and_update());
++                    if now_known != known {
++                        known = now_known;
++                        retry = WATCH_RETRY_MS.0;
++                        break;
++                    }
++                }
++                _ = any_change(&mut docs) => {
++                    tokio::time::sleep(std::time::Duration::from_millis(WATCH_SETTLE_MS)).await;
++                    break;
++                }
++                _ = tokio::time::sleep_until(deadline) => {
++                    retry = (retry * 2).min(WATCH_RETRY_MS.1);
++                    break;
++                }
++            }
++        }
++    }
++}
++
++/// The next change to any of `docs`; never, with none.
++async fn any_change(docs: &mut [watch::Receiver<u64>]) {
++    if docs.is_empty() {
++        return std::future::pending().await;
++    }
++    let _ = futures::future::select_all(docs.iter_mut().map(|doc| Box::pin(doc.changed()))).await;
++}
++
++/// Each device as the watch tells them apart: whether it reports its chats'
++/// turns by itself, and whether it's online. A change in either (an update,
++/// a device back) is worth a look.
++fn device_marks(devices: &[Device]) -> Vec<(String, bool, bool)> {
++    let now = Utc::now();
++    devices
++        .iter()
++        .map(|d| (d.id.clone(), d.supports(zeron_proto::capabilities::CHILD_REPORTS), online(d, now)))
++        .collect()
++}
++
++/// `device` was heard from within [`OFFLINE_AFTER_MS`] of `now`.
++fn online(device: &Device, now: chrono::DateTime<Utc>) -> bool {
++    device
++        .last_seen_at
++        .is_some_and(|at| (now - at).num_milliseconds() <= OFFLINE_AFTER_MS)
++}
++
++/// One look at every child this host watches for ([`watch_children`]): a
++/// child of a parent chat hosted here, itself hosted on a device that
++/// doesn't report by itself (no `child-reports` on its row, or no row),
++/// whose session row moved since `floor` (when the watch came to this
++/// host, less a margin: older work is history).
++async fn look(host: &DocHost, journal: &Arc<RunJournal>, reported: &Arc<Reported>, floor: i64, seen: &mut Seen) -> Look {
++    let mut look = Look::default();
++    let Some(ws) = host.workspace() else {
++        return look;
++    };
++    let (Ok(chats), Ok(devices), Ok(rows)) = (ws.read_chats(), ws.read_devices(), ws.read_sessions()) else {
++        return look;
++    };
++    let here = |id: &str| chats.iter().any(|c| c.id == id && c.device_id == host.device_id());
++    let children: Vec<&Chat> = chats
++        .iter()
++        .filter(|c| {
++            !c.archived && c.parent_chat_id.as_deref().is_some_and(|parent| here(parent)) && watched(c, &devices, host.device_id())
++        })
++        .collect();
++    seen.retain(|id, _| children.iter().any(|c| &c.id == id));
++    let now = now_ms();
++    for child in children {
++        let Some(parent) = child.parent_chat_id.as_deref() else {
++            continue;
++        };
++        let Some(row) = last_row_of(child, &rows).filter(|row| row.updated_at.timestamp_millis() >= floor) else {
++            continue;
++        };
++        if let Some((handle, due)) = reconcile(host, journal, reported, child, parent, row, floor, now, seen).await {
++            look.waiting.push(handle);
++            look.due = due.into_iter().chain(look.due).min();
++        }
++    }
++    look
++}
++
++/// Bring the parent's ledger up to `child`'s settled turn, as its own host
++/// would have (see [`watch_children`]). Its row (`row`, from its device)
++/// says how the turn ended; its doc, synced here, must show that very turn
++/// before anything goes, never a body from a doc half in:
++/// - finished: the answer its row names (`last_completed_turn`) is there,
++///   after the parent's message;
++/// - failed or stopped: its last answer after the parent's message, cut off
++///   or ending on an error (or a Stop after it), ended within
++///   [`FAILED_WITHIN_MS`] before its row's outcome did;
++/// - asking: its question is there, unanswered.
++///
++/// Then the report goes as its host's settle would send it
++/// ([`report_turn_end`]). Short of that, the doc is looked at again as it
++/// changes. Once the row has said so for [`unsynced_after_ms`], and it's
++/// this request's (its turn finished after the parent's message, both on
++/// the child's clock, and nothing newer is on its way), the parent hears its
++/// status alone ([`file_unsynced`]); not this request's, nothing (the
++/// parent's notes say its status is unconfirmed, [`roster`]).
++///
++/// Only a request still open keeps the child's doc syncing here. `Some`:
++/// the doc, still waited on, and when its status-only report falls due.
++#[allow(clippy::too_many_arguments)]
++async fn reconcile(
++    host: &DocHost,
++    journal: &Arc<RunJournal>,
++    reported: &Arc<Reported>,
++    child: &Chat,
++    parent: &str,
++    row: &Session,
++    floor: i64,
++    now: i64,
++    seen: &mut Seen,
++) -> Option<(Arc<ChatDocHandle>, Option<i64>)> {
++    // Still at it (or waiting on its background work): its end isn't in.
++    if row.status == SessionStatus::Working || row.waiting.is_some() {
++        seen.remove(&child.id);
++        return None;
++    }
++    let handle = host.open_local(&child.id).ok()?;
++    let entries = handle.doc().read_entries().unwrap_or_default();
++    let commands = handle.doc().read_commands().unwrap_or_default();
++    let interrupted = row.last_turn_outcome.as_ref().is_some_and(|o| o.status == DoneStatus::Interrupted);
++    let open = request_message(&entries, parent).filter(|&at| {
++        let asked = &entries[at];
++        asked.created_at >= floor
++            && !stopped_by_parent(&commands, parent, asked)
++            && (row.status == SessionStatus::AwaitingInput
++                || (last_end_report(host, parent, &child.id, &asked.id).is_none()
++                    && !delivered(host, parent, &child.id, asked, "end")
++                    && !(interrupted && persons_stop_filed(host, parent, &child.id, &asked.id))))
++    });
++    // A message of the parent's on its way (this copy of the doc may lag
++    // its host's): what the row says is no answer to it yet.
++    if on_its_way(host, &commands, &entries, parent, &child.id, None) {
++        seen.remove(&child.id);
++        host.activate_sync(&handle);
++        return Some((handle, None));
++    }
++    let Some(at) = open else {
++        seen.remove(&child.id);
++        return None;
++    };
++    host.activate_sync(&handle);
++    let asked = &entries[at];
++    let after = answer_to(&entries, at, parent);
++    let report = |status: ReportStatus, stop: Option<TurnStop>, settled_at: i64| {
++        report_turn_end(host.clone(), journal.clone(), reported.clone(), child.id.clone(), status, stop, settled_at)
++    };
++    if row.status == SessionStatus::AwaitingInput {
++        seen.remove(&child.id);
++        if open_question(after).is_none() {
++            return Some((handle, None));
++        }
++        report(ReportStatus::NeedsInput, None, row.updated_at.timestamp_millis()).await;
++        return None;
++    }
++    // Nothing durable says how it ended (a peer older still).
++    let outcome = row.last_turn_outcome.as_ref()?;
++    let finished = outcome.finished_at.timestamp_millis();
++    let last = after.iter().rev().find(|e| e.role == MessageRole::Assistant);
++    let cut_off = last.is_some_and(|e| e.status == Some(MessageStatus::Aborted));
++    let errored = last.is_some_and(|e| e.parts.iter().any(|p| matches!(p, MessagePart::Error { .. })));
++    let whole = !after.iter().any(|e| e.status == Some(MessageStatus::Streaming));
++    let evidence = whole
++        && match outcome.status {
++            DoneStatus::Completed => row.last_completed_turn.as_deref().is_some_and(|id| {
++                after
++                    .iter()
++                    .any(|e| e.role == MessageRole::Assistant && (e.id == id || e.continuation_of.as_deref() == Some(id)))
++            }),
++            // (A Stop ending a wait leaves its answer whole: the Stop in the
++            // doc says it instead. An answer with no length ended by its row.)
++            DoneStatus::Interrupted | DoneStatus::Errored => last.is_some_and(|e| {
++                let ended = match e.duration_ms {
++                    Some(ms) => (finished - FAILED_WITHIN_MS..=finished).contains(&(e.created_at + ms)),
++                    None => e.created_at <= finished,
++                };
++                let stopped = outcome.status == DoneStatus::Interrupted && stop_after(&commands, &asked.id).is_some();
++                ended && (cut_off || ends_on_error(after) || stopped)
++            }),
++        };
++    if evidence {
++        seen.remove(&child.id);
++        // As the next start would read it ([`owed_on_boot`]).
++        let stop = if interrupted || cut_off || persons_stop_filed(host, parent, &child.id, &asked.id) {
++            stop_after(&commands, &asked.id).map(TurnStop::Command)
++        } else {
++            None
++        };
++        let status = if open_question(after).is_some() {
++            ReportStatus::NeedsInput
++        } else if cut_off || errored {
++            ReportStatus::Failed
++        } else {
++            ReportStatus::Finished
++        };
++        report(status, stop, finished).await;
++        return None;
++    }
++    let first = match seen.get(&child.id) {
++        Some(&(was, first)) if was == finished => first,
++        _ => {
++            seen.insert(child.id.clone(), (finished, now));
++            now
++        }
++    };
++    // Not this request's outcome (its device went quiet before it ran it):
++    // nothing terminal.
++    if finished < asked.created_at {
++        return Some((handle, None));
++    }
++    let due = first + unsynced_after_ms();
++    if now < due {
++        return Some((handle, Some(due)));
++    }
++    // Its first turn, whose reply the `create_chat(s)` wait returned.
++    let first_turn = !entries[..at].iter().any(|e| e.role == MessageRole::User);
++    if first_turn
++        && host
++            .open(parent)
++            .is_ok_and(|doc| create_returned(&doc.doc().read_entries().unwrap_or_default(), &child.id))
++    {
++        return Some((handle, None));
++    }
++    let status = match outcome.status {
++        DoneStatus::Completed => ReportStatus::Finished,
++        DoneStatus::Errored => ReportStatus::Failed,
++        // Whose Stop: another chat's agent's is said; the person's, or one
++        // nobody claims, isn't ([`classify_settled_turn`]). None: cut off.
++        DoneStatus::Interrupted => match stop_after(&commands, &asked.id)
++            .and_then(|id| commands.iter().find(|c| c.id == id))
++            .map(|c| &c.payload)
++        {
++            None => ReportStatus::Failed,
++            Some(SessionCommandPayload::Interrupt { stopped_by: Some(_) }) => ReportStatus::Stopped,
++            Some(_) => return Some((handle, None)),
++        },
++    };
++    file_unsynced(host, reported, child, parent, asked, status);
++    Some((handle, None))
++}
++
++/// Tell `parent` how `child`'s turn on its message `asked` ended, its row
++/// saying so long enough with its chat still not synced here ([`reconcile`]):
++/// its status alone, under [`UNSYNCED`], once. Its full end follows when
++/// the chat syncs.
++fn file_unsynced(
++    host: &DocHost,
++    reported: &Reported,
++    child: &Chat,
++    parent: &str,
++    asked: &SessionMessageEntry,
++    status: ReportStatus,
++) {
++    if delivered(host, parent, &child.id, asked, UNSYNCED) || !reported.claim(&child.id, &asked.id, UNSYNCED) {
++        return;
++    }
++    let label = crate::rpc::agent_gate::label(Some(child), &child.id);
++    let text = agent_messages::child_report(
++        &label,
++        &child.id,
++        status,
++        "Its chat hasn't synced to this device yet, so open it for the reply. Its full report follows once it has.",
++    );
++    let key = report_id(&child.id, &asked.id, UNSYNCED);
++    if queue_report(host, reported, &child.id, parent, &asked.id, UNSYNCED, key, &text) {
++        tracing::info!(chat = %child.id, %parent, status = status.as_str(), "a watched child's status, its chat not synced yet");
++    }
++}
++
++/// What `child`, hosted elsewhere, sent `parent` itself since its message
++/// at `since` (the child's host's clock, as its reports are stamped): its
++/// `· message` reports in the parent's ledger.
++fn messages_in_ledger(host: &DocHost, parent: &str, child: &str, since: i64) -> Vec<String> {
++    let ledger = host
++        .open(parent)
++        .ok()
++        .and_then(|doc| doc.doc().read_commands().ok())
++        .unwrap_or_default();
++    ledger
++        .iter()
++        .filter(|c| c.issued_at >= since)
++        .filter_map(|c| match &c.payload {
++            SessionCommandPayload::Run { request, .. } => agent_messages::child_reports(&request.prompt),
++            _ => None,
++        })
++        .flatten()
++        .filter(|r| r.sender.chat_id == child && r.status == ReportStatus::Message)
++        .map(|r| r.body.to_owned())
++        .collect()
++}
++
+ /// The Stop sent the child after the parent's message `asked`, when nothing
+ /// sent after it started another turn: the one that ended its last turn.
+ fn stop_after(commands: &[SessionCommandEntry], asked: &str) -> Option<String> {
+@@ -1265,6 +1688,8 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+         return "No child is working for you now.".into();
+     };
+     let remote = ws.read_sessions().unwrap_or_default();
++    // (Heard from as presence says, not as the rows last did.)
++    let devices: Vec<Device> = ws.watch_devices().borrow().to_vec();
+     let now = Utc::now();
+     let journal = host.sessions().map(|engine| engine.inner.journal.clone());
+     let since = |ms: i64| ago(now.timestamp_millis() - ms);
+@@ -1345,12 +1770,35 @@ fn roster(host: &DocHost, parent: &str, local: &[Session]) -> String {
+                         facts.push(format!("last output {} ago", since(at)));
+                     }
+                 }
+-                Some(_) => return None,
++                // Settled, its row says, but on an earlier message: a child
++                // the watch reports for ([`watched`]) may have run this one
++                // with its row not synced since, or not at all.
++                Some(s) => {
++                    let asked = entries[at].created_at;
++                    if s.last_turn_outcome.is_some_and(|o| o.finished_at.timestamp_millis() >= asked)
++                        || !watched(child, &devices, host.device_id())
++                    {
++                        return None;
++                    }
++                    facts.push(format!("status unconfirmed, its device hasn't synced since {}", stamp(s.updated_at)));
++                }
++                None if watched(child, &devices, host.device_id()) => facts.push(match last_row_of(child, &remote) {
++                    Some(last) => format!("status unconfirmed, its device hasn't synced since {}", stamp(last.updated_at)),
++                    None => "status unconfirmed, no word from its device yet".into(),
++                }),
+                 None => {
+                     // A row from another device gone quiet: the last of it.
+                     let last = last_row_of(child, &remote)
+                         .filter(|s| matches!(s.status, SessionStatus::Working | SessionStatus::AwaitingInput))?;
+-                    facts.push(format!("its device last heard from {} ago", since(last.updated_at.timestamp_millis())));
++                    // Its host reports by itself, once it's back.
++                    let offline = devices
++                        .iter()
++                        .find(|d| d.id == child.device_id && child.device_id != host.device_id() && !online(d, now))
++                        .and_then(|d| d.last_seen_at);
++                    facts.push(match offline {
++                        Some(seen) => format!("its device has been offline since {}", stamp(seen)),
++                        None => format!("its device last heard from {} ago", since(last.updated_at.timestamp_millis())),
++                    });
+                 }
+             }
+             line(facts.join(", "))
+@@ -1398,6 +1846,21 @@ fn last_row_of<'a>(child: &Chat, remote: &'a [Session]) -> Option<&'a Session> {
+     remote.iter().find(|s| s.chat_id == child.id && s.device_id == child.device_id)
+ }
+ 
++/// `child` is hosted on another device than `here`, one that doesn't report
++/// its chats' turns by itself (no `child-reports` on its row, or no row): its
++/// parent's host reports for it ([`watch_children`]).
++fn watched(child: &Chat, devices: &[Device], here: &str) -> bool {
++    child.device_id != here
++        && !devices
++            .iter()
++            .any(|d| d.id == child.device_id && d.supports(zeron_proto::capabilities::CHILD_REPORTS))
++}
++
++/// A moment as the notes say it.
++fn stamp(at: chrono::DateTime<Utc>) -> String {
++    at.format("%Y-%m-%d %H:%M UTC").to_string()
++}
++
+ /// Where the parent's latest message sits in `entries` (see
+ /// [`request_message`]), while the child's latest turn is still the
+ /// parent's: none once the parent heard its answer and the person wrote to
+@@ -1564,7 +2027,7 @@ fn report_id(child: &str, asked: &str, stage: &str) -> String {
+ 
+ /// What a report's key ([`report_id`]) says, `child` known (the report's
+ /// header names it): the parent's message it's on, and its stage as a claim
+-/// spells it (`end`, `stopped`, `end:<answer>`, `ask:<request>`), whatever
++/// spells it (`end`, `stopped`, [`UNSYNCED`], `end:<answer>`, `ask:<request>`), whatever
+ /// marks follow it ([`marks`]). Ids hold dashes, so it's read from both
+ /// ends, never split on them: the child's id off the front, the stage off
+ /// the back in one of its forms. `None` for any other key (a message on the
+@@ -1578,9 +2041,10 @@ fn report_id(child: &str, asked: &str, stage: &str) -> String {
+ /// shortest form; a stage id holding them too can't be told apart.
+ pub(crate) fn report_key_parts(key: &str, child: &str) -> Option<(String, String)> {
+     let rest = marks(key).0.strip_prefix("report-")?.strip_prefix(child)?.strip_prefix('-')?;
+-    // Every way the key ends on a stage: a plain end or stop, or each place
+-    // a follow-up's or a question's could start.
+-    let mut splits: Vec<(&str, String)> = ["end", "stopped"]
++    // Every way the key ends on a stage: a plain end or stop (or a watched
++    // child's status alone), or each place a follow-up's or a question's
++    // could start.
++    let mut splits: Vec<(&str, String)> = ["end", "stopped", UNSYNCED]
+         .into_iter()
+         .filter_map(|stage| Some((rest.strip_suffix(stage)?.strip_suffix('-')?, stage.to_owned())))
+         .collect();
+@@ -2723,7 +3187,7 @@ mod tests {
+     #[test]
+     fn a_reports_key_reads_from_both_ends() {
+         let (child, asked) = ("kid-a-0b1c", "5f0e7a3c-9d2b-4c1e-8a6f-1b2c3d4e5f60");
+-        for stage in ["end", "stopped", "end:a2-9f-end", "ask:toolu-ask-1"] {
++        for stage in ["end", "stopped", UNSYNCED, "end:a2-9f-end", "ask:toolu-ask-1"] {
+             let key = report_id(child, asked, stage);
+             assert_eq!(report_key_parts(&key, child), Some((asked.to_owned(), stage.to_owned())), "{key}");
+         }
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 81b5e1bd73c594de239fac3cf84c064a9ae52358..26d2fd5ae4b0258ad06968018957bd234c0ee288 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -520,6 +520,9 @@ impl SessionsEngine {
+             let Some(host) = engine.inner.doc_host() else {
+                 return;
+             };
++            // Children here report by themselves; those hosted elsewhere,
++            // on a Zeron that doesn't, this host reports for.
++            engine.watch_children();
+             let floor = engine.inner.journal.child_reports_since(now_ms()) - reports::OWED_FLOOR_MARGIN_MS;
+             let stopped = std::mem::take(&mut *lock(&engine.inner.boot_stops));
+             // Revived, or on its way to it: it reports as it settles.
+@@ -537,6 +540,23 @@ impl SessionsEngine {
+         });
+     }
+ 
++    /// Start this host's watch over the children of its chats hosted on a
++    /// device that doesn't report their turns by itself
++    /// ([`reports::watch_children`]): once, for the engine's life. From
++    /// [`Self::report_owed`], once the doc host is wired.
++    pub fn watch_children(&self) {
++        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
++            return;
++        };
++        let Some(ws) = self.inner.workspace() else {
++            return;
++        };
++        if self.inner.reported.watching() {
++            return;
++        }
++        runtime.spawn(reports::watch_children(Arc::downgrade(&self.inner), ws));
++    }
++
+     /// Wire the doc host (called once at engine assembly; the two services are mutually
+     /// referential by design — sessions stream into docs, docs execute commands here).
+     pub fn set_doc_host(&self, host: DocHost) {
+@@ -7665,6 +7685,7 @@ mod tests {
+         unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
+         unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
+         unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
++        unsafe { std::env::set_var("ZERON_REPORT_UNSYNCED_MS", "3000") };
+         let harness = Arc::new(ChatsHarness::default());
+         let registry = HarnessRegistry::new();
+         registry.register(harness.clone());
+@@ -9000,6 +9021,209 @@ mod tests {
+         rig.core.sessions.shutdown().await;
+     }
+ 
++    impl FamilyRig {
++        /// `kid-r`, the lead's subagent on the laptop, whose Zeron has `caps`
++        /// (none: one that doesn't report by itself), and the lead, its first
++        /// turn done. The lead's run.
++        async fn remote_child(&self, caps: &[&str]) -> ChatRun {
++            let lead = self.start("lead", "Get the diff reviewed.").await;
++            lead.feed.send(text("Asked Remote.")).unwrap();
++            lead.feed.send(done(DoneStatus::Completed)).unwrap();
++            self.until("the lead is done", |r| r.status("lead").last_completed_turn.is_some()).await;
++            self.core
++                .workspace
++                .create_chat_with_parent("kid-r", None, Some("laptop"), None, Some(request().cwd), Some("lead".into()))
++                .unwrap();
++            self.core.workspace.rename_chat("kid-r", "Remote").unwrap();
++            self.laptop(caps);
++            lead
++        }
++
++        /// The laptop's device row, its Zeron having `caps`, online.
++        fn laptop(&self, caps: &[&str]) {
++            self.core.workspace.upsert_device_row(&zeron_proto::Device {
++                id: "laptop".into(),
++                name: "Laptop".into(),
++                platform: "macos".into(),
++                last_seen_at: Some(chrono::Utc::now()),
++                created_at: None,
++                version: None,
++                cursor_sdk_version: None,
++                capabilities: caps.iter().map(|c| (*c).to_owned()).collect(),
++            });
++        }
++
++        /// `kid-r`'s transcript gains `id`, written `ago` ms ago by its host
++        /// and synced here: the lead's message (`User`), or its answer.
++        fn remote_says(&self, id: &str, role: zeron_doc::MessageRole, text: &str, ago: i64) {
++            let entry = zeron_doc::SessionMessageEntry {
++                id: id.into(),
++                role,
++                parts: vec![zeron_doc::MessagePart::Text { id: format!("{id}-t"), text: text.into() }],
++                created_at: now_ms() - ago,
++                device_id: "laptop".into(),
++                status: Some(zeron_doc::MessageStatus::Complete),
++                continuation_of: None,
++                duration_ms: Some(100),
++            };
++            self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
++        }
++
++        /// `kid-r`'s registry row from the laptop: `status`, its last turn
++        /// having ended `outcome` `ago` ms ago, its last finished answer
++        /// `completed`.
++        fn remote_row(&self, status: SessionStatus, outcome: Option<(DoneStatus, i64)>, completed: Option<&str>) {
++            self.core.workspace.record_session(&Session {
++                chat_id: "kid-r".into(),
++                device_id: "laptop".into(),
++                status,
++                started_at: None,
++                updated_at: chrono::Utc::now(),
++                running_subagents: 0,
++                background_tasks: Vec::new(),
++                last_completed_turn: completed.map(str::to_owned),
++                last_turn_outcome: outcome.map(|(status, ago)| zeron_proto::NativeTurnOutcome {
++                    status,
++                    finished_at: chrono::Utc::now() - chrono::Duration::milliseconds(ago),
++                }),
++                terminal_activity: None,
++                waiting: None,
++            });
++        }
++
++        /// What `kid-r`'s host, reporting by itself, files in the lead's
++        /// ledger under `key`.
++        fn remote_reports(&self, key: &str, body: &str) {
++            let mut report = request();
++            report.prompt = zeron_proto::agent_messages::child_report("Remote (kid-r)", "kid-r", ReportStatus::Finished, body);
++            self.core
++                .doc_host
++                .queue_command("lead", zeron_doc::SessionCommandPayload::Run { request: report, message_id: key.into() })
++                .unwrap();
++        }
++
++        /// What the lead heard from `kid-r`, read or waiting.
++        fn heard_remote(&self) -> Vec<(ReportStatus, String)> {
++            self.heard().into_iter().filter(|(id, ..)| id == "kid-r").map(|(_, status, body)| (status, body)).collect()
++        }
++
++        /// `kid-r`'s reports in the lead's ledger, by key.
++        fn filed_remote(&self) -> Vec<String> {
++            self.ledger().into_iter().filter(|id| id.starts_with("report-kid-r-")).collect()
++        }
++    }
++
++    /// A child on a Zeron that doesn't report by itself: its row says its
++    /// turn finished, but its answer hasn't synced here. The lead's host
++    /// files nothing from the row alone, and the child's own report, as its
++    /// host would have filed it, once its answer is in.
++    #[tokio::test]
++    async fn a_watched_child_reports_once_its_answer_is_in() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 3_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 1_000)), Some("r-a1"));
++        rig.core.sessions.watch_children();
++        rig.quiet().await;
++        assert!(rig.filed_remote().is_empty(), "{:?}", rig.filed_remote());
++
++        rig.remote_says("r-a1", Assistant, "LGTM.", 2_000);
++        rig.until("the lead hears it", |r| !r.heard_remote().is_empty()).await;
++        assert_eq!(rig.heard_remote(), [(ReportStatus::Finished, "LGTM.".to_owned())]);
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-end"]);
++        rig.quiet().await;
++        assert_eq!(rig.heard_remote().len(), 1, "said once");
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A watched child's row tells of a turn before the lead's message: its
++    /// device hasn't run that, or hasn't said. However long, the lead hears
++    /// no end of it, and its notes say its status is unconfirmed.
++    #[tokio::test]
++    async fn a_watched_childs_row_from_before_the_message_reports_nothing() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        rig.remote_says("r-a0", Assistant, "Earlier work.", 120_000);
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 2_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 60_000)), Some("r-a0"));
++        rig.core.sessions.watch_children();
++        // Past the wait for a status-only report (3 s here).
++        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
++        assert!(rig.filed_remote().is_empty(), "{:?}", rig.filed_remote());
++        assert!(rig.heard_remote().is_empty());
++        let roster = rig.roster();
++        assert!(roster.contains("Remote (asked "), "{roster}");
++        assert!(roster.contains("status unconfirmed, its device hasn't synced since "), "{roster}");
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A watched child's row says its turn on the lead's message finished,
++    /// and its answer stays away: the lead hears its status alone, which
++    /// ends nothing, then its full report once the answer is in.
++    #[tokio::test]
++    async fn a_watched_child_long_unsynced_reports_its_status_then_its_end() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 3_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 1_000)), Some("r-a1"));
++        rig.core.sessions.watch_children();
++        rig.until("the lead hears its status", |r| !r.heard_remote().is_empty()).await;
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-unsynced"]);
++        let heard = rig.heard_remote();
++        assert_eq!(heard[0].0, ReportStatus::Finished);
++        assert!(heard[0].1.contains("hasn't synced to this device yet"), "{heard:?}");
++
++        rig.remote_says("r-a1", Assistant, "LGTM.", 2_000);
++        rig.until("its full report follows", |r| r.heard_remote().len() == 2).await;
++        assert_eq!(rig.heard_remote()[1], (ReportStatus::Finished, "LGTM.".to_owned()));
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-unsynced", "report-kid-r-r-m1-end"]);
++        rig.quiet().await;
++        assert_eq!(rig.heard_remote().len(), 2, "each once");
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// The laptop's Zeron updates while it works on the lead's message: the
++    /// old one ended the turn, the lead's host reported it, and the new
++    /// one's catch-up sends the same report. The lead hears it once. On the
++    /// next message the laptop reports by itself, and the watch keeps out.
++    #[tokio::test]
++    async fn a_child_whose_host_updates_mid_request_reports_once() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 3_000);
++        rig.remote_row(SessionStatus::Working, None, None);
++        rig.core.sessions.watch_children();
++        rig.quiet().await;
++        assert!(rig.filed_remote().is_empty());
++
++        rig.remote_says("r-a1", Assistant, "LGTM.", 1_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 500)), Some("r-a1"));
++        rig.until("the watch reports it", |r| !r.heard_remote().is_empty()).await;
++        rig.laptop(&[zeron_proto::capabilities::CHILD_REPORTS]);
++        rig.remote_reports("report-kid-r-r-m1-end", "LGTM.");
++        rig.quiet().await;
++        assert_eq!(rig.heard_remote(), [(ReportStatus::Finished, "LGTM.".to_owned())], "once");
++
++        rig.remote_says("r-m2", User, &from_lead("And the tests?"), 1_000);
++        rig.remote_row(SessionStatus::Working, Some((DoneStatus::Completed, 500)), Some("r-a1"));
++        rig.remote_says("r-a2", Assistant, "Green.", 300);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 200)), Some("r-a2"));
++        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
++        assert!(!rig.filed_remote().iter().any(|key| key.contains("-r-m2-")), "{:?}", rig.filed_remote());
++        rig.remote_reports("report-kid-r-r-m2-end", "Green.");
++        rig.until("the lead hears it", |r| r.heard_remote().len() == 2).await;
++        rig.quiet().await;
++        assert_eq!(
++            rig.heard_remote(),
++            [(ReportStatus::Finished, "LGTM.".to_owned()), (ReportStatus::Finished, "Green.".to_owned())]
++        );
++        rig.core.sessions.shutdown().await;
++    }
++
+     impl FamilyRig {
+         /// The person stops `chat` (no agent's Stop).
+         fn person_stops(&self, chat: &str) {
+diff --git a/crates/proto/src/workspace.rs b/crates/proto/src/workspace.rs
+index cb296456f05e0f8c4f245004a1d6192cef51d611..442fb53a2fb5d2357e9533b1000a3ef5d8a892c6 100644
+--- a/crates/proto/src/workspace.rs
++++ b/crates/proto/src/workspace.rs
+@@ -66,6 +66,12 @@ pub mod capabilities {
+     /// it keeps the group, and holds each member's end for the rest. Zeron's
+     /// `create_chats` takes `notify` only where the parent's host says so.
+     pub const CHILD_REPORTS_GROUPS: &str = "child-reports-groups";
++    /// A parent chat this engine hosts hears from a child whose host doesn't
++    /// report by itself (no [`CHILD_REPORTS`]): this engine watches the
++    /// child's registry row and doc, and files the child's report once both
++    /// show its turn ended, which may lag the child's sync. Zeron's
++    /// `create_chat(s)` counts such a child as reporting back.
++    pub const CHILD_REPORTS_WATCH: &str = "child-reports-watch";
+ 
+     pub const CURRENT: &[&str] = &[
+         COMPOSER_REFERENCES_V1,
+@@ -85,6 +91,7 @@ pub mod capabilities {
+         CHILD_REPORTS,
+         CHILD_REPORTS_FYI,
+         CHILD_REPORTS_GROUPS,
++        CHILD_REPORTS_WATCH,
+         crate::voice::remote::CAPABILITY,
+     ];
+ 
+@@ -183,6 +190,7 @@ mod tests {
+                     "child-reports",
+                     "child-reports-fyi",
+                     "child-reports-groups",
++                    "child-reports-watch",
+                     "voice-client-media-v1"
+                 ],
+             })
+-- 
+2.55.0.windows.2
+
+
+From 4f42dcb2c71956801f4827ede2b359f022a622ff Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 16 Nov 2026 14:59:05 +0700
+Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
+ report back, and may join a group
+
+---
+ crates/mcp/src/tools.rs | 88 +++++++++++++++++++++++++++++++++--------
+ 1 file changed, 71 insertions(+), 17 deletions(-)
+
+diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
+index 17e680c6bf1d1bb801fbf245e2484320308e1694..b7b27a8ebdc9c04f483deb04f36acb5a71359cb7 100644
+--- a/crates/mcp/src/tools.rs
++++ b/crates/mcp/src/tools.rs
+@@ -1075,8 +1075,8 @@ impl Tools {
+         };
+         let joined = match &created {
+             Err(_) => Joined::Failed,
+-            // (Phase 2: unless this chat's host watches for its ends,
+-            // `child-reports-watch`.)
++            // (Unless this chat's host reports its ends for it,
++            // `child-reports-watch`: then it's in.)
+             Ok(created) if !created.reports => Joined::Out(chat_id.clone(), "its host's Zeron doesn't report back"),
+             Ok(Created { asked: None, .. }) => Joined::Out(chat_id.clone(), "it was given no prompt, so it has nothing to report"),
+             Ok(Created { asked: Some(asked), .. }) => {
+@@ -1568,12 +1568,13 @@ impl Tools {
+         }
+         // A child's host reports its turns back only from the version that
+         // advertises it ([`Self::reports_back`]): the reply says so, and a
+-        // group leaves the child out, its end never coming on its own.
++        // group leaves the child out, its end never coming on its own,
++        // unless the parent's host reports it instead.
+         let silent = match &parent_chat_id {
+-            Some(_) => self.reports_back(&device_id).await,
++            Some(parent) => self.reports_back(&device_id, parent).await,
+             None => None,
+         };
+-        if let Some(warning) = &silent {
++        if let Some((warning, _)) = &silent {
+             result["reportsBack"] = json!(warning);
+         }
+         let mut asked = None;
+@@ -1628,7 +1629,7 @@ impl Tools {
+                     .await?;
+             }
+         }
+-        Ok(Created { result, asked, reports: silent.is_none() })
++        Ok(Created { result, asked, reports: silent.is_none_or(|(_, watched)| watched) })
+     }
+ 
+     async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
+@@ -1717,9 +1718,9 @@ impl Tools {
+             .await?;
+         result["sent"] = delivered.receipt;
+         // A request to a child of this chat's: its answer may not come back.
+-        if chat.parent_chat_id.is_some()
+-            && chat.parent_chat_id.as_deref() == self.zeron.origin().chat_id.as_deref()
+-            && let Some(warning) = self.reports_back(&chat.device_id).await
++        if let Some(parent) = chat.parent_chat_id.as_deref()
++            && Some(parent) == self.zeron.origin().chat_id.as_deref()
++            && let Some((warning, _)) = self.reports_back(&chat.device_id, parent).await
+         {
+             result["reportsBack"] = json!(warning);
+         }
+@@ -1950,20 +1951,41 @@ impl Tools {
+         }
+     }
+ 
+-    /// What to tell a parent of its child hosted on `device_id` when that
+-    /// host may not report the child's turns back on its own: one that
+-    /// doesn't say it does (`child-reports`), or isn't known. Never fails the
+-    /// call it's part of: a device list that can't be read says nothing.
+-    async fn reports_back(&self, device_id: &str) -> Option<String> {
++    /// What to tell a parent (`parent`) of its child hosted on `device_id`
++    /// when that host may not report the child's turns back on its own: one
++    /// that doesn't say it does (`child-reports`), or isn't known. With it,
++    /// whether the parent's own host reports them for it instead
++    /// (`child-reports-watch`): then the child reports back after all, as
++    /// late as its sync. Never fails the call it's part of: a device list
++    /// that can't be read says nothing.
++    async fn reports_back(&self, device_id: &str, parent: &str) -> Option<(String, bool)> {
+         let devices = self.zeron.devices().await.ok()?;
+         let device = devices.iter().find(|d| d.id == device_id);
+         if device.is_some_and(|d| d.supports(zeron_proto::capabilities::CHILD_REPORTS)) {
+             return None;
+         }
+         let name = device.map_or(device_id, |d| d.name.as_str());
+-        Some(format!(
+-            "{name} runs a Zeron that may not report this chat's results back to you on its own. Collect them with wait_for_turn or read_chat."
+-        ))
++        let watcher = match self.zeron.resolve_chat(parent).await {
++            Ok(parent) => devices
++                .iter()
++                .find(|d| d.id == parent.device_id && d.supports(zeron_proto::capabilities::CHILD_REPORTS_WATCH)),
++            Err(_) => None,
++        };
++        Some(match watcher {
++            Some(watcher) => (
++                format!(
++                    "{name} runs a Zeron that doesn't report this chat's results back on its own: its end will be reported by {}'s watcher, which may lag sync.",
++                    watcher.name
++                ),
++                true,
++            ),
++            None => (
++                format!(
++                    "{name} runs a Zeron that may not report this chat's results back to you on its own. Collect them with wait_for_turn or read_chat."
++                ),
++                false,
++            ),
++        })
+     }
+ 
+     /// Whether `chat`'s host holds a child's FYI for its next wake
+@@ -2308,6 +2330,9 @@ mod tests {
+         fyi: bool,
+         /// `dev-local` keeps groups of children (`child-reports-groups`).
+         groups: bool,
++        /// `dev-local` reports for children on hosts that don't
++        /// (`child-reports-watch`).
++        watch: bool,
+     }
+ 
+     fn stream(item: Value) -> RpcReply {
+@@ -2349,6 +2374,7 @@ mod tests {
+                         Some("child-reports"),
+                         self.fyi.then_some("child-reports-fyi"),
+                         self.groups.then_some("child-reports-groups"),
++                        self.watch.then_some("child-reports-watch"),
+                     ]
+                     .into_iter()
+                     .flatten()
+@@ -3037,6 +3063,34 @@ mod tests {
+         assert!(alone.get("reportsBack").is_none(), "{alone}");
+     }
+ 
++    /// The same child where the parent's host reports for it
++    /// (`child-reports-watch`): the reply says whose watch does, and late,
++    /// and a group counts it in.
++    #[tokio::test]
++    async fn a_subagent_its_parents_host_reports_for_is_said_to_report_back() {
++        let world = Arc::new(World { groups: true, watch: true, ..Default::default() });
++        let there = tools_from(&world, "chat-beta-2")
++            .call("create_chat", json!({ "device": "Worker" }))
++            .await
++            .unwrap();
++        let warning = there["reportsBack"].as_str().unwrap_or_default();
++        assert!(
++            warning.ends_with("its end will be reported by Laptop's watcher, which may lag sync."),
++            "{there}"
++        );
++        let reply = tools_from(&world, "chat-beta-2")
++            .call(
++                "create_chats",
++                json!({"notify": "all", "requests": [
++                    {"project": "space-1", "prompt": "Run the tests."},
++                    {"device": "Worker", "prompt": "Write the docs."},
++                ]}),
++            )
++            .await
++            .unwrap();
++        assert_eq!(reply["group"]["members"].as_array().map(Vec::len), Some(2), "{reply}");
++    }
++
+     #[tokio::test]
+     async fn wait_on_an_idle_chat_returns_immediately() {
+         let world = Arc::new(World::default());
+-- 
+2.55.0.windows.2
+
+
+From 1d94658ce8270f14ed2d34ff10f2eb8252a79dba Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 16 Nov 2026 15:37:33 +0700
+Subject: [PATCH 3/4] engine: the parent's watch reports only the turn its
+ child's row names, and looks less
+
+Success evidence now needs the named answer to be the last after the parent's message, complete and ended near the turn; a doc ahead of its row waits for the row. A failure's answer with no length is no evidence. A child asking keeps its doc in sight for its next question. A child whose host reports by itself is reported for once it rests past a 2 minute grace with the request open, for a turn it ended before it updated. Row and chat changes settle for a second, rows at work and restamps are ignored, and a child with nothing new since its last look is passed by. A report kept for a pause counts as kept for a held copy.
+---
+ crates/engine/src/doc_host.rs        |  17 +-
+ crates/engine/src/session_reports.rs | 255 ++++++++++++++++++++++-----
+ crates/engine/src/sessions.rs        | 103 +++++++++++
+ 3 files changed, 319 insertions(+), 56 deletions(-)
+
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e8023d241 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -256,9 +256,10 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
+ 
+ /// Whether a parent's ledger (`commands`) has the report `held` (filed
+ /// under `key`) kept from its agent already under another mark: another
+-/// pusher's `-waited` or `-quiet` of it, by its structured `(child, asked,
+-/// stage)`. Never a `stopped` (see [`DocHost::drop_kept`]), nor a report
+-/// whose key says nothing of what it's on.
++/// pusher's `-waited` or `-quiet` of it, or one kept for a pause (I13), by
++/// its structured `(child, asked, stage)`. Never a `stopped` (see
++/// [`DocHost::drop_kept`]), nor a report whose key says nothing of what
++/// it's on.
+ fn kept_already(commands: &[SessionCommandEntry], held: &HeldReport, key: &str) -> bool {
+     held.stage != "stopped"
+         && !held.asked.is_empty()
+@@ -266,7 +267,8 @@ fn kept_already(commands: &[SessionCommandEntry], held: &HeldReport, key: &str)
+             SessionCommandPayload::Run { message_id, .. } => {
+                 message_id != key
+                     && (message_id.ends_with(crate::sessions::REPORT_WAITED)
+-                        || message_id.ends_with(crate::sessions::REPORT_QUIET))
++                        || message_id.ends_with(crate::sessions::REPORT_QUIET)
++                        || c.resolution.as_deref() == Some(crate::sessions::REPORT_PAUSED))
+                     && crate::sessions::report_key_parts(message_id, &held.child)
+                         .is_some_and(|(asked, stage)| asked == held.asked && stage == held.stage)
+             }
+@@ -7411,12 +7413,12 @@ impl DocHost {
+         }
+         let same = |h: &HeldReport| h.kind == HeldKind::Report && h.child == child && h.asked == asked && h.stage == stage;
+         let mut dropped = false;
+-        for row in handle.doc.read_queue()?.into_iter().filter(|row| held_report_row(row)) {
++        for row in handle.doc.read_queue()?.into_iter().filter(held_report_row) {
+             let held = held_of(&row);
+-            if !held.iter().any(|h| same(h)) {
++            if !held.iter().any(&same) {
+                 continue;
+             }
+-            let rest: Vec<HeldReport> = held.iter().filter(|h| !same(*h)).cloned().collect();
++            let rest: Vec<HeldReport> = held.iter().filter(|h| !same(h)).cloned().collect();
+             if rest.is_empty() {
+                 handle.doc.take_queued(&row.id)?;
+                 lock(&handle.held_sends).remove(&row.id);
+@@ -7430,6 +7432,7 @@ impl DocHost {
+                 let theirs: Vec<usize> =
+                     reports.iter().enumerate().filter(|(_, r)| r.sender.chat_id == child).map(|(i, _)| i).collect();
+                 let [one] = theirs.as_slice() else {
++                    tracing::debug!(chat = %handle.chat_id, %child, blocks = theirs.len(), "a merged report row holding the child more than once: left as it is");
+                     continue;
+                 };
+                 let kept: Vec<&str> =
+diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
+index fd1d1f439301478a6ecc5084747791a4f3fe605e..78bbf9426dba94d4a110f2649d9ae61a07a4ae99 100644
+--- a/crates/engine/src/session_reports.rs
++++ b/crates/engine/src/session_reports.rs
+@@ -730,10 +730,85 @@ const WATCH_IDLE_MS: i64 = 5 * 60 * 1000;
+ /// A doc that changed is looked at once it has been still this long.
+ const WATCH_SETTLE_MS: u64 = 250;
+ 
+-/// What the watch keeps between looks: by child, the outcome its row says
+-/// its turn settled with (when it finished, on its host's clock) and when
+-/// this host first saw it so (its own clock).
+-type Seen = HashMap<String, (i64, i64)>;
++/// Session rows and chats that changed are looked at once they have been
++/// still this long: the registry changes in bursts.
++const WATCH_DEBOUNCE_MS: u64 = 1_000;
++
++/// How long a child whose host reports by itself (`child-reports`) rests,
++/// its parent's message unanswered, before the watch reports for it: that
++/// host may have ended the turn before it updated, and its own catch-up
++/// ([`owed_on_boot`]) takes a turn from before then for history.
++/// `ZERON_REPORT_UPDATED_GRACE_MS` sets it for tests.
++const UPDATED_GRACE_MS: i64 = 2 * 60 * 1000;
++
++fn updated_grace_ms() -> i64 {
++    std::env::var("ZERON_REPORT_UPDATED_GRACE_MS")
++        .ok()
++        .and_then(|ms| ms.parse().ok())
++        .unwrap_or(UPDATED_GRACE_MS)
++}
++
++/// What a session row says that the watch acts on: its status, when its
++/// last turn finished, the answer that finished last, whether it waits on
++/// background work. Not its stamp: a live row is restamped every while.
++type RowMark = (SessionStatus, Option<i64>, Option<String>, bool);
++
++fn row_mark(row: &Session) -> RowMark {
++    (
++        row.status,
++        row.last_turn_outcome.map(|o| o.finished_at.timestamp_millis()),
++        row.last_completed_turn.clone(),
++        row.waiting.is_some(),
++    )
++}
++
++/// Every row at rest, by chat: a change in one (a turn ending, a new
++/// outcome) is worth a look; a row restamped, or still at work, isn't.
++fn rows_at_rest(rows: &[Session]) -> Vec<(String, RowMark)> {
++    let mut marks: Vec<(String, RowMark)> = rows
++        .iter()
++        .filter(|s| s.status != SessionStatus::Working)
++        .map(|s| (s.chat_id.clone(), row_mark(s)))
++        .collect();
++    marks.sort_by(|a, b| a.0.cmp(&b.0));
++    marks
++}
++
++/// Every chat as the watch tells them apart: its host, its parent, whether
++/// it's archived. Not its title, nor its last message.
++fn chat_marks(chats: &[Chat]) -> Vec<(String, String, Option<String>, bool)> {
++    chats
++        .iter()
++        .map(|c| (c.id.clone(), c.device_id.clone(), c.parent_chat_id.clone(), c.archived))
++        .collect()
++}
++
++/// What the watch keeps of a child between looks. In memory only: a
++/// restart starts each wait again, the 10 minutes before an [`UNSYNCED`]
++/// report too.
++#[derive(Default)]
++struct Kept {
++    /// When the turn its row says settled finished (its host's clock), and
++    /// when this host first saw it so (its own): the wait for [`UNSYNCED`].
++    settled: Option<(i64, i64)>,
++    /// Its row as this host first saw it at rest, and when: the grace for a
++    /// child whose host reports by itself.
++    rested: Option<(RowMark, i64)>,
++    /// What the last look at it saw: its row, its doc's change count (while
++    /// waited on), its parent's ledger's length. All unchanged and nothing
++    /// due, a look passes it by.
++    seen: Option<(RowMark, Option<u64>, usize)>,
++    /// Its doc, while its parent's request is open, and when it's next due.
++    waiting: Option<Arc<ChatDocHandle>>,
++    due: Option<i64>,
++}
++
++type Seen = HashMap<String, Kept>;
++
++/// The earlier of two moments, either maybe none.
++fn earliest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
++    a.into_iter().chain(b).min()
++}
+ 
+ /// What one look found: the docs of children whose end hasn't synced here
+ /// yet, looked at again as they change, and when a status-only report next
+@@ -751,22 +826,29 @@ struct Look {
+ /// the child's registry row says its turn settled and its doc, synced here,
+ /// shows that very turn ([`reconcile`]). A child whose host reports too
+ /// (it updated meanwhile) is no harm: both check the ledger first, and the
+-/// parent's host files a key once.
++/// parent's host files a key once. A child whose host does report by
++/// itself is reported for too, once it has rested past a grace with its
++/// parent's message unanswered ([`UPDATED_GRACE_MS`]): its host may have
++/// ended that turn before it updated.
++///
++/// It looks at every such child on start, a second after the registry's
++/// session rows at rest or its chats change, when a device's capabilities
++/// change or it comes back, as a doc it waits on changes, and every while.
++/// As long as its engine runs. What it keeps between looks is in memory
++/// ([`Kept`]): a restart starts its waits again.
+ ///
+-/// It looks at every such child on start, whenever the registry's session
+-/// rows or chats change, when a device's capabilities change or it comes
+-/// back, as a doc it waits on changes, and every while. As long as its
+-/// engine runs.
++/// An [`UNSYNCED`] report on a group member is no end: it isn't held for
++/// the group, and wakes the parent on its own.
+ pub(super) async fn watch_children(inner: Weak<super::Inner>, ws: WorkspaceHost) {
+     let mut rows = ws.watch_session_rows();
+     let mut chats = ws.watch_chats();
+     let mut devices = ws.watch_devices();
+     let mut known = device_marks(&devices.borrow_and_update());
++    let mut resting = rows_at_rest(&rows.borrow_and_update());
++    let mut chats_known = chat_marks(&chats.borrow_and_update());
+     let mut seen = Seen::new();
+     let mut retry = WATCH_RETRY_MS.0;
+     loop {
+-        let _ = rows.borrow_and_update();
+-        let _ = chats.borrow_and_update();
+         let look = {
+             let Some(inner) = inner.upgrade() else {
+                 return;
+@@ -783,21 +865,33 @@ pub(super) async fn watch_children(inner: Weak<super::Inner>, ws: WorkspaceHost)
+         let deadline =
+             tokio::time::Instant::now() + std::time::Duration::from_millis(u64::try_from(next - now).unwrap_or(0));
+         let mut docs: Vec<watch::Receiver<u64>> = look.waiting.iter().map(|handle| handle.changes()).collect();
++        // The registry changed: wait for the rest of its burst.
++        let mut debounce = false;
+         loop {
+             tokio::select! {
+                 changed = rows.changed() => {
+                     if changed.is_err() {
+                         return;
+                     }
+-                    retry = WATCH_RETRY_MS.0;
+-                    break;
++                    let now_resting = rows_at_rest(&rows.borrow_and_update());
++                    if now_resting != resting {
++                        resting = now_resting;
++                        debounce = true;
++                        retry = WATCH_RETRY_MS.0;
++                        break;
++                    }
+                 }
+                 changed = chats.changed() => {
+                     if changed.is_err() {
+                         return;
+                     }
+-                    retry = WATCH_RETRY_MS.0;
+-                    break;
++                    let now_known = chat_marks(&chats.borrow_and_update());
++                    if now_known != chats_known {
++                        chats_known = now_known;
++                        debounce = true;
++                        retry = WATCH_RETRY_MS.0;
++                        break;
++                    }
+                 }
+                 changed = devices.changed() => {
+                     if changed.is_err() {
+@@ -820,6 +914,11 @@ pub(super) async fn watch_children(inner: Weak<super::Inner>, ws: WorkspaceHost)
+                 }
+             }
+         }
++        if debounce {
++            tokio::time::sleep(std::time::Duration::from_millis(WATCH_DEBOUNCE_MS)).await;
++            resting = rows_at_rest(&rows.borrow_and_update());
++            chats_known = chat_marks(&chats.borrow_and_update());
++        }
+     }
+ }
+ 
+@@ -850,10 +949,11 @@ fn online(device: &Device, now: chrono::DateTime<Utc>) -> bool {
+ }
+ 
+ /// One look at every child this host watches for ([`watch_children`]): a
+-/// child of a parent chat hosted here, itself hosted on a device that
+-/// doesn't report by itself (no `child-reports` on its row, or no row),
++/// child of a parent chat hosted here, itself hosted on another device,
+ /// whose session row moved since `floor` (when the watch came to this
+-/// host, less a margin: older work is history).
++/// host, less a margin: older work is history) and is at rest. One whose
++/// device reports by itself only past its grace ([`UPDATED_GRACE_MS`]); one
++/// with nothing new since the last look at it, not at all.
+ async fn look(host: &DocHost, journal: &Arc<RunJournal>, reported: &Arc<Reported>, floor: i64, seen: &mut Seen) -> Look {
+     let mut look = Look::default();
+     let Some(ws) = host.workspace() else {
+@@ -865,36 +965,78 @@ async fn look(host: &DocHost, journal: &Arc<RunJournal>, reported: &Arc<Reported
+     let here = |id: &str| chats.iter().any(|c| c.id == id && c.device_id == host.device_id());
+     let children: Vec<&Chat> = chats
+         .iter()
+-        .filter(|c| {
+-            !c.archived && c.parent_chat_id.as_deref().is_some_and(|parent| here(parent)) && watched(c, &devices, host.device_id())
+-        })
++        .filter(|c| !c.archived && c.device_id != host.device_id() && c.parent_chat_id.as_deref().is_some_and(&here))
+         .collect();
+     seen.retain(|id, _| children.iter().any(|c| &c.id == id));
+     let now = now_ms();
++    let mut ledgers: HashMap<&str, usize> = HashMap::new();
+     for child in children {
+         let Some(parent) = child.parent_chat_id.as_deref() else {
+             continue;
+         };
+-        let Some(row) = last_row_of(child, &rows).filter(|row| row.updated_at.timestamp_millis() >= floor) else {
++        // Still at work (or waiting on its background work): its end isn't
++        // in, and its doc needn't be read.
++        let Some(row) = last_row_of(child, &rows).filter(|row| {
++            row.updated_at.timestamp_millis() >= floor && row.status != SessionStatus::Working && row.waiting.is_none()
++        }) else {
++            seen.remove(&child.id);
+             continue;
+         };
+-        if let Some((handle, due)) = reconcile(host, journal, reported, child, parent, row, floor, now, seen).await {
+-            look.waiting.push(handle);
+-            look.due = due.into_iter().chain(look.due).min();
++        let kept = seen.entry(child.id.clone()).or_default();
++        let mark = row_mark(row);
++        if !watched(child, &devices, host.device_id()) {
++            let since = match &kept.rested {
++                Some((was, since)) if *was == mark => *since,
++                _ => now,
++            };
++            if since == now {
++                kept.rested = Some((mark.clone(), now));
++            }
++            let due = since + updated_grace_ms();
++            if now < due {
++                look.due = earliest(look.due, Some(due));
++                continue;
++            }
++        }
++        let ledger = *ledgers.entry(parent).or_insert_with(|| ledger_len(host, parent));
++        let changes = kept.waiting.as_ref().map(|handle| *handle.changes().borrow());
++        let marks = (mark, changes, ledger);
++        if kept.seen.as_ref() == Some(&marks) && kept.due.is_none_or(|due| now < due) {
++            look.waiting.extend(kept.waiting.clone());
++            look.due = earliest(look.due, kept.due);
++            continue;
+         }
++        let found = reconcile(host, journal, reported, child, parent, row, floor, now, &mut kept.settled).await;
++        (kept.waiting, kept.due) = match found {
++            Some((handle, due)) => (Some(handle), due),
++            None => (None, None),
++        };
++        kept.seen = Some(marks);
++        look.waiting.extend(kept.waiting.clone());
++        look.due = earliest(look.due, kept.due);
+     }
+     look
+ }
+ 
++/// How many commands `parent`'s ledger holds: grown, a report may be in.
++fn ledger_len(host: &DocHost, parent: &str) -> usize {
++    host.open(parent)
++        .ok()
++        .and_then(|doc| doc.doc().read_commands().ok())
++        .map_or(0, |commands| commands.len())
++}
++
+ /// Bring the parent's ledger up to `child`'s settled turn, as its own host
+ /// would have (see [`watch_children`]). Its row (`row`, from its device)
+ /// says how the turn ended; its doc, synced here, must show that very turn
+ /// before anything goes, never a body from a doc half in:
+-/// - finished: the answer its row names (`last_completed_turn`) is there,
+-///   after the parent's message;
++/// - finished: the answer its row names (`last_completed_turn`) is its last
++///   after the parent's message, complete, ended within [`FAILED_WITHIN_MS`]
++///   of the turn (a later answer there: the row has yet to catch up);
+ /// - failed or stopped: its last answer after the parent's message, cut off
+ ///   or ending on an error (or a Stop after it), ended within
+-///   [`FAILED_WITHIN_MS`] before its row's outcome did;
++///   [`FAILED_WITHIN_MS`] before its row's outcome did, by its length (none:
++///   no evidence);
+ /// - asking: its question is there, unanswered.
+ ///
+ /// Then the report goes as its host's settle would send it
+@@ -905,8 +1047,9 @@ async fn look(host: &DocHost, journal: &Arc<RunJournal>, reported: &Arc<Reported
+ /// status alone ([`file_unsynced`]); not this request's, nothing (the
+ /// parent's notes say its status is unconfirmed, [`roster`]).
+ ///
+-/// Only a request still open keeps the child's doc syncing here. `Some`:
+-/// the doc, still waited on, and when its status-only report falls due.
++/// Only a request still open keeps the child's doc syncing here (a child
++/// asking keeps it too, for its next question). `Some`: the doc, still
++/// waited on, and when its status-only report falls due.
+ #[allow(clippy::too_many_arguments)]
+ async fn reconcile(
+     host: &DocHost,
+@@ -917,11 +1060,11 @@ async fn reconcile(
+     row: &Session,
+     floor: i64,
+     now: i64,
+-    seen: &mut Seen,
++    settled: &mut Option<(i64, i64)>,
+ ) -> Option<(Arc<ChatDocHandle>, Option<i64>)> {
+     // Still at it (or waiting on its background work): its end isn't in.
+     if row.status == SessionStatus::Working || row.waiting.is_some() {
+-        seen.remove(&child.id);
++        *settled = None;
+         return None;
+     }
+     let handle = host.open_local(&child.id).ok()?;
+@@ -940,12 +1083,12 @@ async fn reconcile(
+     // A message of the parent's on its way (this copy of the doc may lag
+     // its host's): what the row says is no answer to it yet.
+     if on_its_way(host, &commands, &entries, parent, &child.id, None) {
+-        seen.remove(&child.id);
++        *settled = None;
+         host.activate_sync(&handle);
+         return Some((handle, None));
+     }
+     let Some(at) = open else {
+-        seen.remove(&child.id);
++        *settled = None;
+         return None;
+     };
+     host.activate_sync(&handle);
+@@ -954,13 +1097,15 @@ async fn reconcile(
+     let report = |status: ReportStatus, stop: Option<TurnStop>, settled_at: i64| {
+         report_turn_end(host.clone(), journal.clone(), reported.clone(), child.id.clone(), status, stop, settled_at)
+     };
++    // Its question: reported once (its key in the ledger), and its doc kept
++    // in sight while the request is open, for the next one, which a row
++    // still asking can't tell apart.
+     if row.status == SessionStatus::AwaitingInput {
+-        seen.remove(&child.id);
+-        if open_question(after).is_none() {
+-            return Some((handle, None));
++        *settled = None;
++        if open_question(after).is_some() {
++            report(ReportStatus::NeedsInput, None, row.updated_at.timestamp_millis()).await;
+         }
+-        report(ReportStatus::NeedsInput, None, row.updated_at.timestamp_millis()).await;
+-        return None;
++        return Some((handle, None));
+     }
+     // Nothing durable says how it ended (a peer older still).
+     let outcome = row.last_turn_outcome.as_ref()?;
+@@ -971,24 +1116,36 @@ async fn reconcile(
+     let whole = !after.iter().any(|e| e.status == Some(MessageStatus::Streaming));
+     let evidence = whole
+         && match outcome.status {
++            // The answer its row names (or the last of its continuations)
++            // is its last after the parent's message: one after it is a
++            // later turn's, in ahead of the row, and its body no evidence of
++            // this one. It ended no earlier than [`FAILED_WITHIN_MS`] before
++            // the turn did (its length is stamped in the commit that makes
++            // it complete, after its last words). No bound after: a Cloud
++            // machine's first answer counts its length from the send.
+             DoneStatus::Completed => row.last_completed_turn.as_deref().is_some_and(|id| {
+                 after
+                     .iter()
+-                    .any(|e| e.role == MessageRole::Assistant && (e.id == id || e.continuation_of.as_deref() == Some(id)))
++                    .rposition(|e| e.role == MessageRole::Assistant && (e.id == id || e.continuation_of.as_deref() == Some(id)))
++                    .is_some_and(|at| {
++                        let named = &after[at];
++                        !after[at + 1..].iter().any(|e| e.role == MessageRole::Assistant)
++                            && named.duration_ms.is_some_and(|ms| named.created_at + ms >= finished - FAILED_WITHIN_MS)
++                    })
+             }),
+             // (A Stop ending a wait leaves its answer whole: the Stop in the
+-            // doc says it instead. An answer with no length ended by its row.)
++            // doc says it instead. An answer with no length says nothing of
++            // when it ended: no evidence.)
+             DoneStatus::Interrupted | DoneStatus::Errored => last.is_some_and(|e| {
+-                let ended = match e.duration_ms {
+-                    Some(ms) => (finished - FAILED_WITHIN_MS..=finished).contains(&(e.created_at + ms)),
+-                    None => e.created_at <= finished,
+-                };
++                let ended = e
++                    .duration_ms
++                    .is_some_and(|ms| (finished - FAILED_WITHIN_MS..=finished).contains(&(e.created_at + ms)));
+                 let stopped = outcome.status == DoneStatus::Interrupted && stop_after(&commands, &asked.id).is_some();
+                 ended && (cut_off || ends_on_error(after) || stopped)
+             }),
+         };
+     if evidence {
+-        seen.remove(&child.id);
++        *settled = None;
+         // As the next start would read it ([`owed_on_boot`]).
+         let stop = if interrupted || cut_off || persons_stop_filed(host, parent, &child.id, &asked.id) {
+             stop_after(&commands, &asked.id).map(TurnStop::Command)
+@@ -1005,10 +1162,10 @@ async fn reconcile(
+         report(status, stop, finished).await;
+         return None;
+     }
+-    let first = match seen.get(&child.id) {
+-        Some(&(was, first)) if was == finished => first,
++    let first = match *settled {
++        Some((was, first)) if was == finished => first,
+         _ => {
+-            seen.insert(child.id.clone(), (finished, now));
++            *settled = Some((finished, now));
+             now
+         }
+     };
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 26d2fd5ae4b0258ad06968018957bd234c0ee288..ea86638f6abe4fa7758763ea6da948498ea89a92 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -7686,6 +7686,7 @@ mod tests {
+         unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
+         unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
+         unsafe { std::env::set_var("ZERON_REPORT_UNSYNCED_MS", "3000") };
++        unsafe { std::env::set_var("ZERON_REPORT_UPDATED_GRACE_MS", "3000") };
+         let harness = Arc::new(ChatsHarness::default());
+         let registry = HarnessRegistry::new();
+         registry.register(harness.clone());
+@@ -9069,6 +9070,36 @@ mod tests {
+             self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
+         }
+ 
++        /// `kid-r`'s answer `id`, written `ago` ms ago and synced here,
++        /// stopped on its question `request`, unanswered.
++        fn remote_asks(&self, id: &str, request: &str, question: &str, ago: i64) {
++            let entry = zeron_doc::SessionMessageEntry {
++                id: id.into(),
++                role: zeron_doc::MessageRole::Assistant,
++                parts: vec![zeron_doc::MessagePart::Input {
++                    id: format!("i-{request}"),
++                    request_id: request.into(),
++                    questions: vec![zeron_proto::UserInputQuestion {
++                        id: "q".into(),
++                        header: "Q".into(),
++                        question: question.into(),
++                        options: Vec::new(),
++                        multi_select: false,
++                        prefill: None,
++                        multiline: false,
++                    }],
++                    resolved: false,
++                    answers: None,
++                }],
++                created_at: now_ms() - ago,
++                device_id: "laptop".into(),
++                status: Some(zeron_doc::MessageStatus::Streaming),
++                continuation_of: None,
++                duration_ms: None,
++            };
++            self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
++        }
++
+         /// `kid-r`'s registry row from the laptop: `status`, its last turn
+         /// having ended `outcome` `ago` ms ago, its last finished answer
+         /// `completed`.
+@@ -9224,6 +9255,78 @@ mod tests {
+         rig.core.sessions.shutdown().await;
+     }
+ 
++    /// A watched child's doc is in ahead of its row: the answer its row
++    /// names isn't its last there, a later turn's is. Nothing ends until the
++    /// row catches up, and then the end is the later answer, never the
++    /// later answer passed off as the earlier turn's.
++    #[tokio::test]
++    async fn a_watched_child_whose_doc_is_ahead_of_its_row_waits_for_the_row() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 4_000);
++        rig.remote_says("r-a1", Assistant, "LGTM.", 3_500);
++        rig.remote_says("p-1", User, "Lint it too.", 3_000);
++        rig.remote_says("r-a2", Assistant, "Linted.", 2_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 3_000)), Some("r-a1"));
++        rig.core.sessions.watch_children();
++        rig.quiet().await;
++        assert!(!rig.filed_remote().iter().any(|key| key.contains("-end")), "{:?}", rig.filed_remote());
++
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 1_500)), Some("r-a2"));
++        rig.until("the lead hears its end", |r| r.heard_remote().iter().any(|(_, body)| body == "Linted.")).await;
++        rig.quiet().await;
++        let heard = rig.heard_remote();
++        assert!(!heard.iter().any(|(_, body)| body.contains("LGTM")), "{heard:?}");
++        assert_eq!(rig.filed_remote().iter().filter(|key| key.contains("-end")).count(), 1, "{:?}", rig.filed_remote());
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A watched child asks, and asks again, its row asking all along: the
++    /// lead's host keeps its doc in sight and the lead hears both.
++    #[tokio::test]
++    async fn a_watched_child_asking_again_is_heard_again() {
++        use zeron_doc::MessageRole::User;
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        rig.remote_says("r-m1", User, &from_lead("Ship it."), 3_000);
++        rig.remote_asks("r-a1", "q1", "Which branch?", 2_000);
++        rig.remote_row(SessionStatus::AwaitingInput, None, None);
++        rig.core.sessions.watch_children();
++        rig.until("the lead hears its question", |r| !r.heard_remote().is_empty()).await;
++
++        rig.remote_asks("r-a2", "q2", "Tag it too?", 1_000);
++        rig.until("and its next one", |r| r.heard_remote().len() == 2).await;
++        let heard = rig.heard_remote();
++        assert!(heard.iter().all(|(status, _)| *status == ReportStatus::NeedsInput), "{heard:?}");
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-ask-q1", "report-kid-r-r-m1-ask-q2"]);
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A child whose host reports by itself now, but ended its turn before
++    /// it updated, so its catch-up took that turn for history: past the
++    /// grace, the lead's host files its end, once.
++    #[tokio::test]
++    async fn a_child_whose_host_updated_after_its_turn_is_reported_for_past_the_grace() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[zeron_proto::capabilities::CHILD_REPORTS]).await;
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 3_000);
++        rig.remote_says("r-a1", Assistant, "LGTM.", 2_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 1_000)), Some("r-a1"));
++        rig.core.sessions.watch_children();
++        // Its host has the grace first (3 s here).
++        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
++        assert!(rig.filed_remote().is_empty(), "{:?}", rig.filed_remote());
++
++        rig.until("the lead hears it", |r| !r.heard_remote().is_empty()).await;
++        assert_eq!(rig.heard_remote(), [(ReportStatus::Finished, "LGTM.".to_owned())]);
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-end"]);
++        rig.quiet().await;
++        assert_eq!(rig.heard_remote().len(), 1, "once");
++        rig.core.sessions.shutdown().await;
++    }
++
+     impl FamilyRig {
+         /// The person stops `chat` (no agent's Stop).
+         fn person_stops(&self, chat: &str) {
+-- 
+2.55.0.windows.2
+
+
+From ff5a0befec0c4c484eaf447b3fc8bce22f8c5d89 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 16 Nov 2026 17:51:08 +0700
+Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
+ and leaves a host down mid-turn to report itself
+
+---
+ crates/engine/src/session_reports.rs | 149 ++++++++++++++++++++++-----
+ crates/engine/src/sessions.rs        | 104 ++++++++++++++++++-
+ 2 files changed, 224 insertions(+), 29 deletions(-)
+
+diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
+index 78bbf9426dba94d4a110f2649d9ae61a07a4ae99..0870898c5bba6aae44602a477cd28c919ac1c340 100644
+--- a/crates/engine/src/session_reports.rs
++++ b/crates/engine/src/session_reports.rs
+@@ -297,22 +297,41 @@ pub(super) async fn report_turn_end(
+     stop: Option<TurnStop>,
+     settled_at: i64,
+ ) {
++    report_checked_turn_end(host, journal, reported, child, status, stop, settled_at, None).await;
++}
++
++/// [`report_turn_end`], for the turn the parent's watch read in `child`'s
++/// doc ([`reconcile`]): `expect`, the parent's message it answers and the
++/// entry that answers it ([`answering`]). The doc read again here has moved
++/// on from that turn (the parent's next message in, a later answer): `false`,
++/// nothing filed, for the watch to look again.
++#[allow(clippy::too_many_arguments)]
++pub(super) async fn report_checked_turn_end(
++    host: DocHost,
++    journal: Arc<RunJournal>,
++    reported: Arc<Reported>,
++    child: String,
++    status: ReportStatus,
++    stop: Option<TurnStop>,
++    settled_at: i64,
++    expect: Option<(String, String)>,
++) -> bool {
+     let Some(ws) = host.workspace().cloned() else {
+-        return;
++        return true;
+     };
+     let Ok(Some(row)) = ws.chat(&child) else {
+-        return;
++        return true;
+     };
+     let Some(parent) = row.parent_chat_id.clone() else {
+-        return;
++        return true;
+     };
+     // An archived parent still hears (its host holds the report until it's
+     // restored); a deleted one doesn't.
+     if ws.chat(&parent).ok().flatten().is_none() {
+-        return;
++        return true;
+     }
+     let Ok(handle) = host.open(&child) else {
+-        return;
++        return true;
+     };
+     // A stop that hands the turn to a message already on its way (the
+     // person's "send now") is no end: that message's turn reports.
+@@ -320,7 +339,7 @@ pub(super) async fn report_turn_end(
+         && (stop.is_some() || status == ReportStatus::Stopped)
+         && handle.continues_with_sent_message()
+     {
+-        return;
++        return true;
+     }
+     // A question is folded into the doc on the stream's next commit, a
+     // moment after the status that says it was asked.
+@@ -347,29 +366,45 @@ pub(super) async fn report_turn_end(
+         settled_at,
+         background,
+     };
+-    let (at, status, stage, follow_up) = match classify_settled_turn(&host, &child, &parent, &turn) {
++    let verdict = classify_settled_turn(&host, &child, &parent, &turn);
++    // The turn the watch checked, or none of it: what it read, synced on
++    // since, is another turn's to report.
++    let moved_on = expect.as_ref().is_some_and(|(asked, answer)| {
++        let (at, asking) = match &verdict {
++            Verdict::Report { at, status, .. } => (*at, *status == ReportStatus::NeedsInput),
++            Verdict::Quiet { at } => (*at, false),
++            Verdict::Skip(_) => return false,
++        };
++        entries[at].id != *asked
++            || answering(answer_to(&entries, at, &parent), asking).is_none_or(|e| e.id != *answer)
++    });
++    if moved_on {
++        tracing::info!(chat = %child, %parent, "its doc moved on from the turn the watch read: no report yet");
++        return false;
++    }
++    let (at, status, stage, follow_up) = match verdict {
+         Verdict::Report { at, status, stage, follow_up } => (at, status, stage, follow_up),
+         Verdict::Quiet { at } => {
+             file_persons_stop(&host, &reported, &row, &parent, &entries[at]);
+-            return;
++            return true;
+         }
+         Verdict::Skip(why) => {
+             tracing::info!(chat = %child, %parent, why, "no report");
+-            return;
++            return true;
+         }
+     };
+     let asked = entries[at].id.clone();
+     let after = answer_to(&entries, at, &parent);
+     if follow_up && reply_body(after, status).is_empty() {
+-        return; // woke, and had nothing to say
++        return true; // woke, and had nothing to say
+     }
+     // The parent has it already (this engine, or another before a restart,
+     // sent it): its ledger keeps every report by its key.
+     if delivered(&host, &parent, &child, &entries[at], &stage) {
+-        return;
++        return true;
+     }
+     if !reported.claim(&child, &asked, &stage) {
+-        return;
++        return true;
+     }
+     let chats = ws.read_chats().unwrap_or_default();
+     let keys: Vec<(&str, Option<&str>)> =
+@@ -525,6 +560,31 @@ pub(super) async fn report_turn_end(
+     if queue_report(&host, &reported, &child, &parent, &asked, &stage, key, &text) {
+         tracing::info!(chat = %child, %parent, status = status.as_str(), "child reported to its parent");
+     }
++    true
++}
++
++/// The entry that ends the answer `after` holds, as a report reads it: the
++/// one with its open question (`asking`), or its last.
++fn answering(after: &[SessionMessageEntry], asking: bool) -> Option<&SessionMessageEntry> {
++    after.iter().rev().find(|e| {
++        e.role == MessageRole::Assistant
++            && (!asking || e.parts.iter().any(|p| matches!(p, MessagePart::Input { resolved: false, .. })))
++    })
++}
++
++/// `after` ends on an answer the engine's own shutdown cut off (its error
++/// part says [`super::SHUTDOWN_NOTE`]): no end. Its host revives that turn
++/// as it starts again, and that turn's end is the answer; not revived, the
++/// next start reports it failed, on a host that reports by itself.
++fn cut_by_shutdown(after: &[SessionMessageEntry]) -> bool {
++    after
++        .iter()
++        .rev()
++        .find(|e| e.role == MessageRole::Assistant)
++        .and_then(|e| e.parts.iter().rev().find(|p| !matches!(p, MessagePart::Reasoning { .. })))
++        .is_some_and(|p| {
++            matches!(p, MessagePart::Error { message, .. } if message.as_str() == super::SHUTDOWN_NOTE)
++        })
+ }
+ 
+ /// File the person's Stop on `child`'s turn in its parent's ledger, keyed
+@@ -791,8 +851,8 @@ struct Kept {
+     /// When the turn its row says settled finished (its host's clock), and
+     /// when this host first saw it so (its own): the wait for [`UNSYNCED`].
+     settled: Option<(i64, i64)>,
+-    /// Its row as this host first saw it at rest, and when: the grace for a
+-    /// child whose host reports by itself.
++    /// Its row as this host first saw it at rest, its device online, and
++    /// when: the grace for a child whose host reports by itself.
+     rested: Option<(RowMark, i64)>,
+     /// What the last look at it saw: its row, its doc's change count (while
+     /// waited on), its parent's ledger's length. All unchanged and nothing
+@@ -829,7 +889,8 @@ struct Look {
+ /// parent's host files a key once. A child whose host does report by
+ /// itself is reported for too, once it has rested past a grace with its
+ /// parent's message unanswered ([`UPDATED_GRACE_MS`]): its host may have
+-/// ended that turn before it updated.
++/// ended that turn before it updated. The grace counts only while its
++/// device is online: one down may be mid-update, and revive its turn.
+ ///
+ /// It looks at every such child on start, a second after the registry's
+ /// session rows at rest or its chats change, when a device's capabilities
+@@ -959,9 +1020,12 @@ async fn look(host: &DocHost, journal: &Arc<RunJournal>, reported: &Arc<Reported
+     let Some(ws) = host.workspace() else {
+         return look;
+     };
+-    let (Ok(chats), Ok(devices), Ok(rows)) = (ws.read_chats(), ws.read_devices(), ws.read_sessions()) else {
++    let (Ok(chats), Ok(rows)) = (ws.read_chats(), ws.read_sessions()) else {
+         return look;
+     };
++    // As published, with presence on: a row's own `lastSeenAt` is stamped
++    // only as its engine starts or stops.
++    let devices: Vec<Device> = ws.watch_devices().borrow().to_vec();
+     let here = |id: &str| chats.iter().any(|c| c.id == id && c.device_id == host.device_id());
+     let children: Vec<&Chat> = chats
+         .iter()
+@@ -985,6 +1049,14 @@ async fn look(host: &DocHost, journal: &Arc<RunJournal>, reported: &Arc<Reported
+         let kept = seen.entry(child.id.clone()).or_default();
+         let mark = row_mark(row);
+         if !watched(child, &devices, host.device_id()) {
++            // Its device down (an update, a reboot, maybe mid-turn: it
++            // revives that turn as it starts), the grace waits for it back,
++            // and starts over then.
++            let now_at = Utc::now();
++            if !devices.iter().any(|d| d.id == child.device_id && online(d, now_at)) {
++                kept.rested = None;
++                continue;
++            }
+             let since = match &kept.rested {
+                 Some((was, since)) if *was == mark => *since,
+                 _ => now,
+@@ -1036,12 +1108,14 @@ fn ledger_len(host: &DocHost, parent: &str) -> usize {
+ /// - failed or stopped: its last answer after the parent's message, cut off
+ ///   or ending on an error (or a Stop after it), ended within
+ ///   [`FAILED_WITHIN_MS`] before its row's outcome did, by its length (none:
+-///   no evidence);
++///   no evidence), and not by its engine's shutdown (its host revives that
++///   turn: [`cut_by_shutdown`]);
+ /// - asking: its question is there, unanswered.
+ ///
+-/// Then the report goes as its host's settle would send it
+-/// ([`report_turn_end`]). Short of that, the doc is looked at again as it
+-/// changes. Once the row has said so for [`unsynced_after_ms`], and it's
++/// Then the report goes as its host's settle would send it, built from the
++/// doc as read then, and only while that still shows the same turn
++/// ([`report_checked_turn_end`]). Short of that, the doc is looked at again
++/// as it changes. Once the row has said so for [`unsynced_after_ms`], and it's
+ /// this request's (its turn finished after the parent's message, both on
+ /// the child's clock, and nothing newer is on its way), the parent hears its
+ /// status alone ([`file_unsynced`]); not this request's, nothing (the
+@@ -1094,16 +1168,30 @@ async fn reconcile(
+     host.activate_sync(&handle);
+     let asked = &entries[at];
+     let after = answer_to(&entries, at, parent);
+-    let report = |status: ReportStatus, stop: Option<TurnStop>, settled_at: i64| {
+-        report_turn_end(host.clone(), journal.clone(), reported.clone(), child.id.clone(), status, stop, settled_at)
++    // Built from the doc as read now, and filed only while it still shows
++    // this turn (`answer`, the entry that answers): one synced on since is
++    // looked at again.
++    let report = |status: ReportStatus, stop: Option<TurnStop>, settled_at: i64, answer: &SessionMessageEntry| {
++        report_checked_turn_end(
++            host.clone(),
++            journal.clone(),
++            reported.clone(),
++            child.id.clone(),
++            status,
++            stop,
++            settled_at,
++            Some((asked.id.clone(), answer.id.clone())),
++        )
+     };
+     // Its question: reported once (its key in the ledger), and its doc kept
+     // in sight while the request is open, for the next one, which a row
+     // still asking can't tell apart.
+     if row.status == SessionStatus::AwaitingInput {
+         *settled = None;
+-        if open_question(after).is_some() {
+-            report(ReportStatus::NeedsInput, None, row.updated_at.timestamp_millis()).await;
++        if open_question(after).is_some()
++            && let Some(question) = answering(after, true)
++        {
++            report(ReportStatus::NeedsInput, None, row.updated_at.timestamp_millis(), question).await;
+         }
+         return Some((handle, None));
+     }
+@@ -1135,16 +1223,19 @@ async fn reconcile(
+             }),
+             // (A Stop ending a wait leaves its answer whole: the Stop in the
+             // doc says it instead. An answer with no length says nothing of
+-            // when it ended: no evidence.)
++            // when it ended: no evidence. Nor does one its engine's shutdown
++            // cut off: its host revives that turn.)
+             DoneStatus::Interrupted | DoneStatus::Errored => last.is_some_and(|e| {
+                 let ended = e
+                     .duration_ms
+                     .is_some_and(|ms| (finished - FAILED_WITHIN_MS..=finished).contains(&(e.created_at + ms)));
+                 let stopped = outcome.status == DoneStatus::Interrupted && stop_after(&commands, &asked.id).is_some();
+-                ended && (cut_off || ends_on_error(after) || stopped)
++                ended && !cut_by_shutdown(after) && (cut_off || ends_on_error(after) || stopped)
+             }),
+         };
+-    if evidence {
++    if evidence
++        && let Some(answer) = answering(after, open_question(after).is_some())
++    {
+         *settled = None;
+         // As the next start would read it ([`owed_on_boot`]).
+         let stop = if interrupted || cut_off || persons_stop_filed(host, parent, &child.id, &asked.id) {
+@@ -1159,7 +1250,9 @@ async fn reconcile(
+         } else {
+             ReportStatus::Finished
+         };
+-        report(status, stop, finished).await;
++        if !report(status, stop, finished, answer).await {
++            return Some((handle, None));
++        }
+         return None;
+     }
+     let first = match *settled {
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index ea86638f6abe4fa7758763ea6da948498ea89a92..298c4219ebdee13510496860b0c87058768cb479 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -9042,11 +9042,17 @@ mod tests {
+ 
+         /// The laptop's device row, its Zeron having `caps`, online.
+         fn laptop(&self, caps: &[&str]) {
++            self.laptop_seen(caps, 0);
++        }
++
++        /// The laptop's device row, its Zeron having `caps`, last heard
++        /// from `ago` ms ago (past 70 s: offline).
++        fn laptop_seen(&self, caps: &[&str], ago: i64) {
+             self.core.workspace.upsert_device_row(&zeron_proto::Device {
+                 id: "laptop".into(),
+                 name: "Laptop".into(),
+                 platform: "macos".into(),
+-                last_seen_at: Some(chrono::Utc::now()),
++                last_seen_at: Some(chrono::Utc::now() - chrono::Duration::milliseconds(ago)),
+                 created_at: None,
+                 version: None,
+                 cursor_sdk_version: None,
+@@ -9100,6 +9106,25 @@ mod tests {
+             self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
+         }
+ 
++        /// `kid-r`'s answer `id`, written `ago` ms ago and synced here, cut
++        /// off by its engine's shutdown, as its host writes one.
++        fn remote_cut(&self, id: &str, text: &str, ago: i64) {
++            let entry = zeron_doc::SessionMessageEntry {
++                id: id.into(),
++                role: zeron_doc::MessageRole::Assistant,
++                parts: vec![
++                    zeron_doc::MessagePart::Text { id: format!("{id}-t"), text: text.into() },
++                    zeron_doc::MessagePart::Error { id: format!("{id}-e"), message: SHUTDOWN_NOTE.into() },
++                ],
++                created_at: now_ms() - ago,
++                device_id: "laptop".into(),
++                status: Some(zeron_doc::MessageStatus::Aborted),
++                continuation_of: None,
++                duration_ms: Some(100),
++            };
++            self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
++        }
++
+         /// `kid-r`'s registry row from the laptop: `status`, its last turn
+         /// having ended `outcome` `ago` ms ago, its last finished answer
+         /// `completed`.
+@@ -9327,6 +9352,83 @@ mod tests {
+         rig.core.sessions.shutdown().await;
+     }
+ 
++    /// The watch read a watched child's doc for one turn, and it synced on
++    /// before the report was built: a later answer, then the lead's next
++    /// message. Nothing goes for the turn it read; the doc still showing
++    /// it, it goes.
++    #[tokio::test]
++    async fn a_watched_childs_report_from_a_doc_moved_on_files_nothing() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&[]).await;
++        let report = |asked: &str, answer: &str| {
++            reports::report_checked_turn_end(
++                rig.core.doc_host.clone(),
++                rig.core.sessions.inner.journal.clone(),
++                rig.core.sessions.inner.reported.clone(),
++                "kid-r".into(),
++                ReportStatus::Finished,
++                None,
++                now_ms(),
++                Some((asked.to_owned(), answer.to_owned())),
++            )
++        };
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 4_000);
++        rig.remote_says("r-a1", Assistant, "LGTM.", 3_000);
++        // In since the watch read `r-a1`: a later answer.
++        rig.remote_says("r-a2", Assistant, "Also, a typo.", 2_000);
++        assert!(!report("r-m1", "r-a1").await);
++        rig.quiet().await;
++        assert!(rig.filed_remote().is_empty(), "{:?}", rig.filed_remote());
++
++        assert!(report("r-m1", "r-a2").await);
++        rig.until("it's filed", |r| !r.filed_remote().is_empty()).await;
++
++        // In since: the lead's next message, its turn not ended.
++        rig.remote_says("r-m2", User, &from_lead("And the tests?"), 1_000);
++        assert!(!report("r-m1", "r-a2").await);
++        rig.quiet().await;
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-end"]);
++        rig.core.sessions.shutdown().await;
++    }
++
++    /// A child whose host reports by itself goes down mid-turn (an update):
++    /// its engine's shutdown cut the turn off, and its device stays away
++    /// past the grace. The lead's host files nothing, nor once it's back
++    /// with the turn still cut off. Its host revives the turn, and its own
++    /// report is the one end.
++    #[tokio::test]
++    async fn a_child_whose_host_went_down_mid_turn_is_left_to_report_itself() {
++        use zeron_doc::MessageRole::{Assistant, User};
++        let caps = [zeron_proto::capabilities::CHILD_REPORTS];
++        let rig = family_rig().await;
++        let _lead = rig.remote_child(&caps).await;
++        rig.laptop_seen(&caps, 600_000);
++        rig.remote_says("r-m1", User, &from_lead("Review the diff."), 3_000);
++        rig.remote_cut("r-a1", "Looking at it.", 2_000);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Interrupted, 1_000)), None);
++        rig.core.sessions.watch_children();
++        // Away past the grace (3 s here).
++        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
++        assert!(rig.filed_remote().is_empty(), "{:?}", rig.filed_remote());
++
++        // Back, and past the grace again before it revives the turn (short
++        // of the status-only report's wait after that, 3 s here).
++        rig.laptop(&caps);
++        tokio::time::sleep(std::time::Duration::from_millis(4_500)).await;
++        assert!(rig.filed_remote().is_empty(), "{:?}", rig.filed_remote());
++
++        rig.remote_row(SessionStatus::Working, Some((DoneStatus::Interrupted, 1_000)), None);
++        rig.remote_says("r-a2", Assistant, "LGTM.", 500);
++        rig.remote_row(SessionStatus::Idle, Some((DoneStatus::Completed, 300)), Some("r-a2"));
++        rig.remote_reports("report-kid-r-r-m1-end", "LGTM.");
++        rig.until("the lead hears it", |r| !r.heard_remote().is_empty()).await;
++        rig.quiet().await;
++        assert_eq!(rig.heard_remote(), [(ReportStatus::Finished, "LGTM.".to_owned())]);
++        assert_eq!(rig.filed_remote(), ["report-kid-r-r-m1-end"]);
++        rig.core.sessions.shutdown().await;
++    }
++
+     impl FamilyRig {
+         /// The person stops `chat` (no agent's Stop).
+         fn person_stops(&self, chat: &str) {
+-- 
+2.55.0.windows.2
+
