@@ -12,6 +12,7 @@
 
 mod catalog;
 pub mod docker;
+mod host_device;
 mod keys;
 mod provider;
 mod recovery;
@@ -19,6 +20,8 @@ pub mod scripts;
 mod steps;
 
 pub use catalog::PlaceCatalog;
+pub(crate) use host_device::Handover;
+pub use host_device::pick_host;
 pub use keys::KeySlot;
 pub use provider::{
     Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,

@@ -343,6 +343,7 @@ pub(crate) fn devices(self_id: &str, self_name: &str, now: i64) -> Vec<Device> {
             last_seen_at: Some(ms(seen)),
             created_at: Some(ms(now - 30 * DAY)),
             version: Some(version.into()),
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: if caps {
                 capability::ALL_QUEUE

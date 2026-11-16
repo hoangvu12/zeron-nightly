@@ -407,6 +407,9 @@ impl WorkspaceHost {
             // Every boot restamps the running binary's version (fleet staleness
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // This run's start: the host device is picked among those online
+            // longest (spec #37).
+            online_since: Some(now),
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: device_capabilities(),
         })?;
@@ -628,6 +631,40 @@ impl WorkspaceHost {
     /// the engine points this at `LinkCache::reset_cooldown`.
     pub fn set_peer_alive_hook(&self, hook: PeerAliveHook) {
         *lock(&self.inner.peer_alive) = Some(hook);
+    }
+
+    /// This engine runs as `zeron headless`, an always-on server: its row
+    /// says so ([`zeron_proto::capabilities::HEADLESS_V1`]), so it's picked as
+    /// a sandbox provider's host device first.
+    pub fn advertise_headless(&self) {
+        let own = self.inner.config.device_id.clone();
+        let outcome = self.mutate(|doc| {
+            let Some(mut row) = doc.read_devices()?.into_iter().find(|d| d.id == own) else {
+                return Ok(());
+            };
+            let headless = zeron_proto::capabilities::HEADLESS_V1;
+            if row.supports(headless) {
+                return Ok(());
+            }
+            row.capabilities.push(headless.to_string());
+            doc.upsert_device(&row)
+        });
+        if let Err(err) = outcome {
+            tracing::warn!(error = %err, "couldn't mark this device headless");
+        }
+    }
+
+    /// Every connected sandbox provider's host device.
+    pub fn sandbox_hosts(&self) -> Vec<zeron_proto::SandboxHost> {
+        self.read(|doc| doc.sandbox_hosts())
+    }
+
+    pub fn sandbox_host(&self, provider: &str) -> Option<zeron_proto::SandboxHost> {
+        self.read(|doc| doc.sandbox_host(provider))
+    }
+
+    pub fn set_sandbox_host(&self, host: &zeron_proto::SandboxHost) {
+        self.mutate(|doc| doc.set_sandbox_host(host));
     }
 
     /// Test seam: write a foreign device row (the relay version gate and the
