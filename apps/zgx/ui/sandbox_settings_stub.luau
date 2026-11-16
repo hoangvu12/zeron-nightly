@@ -2,12 +2,13 @@
 -- (src/sandbox_settings.rs: `sandbox_settings.ask` and `.change`, each
 -- `{method, params, device?}`). ui/settings_stub.luau sends those two here.
 --
--- Two providers, Docker Sandbox (signs in on its own page, or takes a
--- pasted token) and Boat (a pasted key), neither connected. A connect makes
--- devbox (the fixture's always-on server) the host device, as the engine
--- picks; the account then shows only in devbox's answer. Step scripts are
--- files on a device: devbox has three (one for every sandbox, one for
--- Docker's, Borealis's own setup.sh).
+-- Two providers, Docker Sandbox (its ops say `signInPage`: it signs in on
+-- its own page, or takes a pasted token) and Boat (a pasted key), neither
+-- connected. A connect makes devbox (the fixture's always-on server) the
+-- host device, as the engine picks; the account then shows only in devbox's
+-- answer. Step scripts are files on the host devices, but the page asks this
+-- device's engine, which routes each call there: three of them (one for
+-- every sandbox, one for Docker's, Borealis's own setup.sh).
 --
 -- What was asked, in order, is `sandbox_settings_stub_asked` ("Method@device",
 -- "" for this one). Commands:
@@ -22,7 +23,7 @@ local last_content = ui.state("sandbox_settings_stub_last_content", "")
 
 local SERVER = "box"
 local providers = {
-	{ id = "docker", name = "Docker Sandbox", icon = "docker", ops = { "create", "connect" } },
+	{ id = "docker", name = "Docker Sandbox", icon = "docker", ops = { "create", "connect", "signInPage" } },
 	{ id = "boat", name = "Boat", icon = "boat", ops = { "create", "connect" } },
 }
 -- Who each is connected as, and its host device.
@@ -34,12 +35,11 @@ local pending: string? = nil
 local function script(scope: any, hook: string, name: string, shown: string, content: string): any
 	return { row = { ["for"] = scope, hook = hook, name = name, script = shown, path = `/home/zeron/{shown}`, runsOn = "sandbox" }, content = content }
 end
-local files: { [string]: { any } } = {
-	[SERVER] = {
-		script({ kind = "all" }, "after-ready", "fleet-sync.sh", "steps/after-ready/fleet-sync.sh", "#!/usr/bin/env bash\nfleet sync\n"),
-		script({ kind = "provider", provider = "docker" }, "after-wake", "git-fetch.sh", "steps/docker/after-wake/git-fetch.sh", "git fetch --all\n"),
-		script({ kind = "project", spaceId = "borealis" }, "setup", "setup.sh", "borealis/.zeron/setup.sh", "pnpm install\n"),
-	},
+-- (Wherever they are: the engine finds them.)
+local files: { any } = {
+	script({ kind = "all" }, "after-ready", "fleet-sync.sh", "steps/after-ready/fleet-sync.sh", "#!/usr/bin/env bash\nfleet sync\n"),
+	script({ kind = "provider", provider = "docker" }, "after-wake", "git-fetch.sh", "steps/docker/after-wake/git-fetch.sh", "git fetch --all\n"),
+	script({ kind = "project", spaceId = "borealis" }, "setup", "setup.sh", "borealis/.zeron/setup.sh", "pnpm install\n"),
 }
 
 -- The picker's list (account/sandboxes, src/sandboxes.rs publishes it), as
@@ -71,8 +71,8 @@ local function scope_key(scope: any): string
 	return if scope.kind == "provider" then scope.provider elseif scope.kind == "project" then scope.spaceId else "all"
 end
 
-local function find_file(device: string, p: any): (number?, any?)
-	for i, f in files[device] or {} do
+local function find_file(p: any): (number?, any?)
+	for i, f in files do
 		if f.row.hook == p.hook and f.row.name == p.name and scope_key(f.row["for"]) == scope_key(p["for"]) then
 			return i, f
 		end
@@ -121,36 +121,34 @@ local engine: { [string]: (p: any, device: string) -> any } = {
 			return settled(nil, `{p.provider} isn't connected.`)
 		end
 		hosts[p.provider] = p.deviceId
-		files[p.deviceId] = files[p.deviceId] or {}
 		return settled({ ok = true, hostDeviceId = p.deviceId })
 	end,
-	ListStepScripts = function(_p, device)
+	ListStepScripts = function()
 		local out = {}
-		for _, f in files[device] or {} do
+		for _, f in files do
 			table.insert(out, f.row)
 		end
 		return settled(out)
 	end,
-	ReadStepScript = function(p, device)
-		local _, f = find_file(device, p)
+	ReadStepScript = function(p)
+		local _, f = find_file(p)
 		return if f then settled({ content = f.content }) else settled(nil, `Couldn't read {p.name}`)
 	end,
-	WriteStepScript = function(p, device)
+	WriteStepScript = function(p)
 		last_write:set(`{scope_key(p["for"])}/{p.hook}/{p.name}`)
 		last_content:set(p.content or "")
-		local _, f = find_file(device, p)
+		local _, f = find_file(p)
 		if f then
 			f.content = p.content
 		else
-			files[device] = files[device] or {}
-			table.insert(files[device], script(p["for"], p.hook, p.name, `steps/{p.hook}/{p.name}`, p.content or ""))
+			table.insert(files, script(p["for"], p.hook, p.name, `steps/{p.hook}/{p.name}`, p.content or ""))
 		end
 		return settled({ ok = true, path = `/home/zeron/steps/{p.hook}/{p.name}` })
 	end,
-	DeleteStepScript = function(p, device)
-		local i = find_file(device, p)
+	DeleteStepScript = function(p)
+		local i = find_file(p)
 		if i then
-			table.remove(files[device], i)
+			table.remove(files, i)
 		end
 		return settled({ ok = true })
 	end,

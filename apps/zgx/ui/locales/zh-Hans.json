@@ -2327,7 +2327,8 @@
       "connected": "Connected",
       "not_connected": "Not connected",
       "host_device": "Host device",
-      "host_sleeps": "{device} sleeps: its sandboxes can't start or wake until it's back.",
+      "host_device_named": "{name} 的主机设备",
+      "host_sleeps": "{device} 可能会休眠：休眠期间，它的沙盒无法启动或唤醒。",
       "scripts": "Scripts",
       "add_script": "Add script",
       "when_label": "When",
@@ -2343,6 +2344,9 @@
       "sign_in_on_page": "Sign in with {name}",
       "code_waiting": "Check this code on the page that opened.",
       "token": "Token",
+      "token_hint": {
+        "docker": "Docker 访问令牌，或 username:personal-access-token。"
+      },
       "disconnect_title": "Disconnect {name}?",
       "disconnect_body": "Sandboxes already made keep running, but Zeron can't reach them until it's connected again.",
       "couldnt_connect": "Couldn't connect",
