@@ -12,6 +12,10 @@
 --   sandbox_stub.fail_next     the next Start fresh fails ("offline")
 --   sandbox_stub.hold_next     the next Start fresh stays on its way
 --   sandbox_stub.started       a fresh sandbox is starting
+--   sandbox_stub.asleep        it's asleep (#43)
+--   sandbox_stub.waking        it's waking
+--   sandbox_stub.wake_failed   its wake failed
+-- (fail_next and hold_next hold for Wake too.)
 
 local sandboxes = require("@account/sandboxes") :: any
 local store = require("@app/screens/chat/store")
@@ -22,6 +26,7 @@ local fail = ui.state("sandbox_stub_fail", false)
 local hold = ui.state("sandbox_stub_hold", false)
 -- (Kept across launches in the app: here, each fixture starts with none.)
 sandboxes.fresh_states:set({})
+sandboxes.wake_states:set({})
 
 local function log(entry: string)
 	calls:push(entry)
@@ -33,8 +38,7 @@ end
 sandboxes.ask_follow = function(chat: string)
 	log(`follow:{chat}`)
 end
-sandboxes.ask_fresh = function(chat: string): any
-	log(`fresh:{chat}`)
+local function answer(): any
 	local p = {}
 	function p.after(_self: any, ok: ((any) -> ())?, bad: ((any) -> ())?)
 		if hold:peek() then
@@ -49,6 +53,14 @@ sandboxes.ask_fresh = function(chat: string): any
 		end
 	end
 	return p
+end
+sandboxes.ask_fresh = function(chat: string): any
+	log(`fresh:{chat}`)
+	return answer()
+end
+sandboxes.ask_wake = function(chat: string): any
+	log(`wake:{chat}`)
+	return answer()
 end
 
 local function open_chat(): string?
@@ -82,6 +94,9 @@ local CASES: { [string]: { [string]: any } } = {
 		disk_full = true,
 	},
 	started = { state = "starting", step = "create" },
+	asleep = { state = "asleep" },
+	waking = { state = "waking", step = "wake" },
+	wake_failed = { state = "failed", step = "wake", error = "Couldn't start the sandbox: it's gone quiet." },
 }
 for case, fields in CASES do
 	ui.command {
