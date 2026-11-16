@@ -95,14 +95,7 @@ fn words(error: &str) -> String {
     if engine::outcome(error) == "offline" && !lower.contains("host device") {
         return "offline".into();
     }
-    let mut said = error.trim();
-    for prefix in ["forwarded:", "failed:", "Failed:"] {
-        while let Some(rest) = said.strip_prefix(prefix) {
-            said = rest.trim();
-        }
-    }
-    let readable = !said.is_empty() && said.len() <= 240 && !said.contains('{');
-    if readable { said.to_owned() } else { "failed".into() }
+    engine::readable(error).unwrap_or_else(|| "failed".into())
 }
 
 #[cfg(test)]
