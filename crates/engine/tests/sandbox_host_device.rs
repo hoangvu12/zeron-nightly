@@ -359,6 +359,87 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     assert!(laptop.core().sandboxes.steps("chat-a").is_none());
 }
 
+/// Who `rpc`'s device says the fake cloud is connected as (`null`: not).
+async fn account_on(rpc: &RpcClient) -> Value {
+    let providers = rpc
+        .call(methods::LIST_SANDBOX_PROVIDERS, json!({}))
+        .await
+        .expect("ListSandboxProviders");
+    providers
+        .as_array()
+        .and_then(|list| list.iter().find(|p| p["id"] == "fake"))
+        .map(|p| p["account"].clone())
+        .expect("the fake cloud is listed")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnecting_on_any_device_clears_the_key_on_the_host_device() {
+    let edge = ScriptedEdge::with_registry().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let cloud = Cloud::new(&dirs.path().join("cloud"));
+    let laptop = device(&dirs.path().join("laptop"), &edge, false).await;
+    let server = device(&dirs.path().join("server"), &edge, true).await;
+    cloud.build_into(&laptop, &dirs.path().join("laptop"));
+    cloud.build_into(&server, &dirs.path().join("server"));
+    let server_id = server.core().device_id.clone();
+    let on_laptop = memory_client(laptop.core().rpc_service());
+    let on_server = memory_client(server.core().rpc_service());
+    sees_online(&on_laptop, &server_id).await;
+    sees_headless(&on_laptop, &server_id).await;
+
+    // Connected on the laptop, kept by the server.
+    on_laptop
+        .call(
+            methods::CONNECT_SANDBOX_PROVIDER,
+            json!({ "provider": "fake", "token": SECRET }),
+        )
+        .await
+        .expect("ConnectSandboxProvider");
+    names_host(&on_laptop, &server_id).await;
+    assert!(!account_on(&on_server).await.is_null());
+
+    // The user disconnects it from the laptop: the server lets the key go.
+    let done = on_laptop
+        .call(
+            methods::DISCONNECT_SANDBOX_PROVIDER,
+            json!({ "provider": "fake" }),
+        )
+        .await
+        .expect("DisconnectSandboxProvider");
+    assert_eq!(done["ok"], true, "{done:#}");
+    assert!(account_on(&on_server).await.is_null(), "the server's still connected");
+    assert!(
+        files_holding(&dirs.path().join("server"), SECRET).is_empty(),
+        "the server kept the key"
+    );
+    assert!(files_holding(&dirs.path().join("laptop"), SECRET).is_empty());
+    // No device is its host device now, on either.
+    assert!(host_of(&on_server).await.is_null());
+    let cleared = eventually(Duration::from_secs(30), async || {
+        host_of(&on_laptop).await.is_null().then_some(())
+    })
+    .await;
+    assert!(cleared.is_some(), "{:#}", host_of(&on_laptop).await);
+
+    // Disconnecting again is nothing; connecting again names a host again.
+    on_laptop
+        .call(
+            methods::DISCONNECT_SANDBOX_PROVIDER,
+            json!({ "provider": "fake" }),
+        )
+        .await
+        .expect("a second Disconnect");
+    on_laptop
+        .call(
+            methods::CONNECT_SANDBOX_PROVIDER,
+            json!({ "provider": "fake", "token": SECRET }),
+        )
+        .await
+        .expect("ConnectSandboxProvider, again");
+    names_host(&on_laptop, &server_id).await;
+    assert!(!account_on(&on_server).await.is_null());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_no_headless_device_online_the_device_it_was_connected_on_is_host() {
     let edge = ScriptedEdge::with_registry().await;
