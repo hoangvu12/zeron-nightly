@@ -52,6 +52,9 @@ pub enum SandboxState {
     Ready,
     /// A step failed: the chat says why and offers Run again.
     Failed,
+    /// The sandbox was deleted outside Zeron: the chat says "Sandbox
+    /// deleted" and offers Start fresh.
+    Gone,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +88,10 @@ pub struct SandboxSteps {
     /// What went wrong, in the words of whatever failed.
     #[serde(default)]
     pub error: Option<String>,
+    /// What failed failed because the sandbox's disk is full: the chat
+    /// says so, with Start fresh beside Run again.
+    #[serde(default)]
+    pub disk_full: bool,
     pub steps: Vec<StepProgress>,
 }
 
@@ -105,6 +112,7 @@ impl SandboxSteps {
             step: Some(Step::STARTING[0]),
             since: crate::now_ms(),
             error: None,
+            disk_full: false,
             steps: Step::STARTING
                 .iter()
                 .map(|&step| StepProgress {
@@ -134,6 +142,7 @@ impl SandboxSteps {
         self.step = Some(step);
         self.since = crate::now_ms();
         self.error = None;
+        self.disk_full = false;
     }
 
     pub(crate) fn finish(&mut self, step: Step, state: StepState) {
@@ -145,7 +154,33 @@ impl SandboxSteps {
         self.state = SandboxState::Failed;
         self.step = Some(step);
         self.since = crate::now_ms();
-        self.error = Some(error);
+        self.disk_full = disk_full(&error);
+        self.error = Some(if self.disk_full {
+            format!("The sandbox's disk is full. Free some space, or start fresh.\n{error}")
+        } else {
+            error
+        });
+    }
+
+    /// Its sandbox was deleted outside Zeron.
+    pub(crate) fn gone(&mut self) {
+        self.state = SandboxState::Gone;
+        self.since = crate::now_ms();
+        self.disk_full = false;
+        self.error = Some("The sandbox was deleted outside Zeron.".into());
+    }
+
+    /// Start fresh: every step again, on a new sandbox (`sandbox`: the
+    /// shared place's, which Zeron doesn't make).
+    pub(crate) fn fresh(&mut self, sandbox: Option<String>) {
+        let mut fresh = Self::new(
+            &self.chat_id,
+            &self.provider,
+            self.template.take(),
+            &self.device_id,
+        );
+        fresh.sandbox_id = sandbox;
+        *self = fresh;
     }
 
     pub(crate) fn ready(&mut self) {
@@ -165,6 +200,7 @@ impl SandboxSteps {
         self.state = SandboxState::Starting;
         self.since = crate::now_ms();
         self.error = None;
+        self.disk_full = false;
     }
 
     /// After a restart: a step that was running when Zeron stopped failed.
@@ -182,9 +218,56 @@ impl SandboxSteps {
     }
 }
 
+/// Whether a command's words say the disk is full (Linux, git, npm, pip).
+pub(crate) fn disk_full(said: &str) -> bool {
+    let said = said.to_ascii_lowercase();
+    ["no space left on device", "enospc", "disk quota exceeded"]
+        .iter()
+        .any(|words| said.contains(words))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_disk_is_said_as_such() {
+        let mut steps = SandboxSteps::new("chat", "fake", None, "device");
+        steps.begin(Step::GetCode);
+        steps.fail(
+            Step::GetCode,
+            "Couldn't clone x:\nfatal: write error: No space left on device".into(),
+        );
+        assert!(steps.disk_full);
+        assert!(
+            steps
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("The sandbox's disk is full.")
+        );
+        steps.retry();
+        assert!(!steps.disk_full);
+        steps.fail(Step::GetCode, "fatal: repository not found".into());
+        assert!(!steps.disk_full);
+        assert!(disk_full("npm ERR! code ENOSPC"));
+    }
+
+    #[test]
+    fn starting_fresh_runs_every_step_again_on_the_same_device() {
+        let mut steps = SandboxSteps::new("chat", "fake", Some("tpl".into()), "device");
+        steps.sandbox_id = Some("old".into());
+        steps.ready();
+        steps.gone();
+        assert_eq!(steps.state, SandboxState::Gone);
+        assert_eq!(serde_json::to_value(&steps).unwrap()["state"], "gone");
+        steps.fresh(None);
+        assert_eq!(steps.state, SandboxState::Starting);
+        assert_eq!(steps.sandbox_id, None);
+        assert_eq!(steps.device_id, "device");
+        assert_eq!(steps.template.as_deref(), Some("tpl"));
+        assert!(steps.steps.iter().all(|s| s.state == StepState::Pending));
+    }
 
     #[test]
     fn a_failed_step_runs_again_and_what_was_done_stays_done() {
