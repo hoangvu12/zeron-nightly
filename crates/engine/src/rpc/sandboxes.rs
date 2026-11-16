@@ -19,7 +19,22 @@ pub(super) fn handles(method: &str) -> bool {
             | methods::RUN_SANDBOX_STEPS_AGAIN
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
+            | methods::SAVE_SANDBOX_TEMPLATE
+            | methods::LIST_SANDBOX_TEMPLATES
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveTemplateParams {
+    chat_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderParams {
+    provider: String,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +130,22 @@ impl EngineRpc {
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SAVE_SANDBOX_TEMPLATE => {
+                let p: SaveTemplateParams = parse_params(params)?;
+                let template = sandboxes
+                    .save_template(self.sandbox_host(), &p.chat_id, &p.name)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "template": template }))
+            }
+            methods::LIST_SANDBOX_TEMPLATES => {
+                let p: ProviderParams = parse_params(params)?;
+                let templates = sandboxes
+                    .templates(&p.provider)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&templates)
             }
             _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }

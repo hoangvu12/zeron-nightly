@@ -244,6 +244,15 @@ pub mod methods {
     /// `{chatId}` → `{ok}`: Start fresh, a new sandbox for the chat (the
     /// old one deleted, if it's still there) with the chat's pushed branch.
     pub const START_SANDBOX_FRESH: &str = "StartSandboxFresh";
+    /// `{chatId, name}` → `{template: {id, name}}`: Save as template. Zeron
+    /// in the sandbox stops and wipes its identity (device id and data),
+    /// the provider saves the sandbox under `name`, then Zeron starts there
+    /// again on the chat's device id. Answers once saved (minutes, for a
+    /// big disk). Refused, saving nothing, while the chat is working.
+    pub const SAVE_SANDBOX_TEMPLATE: &str = "SaveSandboxTemplate";
+    /// `{provider}` → `[{id, name}]`: the provider's templates, for the
+    /// template picker (Docker: the account's finished images).
+    pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run

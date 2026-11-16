@@ -47,6 +47,21 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
             let config = engine_config_from_env();
             runtime.block_on(ipc_cli::quiesce_cli(config.ipc_port, &config.data_dir))
         }
+        EngineCommand::ForgetDevice => {
+            use zeron_engine::sandboxes::{FORGET_BUSY_EXIT, Forgot, forget_device};
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            match runtime.block_on(forget_device(&config.data_dir, config.ipc_port))? {
+                Forgot::Done => {
+                    println!("forgot");
+                    Ok(())
+                }
+                Forgot::Busy(why) => {
+                    eprintln!("busy: {why}");
+                    std::process::exit(FORGET_BUSY_EXIT);
+                }
+            }
+        }
         EngineCommand::Mcp => crate::run_mcp(),
         EngineCommand::Plugin(command) => {
             let runtime = tokio::runtime::Runtime::new()?;

@@ -38,19 +38,35 @@ impl Default for Backoff {
 /// The lock that makes one watchdog per data folder.
 const LOCK_FILE: &str = "watchdog.lock";
 
+/// While this file is in the data folder, an engine that exits isn't started
+/// again: `zeron-engine forget-device` writes it before it stops the engine
+/// (Save as template). Same name as `zeron_engine::sandboxes::WATCHDOG_STOP_FILE`.
+pub const STOP_FILE: &str = "watchdog.stop";
+
 /// `zeron-engine watchdog`: this executable's `headless`, kept running.
 pub fn run(data_dir: &Path) -> anyhow::Result<()> {
     let Some(_lock) = hold(data_dir)? else {
         tracing::info!("watchdog: another one already keeps the engine running");
         return Ok(());
     };
+    // Started again (after a Save as template): it's wanted running now.
+    clear_stop(data_dir);
     let exe = std::env::current_exe()?;
     keep_running(
         || std::process::Command::new(&exe).arg("headless").spawn(),
         Backoff::default(),
-        || false,
+        || stopping(data_dir),
     );
+    tracing::info!("watchdog: asked to stop; the engine stays stopped");
     Ok(())
+}
+
+fn stopping(data_dir: &Path) -> bool {
+    data_dir.join(STOP_FILE).exists()
+}
+
+fn clear_stop(data_dir: &Path) {
+    let _ = std::fs::remove_file(data_dir.join(STOP_FILE));
 }
 
 /// This data folder's watchdog lock, unless another watchdog holds it. It's
@@ -186,6 +202,34 @@ mod tests {
         assert!(gaps[0] >= Duration::from_millis(20), "{gaps:?}");
         assert!(gaps[1] >= Duration::from_millis(40), "{gaps:?}");
         assert!(gaps[2] >= Duration::from_millis(80), "{gaps:?}");
+    }
+
+    #[test]
+    fn a_stop_file_ends_it_and_a_new_one_starts_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(STOP_FILE), "left from before").unwrap();
+        // A new watchdog clears what an old run left.
+        clear_stop(dir.path());
+        assert!(!stopping(dir.path()));
+        // `zeron-engine forget-device` asks it to stop: once the engine
+        // exits it isn't started again.
+        let started = std::cell::Cell::new(0);
+        keep_running(
+            || {
+                started.set(started.get() + 1);
+                if started.get() == 2 {
+                    std::fs::write(dir.path().join(STOP_FILE), "forget-device").unwrap();
+                }
+                exits(0).spawn()
+            },
+            Backoff {
+                first: Duration::from_millis(1),
+                max: Duration::from_millis(2),
+                settled: Duration::from_secs(60),
+            },
+            || stopping(dir.path()),
+        );
+        assert_eq!(started.get(), 2);
     }
 
     #[test]

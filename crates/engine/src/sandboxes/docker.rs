@@ -32,6 +32,15 @@
 //!   A pasted personal access token is exchanged at
 //!   `{hub}/v2/auth/token {identifier, secret}`, as `sbx login
 //!   --password-stdin` does.
+//! - Save as template: `SnapshotService/CreateSnapshot {sandbox: {id}, name,
+//!   captureMode: "CAPTURE_MODE_DISK"}` answers an operation still running
+//!   (`metadata.target` is the new `tmpl_…` id); polled with `GetOperation`
+//!   until its `response` is the Snapshot (`status: SNAPSHOT_STATUS_READY`),
+//!   ~17 s for Blank, ~5 min for an 8 GB disk. The sandbox keeps running.
+//!   Disk only: `CAPTURE_MODE_ALL` would save memory too, and the lent
+//!   sign-in lives there. The template then lists in `ListImages` under the
+//!   same id (`IMAGE_SOURCE_SANDBOX`). `ImageService/CreateImage` can't save
+//!   a sandbox.
 //! - Some networks reset IPv6 connections to Docker (seen while recording),
 //!   so we dial IPv4, and try a dropped connection again.
 
@@ -103,6 +112,8 @@ const AUDIENCE: &str = "https://hub.docker.com";
 const SCOPE: &str = "openid offline_access";
 /// The longest Start or Stop may take before we give up waiting.
 const STATUS_DEADLINE: Duration = Duration::from_secs(240);
+/// The longest a snapshot may take (an 8 GB disk took ~5 min).
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Attempts for a call whose connection drops before an answer.
 const TRIES: u32 = 3;
@@ -497,8 +508,12 @@ impl DockerProvider {
     }
 
     /// Wait for a long-running operation to finish.
-    async fn finish(&self, mut op: Value) -> Result<Value, ProviderError> {
-        let deadline = Instant::now() + STATUS_DEADLINE;
+    async fn finish(&self, op: Value) -> Result<Value, ProviderError> {
+        self.finish_within(op, STATUS_DEADLINE).await
+    }
+
+    async fn finish_within(&self, mut op: Value, within: Duration) -> Result<Value, ProviderError> {
+        let deadline = Instant::now() + within;
         while op["done"] != true {
             if Instant::now() >= deadline {
                 return Err(err(ErrorKind::Retryable, "Docker is still working on it"));
@@ -915,6 +930,7 @@ impl SandboxProvider for DockerProvider {
             | Ops::TEMPLATES
             | Ops::CONNECT
             | Ops::EXTEND
+            | Ops::SAVE_TEMPLATE
     }
 
     fn workdir(&self, _chat_id: &str) -> String {
@@ -1097,6 +1113,32 @@ impl SandboxProvider for DockerProvider {
                 return Ok(templates);
             }
         }
+    }
+
+    async fn save_template(&self, sandbox: &str, name: &str) -> Result<Template, ProviderError> {
+        let op = self
+            .control(
+                "SnapshotService/CreateSnapshot",
+                json!({
+                    "sandbox": {"id": sandbox},
+                    "name": name,
+                    "captureMode": "CAPTURE_MODE_DISK",
+                }),
+            )
+            .await?;
+        let target = op["metadata"]["target"].as_str().map(str::to_owned);
+        let done = self.finish_within(op, SNAPSHOT_DEADLINE).await?;
+        let snapshot = &done["response"];
+        let id = snapshot["id"]
+            .as_str()
+            .map(str::to_owned)
+            .or(target)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| err(ErrorKind::Fatal, "Docker didn't say which template it made"))?;
+        Ok(Template {
+            id,
+            name: snapshot["name"].as_str().unwrap_or(name).to_owned(),
+        })
     }
 
     async fn run(&self, sandbox: &str, command: Command) -> Result<RunStream, ProviderError> {

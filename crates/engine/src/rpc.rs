@@ -2504,6 +2504,8 @@ fn forwardable(method: &str) -> bool {
             | methods::RUN_SANDBOX_STEPS_AGAIN
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
+            | methods::SAVE_SANDBOX_TEMPLATE
+            | methods::LIST_SANDBOX_TEMPLATES
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from

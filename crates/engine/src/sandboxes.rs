@@ -11,11 +11,17 @@
 //! the sandbox's engine when the sandbox is Ready.
 
 pub mod docker;
+mod forget;
 mod keys;
 mod provider;
 mod recovery;
+mod save;
 mod steps;
 
+pub use forget::{
+    FORGET_BUSY_EXIT, FORGET_DEVICE, Forgot, KEEP, WATCHDOG_STOP_FILE, forget_device,
+    forget_device_files,
+};
 pub use keys::KeySlot;
 pub use provider::{
     Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,
@@ -462,24 +468,8 @@ impl Sandboxes {
             Step::Setup => Ok(StepState::Skipped),
             Step::Ready => {
                 if starts_zeron {
-                    let lent = chat.lend(host, &record.steps.device_id).await?;
-                    // Under its watchdog, which restarts it when it stops.
-                    let mut command = Command::new([ENGINE_PROGRAM, "watchdog"])
-                        .env(EDGE_URL_ENV, edge_url(host)?)
-                        .env(DEVICE_ID_ENV, &record.steps.device_id)
-                        .detached();
-                    for (name, value) in lent.to_env() {
-                        command = command.env(name, value);
-                    }
-                    let started = run_to_end(provider, &sandbox()?, command)
-                        .await
-                        .map_err(|e| format!("Couldn't start Zeron in the sandbox: {e}"))?;
-                    if !started.exit.success() {
-                        return Err(format!(
-                            "Couldn't start Zeron in the sandbox: {}",
-                            started.failure()
-                        ));
-                    }
+                    chat.start_zeron(provider, host, &record, &sandbox()?)
+                        .await?;
                 }
                 answers(host, &record.steps.device_id).await?;
                 // What waited for it goes now, not at the next retry.
@@ -532,6 +522,35 @@ impl ChatSandbox {
             record.steps.clone()
         };
         self.progress.send_replace(steps);
+    }
+
+    /// Start Zeron's engine in `sandbox`, under its watchdog (which restarts
+    /// it when it stops), on a lent sign-in and the chat's device id.
+    async fn start_zeron(
+        &self,
+        provider: &dyn SandboxProvider,
+        host: &Host,
+        record: &Record,
+        sandbox: &str,
+    ) -> Result<(), String> {
+        let lent = self.lend(host, &record.steps.device_id).await?;
+        let mut command = Command::new([ENGINE_PROGRAM, "watchdog"])
+            .env(EDGE_URL_ENV, edge_url(host)?)
+            .env(DEVICE_ID_ENV, &record.steps.device_id)
+            .detached();
+        for (name, value) in lent.to_env() {
+            command = command.env(name, value);
+        }
+        let started = run_to_end(provider, sandbox, command)
+            .await
+            .map_err(|e| format!("Couldn't start Zeron in the sandbox: {e}"))?;
+        if !started.exit.success() {
+            return Err(format!(
+                "Couldn't start Zeron in the sandbox: {}",
+                started.failure()
+            ));
+        }
+        Ok(())
     }
 
     /// The sign-in its engine starts on: lent once, again when stale.
