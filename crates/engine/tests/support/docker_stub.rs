@@ -228,30 +228,35 @@ impl DockerStub {
         }
         if let Some(rest) = path.strip_prefix("/v1/sandboxes/") {
             let id = rest.trim_end_matches("/network-policy").to_owned();
-            let mut state = self.state();
-            let Some(sandbox) = state.boxes.get_mut(&id) else {
-                drop(state);
-                return respond(&mut socket, 404, json!({"message": "sandbox not found"})).await;
-            };
-            if method == "PUT" {
-                match parsed["mode"].as_str() {
-                    Some("allow-all") => sandbox.network = "allow-all",
-                    Some("deny-all") => sandbox.network = "deny-all",
-                    _ => {
-                        drop(state);
-                        return respond(&mut socket, 400, json!({"message": "request validation failed: invalid field \"mode\""})).await;
-                    }
-                }
-            }
-            let mode = sandbox.network;
-            drop(state);
-            return respond(&mut socket, 200, json!({"mode": mode})).await;
+            let (status, reply) = self.network(&id, &method, &parsed);
+            return respond(&mut socket, status, reply).await;
         }
         if let Some(rpc) = path.strip_prefix("/sbx/docker.sbx.v1.") {
             let (status, reply) = self.control(rpc, &parsed);
             return respond(&mut socket, status, reply).await;
         }
         respond(&mut socket, 404, json!({"code": "not_found", "message": "no route"})).await
+    }
+
+    /// `GET`/`PUT /v1/sandboxes/{id}/network-policy`.
+    fn network(&self, id: &str, method: &str, body: &Value) -> (u16, Value) {
+        let mut state = self.state();
+        let Some(sandbox) = state.boxes.get_mut(id) else {
+            return (404, json!({"message": "sandbox not found"}));
+        };
+        if method == "PUT" {
+            match body["mode"].as_str() {
+                Some("allow-all") => sandbox.network = "allow-all",
+                Some("deny-all") => sandbox.network = "deny-all",
+                _ => {
+                    return (
+                        400,
+                        json!({"message": "request validation failed: invalid field \"mode\""}),
+                    );
+                }
+            }
+        }
+        (200, json!({"mode": sandbox.network}))
     }
 
     fn token(&self, form: &Value) -> (u16, Value) {
