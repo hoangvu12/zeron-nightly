@@ -1,11 +1,11 @@
-//! Save as template (spec #37): a chat's sandbox saved through its provider
+//! Save as sandbox template (spec #37): a chat's sandbox saved through its provider
 //! (`SaveSandboxTemplate`), by the host device that keeps it; the engine
 //! routes the call there. The engine wipes Zeron's identity from the sandbox
 //! and saves it; this only carries the ask and the answer. (Named apart from
 //! the interface's own templates, `templates.*`. Listing a provider's
 //! templates is src/sandboxes.rs's `sandboxes.templates`.)
 //!
-//!   sandbox_templates.save({ chat, name }) → { id, name }, or rejects with
+//!   sandbox_template.save({ chat, name }) → { id, name }, or rejects with
 //!                                           the engine's words (or an
 //!                                           outcome word: offline, outdated)
 
@@ -16,11 +16,11 @@ use crate::auth::text;
 use crate::engine;
 
 pub fn install(host: &ScriptHost) {
-    host.async_action("sandbox_templates.save", move |arg| {
+    host.async_action("sandbox_template.save", move |arg| {
         let chat = arg.field("chat").map(text).unwrap_or_default();
         let name = arg.field("name").map(text).unwrap_or_default();
         async move {
-            crate::plugins::preview::refuse("sandbox_templates.save")?;
+            crate::plugins::preview::refuse("sandbox_template.save")?;
             if chat.is_empty() {
                 return Err("invalid".to_string());
             }
@@ -46,7 +46,7 @@ fn said(error: &str) -> String {
         return "outdated".into();
     }
     match engine::outcome(error) {
-        "failed" if !error.trim().is_empty() => error.trim().to_string(),
+        "failed" => engine::readable(error).unwrap_or_else(|| "failed".into()),
         word => word.to_string(),
     }
 }
