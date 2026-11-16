@@ -256,12 +256,7 @@ impl FakeProvider {
         tokio::spawn(async move {
             let engine = start_engine(&config).await;
             if let Some(agents) = agents {
-                let registry = &engine.core().registry;
-                for descriptor in registry.descriptors() {
-                    if !agents.contains(&descriptor.id) {
-                        registry.unregister(descriptor.id);
-                    }
-                }
+                engine.core().registry.retain(|id| agents.contains(&id));
             }
             if let Some(fake) = state.lock().unwrap().boxes.get_mut(&sandbox) {
                 fake.engine = Some(engine);
