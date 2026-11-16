@@ -255,6 +255,7 @@ mod tests {
             default_harness: HarnessId::Mock,
             org_id: None,
             workos_client_id: Some("client_test".into()),
+            lent_sign_in: None,
         }
     }
 

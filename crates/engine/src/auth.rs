@@ -5,11 +5,18 @@
 //! delegates the secret-bearing **code exchange** and **refresh** to the edge Worker
 //! (`/auth/exchange`, `/auth/refresh` — the WorkOS API key lives only there).
 //!
-//! Three modes:
+//! Four modes:
 //! - **Runner** (a Cloud device — `{data_dir}/runner.json`, see [`crate::runner`]): always
 //!   signed in as the enrolled `{userId}` in `{orgId}`; bearers are runner JWTs minted by a
 //!   signed `POST /runner/token`, cached + refreshed with the same single-flight, cooldown
 //!   and background loop as WorkOS. Never touches `session.json` or WorkOS.
+//! - **Lent** (a sandbox in the user's own cloud, ADR 0003 — [`LentSignIn`]): signed in on
+//!   access tokens the host device lends, pinned to the org they were lent for. The first
+//!   comes at start; the background loop asks the lender for the next over the relay
+//!   (`LendToken`) before it runs out. No refresh token, no WorkOS, no step-up, nothing on
+//!   disk; once lending stops the last token runs out and the engine goes dark. The other
+//!   side, any signed-in WorkOS engine lending ([`Auth::lend`]), keeps its grants in
+//!   `lending.json`.
 //! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
 //!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
 //! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
@@ -51,6 +58,16 @@ const REFRESH_RETRY_CAP: Duration = Duration::from_secs(5);
 /// A runner whose key the edge rejected (device deleted/revoked) retries
 /// this slowly: it stays dark, but recovers if the rejection was transient.
 const RUNNER_REJECTED_RETRY: Duration = Duration::from_secs(60);
+/// A sandbox asks for its next lent token when this share of the last one's
+/// life is left (half an hour of an hour): time to wait out a host device
+/// that is briefly away.
+const LENT_ASK_SHARE: u32 = 2;
+/// How long a sandbox waits on one `LendToken` answer.
+const LENT_ASK_TIMEOUT: Duration = Duration::from_secs(15);
+/// What a development lender's tokens (the user id; they never expire) are
+/// lent for.
+const LENT_DEV_TTL: Duration = Duration::from_secs(3600);
+const LENDING_FILE: &str = "lending.json";
 
 type RefreshFlight =
     futures::future::Shared<futures::future::BoxFuture<'static, Result<Option<String>, String>>>;
@@ -239,6 +256,69 @@ struct StoredSession {
     user: AuthUser,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     org_id: Option<String>,
+    /// The org the session must be scoped back to: a token lent for another
+    /// org ([`Auth::lend`]) moved it there, and moving it back hasn't
+    /// succeeded yet. The next refresh asks for this org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_org: Option<String>,
+}
+
+/// How a sandbox's engine signs in (ADR 0003): the device lending it tokens,
+/// the key that device lends under, and the first token. Handed to the
+/// engine at start in its environment ([`Self::ENV`]); none of it is written
+/// to disk.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LentSignIn {
+    /// The lending device's id (the host device).
+    pub lender: String,
+    /// What the lender knows this sandbox's grant by; it stops answering it
+    /// when it stops lending.
+    pub key: String,
+    /// The first access token.
+    pub token: String,
+}
+
+impl std::fmt::Debug for LentSignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LentSignIn").field("lender", &self.lender).finish_non_exhaustive()
+    }
+}
+
+impl LentSignIn {
+    /// The environment variables a sandbox's engine reads it from: lender,
+    /// key, token.
+    pub const ENV: [&str; 3] = ["ZERON_LENDER_DEVICE", "ZERON_LEND_KEY", "ZERON_LENT_TOKEN"];
+
+    /// From the environment, when all three are set.
+    pub fn from_env() -> Option<Self> {
+        let [lender, key, token] = Self::ENV.map(|name| {
+            std::env::var(name).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+        });
+        Some(Self { lender: lender?, key: key?, token: token? })
+    }
+
+    /// As environment variables, for whoever starts the sandbox's engine.
+    pub fn to_env(&self) -> [(&'static str, String); 3] {
+        let [lender, key, token] = Self::ENV;
+        [(lender, self.lender.clone()), (key, self.key.clone()), (token, self.token.clone())]
+    }
+}
+
+/// A sandbox's engine: where its next token comes from.
+struct Borrower {
+    lender: String,
+    key: String,
+    /// The relay links it asks the lender through, once the runtime has them.
+    links: Mutex<Option<Arc<zeron_rpc::LinkCache>>>,
+}
+
+/// One sandbox this device lends tokens to, pinned to the org it was lent for.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Grant {
+    sandbox: String,
+    org_id: String,
+    key: String,
 }
 
 /// Access-token cache. Expiry ages the token's own lifetime (`exp - iat`) by
@@ -336,6 +416,10 @@ struct AuthInner {
     step_up_states: Mutex<std::collections::HashSet<String>>,
     /// [`Auth::on_fresh_ticket`].
     fresh_ticket: Mutex<Option<FreshTicketHook>>,
+    /// `Some` = lent mode (a sandbox's engine on borrowed tokens).
+    borrower: Option<Borrower>,
+    /// The sandboxes this device lends tokens to (`lending.json`).
+    lending: Mutex<Vec<Grant>>,
 }
 
 /// The longest a step-up ticket is kept.
@@ -436,7 +520,39 @@ impl Auth {
             (Some(_), None) => AuthState::SignedOut,
         };
         let loaded_workos_session = workos.is_some() && stored.is_some();
-        Self::assemble(config, workos, loaded_workos_session, stored, initial, None)
+        Self::assemble(config, workos, loaded_workos_session, stored, initial, None, None)
+    }
+
+    /// Lent mode: a sandbox's engine on tokens another of the user's devices
+    /// lends (ADR 0003). Signed in as the first token's user, in its org, for
+    /// good: later tokens are asked for in that org. No WorkOS session and
+    /// nothing on disk. A first token that names no user or org is signed
+    /// out, and stays so (there is no other way in).
+    pub fn new_lent(config: AuthConfig, sign_in: LentSignIn) -> Self {
+        let claims = jwt_claims(&sign_in.token).unwrap_or_default();
+        let initial = match (claims.sub.clone(), claims.org_id.clone()) {
+            (Some(user), Some(org_id)) => AuthState::SignedIn {
+                user: AuthUser { id: user, email: String::new(), name: None },
+                org_id: Some(org_id),
+            },
+            _ => {
+                tracing::error!("auth: the lent token names no user or organization");
+                AuthState::SignedOut
+            }
+        };
+        let borrower = Borrower {
+            lender: sign_in.lender,
+            key: sign_in.key,
+            links: Mutex::new(None),
+        };
+        let auth = Self::assemble(config, None, false, None, initial, None, Some(borrower));
+        // What's left of it now: it may have been lent minutes ago.
+        let left = match (claims.exp, claims.iat) {
+            (Some(exp), Some(iat)) if exp > iat => (exp - chrono::Utc::now().timestamp()).clamp(0, exp - iat),
+            _ => LENT_DEV_TTL.as_secs() as i64,
+        };
+        auth.keep_lent(sign_in.token, Duration::from_secs(left as u64));
+        auth
     }
 
     /// Runner mode: a Cloud device authenticating with its enrolled key. The
@@ -451,7 +567,7 @@ impl Auth {
             },
             org_id: Some(identity.org_id().to_string()),
         };
-        Self::assemble(config, None, false, None, initial, Some(identity))
+        Self::assemble(config, None, false, None, initial, Some(identity), None)
     }
 
     fn assemble(
@@ -461,7 +577,12 @@ impl Auth {
         stored: Option<StoredSession>,
         initial: AuthState,
         runner: Option<Arc<crate::runner::RunnerIdentity>>,
+        borrower: Option<Borrower>,
     ) -> Self {
+        let lending = std::fs::read(config.data_dir.join(LENDING_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         let (state_tx, _) = watch::channel(initial);
         let (token_tx, _) = watch::channel(0);
         let (retry_tx, _) = watch::channel(0);
@@ -492,7 +613,21 @@ impl Auth {
                 step_up: Mutex::new(None),
                 step_up_states: Mutex::new(std::collections::HashSet::new()),
                 fresh_ticket: Mutex::new(None),
+                borrower,
+                lending: Mutex::new(lending),
             }),
+        }
+    }
+
+    /// Whether this is a sandbox's engine on lent tokens ([`Self::new_lent`]).
+    pub fn is_lent(&self) -> bool {
+        self.inner.borrower.is_some()
+    }
+
+    /// Lent mode: the relay links the next token is asked for through.
+    pub fn attach_lender_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+        if let Some(borrower) = &self.inner.borrower {
+            *lock(&borrower.links) = Some(links);
         }
     }
 
@@ -575,6 +710,9 @@ impl Auth {
         if let Some(runner) = &self.inner.runner {
             return Some(runner.user_id().to_string());
         }
+        if self.is_lent() {
+            return self.state().user().map(|u| u.id.clone());
+        }
         if self.inner.workos.is_none() {
             let dev = &self.inner.config.dev_user_id;
             return Some(dev.split('@').next().unwrap_or(dev).to_string());
@@ -589,6 +727,9 @@ impl Auth {
     pub async fn access_token(&self) -> Result<String, TokenError> {
         if self.inner.runner.is_some() {
             return self.runner_access_token().await;
+        }
+        if self.is_lent() {
+            return self.lent_access_token();
         }
         if self.inner.workos.is_none() {
             return Ok(self.inner.config.dev_user_id.clone());
@@ -633,6 +774,9 @@ impl Auth {
     pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
         let auth = self.clone();
         tokio::spawn(async move {
+            if auth.is_lent() {
+                return auth.borrow_loop().await;
+            }
             if auth.inner.workos.is_none() && auth.inner.runner.is_none() {
                 return;
             }
@@ -705,6 +849,7 @@ impl Auth {
     /// account or on signing in, and whether it asks afresh rather than
     /// going on as the account the browser is already signed into.
     pub async fn start_sign_in_with(&self, options: SignInOptions) -> Result<String, EngineError> {
+        self.refuse_if_lent()?;
         if self.inner.workos.is_none() {
             return Ok(String::new()); // dev mode: nothing to do (TS parity)
         }
@@ -738,6 +883,7 @@ impl Auth {
     /// Finish a headless sign-in with the pasted `state.code` string. The state half
     /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
     pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
+        self.refuse_if_lent()?;
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -794,6 +940,7 @@ impl Auth {
     /// to open, as [`Self::start_sign_in`]; a sign-in as anyone else is
     /// refused when it lands.
     pub async fn start_step_up(&self) -> Result<String, EngineError> {
+        self.refuse_if_lent()?;
         if self.inner.workos.is_none() || self.user_id().is_none() {
             return Err(EngineError::Other("Sign in first".into()));
         }
@@ -881,6 +1028,11 @@ impl Auth {
             tracing::info!("auth: sign-out ignored on a Cloud runner");
             return;
         }
+        if self.is_lent() {
+            // Its sign-in is the lender's: it ends when lending does.
+            tracing::info!("auth: sign-out ignored on a sandbox");
+            return;
+        }
         let mut sign_in = lock(&self.inner.sign_in);
         self.clear_session(&mut sign_in);
     }
@@ -921,6 +1073,7 @@ impl Auth {
     /// Each user creates one: if we already did (a double-submit, a retry, or an
     /// earlier session), the edge answers 409 with that org and we continue in it.
     pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
+        self.refuse_if_lent()?;
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -961,6 +1114,7 @@ impl Auth {
     /// Scope the session to an org: one refresh with `organizationId`; the state follows
     /// the returned token's `org_id` claim.
     pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
+        self.refuse_if_lent()?;
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -1110,6 +1264,7 @@ impl Auth {
             refresh_token: result.refresh_token,
             user: result.user.clone(),
             org_id: org_id.clone(),
+            restore_org: None,
         };
         self.persist(Some(&session));
         *lock(&self.inner.stored) = Some(session);
@@ -1267,16 +1422,18 @@ impl Auth {
         if let Some(runner) = self.inner.runner.clone() {
             return self.refresh_runner_locked(&runner).await;
         }
-        let (generation, refresh_token) = {
+        let (generation, refresh_token, restore_org) = {
             let sign_in = lock(&self.inner.sign_in);
-            let Some(refresh_token) = lock(&self.inner.stored)
+            let Some((refresh_token, restore_org)) = lock(&self.inner.stored)
                 .as_ref()
-                .map(|s| s.refresh_token.clone())
+                .map(|s| (s.refresh_token.clone(), s.restore_org.clone()))
             else {
                 return Ok(None);
             };
-            (sign_in.generation, refresh_token)
+            (sign_in.generation, refresh_token, restore_org)
         };
+        // Back to the session's own org after a token lent for another.
+        let organization_id = organization_id.or(restore_org.as_deref());
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct RefreshBody<'a> {
@@ -1366,6 +1523,7 @@ impl Auth {
                     let changed = session.org_id != org_id;
                     session.refresh_token = tokens.refresh_token;
                     session.org_id = org_id.clone();
+                    session.restore_org = None;
                     (session.user.clone(), changed)
                 }
                 None => return Ok(None), // signed out mid-refresh
@@ -1508,6 +1666,328 @@ impl Auth {
             .token_tx
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         Ok(Some(token.access_token))
+    }
+
+    // -- lent sign-in (ADR 0003) ---------------------------------------------
+
+    /// What a sandbox gets when it tries to sign in, step up or change org.
+    pub(crate) fn refuse_if_lent(&self) -> Result<(), EngineError> {
+        if self.is_lent() {
+            return Err(EngineError::Other(
+                "a sandbox is signed in by the device that lends it its sign-in; it can't sign in, confirm it's you or change organization itself".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Lend `sandbox` a sign-in pinned to `org_id`: its grant (kept in
+    /// `lending.json`, so a restart goes on lending) and its first token.
+    /// Returns the grant's key and the token. Lending to a sandbox again
+    /// replaces its grant.
+    pub async fn lend(&self, sandbox: &str, org_id: &str) -> Result<(String, String), EngineError> {
+        if self.is_runner() || self.is_lent() {
+            return Err(EngineError::Other(
+                "only a device signed in to your account can lend a sandbox its sign-in".into(),
+            ));
+        }
+        let (token, _) = self.token_for_org(org_id).await?;
+        let key = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let mut grants = lock(&self.inner.lending);
+        grants.retain(|grant| grant.sandbox != sandbox);
+        grants.push(Grant {
+            sandbox: sandbox.to_owned(),
+            org_id: org_id.to_owned(),
+            key: key.clone(),
+        });
+        self.persist_lending(&grants);
+        tracing::info!(sandbox, org = org_id, "auth: lending a sandbox its sign-in");
+        Ok((key, token))
+    }
+
+    /// Stop lending `sandbox` tokens: its next ask is refused, and it goes
+    /// dark when the token it has runs out.
+    pub fn stop_lending(&self, sandbox: &str) {
+        let mut grants = lock(&self.inner.lending);
+        let before = grants.len();
+        grants.retain(|grant| grant.sandbox != sandbox);
+        if grants.len() != before {
+            self.persist_lending(&grants);
+            tracing::info!(sandbox, "auth: stopped lending a sandbox its sign-in");
+        }
+    }
+
+    /// `LendToken`: the next token for the sandbox lent under `key`, in the
+    /// org it was lent for, and how long it lasts.
+    pub async fn lent_token(&self, key: &str) -> Result<(String, Duration), EngineError> {
+        let org_id = lock(&self.inner.lending)
+            .iter()
+            .find(|grant| same_secret(&grant.key, key))
+            .map(|grant| grant.org_id.clone());
+        let Some(org_id) = org_id else {
+            return Err(EngineError::Other(
+                "this device doesn't lend that sandbox a sign-in".into(),
+            ));
+        };
+        self.token_for_org(&org_id).await
+    }
+
+    fn persist_lending(&self, grants: &[Grant]) {
+        let path = self.inner.config.data_dir.join(LENDING_FILE);
+        let outcome = if grants.is_empty() {
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            }
+        } else {
+            serde_json::to_vec(grants)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| write_private(&path, &bytes))
+        };
+        if let Err(err) = outcome {
+            tracing::warn!(error = %err, "auth: failed to save the sandboxes lent a sign-in");
+        }
+    }
+
+    /// An access token of this device's session for `org_id`, with at least
+    /// half its life left, and what is left of it. The session's own org
+    /// lends its own token; another org gets one minted for it, the session
+    /// moved back after ([`Self::mint_for_org_locked`]).
+    async fn token_for_org(&self, org_id: &str) -> Result<(String, Duration), EngineError> {
+        if self.inner.workos.is_none() {
+            return Ok((self.inner.config.dev_user_id.clone(), LENT_DEV_TTL));
+        }
+        let signed_out = || EngineError::Other("this device is signed out".into());
+        if !self.state().is_signed_in() {
+            return Err(signed_out());
+        }
+        let _gate = self.inner.refresh_gate.lock().await;
+        if self
+            .inner
+            .refresh_quiesced
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(EngineError::Other("this device is shutting down".into()));
+        }
+        let own = lock(&self.inner.stored).as_ref().and_then(|s| s.org_id.clone());
+        if own.as_deref() != Some(org_id) {
+            return self.mint_for_org_locked(org_id).await;
+        }
+        let lendable = |least: fn(&AccessEntry) -> Duration| {
+            lock(&self.inner.access)
+                .as_ref()
+                .filter(|entry| entry.remaining() > least(entry))
+                .map(|entry| (entry.token.clone(), entry.remaining()))
+        };
+        if let Some(lent) = lendable(|entry| entry.ttl / 2) {
+            return Ok(lent);
+        }
+        self.refresh_locked(None).await?;
+        lendable(|_| Duration::ZERO).ok_or_else(signed_out)
+    }
+
+    /// A token for `org_id`, another org than the session's: one refresh
+    /// scoped to it (a WorkOS refresh token is single-use and the scope goes
+    /// with it), then one back to the session's own org. Called only under
+    /// the refresh gate. If moving back fails, `restore_org` makes the next
+    /// refresh do it, so the device never stays in the sandbox's org.
+    async fn mint_for_org_locked(&self, org_id: &str) -> Result<(String, Duration), EngineError> {
+        let (generation, refresh_token, home) = {
+            let sign_in = lock(&self.inner.sign_in);
+            let stored = lock(&self.inner.stored);
+            let Some(session) = stored.as_ref() else {
+                return Err(EngineError::Other("this device is signed out".into()));
+            };
+            (
+                sign_in.generation,
+                session.refresh_token.clone(),
+                session.org_id.clone(),
+            )
+        };
+        let url = format!(
+            "{}/auth/refresh",
+            self.inner.config.edge_url.trim_end_matches('/')
+        );
+        let res = self
+            .inner
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "refreshToken": refresh_token, "organizationId": org_id }))
+            .send()
+            .await
+            .map_err(|e| {
+                EngineError::Other(format!(
+                    "could not reach the edge for a sandbox's token: {}",
+                    describe_http_error(e)
+                ))
+            })?;
+        if !res.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "no token for that organization ({}): this account may no longer be in it",
+                res.status().as_u16()
+            )));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Tokens {
+            access_token: String,
+            refresh_token: String,
+        }
+        let tokens: Tokens = res.json().await.map_err(|e| {
+            EngineError::Other(format!(
+                "malformed refresh response: {}",
+                describe_http_error(e)
+            ))
+        })?;
+        {
+            let sign_in = lock(&self.inner.sign_in);
+            let mut stored = lock(&self.inner.stored);
+            match stored.as_mut() {
+                Some(session)
+                    if sign_in.generation == generation && session.refresh_token == refresh_token =>
+                {
+                    session.refresh_token = tokens.refresh_token;
+                    session.restore_org = home;
+                }
+                _ => return Err(EngineError::Other("the sign-in changed; try again".into())),
+            }
+            self.persist(stored.as_ref());
+        }
+        if let Err(err) = self.refresh_locked(None).await {
+            tracing::warn!(error = %err,
+                "auth: lent a token for another org; moving back to this device's own org failed (the next refresh does it)");
+        }
+        if jwt_claims(&tokens.access_token).and_then(|c| c.org_id).as_deref() != Some(org_id) {
+            return Err(EngineError::Other("the edge minted a token for another organization".into()));
+        }
+        let entry = AccessEntry::fresh(tokens.access_token);
+        Ok((entry.token.clone(), entry.remaining()))
+    }
+
+    /// A lent token counts as gone this close to its end (as [`TOKEN_SLACK`],
+    /// less for a short one).
+    fn lent_slack(ttl: Duration) -> Duration {
+        TOKEN_SLACK.min(ttl / 10)
+    }
+
+    fn keep_lent(&self, token: String, ttl: Duration) {
+        *lock(&self.inner.access) = Some(AccessEntry::with_ttl(token, ttl));
+        self.inner
+            .token_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    /// Lent mode's bearer: the lent token while it lasts, then signed out,
+    /// which closes the device room and every authenticated socket.
+    fn lent_access_token(&self) -> Result<String, TokenError> {
+        lock(&self.inner.access)
+            .as_ref()
+            .filter(|entry| entry.remaining() > Self::lent_slack(entry.ttl))
+            .map(|entry| entry.token.clone())
+            .ok_or(TokenError::SignedOut)
+    }
+
+    /// Lent mode's background loop: ask the lender for the next token once
+    /// half of the last one is left, retrying until it runs out; then go
+    /// dark. Never a browser, never a session of its own.
+    async fn borrow_loop(&self) {
+        let Some(borrower) = &self.inner.borrower else {
+            return;
+        };
+        let mut wake = zeron_sync::wake::subscribe();
+        let mut failures = 0u32;
+        loop {
+            let held = lock(&self.inner.access)
+                .as_ref()
+                .map(|entry| (entry.remaining(), entry.ttl))
+                .filter(|(left, ttl)| *left > Self::lent_slack(*ttl));
+            let Some((left, ttl)) = held else {
+                *lock(&self.inner.access) = None;
+                self.inner
+                    .token_tx
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                tracing::error!(lender = %borrower.lender,
+                    "auth: the lent token ran out and the host device lent no other; offline");
+                return;
+            };
+            let ask_at = ttl / LENT_ASK_SHARE;
+            if left > ask_at {
+                tokio::select! {
+                    _ = tokio::time::sleep((left - ask_at).min(Duration::from_secs(60))) => {}
+                    _ = wake.recv() => {}
+                }
+                continue;
+            }
+            match self.ask_lender(borrower).await {
+                Ok((token, ttl)) => {
+                    failures = 0;
+                    tracing::info!(ttl_s = ttl.as_secs(), "auth: lent token renewed");
+                    self.keep_lent(token, ttl);
+                }
+                Err(err) => {
+                    failures = failures.saturating_add(1);
+                    let backoff = REFRESH_RETRY_BASE
+                        .saturating_mul(1 << (failures - 1).min(8))
+                        .min(REFRESH_RETRY_CAP);
+                    let wait = backoff.min(left.saturating_sub(Self::lent_slack(ttl)));
+                    tracing::warn!(error = %err, retry_ms = wait.as_millis() as u64,
+                        "auth: no next lent token yet; retrying");
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = wake.recv() => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// `LendToken` on the lender, through the relay: the next token, checked
+    /// to be for this engine's org, and how long it lasts.
+    async fn ask_lender(&self, borrower: &Borrower) -> Result<(String, Duration), String> {
+        let links = lock(&borrower.links)
+            .clone()
+            .ok_or("the relay isn't up yet")?;
+        let ask = async {
+            let client = links
+                .client(&borrower.lender)
+                .await
+                .map_err(|e| format!("the host device can't be reached: {e}"))?;
+            client
+                .call(
+                    zeron_rpc::methods::LEND_TOKEN,
+                    serde_json::json!({ "key": borrower.key }),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        };
+        let reply = match tokio::time::timeout(LENT_ASK_TIMEOUT, ask).await {
+            Ok(Ok(reply)) => reply,
+            outcome => {
+                links.invalidate(&borrower.lender);
+                return Err(match outcome {
+                    Ok(Err(err)) => err,
+                    _ => "the host device didn't answer".into(),
+                });
+            }
+        };
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Lent {
+            token: String,
+            expires_in: u64,
+        }
+        let lent: Lent =
+            serde_json::from_value(reply).map_err(|e| format!("malformed LendToken answer: {e}"))?;
+        let claims = jwt_claims(&lent.token).unwrap_or_default();
+        if claims.org_id.is_some() && claims.org_id.as_deref() != self.state().org_id() {
+            return Err("the host device lent a token for another organization".into());
+        }
+        let mut ttl = Duration::from_secs(lent.expires_in);
+        if let (Some(exp), Some(iat)) = (claims.exp, claims.iat)
+            && exp > iat
+        {
+            ttl = ttl.min(Duration::from_secs((exp - iat) as u64));
+        }
+        Ok((lent.token, ttl))
     }
 
     fn session_file(&self) -> PathBuf {
@@ -1763,6 +2243,8 @@ fn page(message: &str) -> String {
 #[derive(Debug, Default, Deserialize)]
 struct JwtClaims {
     #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
     exp: Option<i64>,
     #[serde(default)]
     iat: Option<i64>,
@@ -1800,6 +2282,12 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Whether two secrets are equal, in time that doesn't depend on where they
+/// differ.
+fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 fn url_encode(input: &str) -> String {

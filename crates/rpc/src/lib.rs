@@ -210,6 +210,11 @@ pub mod methods {
     /// exchange leaves the engine a one-time step-up ticket, kept in memory
     /// and never handed out. Needed before `DeleteAccount`.
     pub const STEP_UP: &str = "StepUp";
+    /// `{key}` → `{token, expiresIn}` (seconds): the next access token for a
+    /// sandbox this device lends its sign-in to (ADR 0003), in the org it was
+    /// lent for. Asked by the sandbox's engine over the relay before its
+    /// token runs out; refused once this device stops lending under `key`.
+    pub const LEND_TOKEN: &str = "LendToken";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run
@@ -1414,6 +1419,7 @@ mod tests {
             methods::APPLY_UPDATE,
             methods::ACCESS_TOKEN,
             methods::STEP_UP,
+            methods::LEND_TOKEN,
             methods::DELETE_ACCOUNT,
             methods::SIGN_IN,
             methods::COMPLETE_SIGN_IN,
