@@ -4560,6 +4560,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
                 ("text", Value::from(words.as_str())),
                 ("attachments", crate::appshots::tag_attachments(carried_value(&paths, &quotes, &picks, &comments, &chats), &shots)),
                 ("at", stamp(created as i64).map_or(Value::Nil, |at| Value::from(at.as_str()))),
+                // (When, in Unix seconds: what's said in the chat's place is
+                // put among its messages by it, a sandbox's ready row.)
+                ("sent", if created > 0. { Value::Num(created) } else { Value::Nil }),
                 ("copy", copy_value(&words)),
                 ("sender", sender),
             ]))
@@ -7117,6 +7120,17 @@ mod tests {
         let card = chat_chip("Fix the build", "c1");
         assert!(matches!(card.field("mark"), Some(Value::Str(s)) if s.as_ref() == mark("codex")));
         CHATS.with(|c| c.chats.borrow_mut().remove("c1"));
+    }
+    #[test]
+    fn a_prompt_says_when_it_was_sent_in_seconds() {
+        let entry = json!({ "id": "u", "role": "user", "createdAt": 1_788_900_000_000_i64,
+            "parts": [{ "id": "t", "kind": "text", "text": "go" }] });
+        let shown = message(&entry, None).expect("a prompt shows");
+        assert_eq!(shown.field("sent").and_then(Value::as_f64), Some(1_788_900_000.));
+        // None known: nothing said.
+        let bare = json!({ "id": "u", "role": "user", "parts": [{ "id": "t", "kind": "text", "text": "go" }] });
+        let shown = message(&bare, None).expect("a prompt shows");
+        assert!(shown.field("sent").is_none_or(|v| matches!(v, Value::Nil)));
     }
     #[test]
     fn a_prompts_attached_passages_show_as_chips_on_the_sent_message() {

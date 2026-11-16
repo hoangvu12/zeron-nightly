@@ -1,31 +1,30 @@
--- Save as template (spec #37): a chat's sandbox saved through its provider,
--- by the host device that keeps it (src/sandbox_templates.rs). Named apart
--- from the interface's own templates (`templates.*`). What a save says is
--- screens/shell/save_template's; a provider's templates are listed by
--- account/sandboxes.
+-- Save as sandbox template (spec #37): a chat's sandbox saved through its
+-- provider, by the host device that keeps it (src/sandbox_template_save.rs).
+-- A sandbox template, named apart from the interface's own templates
+-- (`templates.*`). What a save says is screens/shell/save_sandbox_template's;
+-- a provider's sandbox templates are listed by account/sandboxes.
 --
---   sandbox_templates.on_sandbox(chat)  whether its device is a sandbox
+--   template_saves.on_sandbox(chat)   whether its device is a sandbox
 --                                     (tracked): its menu offers the save
---   sandbox_templates.save(chat, name)  saves it; while it does, and once
---                                     it's done, its `notice(chat)` says so
---   sandbox_templates.saving(chat)    whether it's saving (tracked)
---   sandbox_templates.notice(chat)    { tone, text, spinner?, dismissable? }
---                                     for the chat's composer (tracked)
---   sandbox_templates.dismiss(chat)   put that notice away
+--   template_saves.save(chat, name)   saves it; while it does, and once
+--                                     it's done, its `band(chat)` says so
+--   template_saves.saving(chat)       whether it's saving (tracked)
+--   template_saves.band(chat)         the chat's composer band (tracked)
+--   template_saves.dismiss(chat)      put that band away
 --
 -- The host's call is a field (`ask_save`) a fixture can answer in its place.
 
 local sessions = require("@account/sessions")
 local sandboxes = require("@account/sandboxes")
-local words = require("@app/screens/shell/save_template")
+local words = require("@app/screens/shell/save_sandbox_template")
 
 local M = {}
 
--- Chat → its last save (screens/shell/save_template's).
+-- Chat → its last save (screens/shell/save_sandbox_template's).
 M.saves = ui.state("account_sandbox_template_saves", {} :: { [string]: any })
 
 function M.ask_save(chat: string, name: string): any
-	return ui.call("sandbox_templates.save", { chat = chat, name = name })
+	return ui.call("sandbox_template.save", { chat = chat, name = name })
 end
 
 M.trimmed = words.trimmed
@@ -70,8 +69,8 @@ function M.saving(chat: string?): boolean
 	return s ~= nil and s.state == "saving"
 end
 
-function M.notice(chat: string?): any
-	return words.notice(chat and M.saves:get()[chat])
+function M.band(chat: string?): any
+	return words.band(chat and M.saves:get()[chat])
 end
 
 function M.dismiss(chat: string?)

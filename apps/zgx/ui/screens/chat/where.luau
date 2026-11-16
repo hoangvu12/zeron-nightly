@@ -64,6 +64,26 @@ M.remembered = ui.persist("chat_where", {
 	projects = {} :: { [string]: string },
 })
 
+-- The sandbox template last used with each provider (its id, or
+-- `sandboxes.BLANK`), kept across launches.
+M.last_templates = ui.persist("chat_where_templates", {} :: { [string]: string })
+
+-- The template a new chat on `provider` starts on: the one last used there,
+-- if it's still listed, else the first listed, else Blank (screen 02).
+function M.default_template(provider: string, list: { any }): string
+	local last = M.last_templates:peek()[provider]
+	if last == sandboxes.BLANK then
+		return last
+	end
+	for _, t in list do
+		if t.id == last then
+			return last
+		end
+	end
+	local first = list[1]
+	return if first then first.id else sandboxes.BLANK
+end
+
 export type Choices = {
 	device: State<string?>,
 	project: State<string?>,
@@ -653,9 +673,10 @@ function M.bind(c: Choices)
 		return { project = p.id, device = p.device, branch = name, cwd = p.path, worktree = false }
 	end
 
-	-- A place's templates: its account's, then Blank (its plain image),
-	-- loaded as another provider is picked; the one picked afresh (Blank
-	-- until one is).
+	-- A place's sandbox templates: its account's, then Blank (its plain
+	-- image), loaded as another provider is picked. The one picked: the one
+	-- last used with that provider, else the first listed, else Blank
+	-- (screen 02).
 	local templates_of = ui.state(
 		if c.slot then `chat_where_templates.{c.slot}` else "chat_where_templates",
 		{ provider = "", state = "idle", list = {} } :: { provider: string, state: string, list: { sandboxes.Template } }
@@ -675,11 +696,18 @@ function M.bind(c: Choices)
 		end
 		local was = templates_of:peek()
 		if was.provider == provider and was.state == "ready" then
+			if c.template then
+				c.template:set(M.default_template(provider, was.list))
+			end
 			return
 		end
 		templates_of:set { provider = provider, state = "loading", list = {} }
 		sandboxes.templates(provider):after(function(list: any)
 			if templates_of:peek().provider == provider then
+				-- (The default first, so it's what's remembered, not Blank.)
+				if c.template and c.template:peek() == sandboxes.BLANK and place_of(c.device:peek()) == provider then
+					c.template:set(M.default_template(provider, list or {}))
+				end
 				templates_of:set { provider = provider, state = "ready", list = list or {} }
 			end
 		end, function()
@@ -687,6 +715,22 @@ function M.bind(c: Choices)
 				templates_of:set { provider = provider, state = "error", list = {} }
 			end
 		end)
+	end)
+	-- The one picked, kept for the next new chat on that provider.
+	ui.effect(function()
+		local picked = if c.template then c.template:get() else nil
+		local provider = place_of(c.device:get())
+		local t = templates_of:get()
+		if not c.active() or not provider or picked == nil or t.provider ~= provider or t.state ~= "ready" then
+			return
+		end
+		local listed = picked == sandboxes.BLANK
+		for _, template in t.list do
+			listed = listed or template.id == picked
+		end
+		if listed and M.last_templates:peek()[provider] ~= picked then
+			M.last_templates:set_key({ provider }, picked)
+		end
 	end)
 	local templates = ui.computed(function(): { any }
 		local out = {}
@@ -697,7 +741,7 @@ function M.bind(c: Choices)
 		for _, template in t.list do
 			table.insert(out, { value = template.id, label = template.name, icon = "box" })
 		end
-		table.insert(out, { value = sandboxes.BLANK, label = ui.t("chat.where.template.blank"):get(), icon = "plus" })
+		table.insert(out, { value = sandboxes.BLANK, label = ui.t("chat.where.sandbox_template.blank"):get(), icon = "plus" })
 		return out
 	end)
 

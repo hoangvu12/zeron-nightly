@@ -15,13 +15,18 @@
 --   sandbox_stub.asleep        it's asleep (#43)
 --   sandbox_stub.waking        it's waking
 --   sandbox_stub.wake_failed   its wake failed
+--   sandbox_stub.script_running  up, its setup.sh running
+--   sandbox_stub.script_failed   up, its setup.sh failed
+--   sandbox_stub.fresh_ready   a fresh sandbox got ready (in 58s)
 -- (fail_next and hold_next hold for Wake too.)
+-- They say it where the host does, account/sandboxes' `steps`, which the
+-- composer reads (each its own clock: `since` now).
 
 local sandboxes = require("@account/sandboxes") :: any
 local store = require("@app/screens/chat/store")
 
 local calls = ui.state("sandbox_stub_calls", {} :: { string })
-local steps = ui.state("sandbox_stub_steps", {} :: { [string]: any })
+local steps = sandboxes.steps
 local fail = ui.state("sandbox_stub_fail", false)
 local hold = ui.state("sandbox_stub_hold", false)
 -- (Kept across launches in the app: here, each fixture starts with none.)
@@ -32,9 +37,6 @@ local function log(entry: string)
 	calls:push(entry)
 end
 
-sandboxes.read = function(): { [string]: any }
-	return steps:get()
-end
 sandboxes.ask_follow = function(chat: string)
 	log(`follow:{chat}`)
 end
@@ -73,7 +75,8 @@ local function say(fields: { [string]: any })
 	if not chat then
 		return
 	end
-	local s: { [string]: any } = { state = "ready", provider = "docker", provider_name = "Docker Sandbox", disk_full = false }
+	local s: { [string]: any } =
+		{ state = "ready", provider = "docker", provider_name = "Docker Sandbox", disk_full = false, since = ui.now() / 1000 }
 	-- (`false` for a field it doesn't have: a nil in a table isn't there.)
 	for k, v in fields do
 		s[k] = if v == false and k ~= "disk_full" then nil else v
@@ -93,10 +96,22 @@ local CASES: { [string]: { [string]: any } } = {
 		error = "The sandbox's disk is full. Free some space, or start fresh.\nwrite error: No space left on device",
 		disk_full = true,
 	},
-	started = { state = "starting", step = "create" },
+	started = {
+		state = "starting",
+		step = "create",
+		progress = { "running", "pending", "pending", "pending", "pending", "pending", "pending", "pending" },
+		started = { at = 0, fresh = true },
+	},
 	asleep = { state = "asleep" },
 	waking = { state = "waking", step = "wake" },
 	wake_failed = { state = "failed", step = "wake", error = "Couldn't start the sandbox: it's gone quiet." },
+	script_running = {
+		scripts = { { name = "setup.sh", script = "reportly/.zeron/setup.sh", step = "setup", state = "running", since = 100 } },
+	},
+	script_failed = {
+		scripts = { { name = "setup.sh", script = "reportly/.zeron/setup.sh", step = "setup", state = "failed", since = 100, error = "exit 1" } },
+	},
+	fresh_ready = { started = { at = 1000, ready_at = 1058, fresh = true } },
 }
 for case, fields in CASES do
 	ui.command {

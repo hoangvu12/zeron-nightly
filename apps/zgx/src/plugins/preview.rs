@@ -104,7 +104,7 @@ pub const BLOCKED: &[&str] = &[
     // (A sandbox provider's key, its host device, the user's step scripts.)
     "sandbox_settings.change",
     // (Restarts Zeron in a sandbox, and saves it at the provider.)
-    "sandbox_templates.save",
+    "sandbox_template.save",
 ];
 
 pub fn blocked(action: &str) -> bool {

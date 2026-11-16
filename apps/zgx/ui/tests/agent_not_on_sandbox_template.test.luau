@@ -2,13 +2,15 @@
 -- its template (#46, spec #37 stories 51 and 52). The composer says so
 -- ("Codex isn't on this template"), has the message's words back, and keeps
 -- the agent as picked; the person switches agent and sends, and it goes as
--- the same message. On ui/chat_fixture.luau (`refused_codex`).
+-- the same message. Said on the composer's band, a row of its own over it,
+-- never behind the Alerts pill (screen 18); gone as soon as another agent is
+-- picked (screen 20). On ui/chat_fixture.luau (`refused_codex`).
 
 local function settle(app: any)
 	app:frames(30)
 end
 
-local LIST = 'role:list "Alerts"'
+local BAND = "#composer-band"
 
 local function refused(app: any)
 	app:command("go_s2")
@@ -20,19 +22,13 @@ local function refused(app: any)
 	settle(app)
 end
 
-local function open_deck(app: any)
-	app:click('role:button "Open Alerts"')
-	app:wait("#never-shown", { timeout_ms = 320 })
-	app:frames(10)
-end
-
 test("Agent not on template: the composer says so and has the words back", function()
 	local app = mount("chat_fixture.luau")
 	app:resize(960, 760)
 	refused(app)
 	expect(app:text("role:textbox")).to_be("Add a landing page for reportly")
-	open_deck(app)
-	expect(app:has(`{LIST} >> ~"Codex isn't on this template"`)).to_be(true)
+	expect(app:has(`{BAND} >> ~"Codex isn't on this template"`)).to_be(true)
+	expect(app:has('role:button "Open Alerts"')).to_be(false)
 	-- Never swapped: the agent stays the one picked, until the person picks.
 	expect(app:state("chat_model")).to_be("gpt")
 	expect(app:state("calls")).never.to_contain("send:")
@@ -66,6 +62,19 @@ test("Agent not on template: a draft typed already isn't overwritten", function(
 	app:command("refused_codex")
 	settle(app)
 	expect(app:text("role:textbox")).to_be("My own draft")
-	open_deck(app)
-	expect(app:has(`{LIST} >> ~"Codex isn't on this template"`)).to_be(true)
+	expect(app:has(`{BAND} >> ~"Codex isn't on this template"`)).to_be(true)
+end)
+
+test("Agent not on template: picking another agent clears it before the send", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(960, 760)
+	refused(app)
+	expect(app:has(`{BAND} >> ~"Codex isn't on this template"`)).to_be(true)
+	app:set_state("chat_model", "sonnet")
+	settle(app)
+	expect(app:has(`~"Codex isn't on this template"`)).to_be(false)
+	-- Codex again: it's said again.
+	app:set_state("chat_model", "gpt")
+	settle(app)
+	expect(app:has(`{BAND} >> ~"Codex isn't on this template"`)).to_be(true)
 end)

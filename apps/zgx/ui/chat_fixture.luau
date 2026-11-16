@@ -1216,7 +1216,12 @@ do
 		sandboxes.now:set { providers = { { id = "docker", name = "Docker Sandbox", icon = "docker" } } }
 	end }
 	local CASES: { [string]: any } = {
-		starting = { state = "starting", step = "installZeron", template = "zeron-dev" },
+		starting = {
+			state = "starting",
+			step = "installZeron",
+			template = "zeron-dev",
+			progress = { "done", "done", "running", "pending", "pending", "pending", "pending", "pending" },
+		},
 		failed = { state = "failed", step = "getCode", template = "zeron-dev", error = "Couldn't clone acme/atlas" },
 		ready = { state = "ready", template = "zeron-dev" },
 	}
