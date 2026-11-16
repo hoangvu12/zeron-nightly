@@ -669,14 +669,7 @@ local function Composer(): Node
 	-- disk full, and Start fresh.
 	local sandbox = SandboxTray.bind {
 		chat = function(): string?
-			return session_id:get()
-		end,
-		device = function(): string?
-			local s = open()
-			return s and s.device
-		end,
-		here = function(): string?
-			return sessions.here:get()
+			return (sandbox_device())
 		end,
 	}
 	-- The deck's alerts: its Cloud machine's, then its sandbox's.

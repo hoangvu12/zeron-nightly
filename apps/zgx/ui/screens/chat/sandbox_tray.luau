@@ -1,8 +1,9 @@
 -- A chat's sandbox, on its composer's deck: tracked reads and the actions,
 -- nothing drawn (as screens/chat/cloud_tray for Cloud). What's said is
--- screens/chat/sandbox_machine's.
+-- screens/chat/sandbox_machine's. The composer follows the chat's steps
+-- (account/sandboxes) while it's open on a sandbox.
 --
---   local sandbox = SandboxTray.bind { chat = fn, device = fn, here = fn }
+--   local sandbox = SandboxTray.bind { chat = fn }
 --   alerts: its alert, as the deck takes them; on_alert(id): its action
 --   line(): the deck's notice while it's asleep (moon, Wake); resting():
 --   asleep or on its way to or from it (its host's offline, not unreachable)
@@ -14,21 +15,13 @@ local logic = require("@app/screens/chat/sandbox_machine")
 local M = {}
 
 export type Bind = {
+	-- The open chat while it runs on a sandbox (its device's row names a
+	-- provider), else nil: a chat on any other device is never asked about.
 	chat: () -> string?,
-	-- The chat's host, and this device's: a chat hosted here isn't on a
-	-- sandbox, so it's never asked about.
-	device: () -> string?,
-	here: () -> string?,
 }
 
 function M.bind(c: Bind): any
 	local b: any = {}
-	ui.effect(function()
-		local chat, device = c.chat(), c.device()
-		if chat and device and device ~= c.here() then
-			sandboxes.follow(chat)
-		end
-	end)
 	function b.steps(): any
 		return sandboxes.machine(c.chat())
 	end
