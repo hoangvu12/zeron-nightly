@@ -23,7 +23,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fake_provider::FakeProvider;
-use places::{SPACE, add_project, create_on_place, eventually, host_device, origin, project, ready, steps_until};
+use places::{
+    SPACE, add_project, create_on_place, eventually, host_device, origin, project, ready,
+    steps_until,
+};
 use scripted_edge::ScriptedEdge;
 use serde_json::{Value, json};
 use zeron_doc::{MessageRole, MessageStatus};
@@ -287,16 +290,21 @@ async fn scripts_run_where_their_moment_says_in_name_order() {
              zeron-sandbox 'echo last words > last-words.txt' && echo sandbox-ok >> \"{log_sh}\""
         ),
     );
-    script(&steps_dir.join("after-delete/bye.sh"), &note("after-delete"));
+    script(
+        &steps_dir.join("after-delete/bye.sh"),
+        &note("after-delete"),
+    );
     rpc.call(
         methods::MUTATE,
         json!({ "op": "deleteChat", "chatId": "chat-a" }),
     )
     .await
     .expect("deleteChat");
-    eventually("the delete scripts ran", Duration::from_secs(30), async || {
-        (lines(&log).len() == 3).then_some(())
-    })
+    eventually(
+        "the delete scripts ran",
+        Duration::from_secs(30),
+        async || (lines(&log).len() == 3).then_some(()),
+    )
     .await;
     assert_eq!(
         lines(&log),
@@ -358,7 +366,10 @@ async fn a_failing_script_opens_the_chat_with_its_error_and_runs_again() {
     assert_eq!(failed[0]["hook"], "setup");
     assert_eq!(failed[0]["state"], "failed");
     let error = failed[0]["error"].as_str().unwrap_or_default();
-    assert!(error.contains("npm ERR! missing script"), "its own words: {error}");
+    assert!(
+        error.contains("npm ERR! missing script"),
+        "its own words: {error}"
+    );
     assert_eq!(lines(&log), ["setup.sh", "ok"]);
     replied(&provider, "chat-f", "chat-f", Duration::from_secs(60)).await;
 
@@ -379,7 +390,10 @@ async fn a_failing_script_opens_the_chat_with_its_error_and_runs_again() {
     assert_eq!(lines(&log), ["setup.sh", "ok", "setup.sh"]);
     let calls = provider.calls();
     assert_eq!(
-        calls.iter().filter(|c| c.contains("zeron-engine watchdog")).count(),
+        calls
+            .iter()
+            .filter(|c| c.contains("zeron-engine watchdog"))
+            .count(),
         1,
         "{calls:#?}"
     );
@@ -404,9 +418,15 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         .unwrap();
     assert_eq!(none, json!([]));
 
-    write(&rpc, json!({"kind": "all"}), "after-setup", "fleet-sync.sh", "fleet sync\n")
-        .await
-        .expect("all sandboxes");
+    write(
+        &rpc,
+        json!({"kind": "all"}),
+        "after-setup",
+        "fleet-sync.sh",
+        "fleet sync\n",
+    )
+    .await
+    .expect("all sandboxes");
     write(
         &rpc,
         json!({"kind": "provider", "provider": "docker"}),
@@ -488,9 +508,15 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         .await
         .unwrap();
     assert_eq!(read["content"], "fleet sync\n");
-    write(&rpc, json!({"kind": "all"}), "after-setup", "fleet-sync.sh", "fleet sync --all\n")
-        .await
-        .unwrap();
+    write(
+        &rpc,
+        json!({"kind": "all"}),
+        "after-setup",
+        "fleet-sync.sh",
+        "fleet sync --all\n",
+    )
+    .await
+    .unwrap();
     let read = rpc
         .call(
             methods::READ_STEP_SCRIPT,
@@ -512,7 +538,11 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         .await
         .unwrap();
     assert_eq!(listed.as_array().unwrap().len(), 3, "{listed:#}");
-    assert!(!host_dir.join("steps/docker/after-wake/git-fetch.sh").exists());
+    assert!(
+        !host_dir
+            .join("steps/docker/after-wake/git-fetch.sh")
+            .exists()
+    );
 
     // Nothing lands outside the folders a script may be in.
     for (scope, hook, name) in [
@@ -520,9 +550,21 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         (json!({"kind": "all"}), "after-setup", "a/b.sh"),
         (json!({"kind": "all"}), "after-lunch", "x.sh"),
         (json!({"kind": "all"}), "setup", "setup.sh"),
-        (json!({"kind": "provider", "provider": "../x"}), "after-wake", "x.sh"),
-        (json!({"kind": "project", "spaceId": "nope"}), "after-setup", "x.sh"),
-        (json!({"kind": "project", "spaceId": SPACE}), "setup", "other.sh"),
+        (
+            json!({"kind": "provider", "provider": "../x"}),
+            "after-wake",
+            "x.sh",
+        ),
+        (
+            json!({"kind": "project", "spaceId": "nope"}),
+            "after-setup",
+            "x.sh",
+        ),
+        (
+            json!({"kind": "project", "spaceId": SPACE}),
+            "setup",
+            "other.sh",
+        ),
     ] {
         let refused = write(&rpc, scope.clone(), hook, name, "x").await;
         assert!(refused.is_err(), "{scope} {hook} {name}");

@@ -502,7 +502,10 @@ impl Sandboxes {
         let record = lock(&chat.record).clone();
         let repo = host_repo(host, &record);
         let scripts: Vec<scripts::Script> = if run.hook == scripts::SETUP_HOOK {
-            repo.as_ref().and_then(scripts::repo_setup).into_iter().collect()
+            repo.as_ref()
+                .and_then(scripts::repo_setup)
+                .into_iter()
+                .collect()
         } else {
             let Some(hook) = Hook::parse(&run.hook) else {
                 return;
@@ -513,10 +516,16 @@ impl Sandboxes {
                 .filter(|script| script.order() >= from)
                 .collect()
         };
-        // This failure is answered either way: by a new run, or by the
-        // script being gone.
-        chat.update(|steps| steps.scripts.retain(|r| !same_script(r, run)));
-        self.persist();
+        // The failure stays shown until its new run takes its place (no
+        // moment of "nothing failed" between); if the script is gone, it
+        // goes now.
+        let reruns_it = scripts
+            .first()
+            .is_some_and(|s| s.hook == run.hook && s.name == run.name && s.scope == run.scope);
+        if !reruns_it {
+            chat.update(|steps| steps.scripts.retain(|r| !same_script(r, run)));
+            self.persist();
+        }
         if !scripts.is_empty() {
             self.run_scripts(chat, provider, host, run.step, scripts)
                 .await;
@@ -1222,7 +1231,10 @@ async fn read_run_request(stream: &mut tokio::net::TcpStream) -> Option<(String,
         return None;
     }
     if expect {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.ok()?;
+        stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .ok()?;
     }
     let mut body = bytes[head_end..].to_vec();
     while body.len() < length {

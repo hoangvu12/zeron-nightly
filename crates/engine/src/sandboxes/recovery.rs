@@ -7,7 +7,7 @@
 use std::sync::atomic::Ordering;
 
 use super::{
-    ChatSandbox, ErrorKind, Host, Hook, Placement, Record, SandboxProvider, SandboxSteps,
+    ChatSandbox, ErrorKind, Hook, Host, Placement, Record, SandboxProvider, SandboxSteps,
     Sandboxes, Timing, lock,
 };
 use crate::auth::Auth;

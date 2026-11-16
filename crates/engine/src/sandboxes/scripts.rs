@@ -225,7 +225,12 @@ pub fn all(steps_dir: &Path, repos: &[Repo]) -> Vec<Script> {
     let mut providers = Vec::new();
     for (folder, path) in dirs_in(steps_dir) {
         if Hook::parse(&folder).is_some() {
-            scripts.extend(for_folder(Scope::All, &folder, &path, &format!("{STEPS_DIR}/{folder}")));
+            scripts.extend(for_folder(
+                Scope::All,
+                &folder,
+                &path,
+                &format!("{STEPS_DIR}/{folder}"),
+            ));
         } else if valid_name(&folder) {
             providers.push((folder, path));
         }
@@ -410,7 +415,12 @@ mod tests {
             ("after-create", Timing::After, Step::Create, false),
             ("instead-of-start", Timing::InsteadOf, Step::Start, false),
             ("after-start", Timing::After, Step::Start, true),
-            ("before-install-zeron", Timing::Before, Step::InstallZeron, true),
+            (
+                "before-install-zeron",
+                Timing::Before,
+                Step::InstallZeron,
+                true,
+            ),
             ("instead-of-secrets", Timing::InsteadOf, Step::Secrets, true),
             ("after-get-code", Timing::After, Step::GetCode, true),
             ("after-setup", Timing::After, Step::Setup, true),
@@ -526,7 +536,10 @@ mod tests {
                 "a.sh",
             ),
         ] {
-            assert!(ok(scope.clone(), hook, name).is_err(), "{scope:?} {hook} {name}");
+            assert!(
+                ok(scope.clone(), hook, name).is_err(),
+                "{scope:?} {hook} {name}"
+            );
         }
     }
 }

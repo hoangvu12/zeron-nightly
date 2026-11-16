@@ -8,7 +8,7 @@ use zeron_rpc::{RpcError, RpcReply, methods};
 
 use super::{EngineRpc, parse_params, watch_stream};
 use crate::sandboxes::scripts::{self, Scope};
-use crate::sandboxes::{Credential, Host, Hook, Sandboxes, Step, repos_here};
+use crate::sandboxes::{Credential, Hook, Host, Sandboxes, Step, repos_here};
 
 pub(super) fn handles(method: &str) -> bool {
     matches!(
@@ -123,11 +123,10 @@ impl EngineRpc {
             }
             methods::LIST_STEP_SCRIPTS => {
                 let repos = repos_here(&self.workspace, self.doc_host.device_id());
-                let rows: Vec<serde_json::Value> =
-                    scripts::all(sandboxes.steps_dir(), &repos)
-                        .into_iter()
-                        .map(|script| script_row(&script))
-                        .collect();
+                let rows: Vec<serde_json::Value> = scripts::all(sandboxes.steps_dir(), &repos)
+                    .into_iter()
+                    .map(|script| script_row(&script))
+                    .collect();
                 RpcReply::value(&rows)
             }
             methods::READ_STEP_SCRIPT => {
@@ -158,10 +157,7 @@ impl EngineRpc {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
-                        return Err(RpcError::Failed(format!(
-                            "Couldn't delete {}: {e}",
-                            p.name
-                        )));
+                        return Err(RpcError::Failed(format!("Couldn't delete {}: {e}", p.name)));
                     }
                 }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
