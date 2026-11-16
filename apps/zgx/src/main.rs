@@ -29,6 +29,7 @@
 
 mod about;
 #[cfg(all(windows, feature = "beta"))]
+mod sandboxes;
 mod windows_install;
 mod acp_registry;
 mod agents;
@@ -784,6 +785,9 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         // Cloud and Billing (src/cloud.rs): Settings' pages, the new chat's
         // Cloud choice.
         cloud::install(cx, &host);
+        // A chat's sandbox: deleted outside Zeron, a full disk, Start fresh
+        // (src/sandboxes.rs).
+        sandboxes::install(cx, &host);
         // The sessions behind the main window (src/sessions.rs).
         sessions::install(cx, &host);
         // What there is to update, on every device (src/updates.rs).

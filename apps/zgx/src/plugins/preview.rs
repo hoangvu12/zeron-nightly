@@ -98,6 +98,7 @@ pub const BLOCKED: &[&str] = &[
     "cloud.wake",
     "cloud.sleep",
     "cloud.retry",
+    "sandboxes.fresh",
     "cloud.set_machine",
 ];
 
