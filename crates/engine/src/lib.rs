@@ -1182,6 +1182,9 @@ impl Engine {
                 .register(Arc::new(sandboxes::docker::DockerProvider::new(
                     sandboxes::KeySlot::open(&config.data_dir, sandboxes::docker::ID),
                 )));
+            core.sandboxes.register(Arc::new(sandboxes::BoatProvider::new(
+                sandboxes::KeySlot::open(&config.data_dir, sandboxes::boat::BOAT_ID),
+            )));
         }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).
