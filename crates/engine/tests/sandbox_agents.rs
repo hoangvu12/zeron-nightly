@@ -262,11 +262,25 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
     ready(&rpc, "chat-b").await;
     // The user picked Codex; the template doesn't have it.
     send(&rpc, "chat-b", &cwd, HarnessId::Codex, "m-1").await;
+    // (The scripted edge sends no nudge: what's queued goes over as Ready
+    // hands the first message over.)
+    let deliver = || {
+        host.core()
+            .doc_host
+            .retry_delivery("chat-b")
+            .expect("hand it over")
+    };
+    deliver();
 
     // The sandbox refuses it with a reason a client can show, and the
     // message waits to be sent again.
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut polls = 0;
     let refused = loop {
+        polls += 1;
+        if polls % 10 == 0 {
+            deliver();
+        }
         let waiting = provider
             .with_engine("chat-b", |core| {
                 core.doc_host.waiting_messages("chat-b").ok()
@@ -315,8 +329,13 @@ async fn an_agent_not_on_the_template_says_so_keeps_the_message_and_is_never_swa
 
     // The user switches agent and sends it again: it runs, once.
     send(&rpc, "chat-b", &cwd, HarnessId::Mock, "m-1").await;
+    deliver();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        polls += 1;
+        if polls % 10 == 0 {
+            deliver();
+        }
         let entries = transcript(&provider, "chat-b", "chat-b");
         let answered = entries
             .iter()
