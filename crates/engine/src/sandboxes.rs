@@ -183,11 +183,12 @@ impl Sandboxes {
     }
 
     /// The place a sandbox device belongs to: `(provider, template)` of a
-    /// chat's sandbox this device keeps.
+    /// chat's sandbox this device keeps. Not a device that runs Zeron of its
+    /// own (a PC at home): it answers for its own agents.
     pub fn place_of_device(&self, device_id: &str) -> Option<(String, Option<String>)> {
         lock(&self.inner.chats).values().find_map(|chat| {
             let record = lock(&chat.record);
-            (record.steps.device_id == device_id)
+            (record.steps.device_id == device_id && !record.resident)
                 .then(|| (record.steps.provider.clone(), record.steps.template.clone()))
         })
     }
