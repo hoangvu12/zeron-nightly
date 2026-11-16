@@ -174,11 +174,36 @@ impl Sandboxes {
                 .run_scripts(chat, provider, host, Step::Delete, instead)
                 .await
                 .any;
-        if !replaced && record.steps.state != SandboxState::Gone {
-            delete_sandbox(&record, provider).await;
+        let gone = replaced
+            || record.steps.state == SandboxState::Gone
+            || delete_sandbox(&record, provider).await;
+        if gone {
+            self.forget_device(chat, &record, host);
         }
         self.run_hook(chat, provider, host, hook(Timing::After))
             .await;
+    }
+
+    /// The sandbox is gone: so is its device, from every device list,
+    /// unless it's a place running Zeron of its own (a PC at home) or
+    /// another chat still runs there.
+    fn forget_device(&self, chat: &ChatSandbox, record: &Record, host: &Host) {
+        let device = &record.steps.device_id;
+        if record.resident || device == host.doc_host.device_id() {
+            return;
+        }
+        let shared = lock(&self.inner.chats).values().any(|other| {
+            !std::ptr::eq(other.as_ref(), chat)
+                && !other.discarded.load(Ordering::SeqCst)
+                && lock(&other.record).steps.device_id == *device
+        });
+        if shared {
+            return;
+        }
+        match host.workspace.delete_device(device) {
+            Ok(_) => tracing::info!(%device, "sandbox: its device is forgotten"),
+            Err(err) => tracing::warn!(%device, error = %err, "sandbox: couldn't forget its device"),
+        }
     }
 
     /// Start fresh: a new sandbox for the chat, every step again; Get the
@@ -229,18 +254,25 @@ fn stop_lending(record: &Record, auth: Option<&Auth>) {
 }
 
 /// Delete the sandbox, if Zeron made it (a shared place isn't Zeron's).
-async fn delete_sandbox(record: &Record, provider: &dyn SandboxProvider) {
+/// Whether it's gone now.
+async fn delete_sandbox(record: &Record, provider: &dyn SandboxProvider) -> bool {
     let Some(sandbox) = &record.steps.sandbox_id else {
-        return;
+        return false;
     };
     if record.steps.state_of(Step::Create) != StepState::Done
         || !provider.ops().contains(Ops::DELETE)
     {
-        return;
+        return false;
     }
     match provider.delete(sandbox).await {
-        Ok(()) => tracing::info!(%sandbox, "sandbox deleted"),
-        Err(err) if err.kind == ErrorKind::NotFound => {}
-        Err(err) => tracing::warn!(%sandbox, error = %err, "sandbox not deleted"),
+        Ok(()) => {
+            tracing::info!(%sandbox, "sandbox deleted");
+            true
+        }
+        Err(err) if err.kind == ErrorKind::NotFound => true,
+        Err(err) => {
+            tracing::warn!(%sandbox, error = %err, "sandbox not deleted");
+            false
+        }
     }
 }
