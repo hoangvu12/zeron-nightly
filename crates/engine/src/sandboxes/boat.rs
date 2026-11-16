@@ -288,9 +288,12 @@ impl SandboxProvider for BoatProvider {
         WORKDIR.to_owned()
     }
 
+    fn account(&self) -> Option<Account> {
+        self.key().ok().map(|_| account())
+    }
+
     async fn connect(&self, credential: Credential) -> Result<Account, ProviderError> {
         // Boat takes a pasted key only (no device sign-in).
-        #[allow(unreachable_patterns)]
         let key = match &credential {
             Credential::Token(key) => key.trim(),
             _ => {
@@ -322,9 +325,7 @@ impl SandboxProvider for BoatProvider {
                 format!("couldn't keep the Boat key on this device: {err}"),
             )
         })?;
-        Ok(Account {
-            name: "Boat account".into(),
-        })
+        Ok(account())
     }
 
     async fn create(&self, request: CreateSandbox) -> Result<String, ProviderError> {
@@ -473,6 +474,13 @@ fn path(sandbox: &str, suffix: &str) -> String {
         })
         .collect();
     format!("/sandboxes/{id}{suffix}")
+}
+
+/// Boat's API names no account to a key, so Settings shows just this.
+fn account() -> Account {
+    Account {
+        name: "Boat account".into(),
+    }
 }
 
 fn gone(sandbox: &str) -> ProviderError {

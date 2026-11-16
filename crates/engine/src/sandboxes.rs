@@ -10,7 +10,8 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
-mod boat;
+pub mod boat;
+pub mod docker;
 mod keys;
 mod provider;
 mod recovery;
@@ -19,8 +20,9 @@ mod steps;
 pub use boat::BoatProvider;
 pub use keys::KeySlot;
 pub use provider::{
-    Account, Command, CreateSandbox, Credential, ErrorKind, Exit, Finished, Ops, Placement,
-    ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template, run_to_end,
+    Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,
+    Placement, ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
+    run_to_end,
 };
 pub use steps::{SandboxState, SandboxSteps, Step, StepProgress, StepState};
 
@@ -73,6 +75,8 @@ pub struct ProviderInfo {
     pub name: String,
     pub icon: String,
     pub ops: Vec<&'static str>,
+    /// The account it's connected to here; `None` until the user connects.
+    pub account: Option<Account>,
 }
 
 /// What `createChat` on a place answers: the chat's host and folder.
@@ -193,19 +197,6 @@ impl Sandboxes {
         providers.push(provider);
     }
 
-    /// Offer the providers built into Zeron (Boat), each on its key slot in
-    /// this data dir. Not connected yet, they're offered all the same: Settings
-    /// connects them.
-    pub fn register_built_in(&self) {
-        let Some(data_dir) = self.inner.records_path.as_deref().and_then(Path::parent) else {
-            return;
-        };
-        self.register(Arc::new(BoatProvider::new(KeySlot::open(
-            data_dir,
-            boat::BOAT_ID,
-        ))));
-    }
-
     pub fn providers(&self) -> Vec<ProviderInfo> {
         lock(&self.inner.providers)
             .iter()
@@ -214,8 +205,14 @@ impl Sandboxes {
                 name: p.name().to_owned(),
                 icon: p.icon().to_owned(),
                 ops: p.ops().names(),
+                account: p.account(),
             })
             .collect()
+    }
+
+    /// The provider with id `id`, as registered.
+    pub fn provider_named(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {
+        self.provider(id)
     }
 
     fn provider(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {

@@ -97,6 +97,7 @@ async fn connecting_checks_the_key_and_keeps_it_on_this_device_only() {
     assert_eq!(wrong.kind, ErrorKind::Config, "{wrong}");
     assert!(!wrong.message.contains("not-the-key"), "{wrong}");
     assert_eq!(boat.slot.get(), None, "a rejected key isn't kept");
+    assert_eq!(boat.provider.account(), None);
 
     let account = boat
         .provider
@@ -106,6 +107,8 @@ async fn connecting_checks_the_key_and_keeps_it_on_this_device_only() {
     assert!(!account.name.is_empty());
     assert!(!account.name.contains(KEY));
     assert!(boat.slot.get().unwrap().contains(KEY));
+    // Settings shows it connected.
+    assert_eq!(boat.provider.account(), Some(account));
 
     // Another provider built on the same slot (a restart) is connected.
     let again = BoatProvider::new(boat.slot.clone())

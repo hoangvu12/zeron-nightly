@@ -271,7 +271,7 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
         .call(methods::LIST_SANDBOX_PROVIDERS, json!({}))
         .await
         .unwrap();
-    // Beside the built-in ones (Boat).
+    // The built-in providers are listed too; this one is the fake.
     let fake = offered
         .as_array()
         .unwrap()
@@ -281,7 +281,8 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
     assert_eq!(
         fake,
         Some(json!({ "id": "fake", "name": "Fake Sandbox", "icon": "box",
-                 "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"] }))
+                     "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"],
+                     "account": null }))
     );
     assert!(
         offered
