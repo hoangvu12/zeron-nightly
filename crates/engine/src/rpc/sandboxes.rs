@@ -53,12 +53,6 @@ struct SaveTemplateParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProviderParams {
-    provider: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
 }
@@ -199,6 +193,7 @@ impl EngineRpc {
                 | methods::RUN_SANDBOX_STEPS_AGAIN
                 | methods::CHECK_SANDBOX
                 | methods::START_SANDBOX_FRESH
+                | methods::SAVE_SANDBOX_TEMPLATE
         ) && !routed(&params)
         {
             let p: ChatParams = parse_params(params.clone())?;
@@ -206,6 +201,19 @@ impl EngineRpc {
                 && let Some(keeper) = self.chat_keeper(&p.chat_id).await
             {
                 return self.forward(&keeper, method, route(params)).await;
+            }
+        }
+        // A provider's templates come from its host device.
+        if method == methods::LIST_SANDBOX_TEMPLATES && !routed(&params) {
+            let p: ProviderParams = parse_params(params.clone())?;
+            if !self.keeps(sandboxes, &p.provider)
+                && let Some(host) = self
+                    .workspace
+                    .sandbox_host(&p.provider)
+                    .map(|host| host.host_device_id)
+                    .filter(|host| host != self.this_device())
+            {
+                return self.forward(&host, method, route(params)).await;
             }
         }
         match method {
