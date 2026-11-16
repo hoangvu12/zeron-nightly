@@ -125,6 +125,17 @@ test("asleep, or on its way to or from it, is resting: its host is offline, not 
 	expect(logic.resting(nil)).to_be(false)
 end)
 
+test("waking says how long above the composer; a failed wake is left to its alert", function()
+	local Line = require("../screens/chat/sandbox_line")
+	local waking = Line.line({ state = "waking", step = "wake", since = 100 }, 103) :: any
+	expect(waking.text).to_be("Waking the sandbox · 3s")
+	expect(waking.spinner).to_be(true)
+	expect(Line.line({ state = "asleep", since = 100 }, 103)).to_be(nil)
+	expect(Line.line({ state = "failed", step = "wake", since = 100, error = "No." }, 103)).to_be(nil)
+	-- (Any other failed step keeps its Run again.)
+	expect((Line.line({ state = "failed", step = "getCode", since = 100 }, 103) :: any).action).to_be("Run again")
+end)
+
 test("a wake that failed: its reason, and Wake", function()
 	local a = logic.alert(steps({ state = "failed", step = "wake", error = "Couldn't start the sandbox." })) :: any
 	expect(a.kind).to_be("wake_failed")

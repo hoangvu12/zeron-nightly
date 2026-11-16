@@ -20,6 +20,7 @@ pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_SANDBOX_PROVIDERS
+            | methods::LIST_SANDBOX_TEMPLATES
             | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
@@ -197,6 +198,14 @@ impl EngineRpc {
         }
         match method {
             methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
+            methods::LIST_SANDBOX_TEMPLATES => {
+                let p: ProviderParams = parse_params(params)?;
+                let templates = sandboxes
+                    .templates(&p.provider)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&templates)
+            }
             methods::CONNECT_SANDBOX_PROVIDER => {
                 let p: ConnectParams = parse_params(params)?;
                 let provider = sandboxes.provider_named(&p.provider).ok_or_else(|| {

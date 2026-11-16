@@ -20,7 +20,7 @@ use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use zeron_engine::sandboxes::{
     Account, Command, CreateSandbox, Credential, ErrorKind, Exit, KeySlot, Ops, Placement,
-    ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus,
+    ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus, Template,
 };
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, HarnessId, LentSignIn};
 
@@ -341,6 +341,9 @@ impl FakeProvider {
         if let Some(device) = var(zeron_engine::sandboxes::DEVICE_ID_ENV) {
             zeron_engine::sandboxes::take_device_id(&data_dir, &device).unwrap();
         }
+        if let Some(provider) = var(zeron_engine::sandboxes::PROVIDER_ENV) {
+            zeron_engine::sandboxes::take_provider(&data_dir, &provider).unwrap();
+        }
         let config = engine_config(&data_dir, &edge_url, Some(lent));
         let up = self.spawn_engine(sandbox, config);
         if self.agents.is_none() {
@@ -499,6 +502,13 @@ impl SandboxProvider for FakeProvider {
                 device_id: self.resident.as_ref().map(|r| r.device_id.clone()),
             },
         }
+    }
+
+    async fn templates(&self) -> Result<Vec<Template>, ProviderError> {
+        Ok(vec![Template {
+            id: "zeron-dev".into(),
+            name: "zeron-dev".into(),
+        }])
     }
 
     fn workdir(&self, chat_id: &str) -> String {

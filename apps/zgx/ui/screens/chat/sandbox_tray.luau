@@ -30,7 +30,7 @@ function M.bind(c: Bind): any
 		end
 	end)
 	function b.steps(): any
-		return sandboxes.steps(c.chat())
+		return sandboxes.machine(c.chat())
 	end
 	b.alert = ui.computed(function(): logic.Alert?
 		return logic.alert(b.steps())

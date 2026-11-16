@@ -1030,7 +1030,7 @@ end }
 local function seed()
 	local chats: { any } = {}
 	for id, m in META do
-		table.insert(chats, { id = id, title = m.title or id, project = m.project, device = "mac", updated = 0, created = 0, agent = m.agent })
+		table.insert(chats, { id = id, title = m.title or id, project = m.project, device = m.device or "mac", updated = 0, created = 0, agent = m.agent })
 	end
 	table.sort(chats, function(a, b)
 		return (a.id :: string) < (b.id :: string)
@@ -1044,6 +1044,9 @@ local function seed()
 			-- (Its beat a day ahead: up however long the fixture runs.)
 			{ id = "box", name = "Build box", platform = "linux", here = false, online = true, seen = ui.now() / 1000 + 86400 },
 			{ id = "old", name = "Old laptop", platform = "macos", here = false, online = false, seen = ui.now() / 1000 - 3 * 3600 },
+			-- A sandbox's engine (its device row names its provider, as the
+			-- host reads it from its capabilities): never listed itself.
+			{ id = "box-sb", name = "zeron-sandbox", platform = "linux", here = false, online = true, seen = ui.now() / 1000 + 86400, sandbox = "docker" },
 		},
 		projects = {
 			{ id = "atlas", name = "Atlas", device = "mac", path = "/tmp/atlas", git = true, github = "acme/atlas" },
@@ -1152,14 +1155,21 @@ sessions_stub.create = function(req: any)
 	made_chats += 1
 	local id = req.id or `new{made_chats}`
 	note(`create:{req.project or "none"}:{req.config and req.config.model or ""}`)
-	note(`made:{req.project or "-"}|{req.device or "-"}|{req.branch or "-"}|{req.cwd or "-"}{if req.cloud then "|cloud" else ""}`)
+	note(`made:{req.project or "-"}|{req.device or "-"}|{req.branch or "-"}|{req.cwd or "-"}{if req.cloud then "|cloud" else ""}{if req.place then `|place:{req.place.provider}:{req.place.template or "blank"}` else ""}`)
 	META[id] = { title = "New chat", project = req.project, model = req.config and req.config.model }
 	-- (On Cloud, its machine's device, as the engine's list will say.)
 	if req.cloud then
 		META[id].device = `cloud-{id}`
 	end
+	-- On a place: a sandbox's device of its own, its checkout there.
+	if req.place then
+		META[id].device = "box-sb"
+	end
 	TRANSCRIPTS[id] = TRANSCRIPTS[id] or {}
 	seed()
+	if req.place then
+		return settled({ id = id, device = "box-sb", cwd = "/home/agent/workspace/atlas" })
+	end
 	-- On Cloud: made on a machine of its own, its checkout of the repository.
 	if req.cloud then
 		if CLOUD_CREATE_FAILS:peek() then
@@ -1177,6 +1187,55 @@ sessions_stub.create = function(req: any)
 		return settled({ id = id, cwd = "/home/user/atlas" })
 	end
 	return settled(id)
+end
+-- Places (account/sandboxes), answered here as the host would: none until
+-- `sandbox_stub.offer` (Docker Sandbox, its templates zeron-dev and
+-- zgx-dev); `sandbox_stub.steps.<case>` says how far the open chat's sandbox
+-- got (starting, failed, ready); follows and Run again are noted.
+do
+	local sandboxes = require("@account/sandboxes") :: any
+	sandboxes.ask_templates = function(provider: string): any
+		note(`templates:{provider}`)
+		return settled({ { id = "zeron-dev", name = "zeron-dev" }, { id = "zgx-dev", name = "zgx-dev" } })
+	end
+	-- (sandbox_stub's notes it too, for its own tests.)
+	local stub_follow = sandboxes.ask_follow
+	sandboxes.ask_follow = function(chat: string)
+		note(`follow:{chat}`)
+		stub_follow(chat)
+	end
+	sandboxes.ask_unfollow = function(_chat: string) end
+	sandboxes.ask_run_again = function(chat: string): any
+		note(`run_again:{chat}`)
+		local steps = table.clone(sandboxes.steps:peek())
+		steps[chat] = { state = "starting", step = "getCode", since = ui.now() / 1000 }
+		sandboxes.steps:set(steps)
+		return settled(nil)
+	end
+	ui.command { id = "sandbox_stub.offer", title = "Docker Sandbox is a place to run", run = function()
+		sandboxes.now:set { providers = { { id = "docker", name = "Docker Sandbox", icon = "docker" } } }
+	end }
+	local CASES: { [string]: any } = {
+		starting = { state = "starting", step = "installZeron", template = "zeron-dev" },
+		failed = { state = "failed", step = "getCode", template = "zeron-dev", error = "Couldn't clone acme/atlas" },
+		ready = { state = "ready", template = "zeron-dev" },
+	}
+	for case, steps in CASES do
+		ui.command { id = `sandbox_stub.steps.{case}`, title = `The open chat's sandbox: {case}`, run = function()
+			local s = store.session:peek()
+			if not s or not s.id then
+				return
+			end
+			META[s.id].device = "box-sb"
+			publish(s.id, { device = "box-sb" })
+			seed()
+			local all = table.clone(sandboxes.steps:peek())
+			local now = table.clone(steps)
+			now.since = ui.now() / 1000 - 12
+			all[s.id] = now
+			sandboxes.steps:set(all)
+		end }
+	end
 end
 sessions_stub.archive = function(id: string)
 	note(`archive:{id}`)
@@ -2185,6 +2244,28 @@ ui.command {
 			end
 		end
 		store.catalog:set({ state = "ready", complete = true, harnesses = c.harnesses, models = models } :: any)
+	end,
+}
+-- The place's catalog (Docker's zeron-dev template) come complete, without
+-- Opus, as the device keeping the provider answers it (#46).
+ui.command {
+	id = "catalog_place_without_opus",
+	title = "The zeron-dev template's catalog comes, without Opus",
+	run = function()
+		local c = store.catalog:peek()
+		local models: { any } = {}
+		for _, m in c.models do
+			if m.value ~= "opus" then
+				table.insert(models, m)
+			end
+		end
+		store.catalog:set({
+			state = "ready",
+			complete = true,
+			device = "place:docker:zeron-dev",
+			harnesses = c.harnesses,
+			models = models,
+		} :: any)
 	end,
 }
 -- The agent marks a default that isn't its first row (Claude lists

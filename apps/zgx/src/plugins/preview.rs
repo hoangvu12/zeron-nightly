@@ -96,6 +96,7 @@ pub const BLOCKED: &[&str] = &[
     "billing.checkout",
     // (Each runs a machine, or says which one new chats run on: credits.)
     "cloud.wake",
+    "sandboxes.run_again",
     "cloud.sleep",
     "cloud.retry",
     "sandboxes.fresh",

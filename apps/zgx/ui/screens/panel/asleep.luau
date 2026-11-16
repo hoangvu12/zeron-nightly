@@ -14,7 +14,7 @@ local M = {}
 -- Whether `chat`'s tab waits for its sandbox: asleep, or on its way to or
 -- from it.
 function M.waits(chat: string?): boolean
-	return logic.resting(sandboxes.steps(chat))
+	return logic.resting(sandboxes.machine(chat))
 end
 
 function M.gate(chat: string?, build: () -> Node): Node
@@ -33,7 +33,7 @@ function M.gate(chat: string?, build: () -> Node): Node
 			fill = true,
 			title = ui.t("panel.asleep.title") :: any,
 			body = function(): string
-				local s = sandboxes.steps(chat)
+				local s = sandboxes.machine(chat)
 				local busy = sandboxes.wake_state(chat).busy
 				if busy or (s and s.state == "waking") then
 					return ui.t("panel.asleep.waking"):get()

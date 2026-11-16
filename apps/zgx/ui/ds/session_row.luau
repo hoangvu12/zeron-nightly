@@ -72,6 +72,9 @@ export type Session = {
 	harness: string?,
 	agent_icon: string?,
 	device: string?,
+	-- Its device's glyph, where that says more than its name: a sandbox's
+	-- provider's (spec #37).
+	device_icon: string?,
 	branch: string?,
 	subagents: number?,
 	pr: { number: number, state: string?, title: string? }?,
@@ -480,8 +483,14 @@ function M.second_line(
 	text: () -> string,
 	branch: () -> boolean,
 	shown: () -> boolean,
-	wrap: ((ContainerProps, () -> boolean) -> ContainerProps)?
+	wrap: ((ContainerProps, () -> boolean) -> ContainerProps)?,
+	-- Where it runs, as a glyph leading the line (a sandbox's provider's),
+	-- while its branch's doesn't.
+	icon: (() -> string?)?
 ): Node
+	local function place_icon(): boolean
+		return icon ~= nil and icon() ~= nil and not branch()
+	end
 	local props: ContainerProps = {
 		w_full = true,
 		h = 14,
@@ -489,6 +498,16 @@ function M.second_line(
 		gap = "$space.1",
 		items = "center",
 		ui.show(branch, ui.div { color = "$text.tertiary", Icon { name = "git-branch", size = 11 } }),
+		ui.show(place_icon, ui.div {
+			class = "session-place-icon",
+			color = "$text.tertiary",
+			Icon {
+				name = function(): Icon.Name
+					return ((icon :: () -> string?)() or "box") :: any
+				end,
+				size = 11,
+			},
+		}),
 		FadeText {
 			text,
 			grow = 1,
@@ -890,7 +909,9 @@ function M.Row(props: RowProps): Node
 				mt = ui.raw(M.PULL, "up a row's inset, under the title"),
 				M.second_line(detail, props.branch or function(): boolean
 					return false
-				end, second_shown),
+				end, second_shown, nil, function(): string?
+					return cur().device_icon
+				end),
 			},
 		},
 	}
