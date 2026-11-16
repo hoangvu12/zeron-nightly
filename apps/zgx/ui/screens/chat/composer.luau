@@ -30,7 +30,7 @@ local sessions = require("@account/sessions")
 local LinkNotice = require("@app/screens/chat/link_notice")
 local CloudTray = require("@app/screens/chat/cloud_tray")
 local SandboxTray = require("@app/screens/chat/sandbox_tray")
-local sandbox_templates = require("@account/sandbox_templates")
+local template_saves = require("@account/sandbox_template_saves")
 local Held = require("@app/screens/chat/held")
 local CloudMachine = require("@app/screens/chat/cloud_machine")
 local Where = require("@app/screens/chat/where")
@@ -514,6 +514,25 @@ local function Composer(): Node
 		end
 		return nil, nil
 	end
+	-- On a sandbox (its chat, or a new chat on a place): the access chip is
+	-- "Sandboxed" and the model chip the agent menu (screens 03, 04, 17–20).
+	local function sandboxed(): boolean
+		if session_id:get() == nil then
+			return sandboxes.of(device:get()) ~= nil
+		end
+		return (sandbox_device()) ~= nil
+	end
+	-- The agent picked from that menu's Agents, while the chip reads it
+	-- ("Codex High"); another chat, none.
+	local agent_pick = ui.state("chat_agent_pick", nil :: string?)
+	local agent_pick_for = ui.state("chat_agent_pick_for", "?")
+	ui.effect(function()
+		local id = session_id:get() or ""
+		if agent_pick_for:peek() ~= id then
+			agent_pick_for:set(id)
+			agent_pick:set(nil)
+		end
+	end)
 	ui.effect(function()
 		local chat = sandbox_device()
 		if not chat then
@@ -537,9 +556,11 @@ local function Composer(): Node
 			sandbox_clock:set(ui.now() / 1000)
 		end)
 	end)
+	-- Failed step scripts put away with their × (by chat, then run).
+	local band_dismissed = ui.state("chat_band_dismissed", {} :: { [string]: { [string]: boolean } })
 	local function sandbox_line(): any
 		local chat = sandbox_device()
-		return SandboxLine.line(sandboxes.steps_of(chat), sandbox_clock:get())
+		return SandboxLine.line(sandboxes.steps_of(chat), sandbox_clock:get(), chat and band_dismissed:get()[chat])
 	end
 	-- (A new chat's project, for what follows the route: its panel.)
 	ui.effect(function()
@@ -667,20 +688,13 @@ local function Composer(): Node
 		end,
 	}
 	-- Its sandbox, on a chat that runs on one: deleted outside Zeron, its
-	-- disk full, and Start fresh.
+	-- disk full, a wake that failed, asleep; Start fresh and Wake. Said in
+	-- its band, never in the deck's alerts.
 	local sandbox = SandboxTray.bind {
 		chat = function(): string?
 			return (sandbox_device())
 		end,
 	}
-	-- The deck's alerts: its Cloud machine's, then its sandbox's.
-	local alerts = ui.computed(function(): { any }
-		local out = table.clone(machine.alerts:get())
-		for _, a in sandbox.alerts:get() do
-			table.insert(out, a)
-		end
-		return out
-	end)
 	-- This device's outbox for the chat (#1256): sends uploading or stopped,
 	-- each removable where the engine can take one back. Whether it can is
 	-- asked once a chat has one, by taking out a send that isn't there (an
@@ -785,31 +799,14 @@ local function Composer(): Node
 			end
 			return mine
 		end
-		-- Its sandbox saved as a template (or saving, or why it wasn't).
-		local saved = sandbox_templates.notice(session_id:get())
-		if saved then
-			return saved
-		end
 		-- A new chat that can't start where it's set to: why.
 		local why = where.blocked:get()
 		if why then
 			return { tone = "warning", text = why }
 		end
 		local s = open()
-		-- Its sandbox refused the last send: the agent picked isn't on its
-		-- template ("Codex isn't on this template"). The words are back in
-		-- the composer; another agent picked, it goes again.
-		if s and s.refused then
-			return { tone = "warning", text = s.refused.words }
-		end
 		if s and s.notice then
 			return s.notice
-		end
-		-- A sandbox starting (the step it's on, and for how long), or a step
-		-- that failed, with Run again.
-		local starting = sandbox_line()
-		if starting then
-			return starting
 		end
 		-- The connection: this device's, then the chat's host. (A sandbox
 		-- asleep, or going to or from it, is offline, not out of reach: it
@@ -824,13 +821,91 @@ local function Composer(): Node
 		end
 		return LinkNotice.of {
 			connection = sessions.connection:get(),
-			cloud = machine.cloud_link(string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0)
-				or (if sandbox.line() then { line = sandbox.line() } else nil),
+			cloud = machine.cloud_link(string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0),
 			host_unreachable = host_unreachable,
 			host = host,
 			intent = string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0,
 		}
 	end)
+
+	-- The agent the model picked runs, as the catalog lists it (nil: it
+	-- doesn't).
+	local function picked_agent(): string?
+		local picked = model:get()
+		for _, m in store.catalog:get().models do
+			if m.value == picked then
+				return m.harness
+			end
+		end
+		return nil
+	end
+	-- The band over the composer (ds/composer_band): a row of its own,
+	-- always shown, never folded into the deck's alerts (spec #37 story 32).
+	-- One at a time: the agent its sandbox refused, then what's wrong with
+	-- the sandbox, then its steps (starting, waking, a script running or
+	-- failed), then a save as a sandbox template, then asleep.
+	local band = ui.computed(function(): any
+		local s = open()
+		-- Its sandbox refused the last send: the agent picked isn't on its
+		-- template ("Codex isn't on this template"). The words are back in
+		-- the composer; another agent picked, it goes (screen 20), and the
+		-- send goes again with it.
+		if s and s.refused then
+			local agent = picked_agent()
+			if agent == nil or agent == s.refused.agent then
+				return { kind = "refused", tone = "warning", icon = "danger-triangle", title = s.refused.words }
+			end
+		end
+		local wrong = sandbox.band()
+		if wrong and wrong.kind ~= "asleep" then
+			return wrong
+		end
+		local line = sandbox_line()
+		if line then
+			return line
+		end
+		local saved = template_saves.band(session_id:get())
+		if saved then
+			return saved
+		end
+		return wrong
+	end)
+	-- Its action: Run again (a step or a script that failed), else the
+	-- sandbox's own (Start fresh, Wake).
+	local function on_band_action()
+		local b = band:peek()
+		if not b then
+			return
+		end
+		local chat = sandbox_device()
+		if chat and (b.kind == "step_failed" or b.kind == "script_failed") then
+			sandboxes.run_again(chat):after(function() end, function(e: any)
+				local why = if type(e) == "table" and type(e.message) == "string" and string.find(e.message, " ", 1, true)
+					then e.message
+					else nil
+				own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.sandbox.run_again_failed", dismissable = true }
+			end)
+		elseif b.kind == "gone" or b.kind == "disk" or b.kind == "wake_failed" or b.kind == "asleep" then
+			sandbox.act()
+		end
+	end
+	-- Its ×: a failed script put away, or a save's word.
+	local function on_dismiss_band()
+		local b = band:peek()
+		if not b then
+			return
+		end
+		local chat = sandbox_device()
+		if b.kind == "script_failed" and chat and b.key then
+			local all = table.clone(band_dismissed:peek())
+			local mine = table.clone(all[chat] or {})
+			mine[b.key] = true
+			all[chat] = mine
+			band_dismissed:set(all)
+		else
+			template_saves.dismiss(session_id:peek())
+		end
+	end
 
 	-- The models looked up once: not again on each reload after a lookup
 	-- that failed (the composer made again).
@@ -1366,6 +1441,8 @@ local function Composer(): Node
 			running = running,
 			access = access,
 			plan = plan,
+			sandboxed = sandboxed,
+			agent = agent_pick,
 			model = model,
 			effort = effort,
 			fast = fast,
@@ -1581,40 +1658,15 @@ local function Composer(): Node
 			on_deny = asks.on_deny,
 			notice = notice,
 			on_dismiss_notice = function()
-				if own_notice:peek() then
-					own_notice:set(nil)
-				else
-					sandbox_templates.dismiss(session_id:peek())
-				end
+				own_notice:set(nil)
 			end,
-			-- (The notices with an action: a sleeping machine's Wake, a
-			-- sandbox asleep's Wake, and a sandbox's failed step's Run again.)
-			on_notice_action = function()
-				if sandbox.line() then
-					sandbox.wake()
-					return
-				end
-				local chat = sandbox_device()
-				local steps = sandboxes.steps_of(chat)
-				if chat and steps and steps.state == "failed" then
-					sandboxes.run_again(chat):after(function() end, function(e: any)
-						local why = if type(e) == "table" and type(e.message) == "string" and string.find(e.message, " ", 1, true)
-							then e.message
-							else nil
-						own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.sandbox.run_again_failed", dismissable = true }
-					end)
-					return
-				end
-				machine.wake()
-			end,
-			alerts = alerts,
-			on_alert_action = function(id: string)
-				if sandbox.owns(id) then
-					sandbox.on_alert(id)
-				else
-					machine.on_alert(id)
-				end
-			end,
+			-- (The only notice with an action: a sleeping machine's Wake.)
+			on_notice_action = machine.wake,
+			alerts = machine.alerts,
+			on_alert_action = machine.on_alert,
+			band = band,
+			on_band_action = on_band_action,
+			on_dismiss_band = on_dismiss_band,
 			on_dismiss_alert = machine.dismiss,
 			disabled = function(): boolean
 				local s = store.session:get()

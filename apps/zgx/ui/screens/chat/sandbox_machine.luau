@@ -1,16 +1,18 @@
 -- What's said of a chat's sandbox when something went wrong with it (spec #37
 -- "When things go wrong"), and what can be done: pure functions over its
 -- steps (account/sandboxes), nothing drawn. screens/chat/sandbox_tray puts it
--- on the composer's deck.
+-- in the composer's band, a row of its own over it.
 --
 --   alert(steps)                 the one thing to raise over the composer:
 --                                > deleted outside Zeron ("Sandbox deleted in
 --                                  Docker", Start fresh)
 --                                > its disk full (Start fresh)
 --                                > a wake that failed (Wake)
---   line(steps)                  the deck's notice: asleep (moon, Wake)
+--   line(steps)                  asleep (moon, Wake)
 --   resting(steps)               asleep, or going to or from it
---   deck_alert(alert, opts)      that alert as ds/composer_dock's Alert
+--   band(alert, opts)            that alert as the composer's band, its row of
+--                                its own over the composer (ds/composer_band)
+--   asleep_band(line)            asleep, the same
 --   failure_words(word)          why Start fresh didn't go
 --
 -- A test requires this module alone, in a VM with no `ui`: there, the English
@@ -25,18 +27,14 @@ local function say(key: string, english: string, args: { [string]: any }?): stri
 	return ui.t(`chat.sandbox_machine.{key}`, args):get()
 end
 
--- The deck's id for it, beside Cloud's.
-M.ALERT_ID = "\0sandbox"
-
 export type Alert = {
-	-- gone, disk.
+	-- gone, disk, wake_failed.
 	kind: string,
 	tone: string,
 	title: string,
-	-- The folded line.
-	summary: string,
-	-- The opened words.
-	body: string,
+	-- A word more, muted after it (none for deleted: its title and Start
+	-- fresh say it, screen 14).
+	detail: string?,
 	-- "fresh" or "wake".
 	action: string?,
 	action_label: string?,
@@ -65,11 +63,6 @@ function M.alert(steps: any?): Alert?
 			title = if place
 				then say("gone_title_in", `Sandbox deleted in {place}`, { place = place })
 				else say("gone_title", "Sandbox deleted"),
-			summary = say("gone_summary", "The conversation is kept"),
-			body = say(
-				"gone_body",
-				"This chat's sandbox was deleted outside Zeron. The conversation is kept. Start fresh makes a new sandbox from its repository, on the chat's branch: what was pushed comes back, what wasn't is lost."
-			),
 			action = "fresh",
 			action_label = fresh,
 		}
@@ -79,10 +72,7 @@ function M.alert(steps: any?): Alert?
 			kind = "wake_failed",
 			tone = "danger",
 			title = say("wake_failed_title", "Sandbox didn't wake"),
-			summary = say("wake_failed_summary", "Try waking it again"),
-			body = if type(steps.error) == "string" and steps.error ~= ""
-				then steps.error
-				else say("wake_failed_body", "This chat's sandbox didn't wake. Try again in a moment."),
+			detail = say("wake_failed_summary", "Try waking it again"),
 			action = "wake",
 			action_label = say("wake", "Wake"),
 		}
@@ -92,10 +82,7 @@ function M.alert(steps: any?): Alert?
 			kind = "disk",
 			tone = "danger",
 			title = say("disk_title", "Sandbox's disk is full"),
-			summary = say("disk_summary", "Free some space, or start fresh"),
-			body = if type(steps.error) == "string" and steps.error ~= ""
-				then steps.error
-				else say("disk_body", "This chat's sandbox ran out of disk. Free some space, or start fresh: a new sandbox with what was pushed."),
+			detail = say("disk_summary", "Free some space, or start fresh"),
 			action = "fresh",
 			action_label = fresh,
 		}
@@ -135,21 +122,27 @@ function M.failure_words(word: string, action: string?): string
 	return if wake then say("wake_failure", "Couldn't wake it. Try again.") else say("failure", "Couldn't start fresh. Try again.")
 end
 
--- The alert as ds/composer_dock's Alert: plain data. `busy`: Start fresh is on
--- its way. `failure`: why the last one didn't go.
-function M.deck_alert(a: Alert, opts: { busy: boolean?, failure: string? }?): { [string]: any }
+-- The alert as the composer's band (screens/chat/sandbox_line's Band): one
+-- row, its title and action alone (screen 14). Deleted wears its provider's
+-- glyph (`icon`, Docker's), the rest their tone's. `busy`: Start fresh (or
+-- Wake) is on its way, the working ring in its glyph's place. `failure`: why
+-- the last one didn't go, said after the title.
+function M.band(a: Alert, opts: { busy: boolean?, failure: string?, icon: string? }?): { [string]: any }
 	local o = opts or {}
 	return {
-		id = M.ALERT_ID,
-		tone = a.tone,
-		title = a.title,
-		detail = if a.summary ~= a.body then a.summary else nil,
-		body = a.body,
-		note = if o.failure then M.failure_words(o.failure, a.action) else nil,
-		action = if o.busy then nil else a.action_label,
+		kind = a.kind,
+		tone = if a.kind == "gone" then nil else a.tone,
+		icon = if a.kind == "gone" then (o.icon or "box") else "danger-triangle",
 		spinner = o.busy == true,
-		dismissable = false,
+		title = a.title,
+		detail = if o.failure then M.failure_words(o.failure, a.action) else a.detail,
+		action = if o.busy then nil else a.action_label,
 	}
+end
+
+-- Asleep as the band (screen 08): the moon, and Wake; always shown.
+function M.asleep_band(line: { [string]: any }): { [string]: any }
+	return { kind = "asleep", icon = line.icon, title = line.text, action = line.action }
 end
 
 return M

@@ -24,6 +24,8 @@ local LinkChips = require("@app/screens/chat/link_chips")
 local LinkMenu = require("@app/screens/chat/link_menu")
 local Find = require("@app/screens/chat/find")
 local boundary = require("@app/screens/shell/boundary")
+local sandboxes = require("@account/sandboxes")
+local SandboxLine = require("@app/screens/chat/sandbox_line")
 
 -- The pictures replies show, read from the open chat's folder on its device.
 local pictures = ReplyImages.for_session(function(): any
@@ -165,6 +167,21 @@ local function Session(id: Id?): Node
 	-- built outside a component.)
 	made += 1
 	local waited = ui.state(`chat_session_waited_{made}`, "")
+	-- What the transcript shows: the chat's messages, and on a sandbox whose
+	-- start got ready, "✓ Sandbox ready 52s" among them ("Fresh sandbox
+	-- ready" after Start fresh), where it happened (screens 06–11, 16).
+	-- (Its steps are followed while the chat's open: screens/chat/composer.)
+	local shown_messages = ui.state(`chat_session_messages_{made}`, store.messages:peek())
+	ui.effect(function()
+		local list = store.messages:get()
+		local s = store.session:get()
+		local ready = if s and s.id then SandboxLine.ready(sandboxes.steps_of(s.id)) else nil
+		if ready then
+			local text = ui.t(if ready.fresh then "chat.sandbox.ready_fresh" else "chat.sandbox.ready"):get()
+			list = SandboxLine.with_ready(list, ready, text)
+		end
+		shown_messages:set(list)
+	end)
 	ui.effect(function()
 		local want = which()
 		waited:set("")
@@ -279,7 +296,7 @@ local function Session(id: Id?): Node
 							end,
 							side = 20,
 							fade_lead = 12,
-							messages = store.messages,
+							messages = shown_messages,
 							offset = offset,
 							-- Made again (a reload, a template saved), it comes
 							-- back where it was.
