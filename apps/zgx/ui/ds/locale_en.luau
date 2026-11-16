@@ -483,7 +483,6 @@ return {
 	["ds.composer.device.label"] = "Device",
 	["ds.composer.device.search"] = "Search devices…",
 	["ds.composer.device.you"] = "You",
-	["ds.composer.template.label"] = "Template",
 	["ds.composer.context_used"] = "Context used",
 	["ds.composer.dismiss"] = "Dismiss",
 	["ds.composer.cancel_dictation"] = "Cancel dictation",
