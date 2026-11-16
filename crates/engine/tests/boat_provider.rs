@@ -260,7 +260,13 @@ async fn a_failed_sandbox_says_why() {
 
 /// Boat's reply (status, code, `retryable` hint, permission named) and the
 /// kind it sorts to.
-type ErrorCase = (u16, &'static str, Option<bool>, Option<&'static str>, ErrorKind);
+type ErrorCase = (
+    u16,
+    &'static str,
+    Option<bool>,
+    Option<&'static str>,
+    ErrorKind,
+);
 
 #[tokio::test]
 async fn errors_sort_as_the_edge_sorts_them() {
