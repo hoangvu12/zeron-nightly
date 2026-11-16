@@ -1229,6 +1229,11 @@ impl Engine {
             }
             core.set_cloud(runner::CloudRunner::new(broker, activity, heartbeat));
         }
+        // A sandbox's engine runs on its template's agents: a send for one
+        // it lacks is refused (#46).
+        if auth.is_lent() {
+            core.sessions.runs_on_a_template();
+        }
         // A sandbox's engine, like a Cloud machine, comes up with sends
         // already waiting for it (a chat's first message, queued while its
         // steps ran): look at every chat it hosts once the registry has synced.

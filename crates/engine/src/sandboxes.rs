@@ -10,6 +10,7 @@
 //! chat returns at once; its first message waits in the chat and goes to
 //! the sandbox's engine when the sandbox is Ready.
 
+mod catalog;
 pub mod docker;
 mod keys;
 mod provider;
@@ -17,6 +18,7 @@ mod recovery;
 pub mod scripts;
 mod steps;
 
+pub use catalog::PlaceCatalog;
 pub use keys::KeySlot;
 pub use provider::{
     Account, Command, CreateSandbox, Credential, DeviceCode, ErrorKind, Exit, Finished, Ops,
@@ -196,6 +198,7 @@ struct Inner {
     steps_dir: PathBuf,
     providers: Mutex<Vec<Arc<dyn SandboxProvider>>>,
     chats: Mutex<HashMap<String, Arc<ChatSandbox>>>,
+    catalogs: catalog::Catalogs,
     /// Chat deletions are followed ([`Sandboxes::follow_deletions`]).
     following: AtomicBool,
 }
@@ -242,9 +245,51 @@ impl Sandboxes {
                 steps_dir: data_dir.join(scripts::STEPS_DIR),
                 providers: Mutex::default(),
                 chats: Mutex::new(chats),
+                catalogs: catalog::Catalogs::open(data_dir),
                 following: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// What agents `provider`'s `template` had the last time it ran (`None`:
+    /// it hasn't run from this device).
+    pub fn catalog(&self, provider: &str, template: Option<&str>) -> Option<PlaceCatalog> {
+        self.inner.catalogs.get(provider, template)
+    }
+
+    /// The place a sandbox device belongs to: `(provider, template)` of a
+    /// chat's sandbox this device keeps. Not a device that runs Zeron of its
+    /// own (a PC at home): it answers for its own agents.
+    pub fn place_of_device(&self, device_id: &str) -> Option<(String, Option<String>)> {
+        lock(&self.inner.chats).values().find_map(|chat| {
+            let record = lock(&chat.record);
+            (record.steps.device_id == device_id && !record.resident)
+                .then(|| (record.steps.provider.clone(), record.steps.template.clone()))
+        })
+    }
+
+    /// Keep what agents the sandbox's engine has, as its template's (it's
+    /// awake now: it just answered).
+    fn read_catalog(&self, host: &Host, record: &Record) {
+        // (A PC at home isn't a template: it answers for itself.)
+        let Some(links) = host.links.clone().filter(|_| !record.resident) else {
+            return;
+        };
+        let catalogs = self.clone();
+        let (provider, template, device_id) = (
+            record.steps.provider.clone(),
+            record.steps.template.clone(),
+            record.steps.device_id.clone(),
+        );
+        tokio::spawn(async move {
+            match catalog::read(&links, &device_id).await {
+                Some(read) => catalogs
+                    .inner
+                    .catalogs
+                    .keep(&provider, template.as_deref(), read),
+                None => tracing::warn!(%provider, ?template, "sandbox: couldn't read its agents"),
+            }
+        });
     }
 
     /// Offer `provider` (replacing one with the same id).
@@ -774,6 +819,7 @@ impl Sandboxes {
                     }
                 }
                 answers(host, &record.steps.device_id).await?;
+                self.read_catalog(host, &record);
                 // What waited for it goes now, not at the next retry.
                 if let Err(err) = host.doc_host.retry_delivery(&record.steps.chat_id) {
                     tracing::warn!(error = %err, "sandbox: couldn't hand the waiting messages over");

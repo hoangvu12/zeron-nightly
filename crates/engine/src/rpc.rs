@@ -3232,6 +3232,10 @@ impl RpcService for EngineRpc {
                 let reply = self.forward(&target, method, params).await;
                 return reply.map_err(|error| remote_plugins::older_engine(&target, method, error));
             }
+            // A place's agents: answered here, never by a sandbox (#46).
+            if let Some(reply) = Box::pin(self.answer_for_place(&target, method, &params)).await {
+                return reply;
+            }
             // Settings → Providers' Cloud: its logins live in the vault.
             if crate::cloud_accounts::is_cloud_accounts_target(&target)
                 && crate::cloud_accounts::handles(method)
@@ -3528,12 +3532,12 @@ impl RpcService for EngineRpc {
             }
             methods::RELAY_COMMAND => {
                 let p: RelayCommandParams = parse_params(params)?;
-                let outcome = self
+                let (outcome, resolution) = self
                     .doc_host
-                    .ingest_relayed_command(&p.chat_id, p.entry)
+                    .ingest_relayed_command_with_reason(&p.chat_id, p.entry)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "outcome": outcome }))
+                RpcReply::value(&serde_json::json!({ "outcome": outcome, "resolution": resolution }))
             }
             methods::FORK_SIDE_CHAT => {
                 #[derive(Deserialize)]

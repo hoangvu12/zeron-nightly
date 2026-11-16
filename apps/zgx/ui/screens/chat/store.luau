@@ -79,7 +79,12 @@ export type Session = {
 	tasks: { any }?,
 	-- A line about it (a failed send, a run that stopped), or nil.
 	notice: any?,
+	-- A send its sandbox refused: the agent picked isn't on its template.
+	-- Its words go back to the composer; sent again (with another agent the
+	-- person picks), it's the same message. Nil when none waits.
+	refused: Refused?,
 }
+export type Refused = { id: string, message: string, agent: string, words: string, text: string }
 export type Catalog = { state: string, harnesses: { ds.Harness }, models: { ds.Model } }
 export type Request = {
 	-- The session it goes to; nil for a new chat.

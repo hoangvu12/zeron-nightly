@@ -536,6 +536,21 @@ local function Composer(): Node
 		end
 		return out
 	end)
+	-- A send its sandbox refused (#46): its words back in the composer, once
+	-- per refusal (kept across a reload), unless something's typed there
+	-- already. The agent stays as picked: the person switches it.
+	local refused_taken = ui.state("chat_refused_taken", nil :: string?)
+	ui.effect(function()
+		local s = open()
+		local refused = s and s.refused
+		if not refused or refused_taken:peek() == refused.id then
+			return
+		end
+		refused_taken:set(refused.id)
+		if string.find(shared.text:peek(), "%S") == nil then
+			shared.text:set(refused.text)
+		end
+	end)
 	-- Its own goes as the chat changes (kept: a reload isn't a change).
 	local notice_for = ui.state("chat_notice_for", "?")
 	ui.effect(function()
@@ -686,6 +701,12 @@ local function Composer(): Node
 			return { tone = "warning", text = why }
 		end
 		local s = open()
+		-- Its sandbox refused the last send: the agent picked isn't on its
+		-- template ("Codex isn't on this template"). The words are back in
+		-- the composer; another agent picked, it goes again.
+		if s and s.refused then
+			return { tone = "warning", text = s.refused.words }
+		end
 		if s and s.notice then
 			return s.notice
 		end
@@ -935,7 +956,11 @@ local function Composer(): Node
 			-- before): nothing of the host's (its copy of the prompt, the
 			-- engine's) can reach the list before the glide is ready, and
 			-- the prompt is there once, whoever adds it first.
-			local mid = store.new_id()
+			-- A send its sandbox refused goes again as the same message
+			-- (once in the transcript), with the agent picked now.
+			local s = store.session:peek()
+			local refused = s and s.id == id and s.refused
+			local mid = if refused then refused.message else store.new_id()
 			-- (To the transcript at its foot: in a split, the focused pane's,
 			-- which shows its lane's list, the prompt joining it there too.)
 			local lane = foot_lane(id)

@@ -100,6 +100,8 @@ pub struct FakeProvider {
     /// Every chat on this one place.
     shared: Option<String>,
     resident: Option<Resident>,
+    /// The agents its template has (`None`: whatever this computer has).
+    agents: Option<Vec<HarnessId>>,
     state: Arc<Mutex<State>>,
     hold: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
@@ -153,8 +155,33 @@ impl FakeProvider {
             has_zeron: true,
             shared: None,
             resident: None,
+            agents: None,
             state: Arc::default(),
             hold: Mutex::new(None),
+        }
+    }
+
+    /// A full cloud whose template has only `agents` on it: its engine
+    /// knows no other.
+    pub fn cloud_with_agents(root: &Path, agents: &[HarnessId]) -> Arc<Self> {
+        let mut provider = Self::new("fake", Ops::ALL, root);
+        provider.agents = Some(agents.to_vec());
+        Arc::new(provider)
+    }
+
+    /// The sandbox goes to sleep: its engine stops and nothing runs there
+    /// until it's started again.
+    pub async fn sleep(&self, sandbox: &str) {
+        let engine = {
+            let mut state = self.state.lock().unwrap();
+            let Some(fake) = state.boxes.get_mut(sandbox) else {
+                return;
+            };
+            fake.running = false;
+            fake.engine.take()
+        };
+        if let Some(engine) = engine {
+            engine.shutdown().await;
         }
     }
 
@@ -278,19 +305,39 @@ impl FakeProvider {
             zeron_engine::sandboxes::take_device_id(&data_dir, &device).unwrap();
         }
         let config = engine_config(&data_dir, &edge_url, Some(lent));
-        self.spawn_engine(sandbox, config);
-        futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed()
+        let up = self.spawn_engine(sandbox, config);
+        if self.agents.is_none() {
+            return futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed();
+        }
+        // A template's agents are there before anyone can ask its engine.
+        futures::stream::once(async move {
+            let _ = up.await;
+            Ok(RunEvent::Exit(Exit::code(0)))
+        })
+        .boxed()
     }
 
-    fn spawn_engine(&self, sandbox: &str, config: EngineConfig) {
+    /// Start an engine in `sandbox`; the receiver fires once it's up.
+    fn spawn_engine(
+        &self,
+        sandbox: &str,
+        config: EngineConfig,
+    ) -> tokio::sync::oneshot::Receiver<()> {
         let state = self.state.clone();
         let sandbox = sandbox.to_owned();
+        let agents = self.agents.clone();
+        let (up_tx, up) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let engine = start_engine(&config).await;
+            if let Some(agents) = agents {
+                engine.core().registry.retain(|id| agents.contains(&id));
+            }
             if let Some(fake) = state.lock().unwrap().boxes.get_mut(&sandbox) {
                 fake.engine = Some(engine);
             }
+            let _ = up_tx.send(());
         });
+        up
     }
 }
 
@@ -420,7 +467,7 @@ impl SandboxProvider for FakeProvider {
             }
         };
         if let Some(config) = config {
-            self.spawn_engine(sandbox, config);
+            drop(self.spawn_engine(sandbox, config));
         }
         Ok(())
     }

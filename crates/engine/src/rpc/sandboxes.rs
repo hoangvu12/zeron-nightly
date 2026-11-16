@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 use zeron_proto::ChatConfig;
-use zeron_rpc::{RpcError, RpcReply, methods};
+use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use super::{EngineRpc, parse_params, watch_stream};
 use crate::sandboxes::scripts::{self, Scope};
@@ -176,6 +176,62 @@ impl EngineRpc {
             }
             _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }
+    }
+
+    /// A composer asking what agents a place offers (#46): a place target
+    /// (`place:<provider>[:<template>]`) or a sandbox device of a chat this
+    /// device keeps. Answered here, never by a sandbox, so asking never
+    /// creates or wakes one: what the template had the last time it ran,
+    /// else this device's own list. `None` = not a place: route as usual.
+    pub(super) async fn answer_for_place(
+        &self,
+        target: &str,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Option<Result<RpcReply, RpcError>> {
+        let named = zeron_proto::places::parse_place_target(target);
+        if !matches!(method, methods::LIST_HARNESSES | methods::LIST_MODELS) {
+            // A place names no device: nothing else can go there.
+            return named.map(|_| {
+                Err(RpcError::Failed(format!(
+                    "{method}: {target} is a place, not a device"
+                )))
+            });
+        }
+        let (provider, template) = match (named, &self.sandboxes) {
+            (Some((provider, template)), _) => (provider.to_owned(), template.map(str::to_owned)),
+            (None, Some(sandboxes)) => sandboxes.place_of_device(target)?,
+            (None, None) => return None,
+        };
+        let kept = self
+            .sandboxes
+            .as_ref()
+            .and_then(|s| s.catalog(&provider, template.as_deref()));
+        let mut local = params.clone();
+        if let Some(map) = local.as_object_mut() {
+            map.remove("targetDeviceId");
+        }
+        Some(match (method, kept) {
+            (methods::LIST_HARNESSES, Some(kept)) => {
+                let mut harnesses = kept.harnesses;
+                if !super::include_registry(params) {
+                    harnesses.retain(|d| d.id.registry().is_none());
+                }
+                RpcReply::value(&harnesses)
+            }
+            (methods::LIST_MODELS, Some(kept)) => {
+                let p: super::ListModelsParams = match parse_params(local.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(e)),
+                };
+                match kept.models.get(p.harness.as_str()) {
+                    Some(models) => RpcReply::value(models),
+                    None => self.handle(method, local).await,
+                }
+            }
+            // The template hasn't run: every agent this device knows.
+            _ => self.handle(method, local).await,
+        })
     }
 
     fn script_path(

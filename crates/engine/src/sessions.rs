@@ -333,6 +333,8 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     /// Plugins whose native MCP servers local runs get (absent in bare tests).
     plugins: OnceLock<crate::plugins::Plugins>,
+    /// [`SessionsEngine::runs_on_a_template`].
+    on_template: std::sync::atomic::AtomicBool,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -386,8 +388,40 @@ impl SessionsEngine {
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 plugins: OnceLock::new(),
+                on_template: std::sync::atomic::AtomicBool::new(false),
             }),
         }
+    }
+
+    /// This engine runs in a sandbox, on its template's agents: a send for
+    /// an agent it doesn't have is refused ([`Self::missing_agent`]).
+    pub fn runs_on_a_template(&self) {
+        self.inner
+            .on_template
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Why a send for `harness` is refused here: in a sandbox, an agent its
+    /// template doesn't have ("Codex isn't on this template"). Never swapped
+    /// for another agent; the message waits to be sent again.
+    pub(crate) fn missing_agent(&self, harness: HarnessId) -> Option<String> {
+        let registry = &self.inner.registry;
+        if !self.inner.on_template.load(std::sync::atomic::Ordering::Acquire)
+            || registry.has_agent(harness)
+        {
+            return None;
+        }
+        let name = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == harness)
+            .map(|d| d.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| match zeron_proto::providers::provider_name(harness) {
+                "this provider" => harness.as_str().to_owned(),
+                name => name.to_owned(),
+            });
+        Some(zeron_proto::places::agent_missing_reason(harness, &name))
     }
 
     pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
