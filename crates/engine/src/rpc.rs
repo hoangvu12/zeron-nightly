@@ -2501,6 +2501,11 @@ fn forwardable(method: &str) -> bool {
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
+            // Step scripts are files on the host device.
+            | methods::LIST_STEP_SCRIPTS
+            | methods::READ_STEP_SCRIPT
+            | methods::WRITE_STEP_SCRIPT
+            | methods::DELETE_STEP_SCRIPT
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from

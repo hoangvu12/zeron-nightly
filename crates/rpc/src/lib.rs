@@ -229,6 +229,24 @@ pub mod methods {
     pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
     /// `{chatId}` → `{ok}`: run a failed step again, and the ones after it.
     pub const RUN_SANDBOX_STEPS_AGAIN: &str = "RunSandboxStepsAgain";
+    // Step scripts (docs/design/cloud-byo.md "Step scripts"): files on the
+    // device that keeps the provider (the host device). A script is named
+    // by `{for, hook, name}`: `for` is `{kind: "all"}`, `{kind: "provider",
+    // provider}` or `{kind: "project", spaceId}` (a project on that
+    // device); `hook` is `before-|after-|instead-of-` + a step
+    // (`create`, `start`, `install-zeron`, `sign-in`, `secrets`,
+    // `get-code`, `setup`, `ready`, `sleep`, `wake`, `delete`), or `setup`
+    // for a project's `.zeron/setup.sh` (`name` is then `setup.sh`).
+    /// `{}` → `[{for, hook, name, timing: before|after|insteadOf|step, step,
+    /// runsOn: sandbox|host, script, path}]`: every script there is, by
+    /// `for`, then hook, then name.
+    pub const LIST_STEP_SCRIPTS: &str = "ListStepScripts";
+    /// `{for, hook, name}` → `{content}`.
+    pub const READ_STEP_SCRIPT: &str = "ReadStepScript";
+    /// `{for, hook, name, content}` → `{ok, path}`: create or save it.
+    pub const WRITE_STEP_SCRIPT: &str = "WriteStepScript";
+    /// `{for, hook, name}` → `{ok}`.
+    pub const DELETE_STEP_SCRIPT: &str = "DeleteStepScript";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run
