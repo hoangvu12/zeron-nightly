@@ -303,6 +303,14 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
                      "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"],
                      "account": null }))
     );
+    assert!(
+        offered
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "boat" && p["name"] == "Boat"),
+        "{offered}"
+    );
     // Picking it opens its account's templates (the picker adds Blank).
     let templates = rpc
         .call(methods::LIST_SANDBOX_TEMPLATES, json!({ "provider": "fake" }))

@@ -37,6 +37,7 @@ export type Name =
 	| "cloud"
 	| "docker"
 	| "box"
+	| "boat"
 	| "wifi-off"
 	| "fast-tier"
 	| "fast-tier-bold"
