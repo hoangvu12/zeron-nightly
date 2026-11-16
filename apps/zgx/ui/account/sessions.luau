@@ -105,8 +105,9 @@ export type Project = { id: string, name: string, device: string, path: string, 
 -- seconds ("last seen …"; online, none: its beat moves every few seconds and
 -- shows nowhere).
 -- `cloud`: one of Cloud's (the account's, or a session's machine): never a
--- device to pick.
-export type Device = { id: string, name: string, platform: string, here: boolean, online: boolean?, seen: number?, version: string?, cloud: boolean? }
+-- device to pick. `host`: it can be a sandbox provider's host device;
+-- `headless`: an always-on `zeron headless` (Settings › Sandboxes).
+export type Device = { id: string, name: string, platform: string, here: boolean, online: boolean?, seen: number?, version: string?, cloud: boolean?, host: boolean?, headless: boolean? }
 export type Section = { id: string, name: string, sessions: { string }, collapsed: boolean? }
 export type Places = { pinned: { string }, sections: { Section } }
 export type Now = {

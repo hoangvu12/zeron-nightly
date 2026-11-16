@@ -61,6 +61,7 @@ mod plugins;
 mod previews;
 mod projects;
 mod relaunch;
+mod sandbox_settings;
 mod session_home;
 mod sessions;
 mod settings;
@@ -811,6 +812,9 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         visuals::install(cx, &host);
         // Settings' account, organization and engine calls (src/settings.rs).
         settings::install(cx, &host);
+        // Settings → Sandboxes: providers, host device, step scripts
+        // (src/sandbox_settings.rs).
+        sandbox_settings::install(cx, &host);
         // The installed fonts, for Settings → Appearance's font pickers
         // (src/fonts.rs).
         fonts::install(&host);

@@ -99,6 +99,8 @@ pub const BLOCKED: &[&str] = &[
     "cloud.sleep",
     "cloud.retry",
     "cloud.set_machine",
+    // (A sandbox provider's key, its host device, the user's step scripts.)
+    "sandbox_settings.change",
 ];
 
 pub fn blocked(action: &str) -> bool {
