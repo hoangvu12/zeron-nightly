@@ -11,190 +11,33 @@
 
 #[path = "support/fake_provider.rs"]
 mod fake_provider;
+#[path = "support/places.rs"]
+mod places;
 #[path = "support/scripted_edge.rs"]
 mod scripted_edge;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fake_provider::{FakeProvider, Resident, engine_config, start_engine};
-use scripted_edge::{ScriptedEdge, USER};
+use fake_provider::{FakeProvider, Resident};
+use places::{
+    ORG, add_project, create_on_place, git, host_device, origin, project, ready, steps,
+    steps_until,
+};
+use scripted_edge::ScriptedEdge;
 use serde_json::{Value, json};
-use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload};
+use zeron_doc::{MessageRole, MessageStatus};
 use zeron_engine::EngineRuntime;
 use zeron_engine::sandboxes::SandboxProvider;
-use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 use zeron_rpc::{RpcClient, memory_client, methods};
 
-const ORG: &str = "org_home";
-const SPACE: &str = "space-1";
-
 // ---------------------------------------------------------------------------
-// Fixtures
+// Fixtures (the shared ones are in support/places.rs)
 // ---------------------------------------------------------------------------
 
-/// The host device: signed in with a WorkOS session on its disk.
-async fn host_device(dir: &Path, edge: &ScriptedEdge) -> EngineRuntime {
-    std::fs::create_dir_all(dir).unwrap();
-    let session = json!({
-        "refreshToken": edge.seed_session(ORG),
-        "user": { "id": USER, "email": "u@example.com" },
-        "orgId": ORG,
-    });
-    std::fs::write(dir.join("session.json"), session.to_string()).unwrap();
-    start_engine(&engine_config(dir, &edge.url, None)).await
-}
-
-fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-/// A bare `origin` with one commit on `main`.
-fn origin(at: &Path) {
-    let seed = at.with_extension("seed");
-    std::fs::create_dir_all(&seed).unwrap();
-    git(&seed, &["init", "-q", "-b", "main"]);
-    std::fs::write(seed.join("README.md"), "reportly\n").unwrap();
-    git(&seed, &["add", "."]);
-    git(
-        &seed,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@example.com",
-            "commit",
-            "-qm",
-            "first",
-        ],
-    );
-    git(
-        at.parent().unwrap(),
-        &[
-            "clone",
-            "-q",
-            "--bare",
-            &seed.to_string_lossy(),
-            &at.to_string_lossy(),
-        ],
-    );
-}
-
-/// The project on the host device: a checkout of `origin_url`.
-fn project(dir: &Path, origin_url: &Path) -> PathBuf {
-    let project = dir.join("reportly");
-    std::fs::create_dir_all(&project).unwrap();
-    git(&project, &["init", "-q", "-b", "main"]);
-    git(
-        &project,
-        &["remote", "add", "origin", &origin_url.to_string_lossy()],
-    );
-    project
-}
-
-async fn add_project(rpc: &RpcClient, host: &EngineRuntime, path: &Path) {
-    rpc.call(
-        methods::MUTATE,
-        json!({
-            "op": "createSpace",
-            "spaceId": SPACE,
-            "deviceId": host.core().device_id,
-            "path": path.to_string_lossy(),
-            "gitDetected": true,
-        }),
-    )
-    .await
-    .expect("createSpace");
-}
-
-/// Create `chat` on `provider`, as the composer does: `{deviceId, cwd}`.
-async fn create_on_place(rpc: &RpcClient, chat: &str, provider: &str) -> Value {
-    rpc.call(
-        methods::MUTATE,
-        json!({
-            "op": "createChat",
-            "chatId": chat,
-            "spaceId": SPACE,
-            "place": { "provider": provider },
-        }),
-    )
-    .await
-    .expect("createChat on a place")
-}
-
-/// Send the first message, as a client does: a Run command in the chat doc.
+/// Send the first message (`<chat>-first`), as a client does.
 async fn send(rpc: &RpcClient, chat: &str, cwd: &str, prompt: &str) {
-    let command = serde_json::to_value(SessionCommandPayload::Run {
-        request: RunRequest {
-            mcp: None,
-            prompt: prompt.into(),
-            harness: Some(HarnessId::Mock),
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            cwd: cwd.into(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            access: Default::default(),
-            plan: false,
-            attachments: Vec::new(),
-            worktree: None,
-            resume: None,
-            env: Default::default(),
-            extra_mcp: Vec::new(),
-        },
-        message_id: format!("{chat}-first"),
-    })
-    .unwrap();
-    rpc.call(
-        methods::QUEUE_COMMAND,
-        json!({ "chatId": chat, "command": command }),
-    )
-    .await
-    .expect("queue the first message");
-}
-
-async fn steps(rpc: &RpcClient, chat: &str) -> Value {
-    rpc.call(methods::SANDBOX_STEPS, json!({ "chatId": chat }))
-        .await
-        .expect("SandboxSteps")
-}
-
-/// Poll the chat's steps until `done` says so; panics with the last answer.
-async fn steps_until(
-    rpc: &RpcClient,
-    chat: &str,
-    within: Duration,
-    done: impl Fn(&Value) -> bool,
-) -> Value {
-    let deadline = Instant::now() + within;
-    loop {
-        let now = steps(rpc, chat).await;
-        if done(&now) {
-            return now;
-        }
-        assert!(Instant::now() < deadline, "steps of {chat}: {now:#}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn ready(rpc: &RpcClient, chat: &str) -> Value {
-    steps_until(rpc, chat, Duration::from_secs(60), |s| {
-        assert_ne!(s["state"], "failed", "{s:#}");
-        s["state"] == "ready"
-    })
-    .await
+    places::send(rpc, chat, &format!("{chat}-first"), cwd, prompt).await;
 }
 
 /// Each step's state, by name: `{"create": "done", "start": "skipped", …}`.
