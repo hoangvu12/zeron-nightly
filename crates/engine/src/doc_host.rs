@@ -6429,6 +6429,13 @@ impl DocHost {
                     );
                 }
                 let harness = self.harness_for_request(chat_id, &request);
+                // In a sandbox, an agent its template lacks: refused before
+                // anything is written, the message waiting to be sent again
+                // with another agent the user picks (never one picked here).
+                if let Some(reason) = sessions.missing_agent(harness) {
+                    tracing::info!(chat = %chat_id, harness = ?harness, "send refused: agent not on this template");
+                    return Ok((SessionCommandStatus::Rejected, Some(reason)));
+                }
                 // A row with no config renders no harness glyph (and every
                 // later dispatch falls back to the engine default), so stamp
                 // what this run actually executes with. Claimed rows and

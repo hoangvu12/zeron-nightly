@@ -3224,6 +3224,10 @@ impl RpcService for EngineRpc {
                 let reply = self.forward(&target, method, params).await;
                 return reply.map_err(|error| remote_plugins::older_engine(&target, method, error));
             }
+            // A place's agents: answered here, never by a sandbox (#46).
+            if let Some(reply) = Box::pin(self.answer_for_place(&target, method, &params)).await {
+                return reply;
+            }
             // Settings → Providers' Cloud: its logins live in the vault.
             if crate::cloud_accounts::is_cloud_accounts_target(&target)
                 && crate::cloud_accounts::handles(method)
