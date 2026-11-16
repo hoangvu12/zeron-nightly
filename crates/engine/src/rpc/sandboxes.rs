@@ -441,6 +441,8 @@ impl EngineRpc {
                 connected_on: Some(me.clone()),
                 grants: Vec::new(),
                 chats: Vec::new(),
+                scripts: Vec::new(),
+                catalogs: Default::default(),
             };
             let params = route(
                 serde_json::to_value(&handover).map_err(|e| RpcError::Failed(e.to_string()))?,
@@ -751,7 +753,7 @@ impl EngineRpc {
                 RpcReply::value(&json!({ "content": content }))
             }
             Method::WriteScript => {
-                write_script(&path, p.content.as_deref().unwrap_or_default())
+                scripts::write(&path, p.content.as_deref().unwrap_or_default())
                     .map_err(|e| RpcError::Failed(format!("Couldn't save {}: {e}", p.name)))?;
                 RpcReply::value(&json!({ "ok": true, "path": path }))
             }
@@ -1091,18 +1093,6 @@ fn script_row(script: &scripts::Script) -> serde_json::Value {
     })
 }
 
-/// Save a script, making its folders: its owner's only, and runnable where
-/// that means something.
-fn write_script(path: &std::path::Path, content: &str) -> Result<(), String> {
-    crate::runner::write_private_atomic(path, content.as_bytes()).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

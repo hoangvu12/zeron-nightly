@@ -64,11 +64,40 @@ impl Catalogs {
     }
 
     pub(super) fn keep(&self, provider: &str, template: Option<&str>, catalog: PlaceCatalog) {
-        let bytes = {
+        super::lock(&self.kept).insert(key(provider, template), catalog);
+        self.save();
+    }
+
+    /// Every template of `provider`'s, by its key (to hand over).
+    pub(super) fn of_provider(&self, provider: &str) -> BTreeMap<String, PlaceCatalog> {
+        let prefix = key(provider, Some(""));
+        super::lock(&self.kept)
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, catalog)| (key.clone(), catalog.clone()))
+            .collect()
+    }
+
+    /// Take `provider`'s catalogs another device kept (handed over): each
+    /// replaces one read before it here. Other providers' are left alone.
+    pub(super) fn take(&self, provider: &str, taken: BTreeMap<String, PlaceCatalog>) {
+        let prefix = key(provider, Some(""));
+        {
             let mut kept = super::lock(&self.kept);
-            kept.insert(key(provider, template), catalog);
-            serde_json::to_vec_pretty(&*kept)
-        };
+            for (key, catalog) in taken {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                if kept.get(&key).is_none_or(|here| here.at <= catalog.at) {
+                    kept.insert(key, catalog);
+                }
+            }
+        }
+        self.save();
+    }
+
+    fn save(&self) {
+        let bytes = serde_json::to_vec_pretty(&*super::lock(&self.kept));
         let Some(path) = &self.path else {
             return;
         };

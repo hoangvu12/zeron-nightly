@@ -322,6 +322,26 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     assert!(laptop.core().sandboxes.steps("chat-a").is_none());
     assert_eq!(cloud.provider.calls()[0], "create");
     assert!(answers(&laptop, &sandbox).await);
+    // The server keeps the user's scripts for the cloud's sandboxes, and
+    // what agents its template had.
+    let (laptop_dir, server_dir) = (dirs.path().join("laptop"), dirs.path().join("server"));
+    let fetch = "steps/fake/after-wake/fetch.sh";
+    write_script(
+        &on_laptop,
+        json!({ "kind": "provider", "provider": "fake" }),
+        "after-wake",
+        "fetch.sh",
+        "git fetch
+",
+    )
+    .await;
+    assert!(server_dir.join(fetch).is_file());
+    assert!(!laptop_dir.join(fetch).exists());
+    let read = eventually(Duration::from_secs(30), async || {
+        server.core().sandboxes.catalog("fake", None)
+    })
+    .await;
+    assert!(read.is_some(), "the server never kept the template's agents");
 
     // The user moves the host device to the laptop: the key moves with it,
     // and the running sandbox keeps going.
@@ -340,9 +360,16 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
         "the server kept the key"
     );
     assert!(!files_holding(&dirs.path().join("laptop"), SECRET).is_empty());
-    // The chat's steps moved too.
+    // The chat's steps moved too, and the scripts and agents.
     assert!(laptop.core().sandboxes.steps("chat-a").is_some());
     assert!(server.core().sandboxes.steps("chat-a").is_none());
+    assert_eq!(
+        std::fs::read_to_string(laptop_dir.join(fetch)).ok().as_deref(),
+        Some("git fetch
+")
+    );
+    assert!(!server_dir.join("steps/fake").exists());
+    assert!(laptop.core().sandboxes.catalog("fake", None).is_some());
 
     // Two of its tokens later the sandbox is still online: its tokens came
     // from the laptop, since the server lends it none any more.
