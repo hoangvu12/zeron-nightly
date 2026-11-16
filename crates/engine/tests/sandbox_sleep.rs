@@ -66,6 +66,10 @@ struct World {
 /// device) ran on its sandbox. It stays awake until a test lets it sleep
 /// (a message reaches a sandbox some seconds after it's sent).
 async fn world(chat: &str) -> World {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let edge = ScriptedEdge::with_registry().await;
     let dirs = tempfile::tempdir().unwrap();
     let origin_url = dirs.path().join("origin.git");

@@ -344,13 +344,19 @@ impl Sandboxes {
         host: Host,
     ) {
         if !chat.claim() {
-            chat.wake_wanted.store(true, Ordering::SeqCst);
+            // Going to sleep: it wakes once that's done. (Anything else
+            // running leaves it awake.)
+            if chat.progress.borrow().state == SandboxState::Sleeping {
+                tracing::info!(chat = %chat.chat_id(), "wake asked while it goes to sleep");
+                chat.wake_wanted.store(true, Ordering::SeqCst);
+            }
             return;
         }
         if !chat.progress.borrow().stopped() {
             chat.release();
             return;
         }
+        tracing::info!(chat = %chat.chat_id(), "waking sandbox");
         chat.update(SandboxSteps::waking);
         self.persist();
         let outcome = self.wake_up(&chat, provider.as_ref(), &host).await;

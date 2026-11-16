@@ -3035,6 +3035,13 @@
       "outbox_failed": "Didn't send"
     },
     "sandbox_machine": {
+      "asleep": "Sandbox asleep",
+      "wake": "Wake",
+      "wake_failed_title": "Sandbox didn't wake",
+      "wake_failed_summary": "Try waking it again",
+      "wake_failed_body": "This chat's sandbox didn't wake. Try again in a moment.",
+      "wake_failure_outdated": "This device's Zeron is too old to wake a sandbox. Update it, then try again.",
+      "wake_failure": "Couldn't wake it. Try again.",
       "fresh": "Start fresh",
       "gone_title_in": "Sandbox deleted in {place}",
       "gone_title": "Sandbox deleted",
@@ -3071,6 +3078,13 @@
     }
   },
   "panel": {
+    "asleep": {
+      "title": "Sandbox asleep",
+      "body": "It went to sleep while nothing ran. Wake it, or send a message.",
+      "sleeping": "It's going to sleep. Wake it, or send a message.",
+      "waking": "Waking…",
+      "wake": "Wake"
+    },
     "tab": {
       "plugin": "Plugin",
       "browser": "Browser",

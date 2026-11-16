@@ -37,7 +37,7 @@ export type Alert = {
 	summary: string,
 	-- The opened words.
 	body: string,
-	-- "fresh".
+	-- "fresh" or "wake".
 	action: string?,
 	action_label: string?,
 }
@@ -120,16 +120,19 @@ function M.line(steps: any?): { [string]: any }?
 	return { text = say("asleep", "Sandbox asleep"), action = say("wake", "Wake"), icon = "moon" }
 end
 
--- Why Start fresh didn't go, in words.
-function M.failure_words(word: string): string
+-- Why Start fresh (or Wake, `action` "wake") didn't go, in words.
+function M.failure_words(word: string, action: string?): string
+	local wake = action == "wake"
 	if word == "offline" then
 		return say("failure_offline", "Couldn't reach Zeron on this device. Try again once it's back.")
 	elseif word == "outdated" then
-		return say("failure_outdated", "This device's Zeron is too old to start a sandbox fresh. Update it, then try again.")
+		return if wake
+			then say("wake_failure_outdated", "This device's Zeron is too old to wake a sandbox. Update it, then try again.")
+			else say("failure_outdated", "This device's Zeron is too old to start a sandbox fresh. Update it, then try again.")
 	elseif word == "signed_out" then
 		return say("failure_signed_out", "Sign in again, then try again.")
 	end
-	return say("failure", "Couldn't start fresh. Try again.")
+	return if wake then say("wake_failure", "Couldn't wake it. Try again.") else say("failure", "Couldn't start fresh. Try again.")
 end
 
 -- The alert as ds/composer_dock's Alert: plain data. `busy`: Start fresh is on
@@ -142,7 +145,7 @@ function M.deck_alert(a: Alert, opts: { busy: boolean?, failure: string? }?): { 
 		title = a.title,
 		detail = if a.summary ~= a.body then a.summary else nil,
 		body = a.body,
-		note = if o.failure then M.failure_words(o.failure) else nil,
+		note = if o.failure then M.failure_words(o.failure, a.action) else nil,
 		action = if o.busy then nil else a.action_label,
 		spinner = o.busy == true,
 		dismissable = false,

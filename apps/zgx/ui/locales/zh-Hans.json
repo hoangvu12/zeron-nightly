@@ -3035,6 +3035,13 @@
       "outbox_failed": "未发送"
     },
     "sandbox_machine": {
+      "asleep": "沙盒已休眠",
+      "wake": "唤醒",
+      "wake_failed_title": "沙盒未能唤醒",
+      "wake_failed_summary": "请再试一次唤醒",
+      "wake_failed_body": "此对话的沙盒未能唤醒。请稍后再试。",
+      "wake_failure_outdated": "此设备上的 Zeron 版本过旧，无法唤醒沙盒。请更新后再试。",
+      "wake_failure": "无法唤醒。请再试一次。",
       "fresh": "Start fresh",
       "gone_title_in": "Sandbox deleted in {place}",
       "gone_title": "Sandbox deleted",
@@ -3071,6 +3078,13 @@
     }
   },
   "panel": {
+    "asleep": {
+      "title": "沙盒已休眠",
+      "body": "没有任务运行时它已进入休眠。唤醒它，或发送一条消息。",
+      "sleeping": "它正在进入休眠。唤醒它，或发送一条消息。",
+      "waking": "正在唤醒…",
+      "wake": "唤醒"
+    },
     "tab": {
       "plugin": "插件",
       "browser": "浏览器",
