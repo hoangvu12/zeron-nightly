@@ -300,6 +300,12 @@ async fn a_chat_on_docker_sandbox_end_to_end() {
             }
         } else {
             say(format!("{sandbox} is gone from Docker"));
+            // And its device from every device list.
+            eventually("the sandbox's device leaves the device list", 2 * MINUTE, async || {
+                let rows = host.core().workspace.read_devices().ok()?;
+                rows.iter().all(|d| d.id != device).then_some(())
+            })
+            .await;
         }
     }
     if let Err(panic) = outcome {
