@@ -154,6 +154,19 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
             .any(|p| p["id"] == "boat" && p["name"] == "Boat"),
         "{offered}"
     );
+    // Settings offers "Sign in with …" for a provider whose connect opens
+    // a sign-in page: Docker's does, Boat's (a pasted key) doesn't.
+    let signs_in_on_a_page = |id: &str| {
+        offered
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .and_then(|p| p["ops"].as_array())
+            .is_some_and(|ops| ops.iter().any(|op| op == "signInPage"))
+    };
+    assert!(signs_in_on_a_page("docker"), "{offered}");
+    assert!(!signs_in_on_a_page("boat"), "{offered}");
     // Picking it opens its account's templates (the picker adds Blank).
     let templates = rpc
         .call(methods::LIST_SANDBOX_TEMPLATES, json!({ "provider": "fake" }))

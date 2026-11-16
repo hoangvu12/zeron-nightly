@@ -62,6 +62,8 @@ async fn it_names_itself_and_supplies_every_operation() {
     let p = &fx.provider;
     assert_eq!((p.id(), p.name()), ("docker", "Docker Sandbox"));
     assert_eq!(p.ops(), Ops::ALL, "{:?}", p.ops().names());
+    // Its connect opens Docker's own sign-in page (a device code).
+    assert!(p.ops().names().contains(&"signInPage"));
     assert_eq!(p.workdir("chat-1"), "/home/agent/workspace");
     // Not connected: every call says so, as a Config error.
     assert_eq!(p.account(), None);

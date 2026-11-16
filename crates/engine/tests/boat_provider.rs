@@ -78,6 +78,9 @@ async fn boat_is_its_own_provider() {
         assert!(ops.contains(op), "{:?}", op.names());
     }
     assert!(!ops.contains(Ops::TEMPLATES) && !ops.contains(Ops::SAVE_TEMPLATE));
+    // It connects with a pasted key only: no sign-in page.
+    assert!(!ops.contains(Ops::SIGN_IN_PAGE));
+    assert!(!ops.names().contains(&"signInPage"));
     assert!(p.workdir("chat-1").starts_with('/'));
 }
 

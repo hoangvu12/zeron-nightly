@@ -32,8 +32,12 @@ impl Ops {
     pub const CONNECT: Ops = Ops(1 << 7);
     /// It can push a sandbox's time limit out ([`SandboxProvider::extend`]).
     pub const EXTEND: Ops = Ops(1 << 8);
+    /// Its connect opens a sign-in page (a device code to approve there,
+    /// [`SandboxProvider::begin_connect`]), so Settings offers "Sign in
+    /// with …" besides pasting a key.
+    pub const SIGN_IN_PAGE: Ops = Ops(1 << 9);
     /// Every operation.
-    pub const ALL: Ops = Ops(0x1ff);
+    pub const ALL: Ops = Ops(0x3ff);
 
     pub const fn contains(self, other: Ops) -> bool {
         self.0 & other.0 == other.0
@@ -51,6 +55,7 @@ impl Ops {
             (Ops::SAVE_TEMPLATE, "saveTemplate"),
             (Ops::CONNECT, "connect"),
             (Ops::EXTEND, "extend"),
+            (Ops::SIGN_IN_PAGE, "signInPage"),
         ]
         .into_iter()
         .filter(|(op, _)| self.contains(*op))
@@ -500,7 +505,7 @@ mod tests {
         assert!(!ops.contains(Ops::CREATE));
         assert!(Ops::ALL.contains(ops));
         assert_eq!(ops.names(), ["start", "run"]);
-        assert_eq!(Ops::ALL.names().len(), 9);
+        assert_eq!(Ops::ALL.names().len(), 10);
         assert_eq!((Ops::CONNECT | Ops::EXTEND).names(), ["connect", "extend"]);
     }
 
