@@ -6096,6 +6096,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: None,
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
         }
@@ -6792,6 +6793,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: version.map(str::to_string),
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: if capable {
                 vec![zeron_proto::capabilities::ATTACHMENT_STORE_V1.to_string()]
@@ -8670,6 +8672,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: Some("0.2.12".into()),
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
         }];
@@ -8693,6 +8696,7 @@ mod tests {
                 last_seen_at: None,
                 created_at: None,
                 version: Some("0.2.31".into()),
+                online_since: None,
                 cursor_sdk_version: None,
                 capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
             },
@@ -8703,6 +8707,7 @@ mod tests {
                 last_seen_at: None,
                 created_at: None,
                 version: Some("0.2.31".into()),
+                online_since: None,
                 cursor_sdk_version: None,
                 capabilities: Vec::new(),
             },
@@ -8730,6 +8735,7 @@ mod tests {
             last_seen_at: Some(now),
             created_at: None,
             version: None,
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
         }];

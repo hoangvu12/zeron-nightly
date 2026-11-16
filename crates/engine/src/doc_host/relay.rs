@@ -1059,6 +1059,7 @@ mod tests {
             last_seen_at: Some(chrono::Utc::now()),
             created_at: None,
             version: None,
+            online_since: None,
             cursor_sdk_version: None,
             capabilities: vec![zeron_proto::relay_gen::CHAT_RELAY_CAPABILITY.into()],
         });

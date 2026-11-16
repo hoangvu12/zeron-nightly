@@ -2992,6 +2992,7 @@ fn add_space_cloud_device(state: &crate::state::AppState) -> Option<Device> {
         last_seen_at: None,
         created_at: None,
         version: None,
+        online_since: None,
         cursor_sdk_version: None,
         capabilities: Vec::new(),
     })

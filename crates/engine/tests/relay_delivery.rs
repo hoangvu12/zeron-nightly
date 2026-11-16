@@ -224,6 +224,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
         last_seen_at: Some(chrono::Utc::now()),
         created_at: None,
         version: Some("0.2.12".into()),
+        online_since: None,
         cursor_sdk_version: None,
         capabilities: zeron_proto::capabilities::current(),
     });

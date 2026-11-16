@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use zeron_engine::sandboxes::{
-    Command, CreateSandbox, ErrorKind, Exit, Ops, Placement, ProviderError, RunEvent, RunStream,
-    SandboxProvider, SandboxStatus,
+    Account, Command, CreateSandbox, Credential, ErrorKind, Exit, KeySlot, Ops, Placement,
+    ProviderError, RunEvent, RunStream, SandboxProvider, SandboxStatus,
 };
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, HarnessId, LentSignIn};
 
@@ -104,6 +104,8 @@ pub struct FakeProvider {
     agents: Option<Vec<HarnessId>>,
     state: Arc<Mutex<State>>,
     hold: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// Where one device keeps the account's key ([`Self::on_device`]).
+    slot: Option<KeySlot>,
 }
 
 impl FakeProvider {
@@ -158,7 +160,25 @@ impl FakeProvider {
             agents: None,
             state: Arc::default(),
             hold: Mutex::new(None),
+            slot: None,
         }
+    }
+
+    /// The same cloud as one of the user's devices builds it in: connected
+    /// with a key kept in that device's data dir, as Docker Sandbox is.
+    pub fn on_device(&self, data_dir: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            id: self.id.clone(),
+            ops: self.ops | Ops::CONNECT,
+            root: self.root.clone(),
+            has_zeron: self.has_zeron,
+            shared: self.shared.clone(),
+            resident: None,
+            state: self.state.clone(),
+            hold: Mutex::new(None),
+            slot: Some(KeySlot::open(data_dir, &self.id)),
+            agents: self.agents.clone(),
+        })
     }
 
     /// A full cloud whose template has only `agents` on it: its engine
@@ -386,6 +406,49 @@ impl SandboxProvider for FakeProvider {
         self.ops
     }
 
+    fn account(&self) -> Option<Account> {
+        self.slot.as_ref()?.get().map(|_| Account {
+            name: "fake-account".into(),
+        })
+    }
+
+    async fn connect(&self, credential: Credential) -> Result<Account, ProviderError> {
+        let Credential::Token(token) = credential else {
+            return Err(ProviderError::unsupported("sign in on a page"));
+        };
+        // The keys the fake cloud gives out start with `fake-`.
+        if !token.starts_with("fake-") {
+            return Err(ProviderError::new(
+                ErrorKind::Config,
+                "that isn't a fake cloud key",
+            ));
+        }
+        self.adopt_key(serde_json::json!({ "token": token }).to_string())
+            .await
+    }
+
+    fn export_key(&self) -> Option<String> {
+        self.slot.as_ref()?.get()
+    }
+
+    async fn adopt_key(&self, raw: String) -> Result<Account, ProviderError> {
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or_else(|| ProviderError::unsupported("keep a key"))?;
+        slot.set(&raw)
+            .map_err(|e| ProviderError::new(ErrorKind::Fatal, e.to_string()))?;
+        Ok(Account {
+            name: "fake-account".into(),
+        })
+    }
+
+    async fn forget_key(&self) {
+        if let Some(slot) = &self.slot {
+            slot.clear().unwrap();
+        }
+    }
+
     fn placement(&self, _chat_id: &str) -> Placement {
         match &self.shared {
             None => Placement::PerChat,
@@ -468,6 +531,22 @@ impl SandboxProvider for FakeProvider {
         };
         if let Some(config) = config {
             drop(self.spawn_engine(sandbox, config));
+        }
+        Ok(())
+    }
+
+    async fn stop(&self, sandbox: &str) -> Result<(), ProviderError> {
+        self.record(format!("stop {sandbox}"));
+        let engine = {
+            let mut state = self.state.lock().unwrap();
+            let fake = state.boxes.get_mut(sandbox).ok_or_else(|| {
+                ProviderError::new(ErrorKind::NotFound, format!("no sandbox {sandbox}"))
+            })?;
+            fake.running = false;
+            fake.engine.take()
+        };
+        if let Some(engine) = engine {
+            engine.shutdown().await;
         }
         Ok(())
     }

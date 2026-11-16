@@ -2453,6 +2453,11 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // update, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => crate::harness_updates::APPLY_REPLY_DEADLINE,
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // A provider's own calls (delete a sandbox), or a host device handing
+        // one over to the next.
+        methods::CONNECT_SANDBOX_PROVIDER
+        | methods::ADOPT_SANDBOX_PROVIDER
+        | methods::SET_SANDBOX_HOST => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -2509,6 +2514,8 @@ fn forwardable(method: &str) -> bool {
             | methods::DELETE_STEP_SCRIPT
             | methods::CHECK_SANDBOX
             | methods::START_SANDBOX_FRESH
+            | methods::ADOPT_SANDBOX_PROVIDER
+            | methods::SET_SANDBOX_HOST
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
@@ -4292,6 +4299,11 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&self.harness_updates()?.set_policy(p.harness, p.policy))
             }
             methods::MUTATE => {
+                // A chat on a place may be the host device's to create.
+                let raw = params
+                    .get("place")
+                    .is_some_and(|place| !place.is_null())
+                    .then(|| params.clone());
                 let p: MutateParams = parse_params(params)?;
                 if let MutateParams::CreateChat {
                     chat_id,
@@ -4305,6 +4317,7 @@ impl RpcService for EngineRpc {
                 } = &p
                 {
                     return Box::pin(self.create_chat_on_place(
+                        raw,
                         chat_id,
                         space_id.as_deref(),
                         device_id.as_deref(),
