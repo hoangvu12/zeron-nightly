@@ -72,10 +72,8 @@ impl Catalogs {
         let Some(path) = &self.path else {
             return;
         };
-        let outcome = bytes.map_err(std::io::Error::other).and_then(|bytes| {
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, bytes)?;
-            std::fs::rename(&tmp, path)
+        let outcome = bytes.map_err(|e| e.to_string()).and_then(|bytes| {
+            crate::runner::write_private_atomic(path, &bytes).map_err(|e| e.to_string())
         });
         if let Err(err) = outcome {
             tracing::warn!(error = %err, "sandboxes: couldn't save {FILE}");
@@ -134,4 +132,27 @@ pub(super) async fn read(
         models,
         at: crate::now_ms(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_a_template_had_is_kept_across_a_restart_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        Catalogs::open(dir.path()).keep("docker", Some("dev"), PlaceCatalog::default());
+        let again = Catalogs::open(dir.path());
+        assert!(again.get("docker", Some("dev")).is_some());
+        assert!(again.get("docker", None).is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 }

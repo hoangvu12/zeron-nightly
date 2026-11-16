@@ -816,17 +816,15 @@ fn script_row(script: &scripts::Script) -> serde_json::Value {
     })
 }
 
-/// Save a script, making its folders; runnable where that means something.
-fn write_script(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("zeron-tmp");
-    std::fs::write(&tmp, content)?;
+/// Save a script, making its folders: its owner's only, and runnable where
+/// that means something.
+fn write_script(path: &std::path::Path, content: &str) -> Result<(), String> {
+    crate::runner::write_private_atomic(path, content.as_bytes()).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
     }
-    std::fs::rename(&tmp, path)
+    Ok(())
 }

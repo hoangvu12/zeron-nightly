@@ -47,11 +47,8 @@ impl KeySlot {
 
     /// Keep `value`, replacing what was there (atomically, owner-only).
     pub fn set(&self, value: &str) -> io::Result<()> {
-        let dir = self.path.parent().expect("a slot is in a folder");
-        std::fs::create_dir_all(dir)?;
-        let tmp = self.path.with_extension("json.tmp");
-        write_private(&tmp, value.as_bytes())?;
-        std::fs::rename(&tmp, &self.path)
+        crate::runner::write_private_atomic(&self.path, value.as_bytes())
+            .map_err(io::Error::other)
     }
 
     /// Forget it (disconnect).
@@ -61,26 +58,6 @@ impl KeySlot {
             other => other,
         }
     }
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let _ = std::fs::remove_file(path);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
-/// On Windows the data dir is in the user's profile, private to them already.
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]

@@ -468,6 +468,16 @@ async fn scripts_are_listed_written_and_read_on_the_host_device() {
         std::fs::read_to_string(path.join(".zeron/setup.sh")).unwrap(),
         "npm ci\n"
     );
+    // Its owner's alone, and runnable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(host_dir.join("steps/after-setup/fleet-sync.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 
     let listed = rpc
         .call(methods::LIST_STEP_SCRIPTS, json!({}))

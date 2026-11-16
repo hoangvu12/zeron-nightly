@@ -934,11 +934,9 @@ impl Sandboxes {
             .map(|chat| lock(&chat.record).clone())
             .collect();
         let outcome = serde_json::to_vec_pretty(&records)
-            .map_err(std::io::Error::other)
+            .map_err(|e| e.to_string())
             .and_then(|bytes| {
-                let tmp = path.with_extension("json.tmp");
-                std::fs::write(&tmp, bytes)?;
-                std::fs::rename(&tmp, path)
+                crate::runner::write_private_atomic(path, &bytes).map_err(|e| e.to_string())
             });
         if let Err(err) = outcome {
             tracing::warn!(error = %err, "sandboxes: couldn't save {RECORDS_FILE}");
@@ -1506,6 +1504,19 @@ mod tests {
             std::fs::read_to_string(dir.path().join("device-id")).unwrap(),
             "sandbox-1"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_chats_on_places_are_kept_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        Sandboxes::open(dir.path()).persist();
+        let mode = std::fs::metadata(dir.path().join(RECORDS_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
