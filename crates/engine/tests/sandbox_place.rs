@@ -368,7 +368,7 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
     );
     assert_eq!(
         calls.last().unwrap(),
-        "run chat-a: zeron-engine headless",
+        "run chat-a: zeron-engine watchdog",
         "{calls:#?}"
     );
 
@@ -519,7 +519,7 @@ async fn a_failed_clone_shows_its_error_and_runs_again() {
         !provider
             .calls()
             .iter()
-            .any(|c| c.contains("zeron-engine headless")),
+            .any(|c| c.contains("zeron-engine watchdog")),
         "{:#?}",
         provider.calls()
     );

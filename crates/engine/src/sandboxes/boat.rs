@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use super::KeySlot;
 use super::provider::{
     Account, Command, CreateSandbox, Credential, ErrorKind, Exit, Ops, ProviderError, RunEvent,
-    RunStream, SandboxProvider,
+    RunStream, SandboxProvider, SandboxStatus,
 };
 
 pub const BOAT_ID: &str = "boat";
@@ -379,6 +379,15 @@ impl SandboxProvider for BoatProvider {
             }
         }
         self.ready(sandbox).await
+    }
+
+    /// Unknown to Boat (404) is gone; failed or on its way down is stopped.
+    async fn status(&self, sandbox: &str) -> Result<SandboxStatus, ProviderError> {
+        Ok(match self.state(sandbox).await?.0 {
+            State::Ready | State::Starting => SandboxStatus::Running,
+            State::Stopping | State::Stopped | State::Failed => SandboxStatus::Stopped,
+            State::Gone => SandboxStatus::Gone,
+        })
     }
 
     /// Never forced: a forced stop throws away what changed since the last

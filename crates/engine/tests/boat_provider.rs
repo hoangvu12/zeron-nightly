@@ -19,7 +19,7 @@ use futures::StreamExt;
 use serde_json::json;
 use zeron_engine::sandboxes::{
     BoatProvider, Command, CreateSandbox, Credential, ErrorKind, KeySlot, Ops, RunEvent,
-    SandboxProvider, run_to_end,
+    SandboxProvider, SandboxStatus, run_to_end,
 };
 
 struct Boat {
@@ -168,8 +168,13 @@ async fn creates_idempotently_runs_extends_stops_starts_and_deletes() {
     p.extend(&id, Duration::from_secs(3600)).await.unwrap();
     assert_eq!(boat.stub.sandbox(&id).unwrap().ttl_seconds, json!(3600));
 
+    assert_eq!(p.status(&id).await.unwrap(), SandboxStatus::Running);
     p.stop(&id).await.unwrap();
     assert_eq!(boat.stub.sandbox(&id).unwrap().state, "archiving");
+    // Stopping, then stopped: both are stopped to Zeron.
+    assert_eq!(p.status(&id).await.unwrap(), SandboxStatus::Stopped);
+    assert_eq!(boat.stub.sandbox(&id).unwrap().state, "archived");
+    assert_eq!(p.status(&id).await.unwrap(), SandboxStatus::Stopped);
     p.start(&id).await.unwrap();
     assert_eq!(boat.stub.sandbox(&id).unwrap().state, "idle");
     // Starting one that runs asks nothing more of Boat than its state.
@@ -187,6 +192,7 @@ async fn creates_idempotently_runs_extends_stops_starts_and_deletes() {
     assert_eq!(deleted.headers.get("x-ascii-confirm-delete"), Some(&id));
     assert!(boat.stub.sandbox(&id).unwrap().deleted);
     assert_eq!(p.start(&id).await.unwrap_err().kind, ErrorKind::NotFound);
+    assert_eq!(p.status(&id).await.unwrap(), SandboxStatus::Gone);
 
     // The account's key went to Boat as the bearer, never into a sandbox.
     for call in boat.stub.calls() {
@@ -212,6 +218,8 @@ async fn a_template_is_a_named_snapshot() {
 async fn unknown_sandboxes_are_gone() {
     let boat = connected().await;
     let p = &boat.provider;
+    // Deleted outside Zeron (or never there): gone, which recovery acts on.
+    assert_eq!(p.status("bx_zzzzzzzz").await.unwrap(), SandboxStatus::Gone);
     for err in [
         p.start("bx_zzzzzzzz").await.unwrap_err(),
         p.stop("bx_zzzzzzzz").await.unwrap_err(),

@@ -216,6 +216,16 @@ pub struct Account {
     pub name: String,
 }
 
+/// Where a sandbox is, as its provider sees it ([`SandboxProvider::status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxStatus {
+    Running,
+    Stopped,
+    /// Deleted, outside Zeron or not.
+    Gone,
+}
+
 /// What kind of failure, so steps can say and decide what to do alike for
 /// every provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -291,6 +301,12 @@ pub trait SandboxProvider: Send + Sync + 'static {
     /// Delete it and its disk, for good.
     async fn delete(&self, _sandbox: &str) -> Result<(), ProviderError> {
         Err(ProviderError::unsupported("delete sandboxes"))
+    }
+    /// Whether it's still there, and running. Optional (not one of
+    /// [`Ops`]): without it, Zeron learns a sandbox is gone only when a step
+    /// finds it so.
+    async fn status(&self, _sandbox: &str) -> Result<SandboxStatus, ProviderError> {
+        Err(ProviderError::unsupported("tell how a sandbox is"))
     }
     /// Run a command in it.
     async fn run(&self, _sandbox: &str, _command: Command) -> Result<RunStream, ProviderError> {
