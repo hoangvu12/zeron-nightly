@@ -659,7 +659,7 @@
         "unreported": "Context usage not reported by this agent yet"
       },
       "sandbox_template": {
-        "label": "Sandbox template",
+        "label": "Template",
         "heading": "Templates"
       },
       "sandboxed": {
@@ -2472,7 +2472,7 @@
         "rename": "Rename…",
         "remove": "Remove…",
         "edit_project": "Edit project…",
-        "save_sandbox_template": "Save as sandbox template"
+        "save_sandbox_template": "Save as template"
       },
       "project": {
         "rename_title": "Rename project",
@@ -2549,12 +2549,12 @@
         "name_placeholder": "Session name"
       },
       "save_sandbox_template": {
-        "title": "Save as sandbox template",
-        "name": "Sandbox template name",
+        "title": "Save as template",
+        "name": "Template name",
         "save": "Save",
-        "saving": "Saving as sandbox template",
-        "couldnt": "Couldn’t save the sandbox template",
-        "saved": "Saved as sandbox template"
+        "saving": "Saving as template",
+        "couldnt": "Couldn’t save the template",
+        "saved": "Saved as template"
       }
     },
     "boundary": {

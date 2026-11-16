@@ -517,7 +517,7 @@ return {
 	["ds.composer.context.capacity"] = "{n} token capacity",
 	["ds.composer.context.waiting"] = "Waiting for context usage",
 	["ds.composer.context.unreported"] = "Context usage not reported by this agent yet",
-	["ds.composer.sandbox_template.label"] = "Sandbox template",
+	["ds.composer.sandbox_template.label"] = "Template",
 	["ds.composer.sandbox_template.heading"] = "Templates",
 	["ds.composer.sandboxed.label"] = "Sandboxed",
 	["ds.composer.sandboxed.hint"] = "Its agent runs any command inside the sandbox, never on this device.",

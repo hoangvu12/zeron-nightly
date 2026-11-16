@@ -181,7 +181,7 @@ test("picking the provider opens its templates, the account's and Blank", functi
 	expect(showing(app, 'role:option ~"Blank"')).to_be(true)
 	app:click('role:option ~"zeron-dev"')
 	settle(app)
-	expect(chosen(app, "Sandbox template")).to_contain("zeron-dev")
+	expect(chosen(app, "Template")).to_contain("zeron-dev")
 	-- No checkout to choose: its sandbox clones the project.
 	panel(app)
 	expect(showing(app, 'role:menuitem "Checkout"')).to_be(false)
@@ -223,9 +223,9 @@ test("a place starts on the template last used there, else the first listed", fu
 	rested(app)
 	close(app)
 	-- None used yet: the first.
-	expect(chosen(app, "Sandbox template")).to_contain("zeron-dev")
+	expect(chosen(app, "Template")).to_contain("zeron-dev")
 	panel(app)
-	open_row(app, "Sandbox template")
+	open_row(app, "Template")
 	app:click('role:option ~"zgx-dev"')
 	close(app)
 	-- Away and back: the one last used.
@@ -236,7 +236,7 @@ test("a place starts on the template last used there, else the first listed", fu
 	app:click('role:option ~"Docker Sandbox"')
 	rested(app)
 	close(app)
-	expect(chosen(app, "Sandbox template")).to_contain("zgx-dev")
+	expect(chosen(app, "Template")).to_contain("zgx-dev")
 end)
 
 test("the chip says provider › template › project › branch, led by the provider's glyph", function()

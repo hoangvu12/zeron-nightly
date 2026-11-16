@@ -57,13 +57,13 @@ function M.band(save: any): any
 		return nil
 	end
 	if save.state == "saving" then
-		return { kind = "saving", spinner = true, title = say("saving", "Saving as sandbox template"), detail = save.name, mono = true }
+		return { kind = "saving", spinner = true, title = say("saving", "Saving as template"), detail = save.name, mono = true }
 	elseif save.state == "saved" then
 		return {
 			kind = "saved",
 			icon = "check-circle",
 			tone = "success",
-			title = say("saved", "Saved as sandbox template"),
+			title = say("saved", "Saved as template"),
 			detail = save.name,
 			mono = true,
 			dismissable = true,
@@ -73,7 +73,7 @@ function M.band(save: any): any
 		kind = "save_failed",
 		icon = "danger-triangle",
 		tone = "danger",
-		title = say("couldnt", "Couldn’t save the sandbox template"),
+		title = say("couldnt", "Couldn’t save the template"),
 		detail = save.why,
 		dismissable = true,
 	}
