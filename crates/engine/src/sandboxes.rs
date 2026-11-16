@@ -814,7 +814,7 @@ impl Sandboxes {
                     // The template already has it.
                     return Ok(StepState::Skipped);
                 }
-                let install = install_command(&edge_url(host)?);
+                let install = install_zeron(&edge_url(host)?);
                 let done = run_to_end(provider, &sandbox, install)
                     .await
                     .map_err(|e| format!("Couldn't install Zeron: {e}"))?;
@@ -1450,22 +1450,63 @@ async fn read_run_request(stream: &mut tokio::net::TcpStream) -> Option<(String,
     Some((path, String::from_utf8_lossy(&body).into_owned()))
 }
 
-/// Install Zeron's engine from this edge's releases into the managed layout
-/// the updater knows (`~/.zeron/app/current`), and on the PATH.
-fn install_command(edge_url: &str) -> Command {
+/// The Zeron release a sandbox's engine should match: this engine's own when
+/// it is a release build (`ZERON_ENGINE_VERSION` at build time), `None` for
+/// a dev build, whose workspace version names no release of its code.
+pub fn host_release() -> Option<&'static str> {
+    option_env!("ZERON_ENGINE_VERSION").filter(|v| !v.trim().is_empty())
+}
+
+/// Dev override, read on the host device: the URL of a Linux engine tarball
+/// (laid out like a release's) that sandboxes install instead of a release,
+/// to try a branch's engine in a real sandbox.
+pub const ENGINE_TARBALL_ENV: &str = "ZERON_SANDBOX_ENGINE_TARBALL";
+/// The release the Install Zeron step asks the edge for first.
+const ENGINE_WANTED_ENV: &str = "ZERON_ENGINE_WANTED";
+
+/// [`install_command`] as the Install Zeron step runs it: the host's own
+/// release, and the dev override when this device sets it.
+fn install_zeron(edge_url: &str) -> Command {
+    let tarball = std::env::var(ENGINE_TARBALL_ENV).ok();
+    install_command(edge_url, host_release(), tarball.as_deref())
+}
+
+/// Install Zeron's engine into the managed layout the updater knows
+/// (`~/.zeron/app/current`), and on the PATH: from `tarball` when given,
+/// else the edge's release `wanted` when it has it, else its latest.
+fn install_command(edge_url: &str, wanted: Option<&str>, tarball: Option<&str>) -> Command {
     const SCRIPT: &str = r#"set -eu
 edge="$ZERON_EDGE_URL"
-version=$(curl -fsSL "$edge/releases/latest.txt")
 case "$(uname -m)" in aarch64|arm64) arch=aarch64 ;; *) arch=x86_64 ;; esac
+if [ -n "${ZERON_SANDBOX_ENGINE_TARBALL:-}" ]; then
+  version=dev
+  url="$ZERON_SANDBOX_ENGINE_TARBALL"
+else
+  version="${ZERON_ENGINE_WANTED:-}"
+  url="$edge/releases/zeron-$version-linux-$arch.tar.gz"
+  if [ -z "$version" ] || ! curl -fsIL "$url" >/dev/null 2>&1; then
+    version=$(curl -fsSL "$edge/releases/latest.txt")
+    url="$edge/releases/zeron-$version-linux-$arch.tar.gz"
+  fi
+fi
+[ -n "$version" ] || { echo "the edge named no release" >&2; exit 1; }
 dir="$HOME/.zeron/app/$version"
 mkdir -p "$dir"
-curl -fsSL "$edge/releases/zeron-$version-linux-$arch.tar.gz" | tar -xz --strip-components=1 -C "$dir"
+curl -fsSL "$url" | tar -xz --strip-components=1 -C "$dir"
 ln -sfn "$dir" "$HOME/.zeron/app/current"
 sudo ln -sf "$HOME/.zeron/app/current/zeron-engine" /usr/local/bin/zeron-engine
 zeron-engine --version"#;
-    Command::new(["sh", "-c", SCRIPT])
+    let present = |v: Option<&str>| v.map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let mut command = Command::new(["sh", "-c", SCRIPT])
         .env(EDGE_URL_ENV, edge_url)
-        .timeout(INSTALL_TIMEOUT)
+        .timeout(INSTALL_TIMEOUT);
+    if let Some(wanted) = present(wanted) {
+        command = command.env(ENGINE_WANTED_ENV, wanted);
+    }
+    if let Some(tarball) = present(tarball) {
+        command = command.env(ENGINE_TARBALL_ENV, tarball);
+    }
+    command
 }
 
 /// `folder` in `dir`, with `dir`'s own separator.
@@ -1569,6 +1610,134 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Runs the Install Zeron step's script against a fake edge: `curl`
+    /// serves `edge/releases/<file>` from a folder (any other URL by its
+    /// last segment) and logs every URL; `sudo` does nothing. Returns what
+    /// `zeron-engine --version` printed and the URLs fetched.
+    #[cfg(unix)]
+    fn install_against(
+        releases: &[&str],
+        latest: &str,
+        wanted: Option<&str>,
+        tarball: Option<&str>,
+    ) -> (String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let (edge, bin, home) = (
+            root.path().join("edge"),
+            root.path().join("bin"),
+            root.path().join("home"),
+        );
+        for dir in [&edge, &bin, &home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(edge.join("latest.txt"), format!("{latest}\n")).unwrap();
+        for version in releases {
+            for arch in ["x86_64", "aarch64"] {
+                let stage = root.path().join(format!("stage-{version}"));
+                let top = stage.join(format!("zeron-{version}"));
+                std::fs::create_dir_all(&top).unwrap();
+                let engine = top.join("zeron-engine");
+                std::fs::write(&engine, format!("#!/bin/sh\necho zeron-engine {version}\n"))
+                    .unwrap();
+                std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let file = edge.join(format!("zeron-{version}-linux-{arch}.tar.gz"));
+                let packed = std::process::Command::new("tar")
+                    .arg("-czf")
+                    .arg(&file)
+                    .arg("-C")
+                    .arg(&stage)
+                    .arg(format!("zeron-{version}"))
+                    .status()
+                    .unwrap();
+                assert!(packed.success());
+            }
+        }
+        let curl = r#"#!/bin/sh
+url=""; head=0
+for a in "$@"; do case "$a" in -*I*) head=1 ;; -*) ;; *) url="$a" ;; esac; done
+echo "$url" >> "$FAKE_LOG"
+file="$FAKE_EDGE/${url##*/}"
+[ -f "$file" ] || exit 22
+[ "$head" = 1 ] || cat "$file"
+"#;
+        for (name, script) in [("curl", curl), ("sudo", "#!/bin/sh\nexit 0\n")] {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log = root.path().join("urls");
+        let command = install_command("https://edge.test", wanted, tarball);
+        let path = format!(
+            "{}:{}:{}",
+            home.join(".zeron/app/current").display(),
+            bin.display(),
+            std::env::var("PATH").unwrap()
+        );
+        let out = std::process::Command::new(&command.args[0])
+            .args(&command.args[1..])
+            .envs(&command.env)
+            .env("PATH", path)
+            .env("HOME", &home)
+            .env("FAKE_EDGE", &edge)
+            .env("FAKE_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            std::fs::read_to_string(log).unwrap_or_default(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sandbox_gets_the_host_engines_own_release_when_the_edge_has_it() {
+        let (installed, urls) = install_against(&["0.3.6", "0.3.7"], "0.3.7", Some("0.3.6"), None);
+        assert_eq!(installed, "zeron-engine 0.3.6");
+        assert!(urls.contains("/releases/zeron-0.3.6-linux-"), "{urls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sandbox_gets_the_latest_release_when_the_edge_lacks_the_hosts() {
+        let (installed, _) = install_against(&["0.3.7"], "0.3.7", Some("0.3.8-beta.1"), None);
+        assert_eq!(installed, "zeron-engine 0.3.7");
+        // A host that isn't a release build (a dev build) takes the latest.
+        let (installed, _) = install_against(&["0.3.0", "0.3.7"], "0.3.7", None, None);
+        assert_eq!(installed, "zeron-engine 0.3.7");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_tarball_overrides_the_edges_releases() {
+        let (installed, urls) = install_against(
+            &["0.3.7", "9.9.9"],
+            "0.3.7",
+            Some("0.3.7"),
+            Some("https://builds.test/x/zeron-9.9.9-linux-x86_64.tar.gz"),
+        );
+        assert_eq!(installed, "zeron-engine 9.9.9");
+        assert!(!urls.contains("edge.test"), "the edge isn't asked: {urls}");
+    }
+
+    #[test]
+    fn the_install_source_is_the_hosts_release_and_the_dev_override() {
+        let command = install_command("https://edge.test", Some("0.3.7"), Some(" "));
+        assert_eq!(command.env.get(ENGINE_WANTED_ENV).map(String::as_str), Some("0.3.7"));
+        assert_eq!(command.env.get(ENGINE_TARBALL_ENV), None, "a blank override is none");
+        let dev = install_command("https://edge.test", None, Some("https://b.test/z.tar.gz"));
+        assert_eq!(dev.env.get(ENGINE_WANTED_ENV), None);
+        assert_eq!(
+            dev.env.get(ENGINE_TARBALL_ENV).map(String::as_str),
+            Some("https://b.test/z.tar.gz")
+        );
     }
 
     #[test]

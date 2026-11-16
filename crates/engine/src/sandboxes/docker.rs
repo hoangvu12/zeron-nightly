@@ -1367,7 +1367,7 @@ mod smoke {
             let probe = Command::new([super::super::ENGINE_PROGRAM, "--version"]);
             let probe = run_to_end(&p, &id, probe).await;
             assert!(!probe.is_ok_and(|done| done.exit.success()), "Blank has no Zeron");
-            let install = run_to_end(&p, &id, super::super::install_command(&edge))
+            let install = run_to_end(&p, &id, super::super::install_zeron(&edge))
                 .await
                 .unwrap();
             assert!(install.exit.success(), "install: {}", install.failure());
