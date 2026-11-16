@@ -350,6 +350,10 @@ struct DocHostInner {
     /// terminalizes the latter as Rejected instead of leaving a forever-
     /// Pending entry no retry could ever reach (2026-08-19 swallowed-send).
     executing: Mutex<HashSet<String>>,
+    /// Commands a remote host said it ran or settled ([`Self::relay_command`]
+    /// answered): no longer waiting there, whatever this device's copy of
+    /// the doc says until its rows catch up ([`DocHost::queued_send`]).
+    relayed: Mutex<HashSet<String>>,
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
@@ -1306,6 +1310,7 @@ impl DocHost {
                 store_looks: Mutex::new(HashMap::new()),
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
+                relayed: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
                 http: reqwest::Client::builder()
                     .pool_max_idle_per_host(2)
@@ -5245,6 +5250,70 @@ impl DocHost {
         Ok(())
     }
 
+    /// Tell the chat's (remote) host again that it has something waiting:
+    /// a nudge to its device room, retried until accepted. A sandbox's host
+    /// device does this once the sandbox is awake, for the nudges it took
+    /// in while standing in for it.
+    pub fn renudge_remote_host(&self, chat_id: &str) {
+        self.nudge_remote_host(chat_id);
+    }
+
+    /// Whether a message waits in `chat_id` for its host: a Run or Steer
+    /// still pending there, unexpired, that no host has said it took. This
+    /// device's copy of the doc is caught up with the chat's room first
+    /// (briefly; a room it can't reach leaves the copy as it is). Opening a
+    /// chat is no send: a nudge alone doesn't make this true.
+    pub async fn queued_send(&self, chat_id: &str) -> bool {
+        const CATCH_UP: std::time::Duration = std::time::Duration::from_secs(8);
+        let known = self
+            .workspace()
+            .and_then(|w| w.chat(chat_id).ok().flatten())
+            .is_some();
+        if !known {
+            return false;
+        }
+        let Ok(handle) = self.open(chat_id) else {
+            return false;
+        };
+        if self.waiting_send(chat_id, &handle) {
+            return true;
+        }
+        self.activate_sync(&handle);
+        let deadline = tokio::time::Instant::now() + CATCH_UP;
+        while tokio::time::Instant::now() < deadline {
+            let caught_up = lock(&handle.chat2).as_ref().is_some_and(|c| {
+                let s = c.stats();
+                s.connected && s.server_known && s.cursor >= s.head_seq
+            });
+            if caught_up {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        self.waiting_send(chat_id, &handle)
+    }
+
+    fn waiting_send(&self, chat_id: &str, handle: &ChatDocHandle) -> bool {
+        let Ok(commands) = handle.doc.read_commands() else {
+            return false;
+        };
+        let now = now_ms();
+        let relayed = lock(&self.inner.relayed);
+        commands.iter().any(|c| {
+            c.status == SessionCommandStatus::Pending
+                && matches!(
+                    c.payload,
+                    SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+                )
+                && c.effective_expiry() > now
+                && !relayed.contains(&c.id)
+                && !self.inner.store.is_processed(&c.id).unwrap_or(false)
+        }) && {
+            tracing::debug!(chat = %chat_id, "a send waits for its host");
+            true
+        }
+    }
+
     /// Persist remote host discovery separately from the outgoing room rows.
     /// A row ACK does not prove a cold host has been told to open its room.
     fn nudge_remote_host(&self, chat_id: &str) {
@@ -5318,6 +5387,7 @@ impl DocHost {
                     Ok((outcome, refused)) => {
                         tracing::info!(chat = %chat, device = %target, command = %entry.id,
                             outcome, "command delivered via peer relay");
+                        lock(&host.inner.relayed).insert(entry.id.clone());
                         // The host refused it (#46: its sandbox lacks the
                         // agent): it's in no doc there, so say so on ours.
                         if let Some(why) = refused

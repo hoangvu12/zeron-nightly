@@ -6,12 +6,15 @@
 //!
 //! - `POST /auth/refresh`: WorkOS refresh through the edge.
 //! - `/device/{id}/ws`: DeviceRoom relay (edge/src/device-room.ts), as the
-//!   client crate's mock edge has it; every dial is recorded.
+//!   client crate's mock edge has it; every dial is recorded. A host joining
+//!   closes the one before with 4409.
+//! - `POST /device/{id}/nudge`: queued per chat in a room some host has
+//!   claimed (404 before), sent to the host now or when one joins, and
+//!   deleted as it's sent: production's front worker drops `nudgeAck`.
 //! - `/registry/{org}/ws`, with [`ScriptedEdge::with_registry`]: proxied to
 //!   zeron-sync's `MockRegistryServer`, so devices' and chats' rows reach
 //!   every engine.
-//! - Anything else (chat rooms, nudges, releases): 404, which engines retry
-//!   quietly.
+//! - Anything else (chat rooms, releases): 404, which engines retry quietly.
 
 // Each test binary uses its own part of this.
 #![allow(dead_code)]
@@ -29,9 +32,13 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http;
-use zeron_rpc::device_room::{CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, RELAY_KIND};
+use zeron_rpc::device_room::{
+    CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, NUDGE_KIND, RELAY_KIND,
+};
 use zeron_rpc::{DeviceFrameHeader, decode_device_frame, encode_device_frame};
 use zeron_sync::registry::mock_server::MockRegistryServer;
 
@@ -65,8 +72,12 @@ pub struct Dial {
 
 enum Out {
     Frame(Vec<u8>),
-    Close,
+    /// Close, with a code (4409: another host joined).
+    Close(Option<u16>),
 }
+
+/// The DeviceRoom's close for a superseded host.
+const SUPERSEDED: u16 = 4409;
 
 type Tx = tokio::sync::mpsc::UnboundedSender<Out>;
 
@@ -74,6 +85,34 @@ type Tx = tokio::sync::mpsc::UnboundedSender<Out>;
 struct Room {
     host: Option<Tx>,
     clients: HashMap<String, Tx>,
+    /// A host has joined once: the room has an owner.
+    claimed: bool,
+    /// Nudges not yet sent to a host, one per chat.
+    nudges: Vec<String>,
+}
+
+impl Room {
+    /// Send every queued nudge to the host, deleting each as it goes.
+    fn replay(&mut self) {
+        let Some(host) = &self.host else { return };
+        for chat in self.nudges.drain(..) {
+            let payload = json!({ "chatId": chat, "token": uuid_ish() }).to_string();
+            let frame = encode_device_frame(&DeviceFrameHeader::new(&chat, NUDGE_KIND), payload.as_bytes())
+                .unwrap();
+            let _ = host.send(Out::Frame(frame));
+        }
+    }
+}
+
+fn uuid_ish() -> String {
+    format!("{:x}", rand_u64())
+}
+
+fn rand_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(0);
+    hasher.finish()
 }
 
 #[derive(Default)]
@@ -88,6 +127,8 @@ struct EdgeState {
     rooms: HashMap<String, Room>,
     /// `POST /plugin-keys` bodies: a device registering a signing key.
     plugin_keys: Vec<Value>,
+    /// Every nudge posted: `(device, chat)`.
+    nudged: Vec<(String, String)>,
 }
 
 impl EdgeState {
@@ -179,6 +220,32 @@ impl ScriptedEdge {
             .collect()
     }
 
+    /// The client sockets dialed into `device`'s room.
+    pub fn client_dials(&self, device: &str) -> Vec<Dial> {
+        self.dials(device)
+            .into_iter()
+            .filter(|d| d.role == "client")
+            .collect()
+    }
+
+    /// Nudge `chat`'s host `device`, as a chat room does for a reader or a
+    /// sender (straight to the room, as the chat room's own wake does): the
+    /// status the room answers.
+    pub async fn post_nudge(&self, device: &str, chat: &str) -> u16 {
+        nudge(&mut self.state.lock().unwrap(), device, chat)
+    }
+
+    /// The chats nudged on `device`, in order.
+    pub fn nudges(&self, device: &str) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .nudged
+            .iter()
+            .filter(|(d, _)| d == device)
+            .map(|(_, chat)| chat.clone())
+            .collect()
+    }
+
     pub fn host_connected(&self, device: &str) -> bool {
         let state = self.state.lock().unwrap();
         state
@@ -193,7 +260,7 @@ impl ScriptedEdge {
         let state = self.state.lock().unwrap();
         if let Some(room) = state.rooms.get(device) {
             for tx in room.host.iter().chain(room.clients.values()) {
-                let _ = tx.send(Out::Close);
+                let _ = tx.send(Out::Close(None));
             }
         }
     }
@@ -206,6 +273,22 @@ impl ScriptedEdge {
             .filter_map(|body| body["deviceId"].as_str().map(str::to_owned))
             .collect()
     }
+}
+
+/// `POST /device/{device}/nudge {chatId}` (edge/src/device-room.ts): 404 in
+/// a room no host ever joined, else queued and sent to its host if one is
+/// there (deleted as it's sent).
+fn nudge(state: &mut EdgeState, device: &str, chat: &str) -> u16 {
+    state.nudged.push((device.to_owned(), chat.to_owned()));
+    let room = state.rooms.entry(device.to_owned()).or_default();
+    if !room.claimed {
+        return 404;
+    }
+    if !room.nudges.iter().any(|c| c == chat) {
+        room.nudges.push(chat.to_owned());
+    }
+    room.replay();
+    200
 }
 
 async fn serve_one(mut stream: TcpStream, state: Arc<Mutex<EdgeState>>, registry: Option<String>) {
@@ -290,6 +373,14 @@ async fn serve_http(stream: &mut TcpStream, state: Arc<Mutex<EdgeState>>) {
                         json!({ "accessToken": jwt(&org, ttl), "refreshToken": rotated }),
                     )
                 }
+            }
+        }
+        ("POST", path) if path.starts_with("/device/") && path.ends_with("/nudge") => {
+            let device = path.trim_start_matches("/device/").trim_end_matches("/nudge");
+            let chat = body["chatId"].as_str().unwrap_or_default();
+            match nudge(&mut state.lock().unwrap(), device, chat) {
+                200 => (200, json!({ "delivered": true, "queued": true })),
+                status => (status, json!({ "error": "not_found" })),
             }
         }
         ("POST", "/plugin-keys") => {
@@ -433,8 +524,10 @@ async fn relay(
         let room = state.rooms.entry(device.clone()).or_default();
         if is_host {
             if let Some(old) = room.host.replace(tx.clone()) {
-                let _ = old.send(Out::Close);
+                let _ = old.send(Out::Close(Some(SUPERSEDED)));
             }
+            room.claimed = true;
+            room.replay();
         } else {
             room.clients.insert(conn_id.clone(), tx.clone());
         }
@@ -447,8 +540,12 @@ async fn relay(
                         break;
                     }
                 }
-                Out::Close => {
-                    let _ = sink.send(Message::Close(None)).await;
+                Out::Close(code) => {
+                    let frame = code.map(|code| CloseFrame {
+                        code: CloseCode::from(code),
+                        reason: "superseded by new host connection".into(),
+                    });
+                    let _ = sink.send(Message::Close(frame)).await;
                     break;
                 }
             }
