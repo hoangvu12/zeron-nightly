@@ -5,14 +5,17 @@
 //!
 //! What scripts see, `sandboxes`: chat id → its sandbox, for each chat
 //! followed whose sandbox this device keeps:
-//!   { state = "starting" | "ready" | "failed" | "gone", provider,
-//!     provider_name?, step?, error?, disk_full }
+//!   { state = "starting" | "ready" | "failed" | "gone" | "sleeping"
+//!     | "asleep" | "waking", provider, provider_name?, step?, error?,
+//!     disk_full }
 //!
 //!   sandboxes.follow(chat)   follow a chat's sandbox (an action; opening a
 //!                            chat). Asks the provider whether it's still
 //!                            there, never waking it, then hears each change.
 //!   sandboxes.fresh(chat)    Start fresh: a new sandbox, with the chat's
 //!                            pushed work. Rejects with an outcome word.
+//!   sandboxes.wake(chat)     Wake a sandbox asleep (`WakeSandbox`): it
+//!                            starts again, its engine with it.
 
 use std::{
     cell::{Cell, RefCell},
@@ -91,6 +94,17 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
                 return Err("invalid".to_string());
             }
             call("StartSandboxFresh", json!({ "chatId": chat })).await?;
+            Ok(Value::Bool(true))
+        }
+    });
+    host.async_action("sandboxes.wake", move |chat| {
+        let chat = text(&chat);
+        async move {
+            crate::plugins::preview::refuse("sandboxes.wake")?;
+            if chat.is_empty() {
+                return Err("invalid".to_string());
+            }
+            call("WakeSandbox", json!({ "chatId": chat })).await?;
             Ok(Value::Bool(true))
         }
     });
@@ -224,5 +238,14 @@ mod tests {
         assert!(matches!(full.field("disk_full"), Some(Value::Bool(true))));
         assert_eq!(full.field("step").map(text).as_deref(), Some("getCode"));
         assert!(matches!(full.field("provider_name"), None | Some(Value::Nil)));
+        // Asleep, and a wake that failed, as the engine says them (#43).
+        let asleep = steps_value(&json!({ "provider": "docker", "state": "asleep", "step": null }), &names);
+        assert_eq!(asleep.field("state").map(text).as_deref(), Some("asleep"));
+        assert!(matches!(asleep.field("step"), None | Some(Value::Nil)));
+        let woke = steps_value(
+            &json!({ "provider": "docker", "state": "failed", "step": "wake", "error": "It didn't start." }),
+            &names,
+        );
+        assert_eq!(woke.field("step").map(text).as_deref(), Some("wake"));
     }
 }

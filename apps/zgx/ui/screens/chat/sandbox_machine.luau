@@ -7,6 +7,9 @@
 --                                > deleted outside Zeron ("Sandbox deleted in
 --                                  Docker", Start fresh)
 --                                > its disk full (Start fresh)
+--                                > a wake that failed (Wake)
+--   line(steps)                  the deck's notice: asleep (moon, Wake)
+--   resting(steps)               asleep, or going to or from it
 --   deck_alert(alert, opts)      that alert as ds/composer_dock's Alert
 --   failure_words(word)          why Start fresh didn't go
 --
@@ -71,6 +74,19 @@ function M.alert(steps: any?): Alert?
 			action_label = fresh,
 		}
 	end
+	if steps.state == "failed" and steps.step == "wake" then
+		return {
+			kind = "wake_failed",
+			tone = "danger",
+			title = say("wake_failed_title", "Sandbox didn't wake"),
+			summary = say("wake_failed_summary", "Try waking it again"),
+			body = if type(steps.error) == "string" and steps.error ~= ""
+				then steps.error
+				else say("wake_failed_body", "This chat's sandbox didn't wake. Try again in a moment."),
+			action = "wake",
+			action_label = say("wake", "Wake"),
+		}
+	end
 	if steps.disk_full then
 		return {
 			kind = "disk",
@@ -85,6 +101,23 @@ function M.alert(steps: any?): Alert?
 		}
 	end
 	return nil
+end
+
+-- Whether it's stopped, or on its way to or from it: its host device is
+-- offline then, and that isn't "Can't reach" (link_notice).
+function M.resting(steps: any?): boolean
+	local s = steps and steps.state
+	return s == "sleeping" or s == "asleep" or s == "waking"
+end
+
+-- The deck's notice for a sandbox asleep (spec #37 "Sleep and wake"): the
+-- moon, and Wake. Nil otherwise: going to sleep or waking is said in the
+-- transcript, where a send waits for it, and a failed wake is an alert.
+function M.line(steps: any?): { [string]: any }?
+	if not steps or steps.state ~= "asleep" then
+		return nil
+	end
+	return { text = say("asleep", "Sandbox asleep"), action = say("wake", "Wake"), icon = "moon" }
 end
 
 -- Why Start fresh didn't go, in words.

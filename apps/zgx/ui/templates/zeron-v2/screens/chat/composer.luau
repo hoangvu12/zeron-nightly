@@ -583,9 +583,11 @@ local function Composer(): Node
 		if s and s.notice then
 			return s.notice
 		end
-		-- The connection: this device's, then the chat's host.
+		-- The connection: this device's, then the chat's host. (A sandbox
+		-- asleep, or going to or from it, is offline, not out of reach: it
+		-- says so itself, and a send wakes it.)
 		local host_unreachable, host = false, nil
-		if s and s.device and s.device ~= sessions.here:get() then
+		if s and s.device and s.device ~= sessions.here:get() and not sandbox.resting() then
 			for _, d in sessions.devices:get() or {} do
 				if d.id == s.device then
 					host_unreachable, host = d.online == false, d.name
@@ -594,7 +596,8 @@ local function Composer(): Node
 		end
 		return LinkNotice.of {
 			connection = sessions.connection:get(),
-			cloud = machine.cloud_link(string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0),
+			cloud = machine.cloud_link(string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0)
+				or (if sandbox.line() then { line = sandbox.line() } else nil),
 			host_unreachable = host_unreachable,
 			host = host,
 			intent = string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0,
@@ -1439,8 +1442,15 @@ local function Composer(): Node
 			on_dismiss_notice = function()
 				own_notice:set(nil)
 			end,
-			-- (The only notice with an action: a sleeping machine's Wake.)
-			on_notice_action = machine.wake,
+			-- (The only notice with an action: a sleeping machine's Wake, or
+			-- a sandbox's.)
+			on_notice_action = function()
+				if sandbox.line() then
+					sandbox.wake()
+				else
+					machine.wake()
+				end
+			end,
 			alerts = alerts,
 			on_alert_action = function(id: string)
 				if sandbox.owns(id) then

@@ -516,7 +516,9 @@ impl Sandboxes {
                 return;
             }
             let Some(strong) = host.upgrade() else { return };
-            let (Some(edge), Some(auth)) = (strong.workspace.edge(), strong.auth.clone()) else {
+            let (Some(edge_url), Some(auth)) =
+                (strong.workspace.edge().map(|e| e.url.to_string()), strong.auth.clone())
+            else {
                 return;
             };
             let device = lock(&chat.record).steps.device_id.clone();
@@ -550,7 +552,7 @@ impl Sandboxes {
                 })
             };
             let joined = Instant::now();
-            let end = stand_in_session(&edge.url, &device, &token, service, on_nudge, || {
+            let end = stand_in_session(&edge_url, &device, &token, service, on_nudge, || {
                 tracing::info!(%device, "stand-in: holding the sleeping sandbox's room");
             })
             .await;
