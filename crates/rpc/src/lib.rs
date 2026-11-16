@@ -219,19 +219,34 @@ pub mod methods {
     // Places chats run on: sandbox providers built into the engine
     // (docs/design/cloud-byo.md). Answered by the device that keeps the
     // provider; relay-forwardable so the account's other devices ask it.
-    /// `{}` → `[{id, name, icon, ops}]`: the providers this device keeps.
+    /// `{}` → `[{id, name, icon, ops, account: {name} | null}]`: the
+    /// providers this device keeps, and who each is connected as.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
     /// `{provider}` → `[{id, name}]`: its account's templates (the template
     /// picker adds Blank, no template, itself).
     pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
+    /// `{provider, token}` → `{account: {name}}`: connect with a pasted key.
+    /// `{provider}` → `{deviceCode: {userCode, verificationUri,
+    /// verificationUriComplete, expiresIn}}`: the user approves that code on
+    /// the provider's page; the account shows in `ListSandboxProviders` once
+    /// they have. The key stays on the device that answers.
+    pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
-    /// state: starting|ready|failed, step, since, error, steps: [{step,
-    /// state}]}`), or `null` for a chat not on a place this device keeps.
+    /// state: starting|ready|failed|gone, step, since, error, diskFull,
+    /// steps: [{step, state}]}`), or `null` for a chat not on a place this
+    /// device keeps.
     pub const SANDBOX_STEPS: &str = "SandboxSteps";
     /// `{chatId}` → stream of `SandboxSteps` (current, then each change).
     pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
     /// `{chatId}` → `{ok}`: run a failed step again, and the ones after it.
     pub const RUN_SANDBOX_STEPS_AGAIN: &str = "RunSandboxStepsAgain";
+    /// `{chatId}` → `SandboxSteps`: ask the provider whether the chat's
+    /// sandbox is still there (a client opening a chat whose sandbox is
+    /// offline); a deleted one reads `state: "gone"`. Never wakes it.
+    pub const CHECK_SANDBOX: &str = "CheckSandbox";
+    /// `{chatId}` → `{ok}`: Start fresh, a new sandbox for the chat (the
+    /// old one deleted, if it's still there) with the chat's pushed branch.
+    pub const START_SANDBOX_FRESH: &str = "StartSandboxFresh";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run
