@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use super::{
     ChatSandbox, ErrorKind, Hook, Host, Placement, Record, SandboxProvider, SandboxSteps,
-    Sandboxes, Timing, lock,
+    Sandboxes, Timing, WeakHost, lock,
 };
 use crate::auth::Auth;
 use crate::sandboxes::{Ops, SandboxState, SandboxStatus, Step, StepState};
@@ -27,7 +27,7 @@ impl Sandboxes {
     pub(crate) fn follow_deletions(
         &self,
         mut chats: tokio::sync::watch::Receiver<Vec<zeron_proto::Chat>>,
-        host: Host,
+        host: WeakHost,
     ) {
         if tokio::runtime::Handle::try_current().is_err()
             || self.inner.following.swap(true, Ordering::SeqCst)
@@ -48,7 +48,11 @@ impl Sandboxes {
                     }
                     tracing::info!(chat = %gone, "chat deleted; deleting its sandbox");
                     let sandboxes = sandboxes.clone();
-                    let (chat_id, host) = (gone.clone(), host.clone());
+                    // Held only while it deletes: the engine can still go.
+                    let Some(host) = host.upgrade() else {
+                        return;
+                    };
+                    let chat_id = gone.clone();
                     tokio::spawn(async move { sandboxes.delete(&chat_id, &host).await });
                 }
                 known = now;

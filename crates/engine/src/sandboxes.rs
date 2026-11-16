@@ -117,6 +117,38 @@ pub(crate) struct Host {
     pub links: Option<Arc<zeron_rpc::LinkCache>>,
 }
 
+impl Host {
+    /// One that doesn't keep the engine alive, for a task that outlives a
+    /// request (following chat deletions). Relay links aren't kept.
+    pub(crate) fn downgrade(&self) -> WeakHost {
+        WeakHost {
+            workspace: self.workspace.downgrade(),
+            doc_host: self.doc_host.downgrade(),
+            auth: self.auth.clone(),
+        }
+    }
+}
+
+/// A [`Host`] that doesn't keep the engine alive ([`Host::downgrade`]).
+#[derive(Clone)]
+pub(crate) struct WeakHost {
+    workspace: crate::workspace_host::WeakWorkspaceHost,
+    doc_host: crate::doc_host::WeakDocHost,
+    auth: Option<Auth>,
+}
+
+impl WeakHost {
+    /// The host again, while the engine is still there.
+    pub(crate) fn upgrade(&self) -> Option<Host> {
+        Some(Host {
+            workspace: self.workspace.upgrade()?,
+            doc_host: self.doc_host.upgrade()?,
+            auth: self.auth.clone(),
+            links: None,
+        })
+    }
+}
+
 /// A chat on a place, as kept on disk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

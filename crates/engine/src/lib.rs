@@ -540,7 +540,8 @@ impl EngineCore {
         self.plugins.attach_auth(auth.clone());
         // A chat deleted on any device takes its sandbox (and the sign-in
         // lent it) with it.
-        // Its delete scripts run here too (they need no relay).
+        // Its delete scripts run here too (they need no relay). Held weakly,
+        // so the following doesn't keep the engine alive.
         let host = sandboxes::Host {
             workspace: self.workspace.clone(),
             doc_host: self.doc_host.clone(),
@@ -548,7 +549,7 @@ impl EngineCore {
             links: None,
         };
         self.sandboxes
-            .follow_deletions(self.workspace.watch_chats(), host);
+            .follow_deletions(self.workspace.watch_chats(), host.downgrade());
         *self
             .auth
             .lock()
