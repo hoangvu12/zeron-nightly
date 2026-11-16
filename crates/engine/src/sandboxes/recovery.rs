@@ -7,7 +7,8 @@
 use std::sync::atomic::Ordering;
 
 use super::{
-    ChatSandbox, ErrorKind, Host, Placement, Record, SandboxProvider, SandboxSteps, Sandboxes, lock,
+    ChatSandbox, ErrorKind, Hook, Host, Placement, Record, SandboxProvider, SandboxSteps,
+    Sandboxes, Timing, WeakHost, lock,
 };
 use crate::auth::Auth;
 use crate::sandboxes::{Ops, SandboxState, SandboxStatus, Step, StepState};
@@ -26,7 +27,7 @@ impl Sandboxes {
     pub(crate) fn follow_deletions(
         &self,
         mut chats: tokio::sync::watch::Receiver<Vec<zeron_proto::Chat>>,
-        auth: Auth,
+        host: WeakHost,
     ) {
         if tokio::runtime::Handle::try_current().is_err()
             || self.inner.following.swap(true, Ordering::SeqCst)
@@ -47,8 +48,12 @@ impl Sandboxes {
                     }
                     tracing::info!(chat = %gone, "chat deleted; deleting its sandbox");
                     let sandboxes = sandboxes.clone();
-                    let (chat_id, auth) = (gone.clone(), auth.clone());
-                    tokio::spawn(async move { sandboxes.delete(&chat_id, Some(&auth)).await });
+                    // Held only while it deletes: the engine can still go.
+                    let Some(host) = host.upgrade() else {
+                        return;
+                    };
+                    let chat_id = gone.clone();
+                    tokio::spawn(async move { sandboxes.delete(&chat_id, &host).await });
                 }
                 known = now;
             }
@@ -58,7 +63,7 @@ impl Sandboxes {
     /// The chat is deleted: stop lending its sandbox tokens, then delete the
     /// sandbox (one Zeron made). Steps still running stop at the next one
     /// and do this themselves.
-    pub(crate) async fn delete(&self, chat_id: &str, auth: Option<&Auth>) {
+    pub(crate) async fn delete(&self, chat_id: &str, host: &Host) {
         let Some(chat) = lock(&self.inner.chats).remove(chat_id) else {
             return;
         };
@@ -66,11 +71,11 @@ impl Sandboxes {
         chat.deleted.store(true, Ordering::SeqCst);
         if *lock(&chat.busy) {
             // Lending stops now all the same; the steps delete the rest.
-            stop_lending(&lock(&chat.record), auth);
+            stop_lending(&lock(&chat.record), host.auth.as_ref());
             return;
         }
         let provider = self.provider(&lock(&chat.record).steps.provider);
-        chat.discard(provider.as_deref(), auth).await;
+        self.discard(&chat, provider.as_deref(), host).await;
     }
 
     /// `CheckSandbox`: ask the provider whether the chat's sandbox is still
@@ -124,6 +129,46 @@ impl Sandboxes {
         true
     }
 
+    /// What a deleted chat leaves: its grant, and the sandbox Zeron made,
+    /// with the user's delete scripts around it (`before-delete`,
+    /// `instead-of-delete`, `after-delete`, on this device). Once only.
+    pub(super) async fn discard(
+        &self,
+        chat: &ChatSandbox,
+        provider: Option<&dyn SandboxProvider>,
+        host: &Host,
+    ) {
+        if chat.discarded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let record = lock(&chat.record).clone();
+        stop_lending(&record, host.auth.as_ref());
+        let Some(provider) = provider else {
+            tracing::warn!(
+                chat = %record.steps.chat_id,
+                provider = %record.steps.provider,
+                "sandbox not deleted: its provider isn't connected here"
+            );
+            return;
+        };
+        let hook = |timing| Hook::new(timing, Step::Delete);
+        self.run_hook(chat, provider, host, hook(Timing::Before))
+            .await;
+        let instead = self
+            .scripts_for(chat, provider, host, hook(Timing::InsteadOf))
+            .await;
+        let replaced = !instead.is_empty()
+            && self
+                .run_scripts(chat, provider, host, Step::Delete, instead)
+                .await
+                .any;
+        if !replaced && record.steps.state != SandboxState::Gone {
+            delete_sandbox(&record, provider).await;
+        }
+        self.run_hook(chat, provider, host, hook(Timing::After))
+            .await;
+    }
+
     /// Start fresh: a new sandbox for the chat, every step again; Get the
     /// code brings back what was pushed to the chat's branch. The old
     /// sandbox, if still there, is deleted first. The chat keeps its device.
@@ -150,33 +195,6 @@ impl Sandboxes {
         *lock(&chat.lent) = None;
         self.persist();
         self.start(host, chat_id)
-    }
-}
-
-impl ChatSandbox {
-    /// What a deleted chat leaves: its grant, and the sandbox Zeron made.
-    /// Once only.
-    pub(super) async fn discard(
-        &self,
-        provider: Option<&dyn SandboxProvider>,
-        auth: Option<&Auth>,
-    ) {
-        if self.discarded.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let record = lock(&self.record).clone();
-        stop_lending(&record, auth);
-        match provider {
-            Some(provider) if record.steps.state != SandboxState::Gone => {
-                delete_sandbox(&record, provider).await;
-            }
-            Some(_) => {}
-            None => tracing::warn!(
-                chat = %record.steps.chat_id,
-                provider = %record.steps.provider,
-                "sandbox not deleted: its provider isn't connected here"
-            ),
-        }
     }
 }
 

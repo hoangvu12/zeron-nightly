@@ -5315,9 +5315,21 @@ impl DocHost {
                     return; // the normal path won while we were retrying
                 }
                 match host.relay_command(&target, &chat, &entry).await {
-                    Ok(outcome) => {
+                    Ok((outcome, refused)) => {
                         tracing::info!(chat = %chat, device = %target, command = %entry.id,
                             outcome, "command delivered via peer relay");
+                        // The host refused it (#46: its sandbox lacks the
+                        // agent): it's in no doc there, so say so on ours.
+                        if let Some(why) = refused
+                            && let Ok(handle) = host.open(&chat)
+                        {
+                            host.resolve_command(
+                                &handle,
+                                &entry.id,
+                                SessionCommandStatus::Rejected,
+                                Some(&why),
+                            );
+                        }
                         return;
                     }
                     Err(err) => {
@@ -5416,7 +5428,7 @@ impl DocHost {
         target: &str,
         chat_id: &str,
         entry: &SessionCommandEntry,
-    ) -> Result<&'static str, String> {
+    ) -> Result<(&'static str, Option<String>), String> {
         let supported = self
             .workspace()
             .and_then(|ws| ws.read_devices().ok())
@@ -5450,11 +5462,21 @@ impl DocHost {
                 Err(format!("relay call failed: {err}"))
             }
             Ok(Ok(reply)) => Ok(match reply.get("outcome").and_then(|v| v.as_str()) {
-                Some("executed") => "executed",
-                Some("duplicate") => "duplicate",
-                Some("expired") => "expired",
-                Some("superseded") => "superseded",
-                _ => "accepted",
+                Some("executed") => ("executed", None),
+                Some("rejected") => (
+                    "rejected",
+                    Some(
+                        reply
+                            .get("resolution")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("refused by its host")
+                            .to_owned(),
+                    ),
+                ),
+                Some("duplicate") => ("duplicate", None),
+                Some("expired") => ("expired", None),
+                Some("superseded") => ("superseded", None),
+                _ => ("accepted", None),
             }),
         }
     }
@@ -5553,7 +5575,13 @@ impl DocHost {
                 // Rejected: execute failed or the sweep terminalized a crash
                 // window. Expired: the entry outlived its TTL undelivered —
                 // an explicit user retry is exactly the consent to re-send.
-                SessionCommandStatus::Rejected | SessionCommandStatus::Expired => true,
+                // Not an agent its sandbox lacks (#46): the same send would
+                // be refused again; the user picks another agent instead.
+                SessionCommandStatus::Rejected => !c
+                    .resolution
+                    .as_deref()
+                    .is_some_and(|r| zeron_proto::places::agent_missing(r).is_some()),
+                SessionCommandStatus::Expired => true,
                 // Its clock ran out unexecuted (its host would mark it
                 // Expired), or is about to: the same consent applies.
                 SessionCommandStatus::Pending if ending(c) => {
@@ -5655,6 +5683,20 @@ impl DocHost {
         chat_id: &str,
         entry: SessionCommandEntry,
     ) -> Result<&'static str, EngineError> {
+        self.ingest_relayed_command_with_reason(chat_id, entry)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// [`Self::ingest_relayed_command`], with why an executed command was
+    /// refused (`"rejected"`: a sandbox without the agent picked, #46). The
+    /// sender records it on its copy of the command: a relayed command is
+    /// in no doc here, so its outcome would otherwise go nowhere.
+    pub async fn ingest_relayed_command_with_reason(
+        &self,
+        chat_id: &str,
+        entry: SessionCommandEntry,
+    ) -> Result<(&'static str, Option<String>), EngineError> {
         let handle = self.open(chat_id)?;
         // The sender sequences attachment transfers BEFORE the relay; refuse
         // (retryably) rather than run without the images.
@@ -5690,29 +5732,30 @@ impl DocHost {
             },
         );
         if matches!(disposition, CommandDisposition::Skip) {
-            return Ok("duplicate");
+            return Ok(("duplicate", None));
         }
         // In-flight claim first (the drain's dead-command sweep must see this
         // id as alive, not crashed, while the execute below runs).
         if !lock(&self.inner.executing).insert(entry.id.clone()) {
-            return Ok("duplicate");
+            return Ok(("duplicate", None));
         }
         // Claim BEFORE executing (the drain's own mark-before-execute rule).
         let marked = self.inner.store.mark_processed(&entry.id);
         let result = match marked {
             Err(err) => Err(err.into()),
-            Ok(false) => Ok("duplicate"),
+            Ok(false) => Ok(("duplicate", None)),
             Ok(true) => match disposition {
-                CommandDisposition::Skip => Ok("duplicate"),
-                CommandDisposition::Expired => Ok("expired"),
-                CommandDisposition::Superseded => Ok("superseded"),
+                CommandDisposition::Skip => Ok(("duplicate", None)),
+                CommandDisposition::Expired => Ok(("expired", None)),
+                CommandDisposition::Superseded => Ok(("superseded", None)),
                 CommandDisposition::Execute => match {
                     if _prompt_guard.is_some() {
                         self.await_earlier_controls(&handle, &entry.id).await;
                     }
                     self.execute(&sessions, &handle, &entry).await
                 } {
-                    Ok(_) => Ok("executed"),
+                    Ok((SessionCommandStatus::Rejected, why)) => Ok(("rejected", why)),
+                    Ok(_) => Ok(("executed", None)),
                     Err(err) => Err(err),
                 },
             },
@@ -6429,6 +6472,13 @@ impl DocHost {
                     );
                 }
                 let harness = self.harness_for_request(chat_id, &request);
+                // In a sandbox, an agent its template lacks: refused before
+                // anything is written, the message waiting to be sent again
+                // with another agent the user picks (never one picked here).
+                if let Some(reason) = sessions.missing_agent(harness) {
+                    tracing::info!(chat = %chat_id, harness = ?harness, "send refused: agent not on this template");
+                    return Ok((SessionCommandStatus::Rejected, Some(reason)));
+                }
                 // A row with no config renders no harness glyph (and every
                 // later dispatch falls back to the engine default), so stamp
                 // what this run actually executes with. Claimed rows and
