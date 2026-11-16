@@ -183,10 +183,16 @@ async fn awake(w: &World, starts: usize) {
 }
 
 /// The stand-in stepped aside for the sandbox's engine and stays out: no
-/// host joins the room again (each would 4409 the other).
+/// host joins the room again (each would 4409 the other). The host device
+/// looks at the sandbox twice more and finds it awake each time (it asks
+/// the provider how it is only then), so it starts no stand-in.
 async fn no_host_fight(w: &World) {
     let joins = w.edge.host_dials(&w.device).len();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let looked = w.provider.statuses();
+    eventually("the host device looks at it twice more", MINUTE, async || {
+        (w.provider.statuses() >= looked + 2).then_some(())
+    })
+    .await;
     assert_eq!(w.edge.host_dials(&w.device).len(), joins);
     assert!(w.edge.host_connected(&w.device));
 }
@@ -347,7 +353,18 @@ async fn a_busy_chat_keeps_its_sandbox_awake_and_a_stopped_sandbox_is_stood_in_f
             .then_some(())
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Extended three more times, a third of its limit apart: past its time
+    // limit and its idle time, found busy (not idle) each time.
+    let extended = w.provider.extends().len();
+    eventually("busy past its time limit", MINUTE, async || {
+        (w.provider.extends()[extended..]
+            .iter()
+            .filter(|e| *e == "chat-busy 3")
+            .count()
+            >= 3)
+            .then_some(())
+    })
+    .await;
     let now = steps(&w.rpc, "chat-busy").await;
     assert_eq!(now["state"], "ready", "{now:#}");
     assert!(

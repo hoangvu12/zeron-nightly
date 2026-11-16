@@ -63,9 +63,11 @@ local locale = require("@self/locale")
 export type Tool = Activity.Tool
 export type Message = {
 	id: string,
-	-- A person's, a reply, or the seam where the chat moved to another
-	-- agent (`[mark] From → [mark] To` over the prompt that moved it).
-	role: "user" | "assistant" | "switch",
+	-- A person's, a reply, the seam where the chat moved to another
+	-- agent (`[mark] From → [mark] To` over the prompt that moved it), or an
+	-- event in the chat's place (`icon` in its `tone`'s ink, `text`, `detail`
+	-- muted after it: "✓ Sandbox ready 52s").
+	role: "user" | "assistant" | "switch" | "event",
 	text: string,
 	-- A person's: what came with it.
 	attachments: { UserMessage.Attachment }?,
@@ -74,6 +76,9 @@ export type Message = {
 	-- written has neither yet.
 	at: string?,
 	copy: string?,
+	-- A person's: when it was sent, in Unix seconds (an event in the
+	-- chat's place goes among the messages by it).
+	sent: number?,
 	-- A reply's model, for naming who said a selection.
 	model: string?,
 	tools: { Tool }?,
@@ -103,6 +108,11 @@ export type Message = {
 	to_mark: Mark.Name?,
 	-- A person's that another chat sent: which, and its title when it was sent.
 	sender: { chat: string, title: string }?,
+	-- An event's glyph, its tone ("success": its glyph's ink) and its word
+	-- after the text.
+	icon: Icon.Name?,
+	tone: string?,
+	detail: string?,
 }
 
 export type Props = {
@@ -360,6 +370,31 @@ local function switch_side(name: string?, mark: Mark.Name?): Node
 		min_w = 0,
 		if mark then ui.div { aria_hidden = true, Mark { name = mark, size = 14, bare = true } } else nil,
 		ui.text { name or "", literal = true, truncate = true, weight = "$font.weight.medium" },
+	}
+end
+
+-- An event in the chat's place ("✓ Sandbox ready 52s"): its glyph in its
+-- tone's ink, its words in the secondary ink, a muted word after, on a
+-- reply's left edge.
+local function event_row(m: Message): Node
+	return ui.row {
+		class = "message message-event",
+		role = "status",
+		label = if m.detail then `{m.text} {m.detail}` else m.text,
+		w_full = true,
+		gap = "$space.2",
+		items = "center",
+		selectable = false,
+		ui.div {
+			aria_hidden = true,
+			shrink = 0,
+			color = if m.tone then `$zeron.tone.{m.tone}.ink` else "$text.secondary",
+			Icon { name = m.icon or "info-circle", size = 16 },
+		},
+		ui.text { m.text, literal = true, text_size = "$font.size.md", color = "$text.secondary" },
+		if m.detail
+			then ui.text { m.detail, literal = true, tabular = true, text_size = "$font.size.md", color = "$text.tertiary" }
+			else nil,
 	}
 end
 
@@ -1864,7 +1899,7 @@ local function Transcript(props: Props): Node
 				max_w = measure,
 				min_w = 0,
 				-- Anywhere on a message shows its lane (Zeron's entry hover).
-				on_hover = if m.role == "switch"
+				on_hover = if m.role == "switch" or m.role == "event"
 					then nil
 					else function(inside: boolean)
 						if inside then
@@ -1874,6 +1909,7 @@ local function Transcript(props: Props): Node
 						end
 					end,
 				if m.role == "switch" then seam(m)
+					elseif m.role == "event" then event_row(m)
 					elseif mine then ui.column {
 						hook = "chat.message.prompt",
 						-- What it is, for a plugin's selector (and the

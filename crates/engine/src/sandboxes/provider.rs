@@ -32,8 +32,12 @@ impl Ops {
     pub const CONNECT: Ops = Ops(1 << 7);
     /// It can push a sandbox's time limit out ([`SandboxProvider::extend`]).
     pub const EXTEND: Ops = Ops(1 << 8);
+    /// Its connect opens a sign-in page (a device code to approve there,
+    /// [`SandboxProvider::begin_connect`]), so Settings offers "Sign in
+    /// with …" besides pasting a key.
+    pub const SIGN_IN_PAGE: Ops = Ops(1 << 9);
     /// Every operation.
-    pub const ALL: Ops = Ops(0x1ff);
+    pub const ALL: Ops = Ops(0x3ff);
 
     pub const fn contains(self, other: Ops) -> bool {
         self.0 & other.0 == other.0
@@ -51,6 +55,7 @@ impl Ops {
             (Ops::SAVE_TEMPLATE, "saveTemplate"),
             (Ops::CONNECT, "connect"),
             (Ops::EXTEND, "extend"),
+            (Ops::SIGN_IN_PAGE, "signInPage"),
         ]
         .into_iter()
         .filter(|(op, _)| self.contains(*op))
@@ -107,7 +112,7 @@ impl CreateSandbox {
 
 /// A command `run` runs in a sandbox: a program and its arguments (no shell
 /// unless `args` asks for one), with environment and working folder.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Command {
     pub args: Vec<String>,
@@ -120,6 +125,19 @@ pub struct Command {
     /// starts it detached from the call and reports only whether it started:
     /// the stream ends with an exit code of 0 once it has.
     pub detach: bool,
+}
+
+/// The environment's names only: a value may be a secret (a lent sign-in).
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command")
+            .field("args", &self.args)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .field("detach", &self.detach)
+            .finish()
+    }
 }
 
 impl Command {
@@ -487,7 +505,7 @@ mod tests {
         assert!(!ops.contains(Ops::CREATE));
         assert!(Ops::ALL.contains(ops));
         assert_eq!(ops.names(), ["start", "run"]);
-        assert_eq!(Ops::ALL.names().len(), 9);
+        assert_eq!(Ops::ALL.names().len(), 10);
         assert_eq!((Ops::CONNECT | Ops::EXTEND).names(), ["connect", "extend"]);
     }
 
@@ -495,5 +513,16 @@ mod tests {
     fn a_credential_never_prints_its_secret() {
         let shown = format!("{:?}", Credential::Token("bk_secret".into()));
         assert!(!shown.contains("bk_secret"), "{shown}");
+    }
+
+    #[test]
+    fn a_command_never_prints_its_environments_values() {
+        let command = Command::new(["zeron-engine", "watchdog"])
+            .env("ZERON_LENT_TOKEN", "eyJ-lent-secret")
+            .cwd("/home/agent");
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("eyJ-lent-secret"), "{shown}");
+        assert!(shown.contains("ZERON_LENT_TOKEN"), "{shown}");
+        assert!(shown.contains("watchdog") && shown.contains("/home/agent"), "{shown}");
     }
 }

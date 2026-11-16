@@ -16,28 +16,84 @@ use super::{EngineRpc, parse_params, watch_stream};
 use crate::sandboxes::scripts::{self, Scope};
 use crate::sandboxes::{Credential, Handover, Hook, Host, Sandboxes, Step, pick_host, repos_here};
 
+/// A Sandbox* method. [`METHODS`] names each once; what's done with one is
+/// matched on this, so a method can't be named and then forgotten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Method {
+    ListProviders,
+    ListTemplates,
+    Connect,
+    Disconnect,
+    Steps,
+    WatchSteps,
+    RunStepsAgain,
+    ListScripts,
+    ReadScript,
+    WriteScript,
+    DeleteScript,
+    Check,
+    StartFresh,
+    SaveTemplate,
+    Wake,
+    Host,
+    Adopt,
+    SetHost,
+}
+
+const METHODS: [(&str, Method); 18] = [
+    (methods::LIST_SANDBOX_PROVIDERS, Method::ListProviders),
+    (methods::LIST_SANDBOX_TEMPLATES, Method::ListTemplates),
+    (methods::CONNECT_SANDBOX_PROVIDER, Method::Connect),
+    (methods::DISCONNECT_SANDBOX_PROVIDER, Method::Disconnect),
+    (methods::SANDBOX_STEPS, Method::Steps),
+    (methods::WATCH_SANDBOX_STEPS, Method::WatchSteps),
+    (methods::RUN_SANDBOX_STEPS_AGAIN, Method::RunStepsAgain),
+    (methods::LIST_STEP_SCRIPTS, Method::ListScripts),
+    (methods::READ_STEP_SCRIPT, Method::ReadScript),
+    (methods::WRITE_STEP_SCRIPT, Method::WriteScript),
+    (methods::DELETE_STEP_SCRIPT, Method::DeleteScript),
+    (methods::CHECK_SANDBOX, Method::Check),
+    (methods::START_SANDBOX_FRESH, Method::StartFresh),
+    (methods::SAVE_SANDBOX_TEMPLATE, Method::SaveTemplate),
+    (methods::WAKE_SANDBOX, Method::Wake),
+    (methods::SANDBOX_HOST, Method::Host),
+    (methods::ADOPT_SANDBOX_PROVIDER, Method::Adopt),
+    (methods::SET_SANDBOX_HOST, Method::SetHost),
+];
+
+impl Method {
+    fn parse(name: &str) -> Option<Self> {
+        METHODS
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, method)| *method)
+    }
+
+    /// A step script's: kept on the host devices.
+    fn scripts(self) -> bool {
+        matches!(
+            self,
+            Method::ListScripts | Method::ReadScript | Method::WriteScript | Method::DeleteScript
+        )
+    }
+
+    /// A chat's: the host device keeping that chat answers it.
+    fn chats(self) -> bool {
+        matches!(
+            self,
+            Method::Steps
+                | Method::WatchSteps
+                | Method::RunStepsAgain
+                | Method::Check
+                | Method::StartFresh
+                | Method::SaveTemplate
+                | Method::Wake
+        )
+    }
+}
+
 pub(super) fn handles(method: &str) -> bool {
-    matches!(
-        method,
-        methods::LIST_SANDBOX_PROVIDERS
-            | methods::LIST_SANDBOX_TEMPLATES
-            | methods::CONNECT_SANDBOX_PROVIDER
-            | methods::DISCONNECT_SANDBOX_PROVIDER
-            | methods::SANDBOX_STEPS
-            | methods::WATCH_SANDBOX_STEPS
-            | methods::RUN_SANDBOX_STEPS_AGAIN
-            | methods::LIST_STEP_SCRIPTS
-            | methods::READ_STEP_SCRIPT
-            | methods::WRITE_STEP_SCRIPT
-            | methods::DELETE_STEP_SCRIPT
-            | methods::CHECK_SANDBOX
-            | methods::START_SANDBOX_FRESH
-            | methods::SAVE_SANDBOX_TEMPLATE
-            | methods::WAKE_SANDBOX
-            | methods::SANDBOX_HOST
-            | methods::ADOPT_SANDBOX_PROVIDER
-            | methods::SET_SANDBOX_HOST
-    )
+    Method::parse(method).is_some()
 }
 
 /// Set on a call one device sends another's way: answer it there.
@@ -187,18 +243,10 @@ impl EngineRpc {
         params: serde_json::Value,
     ) -> Result<RpcReply, RpcError> {
         let sandboxes = self.sandboxes()?;
+        let called =
+            Method::parse(method).ok_or_else(|| RpcError::UnknownMethod(method.to_owned()))?;
         // A chat's methods go to the host device keeping it.
-        if matches!(
-            method,
-            methods::SANDBOX_STEPS
-                | methods::WATCH_SANDBOX_STEPS
-                | methods::RUN_SANDBOX_STEPS_AGAIN
-                | methods::CHECK_SANDBOX
-                | methods::START_SANDBOX_FRESH
-                | methods::SAVE_SANDBOX_TEMPLATE
-                | methods::WAKE_SANDBOX
-        ) && !routed(&params)
-        {
+        if called.chats() && !routed(&params) {
             let p: ChatParams = parse_params(params.clone())?;
             if sandboxes.provider_of(&p.chat_id).is_none()
                 && let Some(keeper) = self.chat_keeper(&p.chat_id).await
@@ -207,7 +255,7 @@ impl EngineRpc {
             }
         }
         // A provider's templates come from its host device.
-        if method == methods::LIST_SANDBOX_TEMPLATES && !routed(&params) {
+        if called == Method::ListTemplates && !routed(&params) {
             let p: ProviderParams = parse_params(params.clone())?;
             if !self.keeps(sandboxes, &p.provider)
                 && let Some(host) = self
@@ -219,9 +267,14 @@ impl EngineRpc {
                 return self.forward(&host, method, route(params)).await;
             }
         }
-        match method {
-            methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
-            methods::LIST_SANDBOX_TEMPLATES => {
+        // Step scripts are kept on host devices (spec #37): Settings asks
+        // its own engine, which goes to the ones that keep each script.
+        if called.scripts() && !routed(&params) {
+            return self.scripts_on_hosts(sandboxes, called, method, params).await;
+        }
+        match called {
+            Method::ListProviders => RpcReply::value(&sandboxes.providers()),
+            Method::ListTemplates => {
                 let p: ProviderParams = parse_params(params)?;
                 let templates = sandboxes
                     .templates(&p.provider)
@@ -229,7 +282,7 @@ impl EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&templates)
             }
-            methods::CONNECT_SANDBOX_PROVIDER => {
+            Method::Connect => {
                 let p: ConnectParams = parse_params(params)?;
                 let provider = sandboxes.provider_named(&p.provider).ok_or_else(|| {
                     RpcError::Failed(format!("{} isn't on this device.", p.provider))
@@ -263,34 +316,34 @@ impl EngineRpc {
                 });
                 RpcReply::value(&serde_json::json!({ "deviceCode": shown }))
             }
-            methods::DISCONNECT_SANDBOX_PROVIDER => {
+            Method::Disconnect => {
                 let p: ProviderParams = parse_params(params.clone())?;
                 self.disconnect(sandboxes, &p.provider, params).await?;
                 RpcReply::value(&json!({ "ok": true }))
             }
-            methods::SANDBOX_STEPS => {
+            Method::Steps => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.steps(&p.chat_id))
             }
-            methods::WATCH_SANDBOX_STEPS => {
+            Method::WatchSteps => {
                 let p: ChatParams = parse_params(params)?;
                 let steps = sandboxes.watch(&p.chat_id).ok_or_else(|| {
                     RpcError::Failed("This chat doesn't run on a sandbox from this device.".into())
                 })?;
                 Ok(RpcReply::Stream(watch_stream(steps)))
             }
-            methods::RUN_SANDBOX_STEPS_AGAIN => {
+            Method::RunStepsAgain => {
                 let p: ChatParams = parse_params(params)?;
                 sandboxes
                     .run_again(self.sandbox_host(), &p.chat_id)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&json!({ "ok": true }))
             }
-            methods::SANDBOX_HOST => {
+            Method::Host => {
                 let p: ProviderParams = parse_params(params)?;
                 RpcReply::value(&self.workspace.sandbox_host(&p.provider))
             }
-            methods::ADOPT_SANDBOX_PROVIDER => {
+            Method::Adopt => {
                 let mut params = params;
                 if let Some(object) = params.as_object_mut() {
                     object.remove(ROUTED);
@@ -300,57 +353,20 @@ impl EngineRpc {
                 self.adopt_provider(sandboxes, handover).await?;
                 RpcReply::value(&json!({ "ok": true, "hostDeviceId": self.this_device() }))
             }
-            methods::SET_SANDBOX_HOST => {
+            Method::SetHost => {
                 let p: SetHostParams = parse_params(params.clone())?;
                 let host = self.move_host(sandboxes, p, params).await?;
                 RpcReply::value(&json!({ "ok": true, "hostDeviceId": host }))
             }
-            methods::LIST_STEP_SCRIPTS => {
-                let repos = repos_here(&self.workspace, self.doc_host.device_id());
-                let rows: Vec<serde_json::Value> = scripts::all(sandboxes.steps_dir(), &repos)
-                    .into_iter()
-                    .map(|script| script_row(&script))
-                    .collect();
-                RpcReply::value(&rows)
-            }
-            methods::READ_STEP_SCRIPT => {
-                let p: ScriptParams = parse_params(params)?;
-                let path = self.script_path(sandboxes, &p)?;
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| RpcError::Failed(format!("Couldn't read {}: {e}", p.name)))?;
-                RpcReply::value(&serde_json::json!({ "content": content }))
-            }
-            methods::WRITE_STEP_SCRIPT => {
-                let p: ScriptParams = parse_params(params)?;
-                let path = self.script_path(sandboxes, &p)?;
-                write_script(&path, p.content.as_deref().unwrap_or_default())
-                    .map_err(|e| RpcError::Failed(format!("Couldn't save {}: {e}", p.name)))?;
-                RpcReply::value(&serde_json::json!({ "ok": true, "path": path }))
-            }
-            methods::DELETE_STEP_SCRIPT => {
-                let p: ScriptParams = parse_params(params)?;
-                let path = self.script_path(sandboxes, &p)?;
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {
-                        // An emptied hook folder goes too (never `.zeron`).
-                        if p.hook != scripts::SETUP_HOOK
-                            && let Some(dir) = path.parent()
-                        {
-                            let _ = std::fs::remove_dir(dir);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(RpcError::Failed(format!("Couldn't delete {}: {e}", p.name)));
-                    }
-                }
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::CHECK_SANDBOX => {
+            Method::ListScripts
+            | Method::ReadScript
+            | Method::WriteScript
+            | Method::DeleteScript => self.scripts_here(sandboxes, called, params),
+            Method::Check => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.check(self.auth.as_ref(), &p.chat_id).await)
             }
-            methods::START_SANDBOX_FRESH => {
+            Method::StartFresh => {
                 let p: ChatParams = parse_params(params)?;
                 sandboxes
                     .start_fresh(self.sandbox_host(), &p.chat_id)
@@ -358,7 +374,7 @@ impl EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::SAVE_SANDBOX_TEMPLATE => {
+            Method::SaveTemplate => {
                 let p: SaveTemplateParams = parse_params(params)?;
                 let template = sandboxes
                     .save_template(self.sandbox_host(), &p.chat_id, &p.name)
@@ -366,14 +382,13 @@ impl EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "template": template }))
             }
-            methods::WAKE_SANDBOX => {
+            Method::Wake => {
                 let p: ChatParams = parse_params(params)?;
                 sandboxes
                     .wake_chat(self.sandbox_host(), &p.chat_id)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }
     }
 
@@ -426,6 +441,8 @@ impl EngineRpc {
                 connected_on: Some(me.clone()),
                 grants: Vec::new(),
                 chats: Vec::new(),
+                scripts: Vec::new(),
+                catalogs: Default::default(),
             };
             let params = route(
                 serde_json::to_value(&handover).map_err(|e| RpcError::Failed(e.to_string()))?,
@@ -598,10 +615,12 @@ impl EngineRpc {
     }
 
     /// A composer asking what agents a place offers (#46): a place target
-    /// (`place:<provider>[:<template>]`) or a sandbox device of a chat this
-    /// device keeps. Answered here, never by a sandbox, so asking never
-    /// creates or wakes one: what the template had the last time it ran,
-    /// else this device's own list. `None` = not a place: route as usual.
+    /// (`place:<provider>[:<template>]`) or a sandbox's device. Never a
+    /// sandbox's to answer, so asking never creates or wakes one: the
+    /// provider's host device answers what the template had the last time
+    /// it ran (it keeps that), else (or when it can't be reached) this
+    /// device answers with its own list. `None` = not a place: route as
+    /// usual.
     pub(super) async fn answer_for_place(
         &self,
         target: &str,
@@ -617,19 +636,46 @@ impl EngineRpc {
                 )))
             });
         }
-        let (provider, template) = match (named, &self.sandboxes) {
-            (Some((provider, template)), _) => (provider.to_owned(), template.map(str::to_owned)),
-            (None, Some(sandboxes)) => sandboxes.place_of_device(target)?,
-            (None, None) => return None,
+        let mut local = params.clone();
+        if let Some(map) = local.as_object_mut() {
+            map.remove("targetDeviceId");
+            map.remove(ROUTED);
+        }
+        let place = match named {
+            Some((provider, template)) => {
+                Some((provider.to_owned(), template.map(str::to_owned)))
+            }
+            None => self.sandboxes.as_ref().and_then(|s| s.place_of_device(target)),
         };
+        let (provider, template) = match place {
+            Some(place) => place,
+            // A sandbox of a chat another device keeps: its provider's
+            // host device knows its template.
+            None => {
+                let device = self
+                    .workspace
+                    .read_devices()
+                    .ok()?
+                    .into_iter()
+                    .find(|d| d.id == target)?;
+                let provider = device.sandbox_provider()?.to_owned();
+                (provider, None)
+            }
+        };
+        let known = place_known(self, &provider, target);
+        if !known
+            && !routed(params)
+            && let Some(answer) = self.ask_place_host(&provider, method, params).await
+        {
+            return Some(Ok(RpcReply::Value(answer)));
+        }
         let kept = self
             .sandboxes
             .as_ref()
             .and_then(|s| s.catalog(&provider, template.as_deref()));
-        let mut local = params.clone();
-        if let Some(map) = local.as_object_mut() {
-            map.remove("targetDeviceId");
-        }
+        // Asked by another device: what the template had, or nothing (it
+        // answers with its own list then).
+        let routed = routed(params);
         Some(match (method, kept) {
             (methods::LIST_HARNESSES, Some(kept)) => {
                 let mut harnesses = kept.harnesses;
@@ -645,12 +691,215 @@ impl EngineRpc {
                 };
                 match kept.models.get(p.harness.as_str()) {
                     Some(models) => RpcReply::value(models),
+                    None if routed => RpcReply::value(&Value::Null),
                     None => self.handle(method, local).await,
                 }
             }
-            // The template hasn't run: every agent this device knows.
+            // The template hasn't run: every agent the asking device knows.
+            _ if routed => RpcReply::value(&Value::Null),
             _ => self.handle(method, local).await,
         })
+    }
+
+    /// Ask `provider`'s host device, when it's another, what a place offers
+    /// (`params` as given, its target kept). `None`: it can't be reached,
+    /// or knows nothing of that template.
+    async fn ask_place_host(&self, provider: &str, method: &str, params: &Value) -> Option<Value> {
+        /// A composer waits no longer than this on the host device.
+        const ASK_HOST_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+        let host = self
+            .workspace
+            .sandbox_host(provider)
+            .map(|host| host.host_device_id)
+            .filter(|host| host != self.this_device())?;
+        let mut asked = params.clone();
+        asked.as_object_mut()?.insert(ROUTED.into(), Value::Bool(true));
+        let reply = tokio::time::timeout(ASK_HOST_WITHIN, self.forward(&host, method, asked)).await;
+        match reply {
+            Ok(Ok(RpcReply::Value(value))) if !value.is_null() => Some(value),
+            Ok(Ok(_)) => None,
+            Ok(Err(err)) => {
+                tracing::info!(%host, %provider, error = %err, "sandboxes: the host device didn't answer for a place; answering here");
+                None
+            }
+            Err(_) => {
+                tracing::info!(%host, %provider, "sandboxes: the host device took too long to answer for a place; answering here");
+                None
+            }
+        }
+    }
+
+    /// The step script methods on this device's own files.
+    fn scripts_here(
+        &self,
+        sandboxes: &Sandboxes,
+        called: Method,
+        params: Value,
+    ) -> Result<RpcReply, RpcError> {
+        if called == Method::ListScripts {
+            let repos = repos_here(&self.workspace, self.doc_host.device_id());
+            let rows: Vec<Value> = scripts::all(sandboxes.steps_dir(), &repos)
+                .into_iter()
+                .map(|script| script_row(&script))
+                .collect();
+            return RpcReply::value(&rows);
+        }
+        let p: ScriptParams = parse_params(params)?;
+        let path = self.script_path(sandboxes, &p)?;
+        match called {
+            Method::ReadScript => {
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| RpcError::Failed(format!("Couldn't read {}: {e}", p.name)))?;
+                RpcReply::value(&json!({ "content": content }))
+            }
+            Method::WriteScript => {
+                scripts::write(&path, p.content.as_deref().unwrap_or_default())
+                    .map_err(|e| RpcError::Failed(format!("Couldn't save {}: {e}", p.name)))?;
+                RpcReply::value(&json!({ "ok": true, "path": path }))
+            }
+            Method::DeleteScript => {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        // An emptied hook folder goes too (never `.zeron`).
+                        if p.hook != scripts::SETUP_HOOK
+                            && let Some(dir) = path.parent()
+                        {
+                            let _ = std::fs::remove_dir(dir);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(RpcError::Failed(format!("Couldn't delete {}: {e}", p.name)));
+                    }
+                }
+                RpcReply::value(&json!({ "ok": true }))
+            }
+            _ => Err(RpcError::UnknownMethod(format!("{called:?}"))),
+        }
+    }
+
+    /// The host devices that keep scripts for `scope`: its provider's, or
+    /// for all sandboxes and a project's, every connected provider's (each
+    /// once, this device first). This device when none is named.
+    fn script_hosts(&self, scope: Option<&Scope>) -> Vec<String> {
+        let me = self.this_device().to_owned();
+        let mut hosts: Vec<String> = match scope {
+            Some(Scope::Provider { provider }) => self
+                .workspace
+                .sandbox_host(provider)
+                .map(|host| host.host_device_id)
+                .into_iter()
+                .collect(),
+            _ => self
+                .workspace
+                .sandbox_hosts()
+                .into_iter()
+                .map(|host| host.host_device_id)
+                .collect(),
+        };
+        hosts.sort_by(|a, b| (*a != me, a).cmp(&(*b != me, b)));
+        hosts.dedup();
+        if hosts.is_empty() {
+            hosts.push(me);
+        }
+        hosts
+    }
+
+    /// One script method on `device`: here, or sent there.
+    async fn script_on(
+        &self,
+        sandboxes: &Sandboxes,
+        device: &str,
+        called: Method,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, RpcError> {
+        let reply = if device == self.this_device() {
+            self.scripts_here(sandboxes, called, params.clone())?
+        } else {
+            self.forward(device, method, route(params.clone())).await?
+        };
+        reply_value(reply, method)
+    }
+
+    /// A step script method as Settings asks it of this device (no
+    /// `targetDeviceId`), done where the scripts are kept: a provider's on
+    /// its host device; one for all sandboxes or a project on every host
+    /// device (listed once). Answered as one device would.
+    async fn scripts_on_hosts(
+        &self,
+        sandboxes: &Sandboxes,
+        called: Method,
+        method: &str,
+        params: Value,
+    ) -> Result<RpcReply, RpcError> {
+        if called == Method::ListScripts {
+            let mut rows: Vec<Value> = Vec::new();
+            let mut failed = None;
+            let mut any = false;
+            for device in self.script_hosts(None) {
+                match self.script_on(sandboxes, &device, called, method, &params).await {
+                    Ok(listed) => {
+                        any = true;
+                        for row in listed.as_array().into_iter().flatten() {
+                            let same = |r: &Value| {
+                                r["for"] == row["for"]
+                                    && r["hook"] == row["hook"]
+                                    && r["name"] == row["name"]
+                            };
+                            if !rows.iter().any(same) {
+                                rows.push(row.clone());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::info!(%device, error = %err, "sandboxes: a host device's scripts couldn't be listed");
+                        failed.get_or_insert(err);
+                    }
+                }
+            }
+            if let (false, Some(err)) = (any, failed) {
+                return Err(err);
+            }
+            rows.sort_by_cached_key(row_order);
+            return RpcReply::value(&rows);
+        }
+        let p: ScriptParams = parse_params(params.clone())?;
+        let hosts = self.script_hosts(Some(&p.scope));
+        if called == Method::ReadScript {
+            // Kept alike on each: the first that has it.
+            let mut last = None;
+            for device in hosts {
+                match self.script_on(sandboxes, &device, called, method, &params).await {
+                    Ok(read) => return RpcReply::value(&read),
+                    Err(err) => last = Some(err),
+                }
+            }
+            return Err(last.unwrap_or_else(|| RpcError::Failed(format!("Couldn't read {}", p.name))));
+        }
+        // Write and Delete: on each host device that keeps it.
+        let mut done = None;
+        let mut failed = None;
+        for device in hosts {
+            match self.script_on(sandboxes, &device, called, method, &params).await {
+                Ok(reply) => {
+                    done.get_or_insert(reply);
+                }
+                Err(err) => {
+                    tracing::info!(%device, error = %err, "sandboxes: a step script wasn't changed on a host device");
+                    failed.get_or_insert(err);
+                }
+            }
+        }
+        // A project's scripts live in its folder, on the host devices that
+        // have it: one is enough. Every host device keeps the others.
+        let one_is_enough = matches!(p.scope, Scope::Project { .. });
+        match (done, failed) {
+            (Some(reply), None) => RpcReply::value(&reply),
+            (Some(reply), Some(_)) if one_is_enough => RpcReply::value(&reply),
+            (_, Some(err)) => Err(err),
+            (None, None) => Err(RpcError::Failed(format!("Couldn't save {}", p.name))),
+        }
     }
 
     fn script_path(
@@ -793,6 +1042,34 @@ impl EngineRpc {
     }
 }
 
+/// Whether this device answers for `provider`'s place itself: it's the
+/// provider's host device (or none is named), or it keeps the sandbox
+/// device asked about.
+fn place_known(rpc: &EngineRpc, provider: &str, target: &str) -> bool {
+    let host_here = rpc
+        .workspace
+        .sandbox_host(provider)
+        .is_none_or(|host| host.host_device_id == rpc.this_device());
+    host_here
+        || rpc
+            .sandboxes
+            .as_ref()
+            .is_some_and(|s| s.place_of_device(target).is_some())
+}
+
+/// Where a listed script sorts, as [`scripts::all`] sorts them: all
+/// sandboxes', providers', projects', then hook, then name.
+fn row_order(row: &Value) -> (u8, String, String, String) {
+    let scope = &row["for"];
+    let (rank, key) = match scope["kind"].as_str() {
+        Some("all") => (0, ""),
+        Some("provider") => (1, scope["provider"].as_str().unwrap_or_default()),
+        _ => (2, scope["spaceId"].as_str().unwrap_or_default()),
+    };
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    (rank, key.to_owned(), text(&row["hook"]), text(&row["name"]))
+}
+
 /// A script as Settings lists it: when it runs (and where), what it's for.
 fn script_row(script: &scripts::Script) -> serde_json::Value {
     let (timing, step, runs_on) = match Hook::parse(&script.hook) {
@@ -816,17 +1093,21 @@ fn script_row(script: &scripts::Script) -> serde_json::Value {
     })
 }
 
-/// Save a script, making its folders; runnable where that means something.
-fn write_script(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_sandbox_method_is_named_once() {
+        for (name, method) in METHODS {
+            assert_eq!(Method::parse(name), Some(method), "{name}");
+            assert!(handles(name));
+        }
+        let mut names: Vec<&str> = METHODS.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), METHODS.len());
+        assert!(!handles(methods::LIST_HARNESSES));
     }
-    let tmp = path.with_extension("zeron-tmp");
-    std::fs::write(&tmp, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    }
-    std::fs::rename(&tmp, path)
 }

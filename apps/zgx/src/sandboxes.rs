@@ -5,11 +5,15 @@
 //! ```text
 //! shared  sandboxes            { providers = { { id, name, icon }… } }
 //! shared  sandbox_steps        { [chat] = { state, step?, template?, since, error?,
-//!                              provider?, disk_full } }: `state` starting |
-//!                              ready | failed | gone | sleeping | asleep |
-//!                              waking, `step` the one it's on (or that
-//!                              failed), `since` when that began, in Unix
-//!                              seconds
+//!                              provider?, disk_full, progress?, scripts?,
+//!                              started? } }: `state` starting | ready |
+//!                              failed | gone | sleeping | asleep | waking,
+//!                              `step` the one it's on (or that failed),
+//!                              `since` when that began, in Unix seconds;
+//!                              `progress` each starting step's state;
+//!                              `scripts` { name, script, step, state, since,
+//!                              error? } running or failed; `started` { at,
+//!                              ready_at?, fresh } its last start
 //! call    sandboxes.templates  provider → { { id, name }… } (Blank isn't one)
 //! invoke  sandboxes.follow     chat: keep its steps in `sandbox_steps`; first
 //!                              asks the provider whether it's still there,
@@ -113,7 +117,53 @@ fn steps_json(steps: &Json) -> Option<Json> {
         out["provider"] = Json::from(provider);
     }
     out["disk_full"] = Json::Bool(steps["diskFull"].as_bool() == Some(true));
+    // Each starting step's state, in order: the progress line's segments.
+    let progress: Vec<Json> = steps["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["state"].as_str().map(Json::from))
+        .collect();
+    if !progress.is_empty() {
+        out["progress"] = Json::Array(progress);
+    }
+    // The step script running, and those that failed ("Running setup.sh",
+    // "Setup failed reportly/.zeron/setup.sh").
+    let scripts: Vec<Json> = steps["scripts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let mut run = json!({
+                "name": s["name"].as_str()?,
+                "script": s["script"].as_str().unwrap_or_default(),
+                "step": s["step"].as_str().unwrap_or_default(),
+                "state": s["state"].as_str()?,
+                "since": seconds(&s["since"]),
+            });
+            if let Some(error) = s["error"].as_str().filter(|e| !e.is_empty()) {
+                run["error"] = Json::from(error);
+            }
+            Some(run)
+        })
+        .collect();
+    if !scripts.is_empty() {
+        out["scripts"] = Json::Array(scripts);
+    }
+    // Its last start, and when it got ready ("Sandbox ready 52s").
+    if let Some(at) = steps["started"]["at"].as_i64() {
+        let mut started = json!({ "at": at as f64 / 1000.0, "fresh": steps["started"]["fresh"].as_bool() == Some(true) });
+        if steps["started"]["readyAt"].is_i64() {
+            started["ready_at"] = Json::from(seconds(&steps["started"]["readyAt"]));
+        }
+        out["started"] = started;
+    }
     Some(out)
+}
+
+/// Epoch ms as Unix seconds.
+fn seconds(ms: &Json) -> f64 {
+    ms.as_i64().unwrap_or_default() as f64 / 1000.0
 }
 
 fn templates_json(listed: &Json) -> Json {
@@ -291,6 +341,40 @@ mod tests {
             Some(json!({ "state": "failed", "step": "getCode", "since": 1.0, "error": "Couldn't clone", "disk_full": false }))
         );
         assert_eq!(super::steps_json(&json!(null)), None);
+    }
+
+    /// Its band reads each starting step's state (the segments), the step
+    /// script running or failed (named, its path), and when its last start
+    /// got ready (the transcript's "Sandbox ready 52s").
+    #[test]
+    fn a_sandbox_s_progress_scripts_and_start_read_as_its_band_and_ready_row() {
+        let steps = json!({ "provider": "docker", "state": "ready", "since": 1_700_000_052_000_i64,
+            "steps": [{ "step": "create", "state": "done" }, { "step": "start", "state": "running" }, { "step": "setup", "state": "pending" }],
+            "scripts": [
+                { "hook": "setup", "step": "setup", "name": "setup.sh", "script": "reportly/.zeron/setup.sh",
+                  "for": { "repo": "reportly" }, "state": "failed", "since": 1_700_000_050_000_i64, "error": "exit 1" },
+                { "hook": "after-ready", "step": "ready", "name": "sync.sh", "script": "~/.zeron/steps/after-ready/sync.sh",
+                  "for": "all", "state": "running", "since": 1_700_000_051_000_i64, "error": null },
+            ],
+            "started": { "at": 1_700_000_000_000_i64, "readyAt": 1_700_000_052_000_i64, "fresh": false } });
+        let read = super::steps_json(&steps).unwrap();
+        assert_eq!(read["progress"], json!(["done", "running", "pending"]));
+        assert_eq!(
+            read["scripts"],
+            json!([
+                { "name": "setup.sh", "script": "reportly/.zeron/setup.sh", "step": "setup", "state": "failed",
+                  "since": 1_700_000_050.0, "error": "exit 1" },
+                { "name": "sync.sh", "script": "~/.zeron/steps/after-ready/sync.sh", "step": "ready", "state": "running",
+                  "since": 1_700_000_051.0 },
+            ])
+        );
+        assert_eq!(read["started"], json!({ "at": 1_700_000_000.0, "ready_at": 1_700_000_052.0, "fresh": false }));
+        // Still starting (fresh): no ready yet. From before it: none at all.
+        let fresh = json!({ "state": "starting", "since": 0, "started": { "at": 5000, "fresh": true } });
+        assert_eq!(super::steps_json(&fresh).unwrap()["started"], json!({ "at": 5.0, "fresh": true }));
+        let old = json!({ "state": "ready", "since": 0 });
+        let read = super::steps_json(&old).unwrap();
+        assert!(read.get("started").is_none() && read.get("scripts").is_none() && read.get("progress").is_none());
     }
 
     /// What its alerts read (#44): deleted outside Zeron, a full disk; and

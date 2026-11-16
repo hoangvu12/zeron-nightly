@@ -1,12 +1,15 @@
--- A chat's sandbox, on its composer's deck: tracked reads and the actions,
--- nothing drawn (as screens/chat/cloud_tray for Cloud). What's said is
--- screens/chat/sandbox_machine's. The composer follows the chat's steps
+-- A chat's sandbox, in its composer's band (a row of its own over the
+-- composer, always shown, never in the deck's alerts): tracked reads and the
+-- actions, nothing drawn (as screens/chat/cloud_tray for Cloud). What's said
+-- is screens/chat/sandbox_machine's. The composer follows the chat's steps
 -- (account/sandboxes) while it's open on a sandbox.
 --
 --   local sandbox = SandboxTray.bind { chat = fn }
---   alerts: its alert, as the deck takes them; on_alert(id): its action
---   line(): the deck's notice while it's asleep (moon, Wake); resting():
---   asleep or on its way to or from it (its host's offline, not unreachable)
+--   band(): what's wrong with it (deleted, its disk full, a wake that
+--   failed), else asleep (moon, Wake), as the band takes it; nil for none
+--   act(): its band's action (Start fresh, Wake)
+--   resting(): asleep or on its way to or from it (its host's offline, not
+--   unreachable)
 --   wake(): Wake
 
 local sandboxes = require("@account/sandboxes")
@@ -28,17 +31,19 @@ function M.bind(c: Bind): any
 	b.alert = ui.computed(function(): logic.Alert?
 		return logic.alert(b.steps())
 	end)
-	b.alerts = ui.computed(function(): { any }
+	function b.band(): { [string]: any }?
 		local a = b.alert:get()
-		if not a then
-			return {}
+		if a then
+			local f = if a.action == "wake" then sandboxes.wake_state(c.chat()) else sandboxes.fresh_state(c.chat())
+			local s = b.steps()
+			return logic.band(a, { busy = f.busy, failure = f.failure, icon = sandboxes.icon(s and s.provider) })
 		end
-		local f = if a.action == "wake" then sandboxes.wake_state(c.chat()) else sandboxes.fresh_state(c.chat())
-		return { logic.deck_alert(a, { busy = f.busy, failure = f.failure }) }
-	end)
+		local line = b.line()
+		return if line then logic.asleep_band(line) else nil
+	end
 	function b.line(): any
 		if sandboxes.wake_state(c.chat()).busy then
-			-- (Woken: said in the transcript as it comes up.)
+			-- (Woken: its band says so as it comes up.)
 			return nil
 		end
 		return logic.line(b.steps())
@@ -52,16 +57,15 @@ function M.bind(c: Bind): any
 			sandboxes.wake(chat)
 		end
 	end
-	-- Whether a deck id is its alert's.
-	function b.owns(id: string): boolean
-		return id == logic.ALERT_ID
-	end
-	function b.on_alert(_id: string)
+	function b.act()
 		local chat, a = c.chat(), b.alert:peek()
-		if not chat or not a then
+		if not chat then
 			return
 		end
-		if a.action == "fresh" then
+		if not a then
+			-- Asleep: Wake.
+			sandboxes.wake(chat)
+		elseif a.action == "fresh" then
 			sandboxes.fresh(chat)
 		elseif a.action == "wake" then
 			sandboxes.wake(chat)

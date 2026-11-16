@@ -6,20 +6,25 @@
 //! Here: picking the host device ([`pick_host`]), and what one host device
 //! hands the next ([`Handover`]): the key from the provider's key slot
 //! ([`super::SandboxProvider::export_key`]), the sign-ins it lends running
-//! sandboxes, and their chats' steps, so changing it interrupts nothing.
+//! sandboxes, their chats' steps, the user's step scripts for them and what
+//! agents each template had, so changing it interrupts nothing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use zeron_proto::Device;
 use zeron_proto::capabilities::{HEADLESS_V1, SANDBOX_HOST_V1};
 
+use super::catalog::PlaceCatalog;
+use super::scripts::{self, ScriptFile};
 use super::{ChatSandbox, Record, Sandboxes, lock};
 use crate::auth::{Auth, LentGrant};
 
 /// What a host device hands the next (`AdoptSandboxProvider`): the key, the
-/// sign-ins it lends the provider's sandboxes, and their chats. A first
-/// connect hands the key alone.
+/// sign-ins it lends the provider's sandboxes, their chats, the step
+/// scripts they run and what agents each template had. A first connect
+/// hands the key alone.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Handover {
@@ -33,6 +38,13 @@ pub(crate) struct Handover {
     /// Each chat's record, as kept in `sandboxes.json`.
     #[serde(default)]
     pub chats: Vec<serde_json::Value>,
+    /// The step scripts for the provider's sandboxes: every sandbox's and
+    /// the provider's own.
+    #[serde(default)]
+    pub scripts: Vec<ScriptFile>,
+    /// What agents each of its templates had, by template.
+    #[serde(default)]
+    pub catalogs: BTreeMap<String, PlaceCatalog>,
 }
 
 impl std::fmt::Debug for Handover {
@@ -41,6 +53,8 @@ impl std::fmt::Debug for Handover {
             .field("provider", &self.provider)
             .field("grants", &self.grants.len())
             .field("chats", &self.chats.len())
+            .field("scripts", &self.scripts.len())
+            .field("catalogs", &self.catalogs.len())
             .finish_non_exhaustive()
     }
 }
@@ -102,6 +116,8 @@ impl Sandboxes {
                 .iter()
                 .filter_map(|record| serde_json::to_value(record).ok())
                 .collect(),
+            scripts: scripts::for_provider(&self.inner.steps_dir, provider),
+            catalogs: self.inner.catalogs.of_provider(provider),
         })
     }
 
@@ -130,6 +146,11 @@ impl Sandboxes {
                 );
             }
         };
+        // The scripts first: a sandbox this device goes on with runs them.
+        scripts::take(&self.inner.steps_dir, &handover.scripts)?;
+        self.inner
+            .catalogs
+            .take(&handover.provider, handover.catalogs);
         provider
             .adopt_key(handover.key)
             .await
@@ -152,11 +173,19 @@ impl Sandboxes {
         Ok(())
     }
 
-    /// No longer `provider`'s host device: its key, its chats and the
-    /// sign-ins lent to their sandboxes go (the next host device has them).
+    /// No longer `provider`'s host device: its key, its chats, its own
+    /// step scripts and the sign-ins lent to their sandboxes go (the next
+    /// host device has them). Every sandbox's scripts stay: another
+    /// provider's sandboxes may run them here.
     pub(crate) async fn forget(&self, provider: &str, auth: Option<&Auth>) {
         if let Some(built) = self.provider(provider) {
             built.forget_key().await;
+        }
+        if let Ok(dir) = scripts::provider_dir(&self.inner.steps_dir, provider)
+            && let Err(err) = std::fs::remove_dir_all(&dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%provider, error = %err, "sandboxes: the provider's step scripts stayed behind");
         }
         let gone: Vec<Record> = {
             let mut chats = lock(&self.inner.chats);

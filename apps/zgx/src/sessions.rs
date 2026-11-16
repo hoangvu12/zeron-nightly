@@ -1682,14 +1682,7 @@ impl Sessions {
 /// Why a chat on a place didn't start: the engine's own sentence (the
 /// provider isn't connected here), else a plain retry.
 fn place_words(error: &str) -> String {
-    let mut words = error.trim();
-    for prefix in ["forwarded:", "failed:"] {
-        while let Some(rest) = words.strip_prefix(prefix) {
-            words = rest.trim();
-        }
-    }
-    let readable = !words.is_empty() && words.len() <= 200 && !words.contains('{');
-    if readable { words.to_string() } else { "The sandbox couldn't be made. Try again.".into() }
+    crate::engine::readable(error).unwrap_or_else(|| "The sandbox couldn't be made. Try again.".into())
 }
 
 /// `createChat` on a place: in `project` (else a projectless chat this device

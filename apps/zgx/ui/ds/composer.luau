@@ -25,7 +25,9 @@
 -- draft then being the answer. Over it, the deck (ds/composer_dock: the
 -- alerts, the queue, subagents, what is running, the plan): folded, a pill
 -- floating over it; opened, its own top. A notice (offline, a failed send,
--- a draft restored) is the first of the alerts, there till it's over.
+-- a draft restored) is the first of the alerts, there till it's over. Over
+-- them all, the band (ds/composer_band): one row of its own, always shown,
+-- the composer's rounded top (a sandbox's state, spec #37 story 32).
 -- Mentions (ds/composer_mentions) open at the caret. Dictating, a track
 -- unrolls from the microphone over the controls: a dot, "Listening", the
 -- voice, a clock.
@@ -39,6 +41,7 @@ local FadeText = require("@self/fade_text")
 local Tile = require("@self/tile")
 local Dropdown = require("@self/dropdown")
 local ModelPicker = require("@self/model_picker")
+local AgentMenu = require("@self/agent_menu")
 local Switch = require("@self/switch")
 local Menu = require("@self/menu")
 local IconButton = require("@self/icon_button").IconButton
@@ -49,6 +52,7 @@ local DropOverlay = require("@self/drop_overlay")
 local cargo = require("@self/composer_cargo")
 local Lightbox = require("@self/lightbox")
 local dock = require("@self/composer_dock")
+local ComposerBand = require("@self/composer_band")
 local ask = require("@self/composer_ask")
 local mentions = require("@self/composer_mentions")
 local locale = require("@self/locale")
@@ -124,6 +128,12 @@ export type Props = {
 	-- plan mode (explore and propose before changing anything).
 	access: State<string?>?,
 	plan: State<boolean>?,
+	-- On a sandbox (spec #37, screens 03–20): while true, the access chip
+	-- is "Sandboxed" (the shield: its agent runs anything, in there), and
+	-- the model chip the agent menu (ds/agent_menu: Agents over Model, the
+	-- chip reading the agent picked from Agents, `agent`).
+	sandboxed: (() -> boolean)?,
+	agent: State<string?>?,
 	-- The model (a ModelPicker: its agents' tabs, its models, its reasoning,
 	-- Fast mode and its other options' picks).
 	model: State<string?>,
@@ -260,6 +270,11 @@ export type Props = {
 	notice: State<Notice?>?,
 	on_notice_action: (() -> ())?,
 	on_dismiss_notice: (() -> ())?,
+	-- The band at its top (ds/composer_band): a row of its own, always
+	-- shown while there's one, never in the deck; its action and its ×.
+	band: (State<ComposerBand.Band?> | () -> ComposerBand.Band?)?,
+	on_band_action: (() -> ())?,
+	on_dismiss_band: (() -> ())?,
 	-- Dictating: the track over the controls; the mic starts and stops it,
 	-- Escape or the × cancels.
 	dictating: State<boolean>?,
@@ -415,6 +430,16 @@ local function ACCESS(): { Dropdown.Item }
 	}
 end
 
+-- On a sandbox, its one access mode.
+local function SANDBOXED(): { Dropdown.Item }
+	return {
+		worded({ value = "sandboxed", icon = "shield-check" }, {
+			label = "ds.composer.sandboxed.label",
+			description = "ds.composer.sandboxed.hint",
+		}),
+	}
+end
+
 -- Plan mode's row at the access panel's foot: an item's shape, its icon on
 -- its title's line, its switch (centred) where the check would be. The row
 -- (or the switch) flips it.
@@ -510,7 +535,10 @@ local function submenu(
 	-- Told of each pick (the one already chosen too).
 	on_choose: ((value: string) -> ())?,
 	-- Handed its open state, as its row is made (to open it from elsewhere).
-	on_menu: ((open: State<boolean>) -> ())?
+	on_menu: ((open: State<boolean>) -> ())?,
+	-- Its panel's own: rows over its list (`head`), a title over the list,
+	-- a check on the chosen one, and something at a row's end.
+	opts: { head: Node?, list_heading: Message?, check: boolean?, trailing_item: ((item: any) -> Node?)? }?
 ): Node
 	local function current(): Choice
 		local v = value:get()
@@ -533,9 +561,18 @@ local function submenu(
 			end
 		end
 	end
+	local o = opts or {}
 	return Dropdown {
 		on_open = close_siblings,
 		on_choose = on_choose,
+		head = o.head,
+		list_heading = o.list_heading :: any,
+		check = o.check,
+		trailing_item = if o.trailing_item
+			then function(item: any, _lit: () -> boolean): Node?
+				return (o.trailing_item :: any)(item)
+			end
+			else nil,
 		value = value,
 		items = choices,
 		actions = actions,
@@ -695,6 +732,18 @@ local function work_in(
 	-- The templates' row's open state, once it's made: picking a place
 	-- opens it, every time.
 	local templates_open: State<boolean>? = nil
+	-- The devices' row's, for the templates' way back to it.
+	local devices_open: State<boolean>? = nil
+	-- The place picked, by name ("Docker Sandbox").
+	local function place_name(): string
+		local chosen = device and device:get()
+		for _, d in list_of(devices) :: { Device } do
+			if d.value == chosen then
+				return d.label
+			end
+		end
+		return ""
+	end
 	local rows: { Node } = {
 		Menu.Heading { locale.t("ds.composer.work_in") },
 	}
@@ -712,7 +761,9 @@ local function work_in(
 					warn = d.offline,
 					description = d.description,
 					disabled = d.disabled,
-				})
+					-- (A place opens its templates: a chevron says so.)
+					place = d.sandbox ~= nil,
+				} :: any)
 			end
 			return out
 		end
@@ -734,7 +785,13 @@ local function work_in(
 						end)
 					end
 				end
-			end))
+			end, function(open: State<boolean>)
+				devices_open = open
+			end, {
+				trailing_item = function(item: any): Node?
+					return if item.place then ui.div { self = "center", shrink = 0, Menu.chevron() } else nil
+				end,
+			}))
 		)
 	end
 	if template and templates and device and devices then
@@ -753,9 +810,29 @@ local function work_in(
 			end, ui.div {
 				id = "composer-place-templates",
 				w_full = true,
-				submenu(siblings, locale.t("ds.composer.template.label"), template, choices, 1, nil, nil, nil, nil, function(open: State<boolean>)
+				submenu(siblings, locale.t("ds.composer.sandbox_template.label"), template, choices, 1, nil, nil, nil, nil, function(open: State<boolean>)
 					templates_open = open
-				end),
+				end, {
+					-- Back to the devices ("‹ Docker Sandbox", its name), then
+					-- "Templates" over them, the one picked checked (screen 02).
+					head = Menu.Row {
+						id = "composer-place-templates-back",
+						icon = "alt-arrow-left",
+						label = place_name,
+						on_click = function()
+							for _, open in siblings do
+								open:set(false)
+							end
+							ui.after(0, function()
+								if devices_open then
+									devices_open:set(true)
+								end
+							end)
+						end,
+					},
+					list_heading = locale.t("ds.composer.sandbox_template.heading"),
+					check = true,
+				}),
 			})
 		)
 	end
@@ -1580,7 +1657,7 @@ return ui.component(function(props: Props): Node
 	end)
 
 	local model = ui.presence(side, function(at: string): Node
-		return ModelPicker {
+		local picker = ModelPicker {
 			model = props.model,
 			effort = props.effort,
 			fast = props.fast,
@@ -1600,6 +1677,24 @@ return ui.component(function(props: Props): Node
 				return model_fold(fold:get())
 			end,
 		}
+		if not (props.sandboxed and props.agent) then
+			return picker
+		end
+		return ui.show(props.sandboxed, AgentMenu {
+			model = props.model,
+			effort = props.effort,
+			agent = props.agent :: State<string?>,
+			harnesses = props.harnesses :: any,
+			models = props.models :: any,
+			model_label = props.model_label,
+			loading = props.models_loading,
+			placement = { side = at, align = "end", offset = 6 },
+			open_with = props.open_model,
+			showing = props.model_open,
+			fold = function(): number
+				return model_fold(fold:get())
+			end,
+		}, picker)
 	end)
 
 	-- The access mode: its icon and name; with plan mode on, "Plan" after it
@@ -1630,6 +1725,21 @@ return ui.component(function(props: Props): Node
 			extra = if plan then plan_row(plan) else nil,
 			placement = { side = "bottom", align = "start", offset = 6 },
 		}
+		-- On a sandbox: "Sandboxed", the one mode there (screen 03).
+		if props.sandboxed then
+			access = ui.show(props.sandboxed, Dropdown {
+				fold = function()
+					return math.min(left_fold(fold:get()), 2)
+				end,
+				value = ui.use_state("sandboxed" :: string?),
+				items = SANDBOXED,
+				tone = "chip",
+				label = locale.t("ds.composer.access.label") :: any,
+				search = false,
+				width = 300,
+				placement = { side = "bottom", align = "start", offset = 6 },
+			}, access)
+		end
 	end
 	local mic = ui.show(dictating, Button {
 		tone = "accent",
@@ -2662,6 +2772,13 @@ return ui.component(function(props: Props): Node
 					return if material.see_through() then "$zeron.composer.rest" else "$zeron.composer.shadow"
 				end,
 			},
+			if props.band
+				then ComposerBand.Band {
+					band = props.band,
+					on_action = props.on_band_action,
+					on_dismiss = props.on_dismiss_band,
+				}
+				else nil,
 			trays,
 			ui.popover(m.popover(surface)),
 		},

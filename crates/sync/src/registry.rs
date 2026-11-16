@@ -365,6 +365,7 @@ impl RegistryClient {
             events: events.clone(),
             shutdown: shutdown_rx,
             nudge_rx,
+            nudge: nudge_tx.clone(),
             probe_rx,
             redial_rx,
             presence_rx,
@@ -497,6 +498,9 @@ struct Actor {
     events: broadcast::Sender<RegistryEvent>,
     shutdown: watch::Receiver<bool>,
     nudge_rx: mpsc::Receiver<()>,
+    /// Its own nudge: an HTTPS push that failed hands its batches back to a
+    /// socket that joined while it was in flight.
+    nudge: mpsc::Sender<()>,
     probe_rx: mpsc::Receiver<()>,
     redial_rx: mpsc::Receiver<()>,
     presence_rx: mpsc::Receiver<i64>,
@@ -907,6 +911,7 @@ impl Actor {
         let presence = self.presence.clone();
         let stats = self.stats.clone();
         let busy = self.sync_busy.clone();
+        let nudge = self.nudge.clone();
         tokio::spawn(async move {
             let batches: Vec<PendingBatch> = lock(&doc).take_pushable();
             let mut push_failed = false;
@@ -951,6 +956,9 @@ impl Actor {
                 // that until the next socket disconnect — un-mark so the
                 // next cycle (HTTP or WS) retries them.
                 lock(&doc).mark_disconnected();
+                // A socket that joined while they were in flight found
+                // nothing to push, and nothing else asks it again: ask now.
+                let _ = nudge.try_send(());
             }
             let since = lock(&doc).cursor();
             match transport.fetch(since).await {
@@ -1074,3 +1082,82 @@ impl Actor {
 
 #[cfg(any(test, feature = "mock-server"))]
 pub mod mock_server;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An HTTPS seam whose push fails, but only once let go: the test lets
+    /// it go after the socket has joined, so the failure lands while the
+    /// batch is in flight over HTTPS and the socket found nothing to push.
+    struct FailingPush {
+        let_go: Arc<tokio::sync::Notify>,
+    }
+
+    impl RegistryTransport for FailingPush {
+        fn fetch(&self, _since: u64) -> BoxFuture<'static, Result<String, SyncError>> {
+            Box::pin(async { Err(SyncError::Protocol("registry pull http 404".into())) })
+        }
+
+        fn push(&self, _body: String) -> BoxFuture<'static, Result<String, SyncError>> {
+            let let_go = self.let_go.clone();
+            Box::pin(async move {
+                let_go.notified().await;
+                Err(SyncError::Protocol("registry push http 404".into()))
+            })
+        }
+    }
+
+    /// A sandbox engine's own device row (written at boot, before it joins)
+    /// once never reached the room: the HTTPS bootstrap had it in flight
+    /// when the socket joined, then failed, and nothing pushed it again.
+    #[tokio::test]
+    async fn a_write_an_https_push_failed_on_goes_by_a_socket_that_joined_meanwhile() {
+        let server = mock_server::MockRegistryServer::start().await;
+        let doc = Arc::new(Mutex::new(RegistryDoc::new("dev-a")));
+        lock(&doc)
+            .upsert_device(&zeron_proto::Device {
+                id: "dev-a".into(),
+                name: "dev-a".into(),
+                platform: "linux".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.3.0".into()),
+                online_since: None,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+            })
+            .unwrap();
+        let let_go = Arc::new(tokio::sync::Notify::new());
+        let client = RegistryClient::connect_via_transport(
+            Arc::new(StaticUrl(server.url())),
+            doc.clone(),
+            "dev-a",
+            RegistryTuning::default(),
+            Arc::new(FailingPush {
+                let_go: let_go.clone(),
+            }),
+        )
+        .await
+        .expect("a client with HTTPS constructs at once");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !client.stats().connected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the socket joins");
+        assert!(server.row("devices", "dev-a").is_none(), "still in flight over HTTPS");
+        let_go.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while server.row("devices", "dev-a").is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the row reaches the room by the socket");
+        client.shutdown().await;
+    }
+}

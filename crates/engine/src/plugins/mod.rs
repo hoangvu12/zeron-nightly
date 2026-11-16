@@ -102,7 +102,8 @@ pub const BUILTIN_AUTHOR: &str = "zeron";
 /// stops counting within the hour).
 const NEW_KEYS_EVERY: Duration = Duration::from_secs(15 * 60);
 /// Why something needing this device's signing key is refused on a sandbox.
-const NO_SIGNING_KEY: &str = "A sandbox has no signing key (it can't confirm it's you), so plugins that need one can't be made or signed here";
+const NEEDS_SIGNING_KEY: &str = "It's yours, kept signed by your device's key, and a sandbox has no signing key, so it doesn't run here";
+const NO_SIGNING_KEY: &str ="A sandbox has no signing key (it can't confirm it's you), so plugins that need one can't be made or signed here";
 /// A peer's word (`CheckPluginKey`) looks this device's key up at most this often.
 const OWN_KEY_CHECK_APART: Duration = Duration::from_secs(5);
 /// Until those checks can run (auth not ready, the edge not answering).
@@ -1176,6 +1177,7 @@ impl Plugins {
         let account = self.account();
         let can_look_up = self.directory().is_some() && account.is_some();
         let now = now_secs();
+        let keyless = self.inner.keyless.load(Ordering::SeqCst);
         let mut owed = Vec::new();
         let mut entries: Vec<Entry> = scan::plugin_dirs(&self.inner.plugins_dir)
             .into_iter()
@@ -1203,7 +1205,16 @@ impl Plugins {
                         }
                     }
                 };
-                scan::entry(inspected, author, &state)
+                let mut entry = scan::entry(inspected, author, &state);
+                // Yours by this device's word alone, kept signed by its key:
+                // where there's none (a sandbox), it doesn't run.
+                if keyless && entry.item.own {
+                    entry.item.status = Status::Broken;
+                    entry.item.error = Some(NEEDS_SIGNING_KEY.to_string());
+                    entry.item.allowed = Vec::new();
+                    entry.item.ask = Vec::new();
+                }
+                entry
             })
             .collect();
         // Zeron's own, from the app's folder of them. A folder of yours by

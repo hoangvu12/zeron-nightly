@@ -62,8 +62,18 @@ impl Sandboxes {
 
     /// The chat is deleted: stop lending its sandbox tokens, then delete the
     /// sandbox (one Zeron made). Steps still running stop at the next one
-    /// and do this themselves.
+    /// and do this themselves. Until its provider is here (just started,
+    /// or not connected yet) the chat's sandbox is kept: the look after
+    /// sandboxes deletes it once it is.
     pub(crate) async fn delete(&self, chat_id: &str, host: &Host) {
+        let Some(chat) = self.chat(chat_id) else {
+            return;
+        };
+        if self.provider(&lock(&chat.record).steps.provider).is_none() {
+            stop_lending(&lock(&chat.record), host.auth.as_ref());
+            tracing::info!(chat = %chat_id, "chat deleted; its sandbox goes once its provider is here");
+            return;
+        }
         let Some(chat) = lock(&self.inner.chats).remove(chat_id) else {
             return;
         };

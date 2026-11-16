@@ -1,6 +1,6 @@
 -- A chat's panel tab that reaches its sandbox (Files, Terminal, Diffs), while
 -- that sandbox is asleep (spec #37 "Sleep and wake"): the moon, "Sandbox
--- asleep", and Wake, in the tab's place. Opening the tab never wakes it;
+-- asleep", and Wake, in the tab's place (no line under it, design 08). Opening the tab never wakes it;
 -- awake again, the tab is built as it was.
 --
 --   Asleep.gate(chat, function() return Files.Tab { … } end)
@@ -31,8 +31,9 @@ function M.gate(chat: string?, build: () -> Node): Node
 			icon = "moon",
 			size = "sm",
 			fill = true,
-			title = ui.t("panel.asleep.title") :: any,
-			body = function(): string
+			-- (Design 08: the moon, its title and Wake; no line under it. On
+			-- its way to or from sleep, the title says so instead.)
+			title = function(): string
 				local s = sandboxes.machine(chat)
 				local busy = sandboxes.wake_state(chat).busy
 				if busy or (s and s.state == "waking") then
@@ -40,7 +41,7 @@ function M.gate(chat: string?, build: () -> Node): Node
 				elseif s and s.state == "sleeping" then
 					return ui.t("panel.asleep.sleeping"):get()
 				end
-				return ui.t("panel.asleep.body"):get()
+				return ui.t("panel.asleep.title"):get()
 			end,
 			action = {
 				label = ui.t("panel.asleep.wake") :: any,

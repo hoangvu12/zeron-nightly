@@ -7,7 +7,9 @@
 //! - a subagent shares its parent's sandbox unless it asks for its own;
 //! - a sandbox deleted outside Zeron reads as gone, and Start fresh makes a
 //!   new one with the work pushed to the chat's branch;
-//! - a full disk is said as such, and Start fresh gets past it.
+//! - a full disk is said as such, and Start fresh gets past it;
+//! - a chat deleted while its host device was off takes its sandbox with it
+//!   when the host device is back.
 //!
 //! The watchdog that restarts a crashed engine in a sandbox is tested in
 //! `zeron-cli` (`watchdog.rs`); here, Zeron starts its engine under it.
@@ -52,6 +54,74 @@ async fn create_child(rpc: &RpcClient, chat: &str, parent: &str, extra: Value) -
     rpc.call(methods::MUTATE, params)
         .await
         .unwrap_or_else(|e| panic!("createChat {chat}: {e}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_deleted_while_its_host_device_was_off_loses_its_sandbox_when_it_is_back() {
+    let edge = ScriptedEdge::with_registry().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let origin_url = dirs.path().join("origin.git");
+    origin(&origin_url);
+    let host_dir = dirs.path().join("host");
+    let host = host_device(&host_dir, &edge).await;
+    let provider = FakeProvider::cloud(&dirs.path().join("cloud"));
+    host.core().sandboxes.register(provider.clone());
+    let rpc = memory_client(host.core().rpc_service());
+    add_project(&rpc, &host, &project(dirs.path(), &origin_url)).await;
+    create_on_place(&rpc, "chat-a", "fake").await;
+    ready(&rpc, "chat-a").await;
+    assert_eq!(provider.sandboxes(), ["chat-a"]);
+    host.shutdown().await;
+    drop(rpc);
+    drop(host);
+
+    // While it's off, the chat is deleted on another device.
+    let phone = host_device(&dirs.path().join("phone"), &edge).await;
+    eventually(
+        "the other device has the chat",
+        Duration::from_secs(30),
+        async || phone.core().workspace.chat("chat-a").ok().flatten(),
+    )
+    .await;
+    memory_client(phone.core().rpc_service())
+        .call(
+            methods::MUTATE,
+            json!({ "op": "deleteChat", "chatId": "chat-a" }),
+        )
+        .await
+        .expect("deleteChat, on the other device");
+    assert_eq!(provider.sandboxes(), ["chat-a"]);
+
+    // The host device is back; it hears of the deletion before its
+    // providers are here (they connect after it starts). Once they are,
+    // the sandbox goes.
+    let host = host_device(&host_dir, &edge).await;
+    eventually(
+        "the host device hears the chat was deleted",
+        Duration::from_secs(30),
+        async || host.core().workspace.chat_deleted("chat-a").then_some(()),
+    )
+    .await;
+    host.core()
+        .sandboxes
+        .set_sleep_timings(zeron_engine::sandboxes::SleepTimings {
+            idle: Duration::from_secs(60 * 60),
+            time_limit: Duration::from_secs(60 * 60),
+            check_every: Duration::from_millis(250),
+        });
+    host.core().sandboxes.register(provider.clone());
+    eventually(
+        "the sandbox is deleted",
+        Duration::from_secs(30),
+        async || provider.sandboxes().is_empty().then_some(()),
+    )
+    .await;
+    assert!(host.core().sandboxes.steps("chat-a").is_none());
+    assert!(
+        provider.calls().contains(&"delete chat-a".to_owned()),
+        "{:?}",
+        provider.calls()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

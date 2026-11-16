@@ -439,6 +439,44 @@ pub fn outcome(error: &str) -> &'static str {
     }
 }
 
+/// How long the engine's own sentence may be and still be said to a person
+/// as it is (a longer one is a dump, not a sentence).
+pub const READABLE_MAX: usize = 240;
+
+/// An engine error as a person can read it: its own sentence, the
+/// forwarding and failure prefixes taken off, when it is one (not empty, not
+/// past [`READABLE_MAX`], no JSON in it). None: say something of your own.
+/// (Every screen that shows the engine's words reads them through here.)
+pub fn readable(error: &str) -> Option<String> {
+    let mut said = error.trim();
+    loop {
+        let Some(rest) = ["forwarded:", "failed:", "Failed:"].iter().find_map(|p| said.strip_prefix(p)) else {
+            break;
+        };
+        said = rest.trim();
+    }
+    (!said.is_empty() && said.len() <= READABLE_MAX && !said.contains('{')).then(|| said.to_owned())
+}
+
+#[cfg(test)]
+mod readable_tests {
+    use super::*;
+
+    #[test]
+    fn the_engines_sentence_is_read_without_its_prefixes() {
+        assert_eq!(
+            readable("forwarded: failed: Docker isn't connected on this device.").as_deref(),
+            Some("Docker isn't connected on this device.")
+        );
+        assert_eq!(readable("Failed: Couldn't clone").as_deref(), Some("Couldn't clone"));
+        assert_eq!(readable("  "), None);
+        assert_eq!(readable("failed:"), None);
+        assert_eq!(readable(r#"failed: {"code":1}"#), None);
+        assert_eq!(readable(&"x".repeat(READABLE_MAX)).map(|s| s.len()), Some(READABLE_MAX));
+        assert_eq!(readable(&"x".repeat(READABLE_MAX + 1)), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

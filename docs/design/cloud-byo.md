@@ -259,6 +259,11 @@ no edge change.
   `/oauth/token`, Docker CLI's public client id), with "paste a Docker access token" as a fallback.
   Access tokens last ~15 min and refresh tokens rotate, so the host device refreshes them like
   Zeron's own.
+  - The paste field takes either an access token as it is, or `username:token` with a Docker
+    Hub personal access token. A `username:token` is exchanged at Docker Hub
+    (`POST {hub}/v2/auth/token {identifier, secret}`, as `sbx login --password-stdin` does)
+    for a short-lived token, and exchanged again when that expires. The host device keeps the
+    username and personal access token as the account's key, owner-only, like any other key.
 - **Always create with `on_timeout: stop`.** Without it the server may delete a sandbox at its time
   limit instead of stopping it.
 - **Save as template wipes Zeron's identity** (its device id and data). Otherwise every sandbox from

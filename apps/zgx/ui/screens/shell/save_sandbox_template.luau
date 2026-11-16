@@ -1,7 +1,10 @@
--- Save as template (spec #37, design 21–23): what's said of a chat's save,
--- as pure functions. account/sandbox_templates keeps the saves and asks the
--- host; this says what they mean. A test requires this module alone, in a VM
--- with no `ui` (it says the English there).
+-- Save as sandbox template (spec #37, design 21–23): what's said of a chat's
+-- save, as pure functions. account/sandbox_template_saves keeps the saves and
+-- asks the host; this says what they mean. A test requires this module
+-- alone, in a VM with no `ui` (it says the English there).
+--
+-- (A sandbox template is a provider's: what a sandbox starts from. Never
+-- one of Zeron's own interface templates, `templates.*`.)
 --
 -- A save: { name, state = "saving" | "saved" | "failed", why? }.
 
@@ -14,7 +17,7 @@ local function say(key: string, english: string, args: { [string]: any }?): stri
 			return tostring(args and args[k] or "")
 		end))
 	end
-	return ui.t(`shell.sidebar.save_template.{key}`, args):get()
+	return ui.t(`shell.sidebar.save_sandbox_template.{key}`, args):get()
 end
 
 -- The name as the engine saves it: trimmed.
@@ -45,20 +48,38 @@ function M.failed(save: any, e: any): any
 	return { name = save.name, state = "failed", why = if plain then nil else m }
 end
 
--- The composer's notice for it (ds/composer's Notice), or nil.
-function M.notice(save: any): any
+-- The composer's band for it (ds/composer_band's Band), or nil: always
+-- shown, never in the deck. Saving, the working ring and its name; saved
+-- (screen 23), a green check, its label and the name in mono, put away with
+-- ×; not saved, why.
+function M.band(save: any): any
 	if not save then
 		return nil
 	end
 	if save.state == "saving" then
-		return { tone = "info", spinner = true, text = say("saving", "Saving “{name}” as a template…", { name = save.name }) }
+		return { kind = "saving", spinner = true, title = say("saving", "Saving as template"), detail = save.name, mono = true }
 	elseif save.state == "saved" then
-		return { tone = "success", dismissable = true, text = say("saved", "Saved as template {name}", { name = save.name }) }
+		return {
+			kind = "saved",
+			icon = "check-circle",
+			tone = "success",
+			title = say("saved", "Saved as template"),
+			detail = save.name,
+			mono = true,
+			dismissable = true,
+		}
 	end
-	return { tone = "danger", dismissable = true, text = save.why or say("couldnt", "Couldn’t save the template") }
+	return {
+		kind = "save_failed",
+		icon = "danger-triangle",
+		tone = "danger",
+		title = say("couldnt", "Couldn’t save the template"),
+		detail = save.why,
+		dismissable = true,
+	}
 end
 
--- Whether its notice may be put away (not while it saves).
+-- Whether its band may be put away (not while it saves).
 function M.dismissable(save: any): boolean
 	return save ~= nil and save.state ~= "saving"
 end

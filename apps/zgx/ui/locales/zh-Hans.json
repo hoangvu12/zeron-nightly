@@ -658,8 +658,17 @@
         "waiting": "正在等待上下文用量",
         "unreported": "此智能体尚未报告上下文用量"
       },
-      "template": {
-        "label": "Template"
+      "sandbox_template": {
+        "label": "模板",
+        "heading": "Templates"
+      },
+      "sandboxed": {
+        "label": "沙盒内运行",
+        "hint": "沙盒内的代理可运行任何命令，不会影响此设备。"
+      },
+      "agent_menu": {
+        "agents": "代理",
+        "model": "模型"
       }
     },
     "markdown": {
@@ -2327,7 +2336,8 @@
       "connected": "Connected",
       "not_connected": "Not connected",
       "host_device": "Host device",
-      "host_sleeps": "{device} sleeps: its sandboxes can't start or wake until it's back.",
+      "host_device_named": "{name} 的主机设备",
+      "host_sleeps": "{device} 可能会休眠：休眠期间，它的沙盒无法启动或唤醒。",
       "scripts": "Scripts",
       "add_script": "Add script",
       "when_label": "When",
@@ -2343,6 +2353,9 @@
       "sign_in_on_page": "Sign in with {name}",
       "code_waiting": "Check this code on the page that opened.",
       "token": "Token",
+      "token_hint": {
+        "docker": "Docker 访问令牌，或 username:personal-access-token。"
+      },
       "disconnect_title": "Disconnect {name}?",
       "disconnect_body": "Sandboxes already made keep running, but Zeron can't reach them until it's connected again.",
       "couldnt_connect": "Couldn't connect",
@@ -2459,7 +2472,7 @@
         "rename": "重命名…",
         "remove": "移除…",
         "edit_project": "编辑项目…",
-        "save_template": "存为模板"
+        "save_sandbox_template": "存为模板"
       },
       "project": {
         "rename_title": "重命名项目",
@@ -2535,14 +2548,13 @@
         "name": "名称",
         "name_placeholder": "会话名称"
       },
-      "save_template": {
+      "save_sandbox_template": {
         "title": "存为模板",
         "name": "模板名称",
-        "body": "保存此对话的沙盒，新对话可以从它开始。Zeron 的身份和登录信息不会保存。",
         "save": "保存",
-        "saving": "正在将“{name}”存为模板…",
+        "saving": "正在存为模板",
         "couldnt": "无法保存模板",
-        "saved": "已存为模板 {name}"
+        "saved": "已存为模板"
       }
     },
     "boundary": {
@@ -3003,7 +3015,7 @@
         "project_gone": "该项目已不存在。请选择其他项目或不选择项目。",
         "cloud_needs_project": "Cloud 对话需要在项目中运行。请选择 Cloud 可以打开的项目。"
       },
-      "template": {
+      "sandbox_template": {
         "blank": "Blank"
       }
     },
@@ -3123,17 +3135,13 @@
       "wake": "唤醒",
       "wake_failed_title": "沙盒未能唤醒",
       "wake_failed_summary": "请再试一次唤醒",
-      "wake_failed_body": "此对话的沙盒未能唤醒。请稍后再试。",
       "wake_failure_outdated": "此设备上的 Zeron 版本过旧，无法唤醒沙盒。请更新后再试。",
       "wake_failure": "无法唤醒。请再试一次。",
       "fresh": "Start fresh",
       "gone_title_in": "Sandbox deleted in {place}",
       "gone_title": "Sandbox deleted",
-      "gone_summary": "The conversation is kept",
-      "gone_body": "This chat's sandbox was deleted outside Zeron. The conversation is kept. Start fresh makes a new sandbox from its repository, on the chat's branch: what was pushed comes back, what wasn't is lost.",
       "disk_title": "Sandbox's disk is full",
       "disk_summary": "Free some space, or start fresh",
-      "disk_body": "This chat's sandbox ran out of disk. Free some space, or start fresh: a new sandbox with what was pushed.",
       "failure_offline": "Couldn't reach Zeron on this device. Try again once it's back.",
       "failure_outdated": "This device's Zeron is too old to start a sandbox fresh. Update it, then try again.",
       "failure_signed_out": "Sign in again, then try again.",
@@ -3162,30 +3170,47 @@
     },
     "sandbox": {
       "step": {
-        "create": "Creating the sandbox",
-        "start": "Starting the sandbox",
-        "install": "Installing Zeron",
-        "sign_in": "Signing in",
-        "secrets": "Adding secrets",
-        "get_code": "Getting the code",
-        "setup": "Running setup",
-        "ready": "Starting Zeron",
-        "other": "Setting up the sandbox"
+        "create": "正在创建沙盒",
+        "start": "正在启动沙盒",
+        "install": "正在安装 Zeron",
+        "sign_in": "正在登录",
+        "secrets": "正在添加密钥",
+        "get_code": "正在获取代码",
+        "setup": "正在运行设置",
+        "ready": "正在启动 Zeron",
+        "wake": "正在唤醒沙盒",
+        "sleep": "正在休眠",
+        "delete": "正在删除沙盒",
+        "other": "正在设置沙盒"
       },
-      "starting": "{step} · {elapsed}",
-      "waking": "正在唤醒沙盒 · {elapsed}",
+      "waking": "正在唤醒沙盒",
+      "running_script": "正在运行 {name}",
+      "script_failed": {
+        "create": "Create failed",
+        "start": "Start failed",
+        "install": "Install failed",
+        "sign_in": "Sign-in failed",
+        "secrets": "Secrets failed",
+        "get_code": "Getting the code failed",
+        "setup": "设置失败",
+        "ready": "Ready failed",
+        "wake": "Wake failed",
+        "sleep": "Sleep failed",
+        "delete": "Delete failed",
+        "other": "脚本失败"
+      },
       "failed": "{step} failed",
-      "failed_because": "{step} failed: {error}",
       "run_again": "Run again",
-      "run_again_failed": "Couldn't run the steps again."
+      "run_again_failed": "Couldn't run the steps again.",
+      "ready": "沙盒已就绪",
+      "ready_fresh": "新沙盒已就绪"
     }
   },
   "panel": {
     "asleep": {
       "title": "沙盒已休眠",
-      "body": "没有任务运行时它已进入休眠。唤醒它，或发送一条消息。",
-      "sleeping": "它正在进入休眠。唤醒它，或发送一条消息。",
-      "waking": "正在唤醒…",
+      "sleeping": "正在休眠",
+      "waking": "正在唤醒沙盒",
       "wake": "唤醒"
     },
     "tab": {

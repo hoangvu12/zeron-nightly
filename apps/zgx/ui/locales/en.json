@@ -658,8 +658,17 @@
         "waiting": "Waiting for context usage",
         "unreported": "Context usage not reported by this agent yet"
       },
-      "template": {
-        "label": "Template"
+      "sandbox_template": {
+        "label": "Template",
+        "heading": "Templates"
+      },
+      "sandboxed": {
+        "label": "Sandboxed",
+        "hint": "Its agent runs any command inside the sandbox, never on this device."
+      },
+      "agent_menu": {
+        "agents": "Agents",
+        "model": "Model"
       }
     },
     "markdown": {
@@ -2327,7 +2336,8 @@
       "connected": "Connected",
       "not_connected": "Not connected",
       "host_device": "Host device",
-      "host_sleeps": "{device} sleeps: its sandboxes can't start or wake until it's back.",
+      "host_device_named": "Host device for {name}",
+      "host_sleeps": "{device} may sleep: its sandboxes can't start or wake while it does.",
       "scripts": "Scripts",
       "add_script": "Add script",
       "when_label": "When",
@@ -2343,6 +2353,9 @@
       "sign_in_on_page": "Sign in with {name}",
       "code_waiting": "Check this code on the page that opened.",
       "token": "Token",
+      "token_hint": {
+        "docker": "A Docker access token, or username:personal-access-token."
+      },
       "disconnect_title": "Disconnect {name}?",
       "disconnect_body": "Sandboxes already made keep running, but Zeron can't reach them until it's connected again.",
       "couldnt_connect": "Couldn't connect",
@@ -2459,7 +2472,7 @@
         "rename": "Rename…",
         "remove": "Remove…",
         "edit_project": "Edit project…",
-        "save_template": "Save as template"
+        "save_sandbox_template": "Save as template"
       },
       "project": {
         "rename_title": "Rename project",
@@ -2535,14 +2548,13 @@
         "name": "Name",
         "name_placeholder": "Session name"
       },
-      "save_template": {
+      "save_sandbox_template": {
         "title": "Save as template",
         "name": "Template name",
-        "body": "Saves this chat's sandbox so new chats can start from it. Zeron's identity and sign-in are left out.",
         "save": "Save",
-        "saving": "Saving “{name}” as a template…",
+        "saving": "Saving as template",
         "couldnt": "Couldn’t save the template",
-        "saved": "Saved as template {name}"
+        "saved": "Saved as template"
       }
     },
     "boundary": {
@@ -3003,7 +3015,7 @@
         "project_gone": "That project is no longer there. Pick another, or none.",
         "cloud_needs_project": "Cloud chats work in a project. Pick one Cloud can open."
       },
-      "template": {
+      "sandbox_template": {
         "blank": "Blank"
       }
     },
@@ -3123,17 +3135,13 @@
       "wake": "Wake",
       "wake_failed_title": "Sandbox didn't wake",
       "wake_failed_summary": "Try waking it again",
-      "wake_failed_body": "This chat's sandbox didn't wake. Try again in a moment.",
       "wake_failure_outdated": "This device's Zeron is too old to wake a sandbox. Update it, then try again.",
       "wake_failure": "Couldn't wake it. Try again.",
       "fresh": "Start fresh",
       "gone_title_in": "Sandbox deleted in {place}",
       "gone_title": "Sandbox deleted",
-      "gone_summary": "The conversation is kept",
-      "gone_body": "This chat's sandbox was deleted outside Zeron. The conversation is kept. Start fresh makes a new sandbox from its repository, on the chat's branch: what was pushed comes back, what wasn't is lost.",
       "disk_title": "Sandbox's disk is full",
       "disk_summary": "Free some space, or start fresh",
-      "disk_body": "This chat's sandbox ran out of disk. Free some space, or start fresh: a new sandbox with what was pushed.",
       "failure_offline": "Couldn't reach Zeron on this device. Try again once it's back.",
       "failure_outdated": "This device's Zeron is too old to start a sandbox fresh. Update it, then try again.",
       "failure_signed_out": "Sign in again, then try again.",
@@ -3162,30 +3170,47 @@
     },
     "sandbox": {
       "step": {
-        "create": "Creating the sandbox",
-        "start": "Starting the sandbox",
+        "create": "Creating sandbox",
+        "start": "Starting sandbox",
         "install": "Installing Zeron",
         "sign_in": "Signing in",
         "secrets": "Adding secrets",
         "get_code": "Getting the code",
         "setup": "Running setup",
         "ready": "Starting Zeron",
-        "other": "Setting up the sandbox"
+        "wake": "Waking sandbox",
+        "sleep": "Going to sleep",
+        "delete": "Deleting sandbox",
+        "other": "Setting up sandbox"
       },
-      "starting": "{step} · {elapsed}",
-      "waking": "Waking the sandbox · {elapsed}",
+      "waking": "Waking sandbox",
+      "running_script": "Running {name}",
+      "script_failed": {
+        "create": "Create failed",
+        "start": "Start failed",
+        "install": "Install failed",
+        "sign_in": "Sign-in failed",
+        "secrets": "Secrets failed",
+        "get_code": "Getting the code failed",
+        "setup": "Setup failed",
+        "ready": "Ready failed",
+        "wake": "Wake failed",
+        "sleep": "Sleep failed",
+        "delete": "Delete failed",
+        "other": "Script failed"
+      },
       "failed": "{step} failed",
-      "failed_because": "{step} failed: {error}",
       "run_again": "Run again",
-      "run_again_failed": "Couldn't run the steps again."
+      "run_again_failed": "Couldn't run the steps again.",
+      "ready": "Sandbox ready",
+      "ready_fresh": "Fresh sandbox ready"
     }
   },
   "panel": {
     "asleep": {
       "title": "Sandbox asleep",
-      "body": "It went to sleep while nothing ran. Wake it, or send a message.",
-      "sleeping": "It's going to sleep. Wake it, or send a message.",
-      "waking": "Waking…",
+      "sleeping": "Going to sleep",
+      "waking": "Waking sandbox",
       "wake": "Wake"
     },
     "tab": {

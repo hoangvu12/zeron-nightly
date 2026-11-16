@@ -10,7 +10,7 @@
 #   powershell -NoProfile -File scripts\smoke-docker-sandbox.ps1 [-Cargo "<cargo wrapper>"]
 #
 # On a shared laptop pass the build-slot wrapper, for example
-#   -Cargo "& 'C:\Users\HP MEDIA\src\cargo-slot.ps1' cargo"
+#   -Cargo "& '<path to>\cargo-slot.ps1' cargo"
 param([string]$Cargo = "cargo")
 $ErrorActionPreference = "Stop"
 
