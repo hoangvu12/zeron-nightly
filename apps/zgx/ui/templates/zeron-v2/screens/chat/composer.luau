@@ -473,6 +473,22 @@ local function Composer(): Node
 			end
 		end
 	end)
+	-- The model picked, by name, as the last catalog listing it said: on a
+	-- place whose template doesn't list it, it stays picked (#46) and the
+	-- chip still names it.
+	local picked_named = ui.state("chat_model_named", nil :: { value: string, label: string }?)
+	ui.effect(function()
+		local picked = model:get()
+		for _, m in store.catalog:get().models do
+			if m.value == picked then
+				local was = picked_named:peek()
+				if not was or was.value ~= m.value or was.label ~= m.label then
+					picked_named:set({ value = m.value, label = m.label })
+				end
+				return
+			end
+		end
+	end)
 	-- Where a new chat works (screens/chat/where): the devices, the chosen
 	-- one's projects, its refs, kept in step and remembered; how it's sent.
 	local where = Where.bind {
@@ -1315,6 +1331,10 @@ local function Composer(): Node
 				local s = open()
 				if s and s.model == model:get() then
 					return s.model_label
+				end
+				local named = picked_named:get()
+				if session_id:get() == nil and sandboxes.of(run_device()) and named and named.value == model:get() then
+					return named.label
 				end
 				return nil
 			end,
