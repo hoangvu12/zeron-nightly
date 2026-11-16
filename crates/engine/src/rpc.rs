@@ -2498,6 +2498,7 @@ fn forwardable(method: &str) -> bool {
             | methods::QUEUE_COMMAND
             // Answered by the device that keeps the provider (the host device).
             | methods::LIST_SANDBOX_PROVIDERS
+            | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN

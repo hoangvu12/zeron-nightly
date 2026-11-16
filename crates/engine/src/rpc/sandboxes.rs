@@ -8,12 +8,13 @@ use zeron_rpc::{RpcError, RpcReply, methods};
 
 use super::{EngineRpc, parse_params, watch_stream};
 use crate::sandboxes::scripts::{self, Scope};
-use crate::sandboxes::{Host, Hook, Sandboxes, Step, repos_here};
+use crate::sandboxes::{Credential, Host, Hook, Sandboxes, Step, repos_here};
 
 pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_SANDBOX_PROVIDERS
+            | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
@@ -44,6 +45,15 @@ struct ScriptParams {
     content: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectParams {
+    provider: String,
+    /// A pasted key; without one, the provider's own sign-in page.
+    #[serde(default)]
+    token: Option<String>,
+}
+
 impl EngineRpc {
     fn sandboxes(&self) -> Result<&Sandboxes, RpcError> {
         self.sandboxes
@@ -68,6 +78,31 @@ impl EngineRpc {
         let sandboxes = self.sandboxes()?;
         match method {
             methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
+            methods::CONNECT_SANDBOX_PROVIDER => {
+                let p: ConnectParams = parse_params(params)?;
+                let provider = sandboxes.provider_named(&p.provider).ok_or_else(|| {
+                    RpcError::Failed(format!("{} isn't on this device.", p.provider))
+                })?;
+                let failed = |e: crate::sandboxes::ProviderError| RpcError::Failed(e.message);
+                if let Some(token) = p.token.filter(|t| !t.trim().is_empty()) {
+                    let account = provider
+                        .connect(Credential::Token(token))
+                        .await
+                        .map_err(failed)?;
+                    return RpcReply::value(&serde_json::json!({ "account": account }));
+                }
+                let code = provider.begin_connect().await.map_err(failed)?.ok_or_else(|| {
+                    RpcError::Failed(format!("{} connects with a pasted key.", provider.name()))
+                })?;
+                let shown = serde_json::to_value(&code).unwrap_or_default();
+                // Approved on the provider's page, in the user's time.
+                tokio::spawn(async move {
+                    if let Err(err) = provider.connect(Credential::DeviceCode(code)).await {
+                        tracing::warn!(provider = provider.id(), %err, "sandboxes: connect didn't finish");
+                    }
+                });
+                RpcReply::value(&serde_json::json!({ "deviceCode": shown }))
+            }
             methods::SANDBOX_STEPS => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.steps(&p.chat_id))

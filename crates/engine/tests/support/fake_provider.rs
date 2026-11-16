@@ -108,7 +108,14 @@ impl FakeProvider {
     /// A full cloud: one sandbox per chat, every operation, templates with
     /// Zeron on them.
     pub fn cloud(root: &Path) -> Arc<Self> {
-        Arc::new(Self::new("fake", Ops::ALL, root))
+        let ops = Ops::CREATE
+            | Ops::START
+            | Ops::STOP
+            | Ops::DELETE
+            | Ops::RUN
+            | Ops::TEMPLATES
+            | Ops::SAVE_TEMPLATE;
+        Arc::new(Self::new("fake", ops, root))
     }
 
     /// An SSH box: `run` only, every chat on the one box.
