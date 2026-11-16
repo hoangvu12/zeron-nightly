@@ -46,7 +46,7 @@ impl Catalogs {
             .and_then(|bytes| match serde_json::from_slice(&bytes) {
                 Ok(kept) => Some(kept),
                 Err(err) => {
-                    tracing::warn!(error = %err, "sandboxes: unreadable {FILE}; starting empty");
+                    tracing::warn!(error = %err, file = FILE, "sandboxes: unreadable; starting empty");
                     None
                 }
             })
@@ -76,7 +76,7 @@ impl Catalogs {
             crate::runner::write_private_atomic(path, &bytes).map_err(|e| e.to_string())
         });
         if let Err(err) = outcome {
-            tracing::warn!(error = %err, "sandboxes: couldn't save {FILE}");
+            tracing::warn!(error = %err, file = FILE, "sandboxes: couldn't save");
         }
     }
 }
