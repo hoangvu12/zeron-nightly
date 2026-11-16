@@ -495,3 +495,200 @@ async fn with_no_headless_device_online_the_device_it_was_connected_on_is_host()
     assert!(refused.is_err(), "{refused:?}");
     names_host(&on_laptop, &laptop_id).await;
 }
+
+/// The ids a `ListHarnesses` answer lists.
+fn ids(listed: &Value) -> Vec<String> {
+    listed
+        .as_array()
+        .expect("a list of agents")
+        .iter()
+        .map(|d| d["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+async fn agents_on(rpc: &RpcClient, target: &str) -> Vec<String> {
+    let listed = tokio::time::timeout(
+        Duration::from_secs(30),
+        rpc.call(
+            methods::LIST_HARNESSES,
+            json!({ "targetDeviceId": target, "includeRegistry": true }),
+        ),
+    )
+    .await
+    .expect("answered")
+    .expect("ListHarnesses");
+    ids(&listed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_composer_on_any_device_offers_what_the_template_had_on_the_host_device() {
+    let edge = ScriptedEdge::with_registry().await;
+    let dirs = tempfile::tempdir().unwrap();
+    // The template has only the mock agent.
+    let cloud = FakeProvider::cloud_with_agents(
+        &dirs.path().join("cloud"),
+        &[zeron_engine::HarnessId::Mock],
+    );
+    let laptop = device(&dirs.path().join("laptop"), &edge, false).await;
+    let server = device(&dirs.path().join("server"), &edge, true).await;
+    laptop
+        .core()
+        .sandboxes
+        .register(cloud.on_device(&dirs.path().join("laptop")));
+    server
+        .core()
+        .sandboxes
+        .register(cloud.on_device(&dirs.path().join("server")));
+    let server_id = server.core().device_id.clone();
+    let on_laptop = memory_client(laptop.core().rpc_service());
+    sees_online(&on_laptop, &server_id).await;
+    sees_headless(&on_laptop, &server_id).await;
+    on_laptop
+        .call(
+            methods::CONNECT_SANDBOX_PROVIDER,
+            json!({ "provider": "fake", "token": SECRET }),
+        )
+        .await
+        .expect("ConnectSandboxProvider");
+    names_host(&on_laptop, &server_id).await;
+
+    // A chat on the template runs, made by the server (the host device).
+    on_laptop
+        .call(
+            methods::MUTATE,
+            json!({ "op": "createChat", "chatId": "chat-a",
+                    "place": { "provider": "fake", "template": "zeron-dev" } }),
+        )
+        .await
+        .expect("createChat on a place");
+    ready(&on_laptop, "chat-a").await;
+
+    // The laptop never ran it, yet its composer offers what it had: the
+    // server keeps that, and answers.
+    let place = zeron_proto::places::place_target("fake", Some("zeron-dev"));
+    let offered = eventually(Duration::from_secs(30), async || {
+        let offered = agents_on(&on_laptop, &place).await;
+        (offered == ["mock"]).then_some(offered)
+    })
+    .await;
+    assert!(offered.is_some(), "{:?}", agents_on(&on_laptop, &place).await);
+    assert!(
+        laptop
+            .core()
+            .sandboxes
+            .catalog("fake", Some("zeron-dev"))
+            .is_none()
+    );
+    let mine = ids(
+        &on_laptop
+            .call(methods::LIST_HARNESSES, json!({ "includeRegistry": true }))
+            .await
+            .unwrap(),
+    );
+    assert!(mine.len() > 1, "{mine:?}");
+
+    // The host device is off: the laptop offers its own agents.
+    server.shutdown().await;
+    assert_eq!(agents_on(&on_laptop, &place).await, mine);
+}
+
+/// Save a script from `rpc`'s device, as Settings does (no target device).
+async fn write_script(rpc: &RpcClient, scope: Value, hook: &str, name: &str, content: &str) {
+    rpc.call(
+        methods::WRITE_STEP_SCRIPT,
+        json!({ "for": scope, "hook": hook, "name": name, "content": content }),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("WriteStepScript {name}: {e:?}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn step_scripts_are_kept_on_the_host_device_of_each_provider_they_are_for() {
+    let edge = ScriptedEdge::with_registry().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let (laptop_dir, server_dir) = (dirs.path().join("laptop"), dirs.path().join("server"));
+    let laptop = device(&laptop_dir, &edge, false).await;
+    let server = device(&server_dir, &edge, true).await;
+    let laptop_id = laptop.core().device_id.clone();
+    let server_id = server.core().device_id.clone();
+    let on_laptop = memory_client(laptop.core().rpc_service());
+    sees_online(&on_laptop, &server_id).await;
+    // Docker is kept on the server, Boat on the laptop.
+    for (provider, host) in [("docker", &server_id), ("boat", &laptop_id)] {
+        laptop
+            .core()
+            .workspace
+            .set_sandbox_host(&zeron_proto::SandboxHost {
+                provider: provider.into(),
+                host_device_id: host.clone(),
+                connected_on: Some(laptop_id.clone()),
+            });
+    }
+
+    // Settings on the laptop saves each script; each lands where it runs.
+    let docker = json!({ "kind": "provider", "provider": "docker" });
+    let boat = json!({ "kind": "provider", "provider": "boat" });
+    let all = json!({ "kind": "all" });
+    write_script(&on_laptop, docker.clone(), "after-ready", "d.sh", "docker\n").await;
+    write_script(&on_laptop, boat.clone(), "after-ready", "b.sh", "boat\n").await;
+    write_script(&on_laptop, all.clone(), "after-setup", "fleet-sync.sh", "fleet sync\n").await;
+    let at = |dir: &Path, path: &str| std::fs::read_to_string(dir.join(path)).ok();
+    assert_eq!(at(&server_dir, "steps/docker/after-ready/d.sh").as_deref(), Some("docker\n"));
+    assert_eq!(at(&laptop_dir, "steps/docker/after-ready/d.sh"), None);
+    assert_eq!(at(&laptop_dir, "steps/boat/after-ready/b.sh").as_deref(), Some("boat\n"));
+    assert_eq!(at(&server_dir, "steps/boat/after-ready/b.sh"), None);
+    // For all sandboxes: on every host device.
+    for dir in [&laptop_dir, &server_dir] {
+        assert_eq!(
+            at(dir, "steps/after-setup/fleet-sync.sh").as_deref(),
+            Some("fleet sync\n")
+        );
+    }
+
+    // Listed once each, from both host devices.
+    let listed = on_laptop
+        .call(methods::LIST_STEP_SCRIPTS, json!({}))
+        .await
+        .unwrap();
+    let rows: Vec<(Value, String)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["for"].clone(), r["name"].as_str().unwrap().to_owned()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (all.clone(), "fleet-sync.sh".to_owned()),
+            (boat.clone(), "b.sh".to_owned()),
+            (docker.clone(), "d.sh".to_owned()),
+        ],
+        "{listed:#}"
+    );
+    // Read from where it's kept.
+    let read = on_laptop
+        .call(
+            methods::READ_STEP_SCRIPT,
+            json!({ "for": docker, "hook": "after-ready", "name": "d.sh" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["content"], "docker\n");
+
+    // Deleted from every host device.
+    on_laptop
+        .call(
+            methods::DELETE_STEP_SCRIPT,
+            json!({ "for": all, "hook": "after-setup", "name": "fleet-sync.sh" }),
+        )
+        .await
+        .unwrap();
+    for dir in [&laptop_dir, &server_dir] {
+        assert_eq!(at(dir, "steps/after-setup/fleet-sync.sh"), None);
+    }
+    let listed = on_laptop
+        .call(methods::LIST_STEP_SCRIPTS, json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed:#}");
+}
