@@ -187,6 +187,21 @@ use zeron_engine::deferred::{
     DeferredEngine, DeferredState as DeferredEngineState, wait as wait_for_deferred_engine,
 };
 
+/// Wait (up to 2 s) until nothing answers on `port` any more. Closing the
+/// IPC listener isn't always enough: a program the engine was starting at
+/// that moment holds a copy of it from its fork until its exec (seen on
+/// Linux CI), and a retry or another viewport must find the port free.
+async fn wait_until_released(port: u16) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(port, "the IPC port still answers after shutdown");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Start the app's background engine when no engine serves the port, and
 /// attach to it, rather than embedding one (set once at startup by the app;
 /// tests and fixtures embed).
@@ -385,6 +400,9 @@ impl EngineHandle {
             && let Err(message) = wait_for_deferred_engine(&mut state_rx).await
         {
             handle.shutdown().await;
+            if let Some(port) = served_ipc_port.filter(|port| *port != 0) {
+                wait_until_released(port).await;
+            }
             return Err(anyhow::anyhow!(message));
         }
         Ok(handle)

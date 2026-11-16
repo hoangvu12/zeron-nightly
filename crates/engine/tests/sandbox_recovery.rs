@@ -236,6 +236,20 @@ async fn deleting_a_chat_deletes_its_sandbox_and_stops_lending_it_tokens() {
     // Tokens stop: its next ask is refused.
     assert!(!lends(&rpc, &key).await);
     assert!(steps(&rpc, "chat-a").await.is_null());
+    // Nothing is left behind: no device list shows the sandboxes' devices
+    // (seen in a real Docker run, 2026-11-17: the row outlived its sandbox).
+    let own_device = own["deviceId"].as_str().unwrap().to_owned();
+    eventually(
+        "the sandboxes' devices leave the device list",
+        Duration::from_secs(30),
+        async || {
+            let rows = host.core().workspace.read_devices().ok()?;
+            rows.iter()
+                .all(|d| d.id != device && d.id != own_device)
+                .then_some(())
+        },
+    )
+    .await;
     // Deleting it on another device deletes it here too (the rows sync):
     // shown by the child's sandbox, whose row went with its parent's.
 }

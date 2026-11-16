@@ -698,9 +698,17 @@ fn claims(jwt: &str) -> Option<Value> {
 fn account_name(claims: Option<&Value>) -> String {
     claims
         .and_then(|c| {
-            ["username", "https://hub.docker.com/username", "email", "sub"]
-                .iter()
-                .find_map(|k| c[*k].as_str().filter(|v| !v.is_empty()))
+            let hub = &c["https://hub.docker.com"];
+            [
+                &c["username"],
+                &hub["username"],
+                &c["https://hub.docker.com/username"],
+                &c["email"],
+                &hub["email"],
+                &c["sub"],
+            ]
+            .into_iter()
+            .find_map(|v| v.as_str().filter(|v| !v.is_empty()))
         })
         .unwrap_or("Docker account")
         .to_owned()
@@ -1289,6 +1297,22 @@ mod tests {
         assert_eq!(account_name(claims(&jwt).as_ref()), "vu");
     }
 
+    /// Docker's access tokens (as `sbx` holds them, 2026-11-17) name the
+    /// user inside a `https://hub.docker.com` object; `sub` is an auth0 id.
+    #[test]
+    fn a_docker_access_token_names_its_hub_user() {
+        let claims = serde_json::json!({
+            "https://hub.docker.com": { "email": "vu@example.com", "username": "vu" },
+            "sub": "auth0|0000",
+        });
+        assert_eq!(account_name(Some(&claims)), "vu");
+        let no_username = serde_json::json!({
+            "https://hub.docker.com": { "email": "vu@example.com" },
+            "sub": "auth0|0000",
+        });
+        assert_eq!(account_name(Some(&no_username)), "vu@example.com");
+    }
+
     #[tokio::test]
     async fn a_sign_in_moves_to_another_device_and_leaves_this_one() {
         let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1367,21 +1391,23 @@ mod smoke {
             let probe = Command::new([super::super::ENGINE_PROGRAM, "--version"]);
             let probe = run_to_end(&p, &id, probe).await;
             assert!(!probe.is_ok_and(|done| done.exit.success()), "Blank has no Zeron");
-            let install = run_to_end(&p, &id, super::super::install_command(&edge))
+            let install = run_to_end(&p, &id, super::super::install_zeron(&edge))
                 .await
                 .unwrap();
             assert!(install.exit.success(), "install: {}", install.failure());
             eprintln!("smoke: installed {}", install.stdout.trim());
 
             // A detached program outlives its call, and starting it again
-            // replaces it.
-            let detach = || Command::new(["sleep", "600"]).detached();
+            // replaces it. Docker's image runs `sleep`s of its own, so ours
+            // is told apart by its argument.
+            let detach = || Command::new(["sleep", "617"]).detached();
+            let ours = "pgrep -fx 'sleep 617'";
             let started = run_to_end(&p, &id, detach()).await.unwrap();
             assert!(started.exit.success(), "{}", started.failure());
-            let first = sh(&p, &id, "pgrep -x sleep").await.stdout;
+            let first = sh(&p, &id, ours).await.stdout;
             assert_eq!(first.lines().count(), 1, "running: {first}");
             run_to_end(&p, &id, detach()).await.unwrap();
-            let second = sh(&p, &id, "pgrep -x sleep").await.stdout;
+            let second = sh(&p, &id, ours).await.stdout;
             assert!(
                 second.lines().count() == 1 && second != first,
                 "replaced: {first} → {second}"
@@ -1391,7 +1417,7 @@ mod smoke {
             p.stop(&id).await.unwrap();
             eprintln!("smoke: stopped");
             p.start(&id).await.unwrap();
-            let after = sh(&p, &id, "pgrep -x sleep | head -1").await.stdout;
+            let after = sh(&p, &id, ours).await.stdout;
             assert_eq!(after, second, "a stop and start is a suspend");
         };
         // Delete it even when a check failed.
