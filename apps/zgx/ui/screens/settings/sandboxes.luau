@@ -302,7 +302,9 @@ local function connect_on_page()
 		local until_at = os.time() + (tonumber(shown.expiresIn) or 900)
 		-- (Only while this code shows: closed, approved or run out, it stops.)
 		local function waiting(): boolean
-			return connect_open:peek() and code:peek() == shown and os.time() <= until_at
+			-- (A state holds a copy: the code's own words say which.)
+			local now = code:peek()
+			return connect_open:peek() and now ~= nil and now.userCode == shown.userCode and os.time() <= until_at
 		end
 		local function look()
 			ui.after(POLL_MS, function()
