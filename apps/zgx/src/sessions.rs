@@ -1285,6 +1285,12 @@ impl Sessions {
                     ("cloud", Value::Bool(is_cloud(d))),
                     ("here", Value::Bool(here.as_deref() == Some(id))),
                     ("online", Value::Bool(online)),
+                    // Settings › Sandboxes: whether it can keep a sandbox
+                    // provider's key (the host device), and whether it's an
+                    // always-on `zeron headless` (else a laptop's sleep stops
+                    // the sandboxes it keeps).
+                    ("host", Value::Bool(has_capability(d, "sandbox-host-v1"))),
+                    ("headless", Value::Bool(has_capability(d, "headless-v1"))),
                 ];
                 // A sandbox's engine (spec #37): the provider it's of. Lists
                 // hide it and offer the provider instead (`sandbox:<provider>`).
@@ -1731,6 +1737,13 @@ pub(crate) fn is_cloud(d: &Json) -> bool {
         || d["capabilities"]
             .as_array()
             .is_some_and(|c| c.iter().any(|c| matches!(c.as_str(), Some("cloud-session" | "cloud-account"))))
+}
+
+/// Whether device row `d` says it has `capability`.
+fn has_capability(d: &Json, capability: &str) -> bool {
+    d["capabilities"]
+        .as_array()
+        .is_some_and(|c| c.iter().any(|c| c.as_str() == Some(capability)))
 }
 
 /// Why the engine didn't remove a device, as a word for the page.
@@ -2695,6 +2708,31 @@ mod tests {
             assert_eq!(d.field("online"), Some(&zgx_script::Value::Bool(online)), "{id}");
             assert_eq!(d.field("seen").and_then(|n| n.as_f64()), seen, "{id}");
         }
+    }
+
+    /// Settings › Sandboxes picks a host device among those that can be one
+    /// (`sandbox-host-v1`), and says a laptop's sleep stops its sandboxes:
+    /// one that isn't an always-on `zeron headless` (`headless-v1`).
+    #[test]
+    fn a_device_says_whether_it_can_be_a_host_device_and_is_headless() {
+        let s = Sessions::default();
+        *s.here.borrow_mut() = Some("mac".into());
+        *s.devices.borrow_mut() = json!([
+            { "id": "mac", "platform": "macos", "capabilities": ["sandbox-host-v1"] },
+            { "id": "box", "platform": "linux", "capabilities": ["sandbox-host-v1", "headless-v1"] },
+            { "id": "old", "platform": "linux" },
+        ]);
+        let v = s.value();
+        let device = |id: &str| v.field("devices").unwrap().list().iter().find(|d| d.field("id").map(crate::auth::text).as_deref() == Some(id)).unwrap().clone();
+        let flag = |id: &str, name: &str| device(id).field(name).cloned();
+        use zgx_script::Value::Bool;
+        assert_eq!(flag("mac", "host"), Some(Bool(true)));
+        assert_eq!(flag("mac", "headless"), Some(Bool(false)));
+        assert_eq!(flag("box", "host"), Some(Bool(true)));
+        assert_eq!(flag("box", "headless"), Some(Bool(true)));
+        // An older Zeron says neither.
+        assert_eq!(flag("old", "host"), Some(Bool(false)));
+        assert_eq!(flag("old", "headless"), Some(Bool(false)));
     }
 
     use super::rfc3339 as iso;

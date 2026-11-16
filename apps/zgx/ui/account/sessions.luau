@@ -108,7 +108,9 @@ export type Project = { id: string, name: string, device: string, path: string, 
 -- device to pick.
 -- `sandbox`: the provider whose sandbox it is (an engine in one chat's
 -- sandbox, spec #37): never listed, its provider is.
-export type Device = { id: string, name: string, platform: string, here: boolean, online: boolean?, seen: number?, version: string?, cloud: boolean?, sandbox: string? }
+-- `host`: it can be a sandbox provider's host device; `headless`: an
+-- always-on `zeron headless` (Settings › Sandboxes).
+export type Device = { id: string, name: string, platform: string, here: boolean, online: boolean?, seen: number?, version: string?, cloud: boolean?, sandbox: string?, host: boolean?, headless: boolean? }
 export type Section = { id: string, name: string, sessions: { string }, collapsed: boolean? }
 export type Places = { pinned: { string }, sections: { Section } }
 export type Now = {

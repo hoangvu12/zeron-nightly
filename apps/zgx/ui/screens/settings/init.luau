@@ -35,6 +35,7 @@ local members = require("@app/screens/settings/members")
 local about = require("@app/screens/settings/about")
 local cloud_page = require("@app/screens/settings/cloud")
 local billing_page = require("@app/screens/settings/billing")
+local sandboxes_page = require("@app/screens/settings/sandboxes")
 local cloud = require("@account/cloud")
 
 type Module = { ID: string, TITLE: string, view: () -> Node }
@@ -92,13 +93,16 @@ settings.add {
 
 -- Cloud and Billing, only while the account has Cloud (the shipping app's
 -- `cloud_offered`): listed ahead of Zeron's own, and found by the search
--- only then.
+-- only then. Sandboxes (your own cloud: Docker Sandbox, Boat) always, under
+-- the same heading, between them.
 settings.extra("cloud", function(): { any }
+	local sandboxes = { id = sandboxes_page.ID, title = sandboxes_page.TITLE, icon = "global", group = "Cloud", view = sandboxes_page.view }
 	if not cloud.offered() then
-		return {}
+		return { sandboxes }
 	end
 	return {
 		{ id = cloud_page.ID, title = cloud_page.TITLE, icon = "cloud", group = "Cloud", view = cloud_page.view, private = true },
+		sandboxes,
 		{ id = billing_page.ID, title = billing_page.TITLE, icon = "wallet", group = "Cloud", view = billing_page.view, private = true },
 	}
 end)

@@ -667,6 +667,11 @@ impl WorkspaceHost {
         self.mutate(|doc| doc.set_sandbox_host(host));
     }
 
+    /// `provider` was disconnected: the registry names no host device for it.
+    pub fn clear_sandbox_host(&self, provider: &str) {
+        self.mutate(|doc| doc.clear_sandbox_host(provider));
+    }
+
     /// Test seam: write a foreign device row (the relay version gate and the
     /// dial gate read these; production rows arrive via registry sync).
     #[doc(hidden)]

@@ -362,6 +362,13 @@ local answers: { [string]: (arg: any) -> any } = {
 		local name = string.match(arg.path, "[^/]+$") or arg.path
 		return settled({ path = arg.path, name = name, w = 512, h = 512 })
 	end,
+	-- Settings › Sandboxes' engine (ui/sandbox_settings_stub.luau).
+	["sandbox_settings.ask"] = function(arg: any)
+		return require("./sandbox_settings_stub").answer(arg)
+	end,
+	["sandbox_settings.change"] = function(arg: any)
+		return require("./sandbox_settings_stub").answer(arg)
+	end,
 }
 
 local function detail(arg: any): string
@@ -616,6 +623,8 @@ ui.command {
 -- Cloud, Billing and GitHub for Cloud (Settings → Cloud and → Billing),
 -- the same way: none until `cloud_stub.offer`.
 require("./cloud_stub")
+-- Settings › Sandboxes' providers, host device and step scripts.
+require("./sandbox_settings_stub")
 -- The ACP registry's agents (Settings → Providers → Add an agent).
 require("./registry_stub")
 

@@ -2456,6 +2456,7 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // A provider's own calls (delete a sandbox), or a host device handing
         // one over to the next.
         methods::CONNECT_SANDBOX_PROVIDER
+        | methods::DISCONNECT_SANDBOX_PROVIDER
         | methods::ADOPT_SANDBOX_PROVIDER
         | methods::SET_SANDBOX_HOST => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
@@ -2505,6 +2506,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_SANDBOX_PROVIDERS
             | methods::LIST_SANDBOX_TEMPLATES
             | methods::CONNECT_SANDBOX_PROVIDER
+            | methods::DISCONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN

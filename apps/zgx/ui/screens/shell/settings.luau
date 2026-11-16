@@ -162,6 +162,7 @@ local TITLE_KEYS: { [string]: { string } } = {
 	profile = { "Account", "settings.profile.title" },
 	cloud = { "Cloud", "settings.cloud.title" },
 	billing = { "Billing", "settings.billing.title" },
+	sandboxes = { "Sandboxes", "settings.sandboxes.title" },
 	about = { "About & updates", "settings.about.title" },
 	archived = { "Archived", "settings.archived.title" },
 	plugins = { "Plugins", "plugins.page.title" },

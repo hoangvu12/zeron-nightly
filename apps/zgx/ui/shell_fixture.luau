@@ -253,8 +253,10 @@ ui.shared("agent_icons", {} :: { [string]: string }):set({
 local model = {
 	here = "mac",
 	devices = {
-		{ id = "mac", name = "MacBook Pro", platform = "macos", here = true },
-		{ id = "box", name = "devbox", platform = "linux", here = false },
+		-- (Both can be a sandbox provider's host device; devbox is an
+		-- always-on `zeron headless`.)
+		{ id = "mac", name = "MacBook Pro", platform = "macos", here = true, host = true, headless = false },
+		{ id = "box", name = "devbox", platform = "linux", here = false, host = true, headless = true },
 	} :: { any },
 	projects = {
 		{ id = "atlas", name = "Atlas", device = "mac", path = "/work/atlas", git = true },

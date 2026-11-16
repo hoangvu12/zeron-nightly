@@ -22,6 +22,7 @@ pub(super) fn handles(method: &str) -> bool {
         methods::LIST_SANDBOX_PROVIDERS
             | methods::LIST_SANDBOX_TEMPLATES
             | methods::CONNECT_SANDBOX_PROVIDER
+            | methods::DISCONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
@@ -262,6 +263,11 @@ impl EngineRpc {
                 });
                 RpcReply::value(&serde_json::json!({ "deviceCode": shown }))
             }
+            methods::DISCONNECT_SANDBOX_PROVIDER => {
+                let p: ProviderParams = parse_params(params.clone())?;
+                self.disconnect(sandboxes, &p.provider, params).await?;
+                RpcReply::value(&json!({ "ok": true }))
+            }
             methods::SANDBOX_STEPS => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.steps(&p.chat_id))
@@ -454,6 +460,49 @@ impl EngineRpc {
                 .or_else(|| Some(me.clone())),
         });
         Ok(me)
+    }
+
+    /// `DisconnectSandboxProvider`: the host device forgets the key (its
+    /// slot and session), and the registry names no host device for it.
+    /// Asked of another device, it goes to the host device; one that can't
+    /// be reached refuses, since its key would stay behind.
+    async fn disconnect(
+        &self,
+        sandboxes: &Sandboxes,
+        provider: &str,
+        params: Value,
+    ) -> Result<(), RpcError> {
+        let built = sandboxes
+            .provider_named(provider)
+            .ok_or_else(|| RpcError::Failed(format!("{provider} isn't on this device.")))?;
+        let host = self
+            .workspace
+            .sandbox_host(provider)
+            .map(|host| host.host_device_id)
+            .filter(|host| host != self.this_device());
+        if let Some(host) = host
+            && !routed(&params)
+        {
+            let reply = self
+                .forward(&host, methods::DISCONNECT_SANDBOX_PROVIDER, route(params))
+                .await
+                .map_err(|err| {
+                    if unreachable(&err) {
+                        RpcError::Failed(format!(
+                            "The host device is offline, so it can't let go of {}. Try again once it's online.",
+                            built.name()
+                        ))
+                    } else {
+                        err
+                    }
+                })?;
+            reply_value(reply, methods::DISCONNECT_SANDBOX_PROVIDER)?;
+            return Ok(());
+        }
+        // This device keeps it (or none does): forget it here.
+        built.forget_key().await;
+        self.workspace.clear_sandbox_host(provider);
+        Ok(())
     }
 
     /// Become the provider's host device ([`Handover`]).

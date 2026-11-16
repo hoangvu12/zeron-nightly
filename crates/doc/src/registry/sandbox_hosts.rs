@@ -31,6 +31,14 @@ impl RegistryDoc {
         ]);
         self.write(KIND_SANDBOX_HOSTS, &host.provider, OpKind::Upsert, set);
     }
+
+    /// `provider` was disconnected: no device is its host device any more
+    /// (a later connect names one again, its write the newer).
+    pub fn clear_sandbox_host(&mut self, provider: &str) {
+        if self.row_exists(KIND_SANDBOX_HOSTS, provider) {
+            self.delete_row_ops(&[(KIND_SANDBOX_HOSTS, provider)]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -53,7 +61,26 @@ mod tests {
             ..laptop
         };
         doc.set_sandbox_host(&server);
-        assert_eq!(doc.sandbox_hosts(), [server]);
+        assert_eq!(doc.sandbox_hosts(), [server.clone()]);
         assert_eq!(doc.sandbox_host("boat"), None);
+    }
+
+    #[test]
+    fn a_disconnected_provider_names_no_host_device_until_it_connects_again() {
+        let mut doc = RegistryDoc::new("laptop");
+        let server = SandboxHost {
+            provider: "docker".into(),
+            host_device_id: "server".into(),
+            connected_on: Some("laptop".into()),
+        };
+        doc.set_sandbox_host(&server);
+        doc.clear_sandbox_host("docker");
+        assert_eq!(doc.sandbox_host("docker"), None);
+        assert!(doc.sandbox_hosts().is_empty());
+        // (Clearing one that isn't there is nothing.)
+        doc.clear_sandbox_host("boat");
+        // Connected again, it's named again.
+        doc.set_sandbox_host(&server);
+        assert_eq!(doc.sandbox_host("docker"), Some(server));
     }
 }

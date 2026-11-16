@@ -232,6 +232,13 @@ pub mod methods {
     /// host device (`SandboxHost`; picked if there's none yet) once and stays
     /// there; the account shows in that device's `ListSandboxProviders`.
     pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
+    /// `{provider}` → `{ok}`: Settings' Disconnect. The provider's host
+    /// device clears its key slot and session, and the registry names no
+    /// host device for it; asked of another device, it goes to the host
+    /// device (an offline one refuses: its key would stay). Sandboxes
+    /// already made keep running; Zeron can't reach them until it's
+    /// connected again.
+    pub const DISCONNECT_SANDBOX_PROVIDER: &str = "DisconnectSandboxProvider";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
     /// state: starting|ready|failed|gone|sleeping|asleep|waking, step,
     /// since, error, diskFull,
@@ -1503,6 +1510,7 @@ mod tests {
             methods::STEP_UP,
             methods::LEND_TOKEN,
             methods::CONNECT_SANDBOX_PROVIDER,
+            methods::DISCONNECT_SANDBOX_PROVIDER,
             methods::ADOPT_SANDBOX_PROVIDER,
             methods::SET_SANDBOX_HOST,
             methods::DELETE_ACCOUNT,
