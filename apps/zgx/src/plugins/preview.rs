@@ -99,6 +99,8 @@ pub const BLOCKED: &[&str] = &[
     "cloud.sleep",
     "cloud.retry",
     "cloud.set_machine",
+    // (Restarts Zeron in a sandbox, and saves it at the provider.)
+    "sandbox_templates.save",
 ];
 
 pub fn blocked(action: &str) -> bool {

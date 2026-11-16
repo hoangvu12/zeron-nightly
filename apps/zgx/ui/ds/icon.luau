@@ -59,6 +59,7 @@ export type Name =
 	| "laptop"
 	| "list"
 	| "bot"
+	| "box"
 	| "remote-server"
 	| "project-default"
 	| "calendar"

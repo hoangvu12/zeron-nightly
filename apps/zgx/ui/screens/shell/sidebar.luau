@@ -32,6 +32,7 @@ local control = require("@ds/control")
 local locale = require("@ds/locale")
 local ds_session_row = require("@ds/session_row")
 local activity = require("@app/screens/shell/activity")
+local sandbox_templates = require("@account/sandbox_templates")
 
 export type Props = {
 	collapsed: State<boolean>,
@@ -865,6 +866,10 @@ local sleep_custom = ui.state("shell_sleep_custom", nil :: string?)
 local sleep_custom_at = ui.state("shell_sleep_custom_at", nil :: number?)
 local sleep_custom_open = ui.state("shell_sleep_custom_open", false)
 local new_title = ui.state("shell_rename_title", "")
+-- Save as template: the chat, its dialog, and the name typed.
+local templating = ui.state("shell_templating", nil :: string?)
+local template_open = ui.state("shell_template_open", false)
+local template_name = ui.state("shell_template_name", "")
 
 local function chat(id: string): sessions.Chat?
 	local now = sessions.now:peek()
@@ -985,6 +990,11 @@ end)
 -- The sessions the list shows, in its order (those folded away, and those
 -- past a group's "Show N more", left out): ⌘1–9 go to its first nine.
 M.order = ui.state("shell_sidebar_order", {} :: { string })
+-- Which of them run on a sandbox this device keeps (their menus offer Save
+-- as template), asked as they're listed.
+ui.effect(function()
+	sandbox_templates.check(M.order:get())
+end)
 -- ⌘ held alone: those nine wear their keys (Zeron's jump hints): shown at
 -- once, as Zeron's are, kept through the ⌘1–9 they offer, and only while
 -- this window is the one typed in and no palette has the keys. Any other
@@ -1237,6 +1247,18 @@ local function menu(id: string): { any }?
 		if side or activity.on:peek() then false else { label = locale.s("shell.sidebar.menu.move_to"), icon = "folder-with-files", submenu = into },
 		sleep,
 		stop_waiting,
+		-- (A chat on a sandbox this device keeps: saved for new chats to
+		-- start from, Zeron's identity left out.)
+		if sandbox_templates.can_save(id)
+			then {
+				label = locale.s("shell.sidebar.menu.save_template"),
+				icon = "box",
+				disabled = if sandbox_templates.saving(id) then locale.s("shell.sidebar.save_template.saving", { name = sandbox_templates.saves:peek()[id].name }) else nil,
+				on_select = function()
+					M.save_template(id)
+				end,
+			}
+			else false,
 		{ separator = true },
 		{
 			-- (No key: ⌘⌫ is a text field's, deleting to the line's start.)
@@ -1585,6 +1607,49 @@ local function rename_dialog(): Node
 	}
 end
 
+-- Save as template's dialog: a name (as the provider lists it), then Save.
+local function template_dialog(): Node
+	local function done()
+		local id = templating:peek()
+		local name = sandbox_templates.trimmed(template_name:peek())
+		if not id or name == "" then
+			return
+		end
+		templating:set(nil)
+		template_open:set(false)
+		sandbox_templates.save(id, name)
+	end
+	return ds.Dialog {
+		open = template_open,
+		title = ui.t("shell.sidebar.save_template.title") :: any,
+		body = ui.t("shell.sidebar.save_template.body") :: any,
+		size = "sm",
+		confirm = { label = ui.t("shell.sidebar.save_template.save") :: any, on_click = done },
+		ds.TextField {
+			value = template_name,
+			label = ui.t("shell.sidebar.save_template.name"),
+			placeholder = function(): string
+				return "reportly-dev"
+			end,
+			autofocus = true,
+			on_commit = function()
+				done()
+			end,
+			w_full = true,
+		},
+	}
+end
+
+-- Save as template, from a session's menu: its name asked first.
+function M.save_template(id: string)
+	if not sandbox_templates.can_save(id) or sandbox_templates.saving(id) then
+		return
+	end
+	templating:set(id)
+	template_name:set("")
+	template_open:set(true)
+end
+
 M.Sidebar = ui.component(function(props: Props): Node
 	probe.builds += 1
 	probe.built_at = ui.now()
@@ -1698,6 +1763,7 @@ M.Sidebar = ui.component(function(props: Props): Node
 		ui.div { absolute = true, left = 0, top = 0, w = ui.raw(5, "the window's gap"), h = ui.raw(42, "the top bar"), window_drag = true },
 		bar,
 		rename_dialog(),
+		template_dialog(),
 		delete_dialog(),
 		sleep_dialog(),
 		project_dialogs(),

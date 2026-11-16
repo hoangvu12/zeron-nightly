@@ -2387,7 +2387,8 @@
         "delete": "删除…",
         "rename": "重命名…",
         "remove": "移除…",
-        "edit_project": "编辑项目…"
+        "edit_project": "编辑项目…",
+        "save_template": "存为模板"
       },
       "project": {
         "rename_title": "重命名项目",
@@ -2462,6 +2463,15 @@
         "rename_title": "重命名会话",
         "name": "名称",
         "name_placeholder": "会话名称"
+      },
+      "save_template": {
+        "title": "存为模板",
+        "name": "模板名称",
+        "body": "保存此对话的沙盒，新对话可以从它开始。Zeron 的身份和登录信息不会保存。",
+        "save": "保存",
+        "saving": "正在将“{name}”存为模板…",
+        "couldnt": "无法保存模板",
+        "saved": "已存为模板 {name}"
       }
     },
     "boundary": {
