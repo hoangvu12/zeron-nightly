@@ -32,6 +32,9 @@ pub(super) fn handles(method: &str) -> bool {
 
 /// Set on a call one device sends another's way: answer it there.
 const ROUTED: &str = "routed";
+/// A device whose last presence beat is this recent is online (beats come
+/// every 15 s; the engine's own `PRESENCE_FRESH_MS`).
+const ONLINE_WITHIN_SECS: i64 = 45;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,15 +241,21 @@ impl EngineRpc {
         let target = match &current {
             Some(host) => host.host_device_id.clone(),
             None => {
-                let devices = self
-                    .workspace
-                    .read_devices()
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                pick_host(
-                    &devices,
-                    |id| self.workspace.peer_liveness(id) == zeron_rpc::PeerLiveness::Live,
-                    &me,
-                )
+                // The device list as it's shown: presence overlaid, so
+                // "online" means what the Devices page says it does.
+                let devices = self.workspace.watch_devices().borrow().clone();
+                let now = chrono::Utc::now();
+                let online = |id: &str| {
+                    id == me
+                        || devices.iter().any(|d| {
+                            d.id == id
+                                && d.last_seen_at.is_some_and(|seen| {
+                                    now.signed_duration_since(seen)
+                                        < chrono::Duration::seconds(ONLINE_WITHIN_SECS)
+                                })
+                        })
+                };
+                pick_host(&devices, online, &me)
             }
         };
         let handover = Handover {

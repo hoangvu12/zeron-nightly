@@ -139,6 +139,18 @@ async fn sees_online(rpc: &RpcClient, other: &str) {
     assert!(seen.is_some(), "{other} never came online");
 }
 
+/// Wait until `rpc`'s device has `other`'s row saying it's headless.
+async fn sees_headless(rpc: &RpcClient, other: &str) {
+    let seen = eventually(Duration::from_secs(30), async || {
+        let list = devices(rpc).await;
+        row(&list, other)
+            .is_some_and(|d| has_capability(d, "headless-v1"))
+            .then_some(())
+    })
+    .await;
+    assert!(seen.is_some(), "{other}'s row never said it's headless");
+}
+
 async fn host_of(rpc: &RpcClient) -> Value {
     rpc.call(methods::SANDBOX_HOST, json!({ "provider": "fake" }))
         .await
@@ -271,6 +283,7 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     let on_laptop = memory_client(laptop.core().rpc_service());
     let on_server = memory_client(server.core().rpc_service());
     sees_online(&on_laptop, &server_id).await;
+    sees_headless(&on_laptop, &server_id).await;
     // Nothing is connected yet.
     assert!(host_of(&on_laptop).await.is_null());
 
