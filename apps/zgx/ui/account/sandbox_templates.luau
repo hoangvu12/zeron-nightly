@@ -1,6 +1,7 @@
 -- Save as template (spec #37): a chat's sandbox saved through its provider,
 -- by the engine that keeps it (src/sandbox_templates.rs). Named apart from
--- the interface's own templates (`templates.*`).
+-- the interface's own templates (`templates.*`). What a save says is
+-- screens/shell/save_template's.
 --
 --   sandbox_templates.check(chats)    ask which chats run on a sandbox kept
 --                                     here (each once)
@@ -14,12 +15,12 @@
 --
 -- Each host call is a field (`ask_*`) a fixture can answer in the host's place.
 
-local locale = require("@ds/locale")
+local words = require("@app/screens/shell/save_template")
 
 local M = {}
 
 local KEPT = ui.shared("sandbox_templates", {} :: { [string]: any })
--- Chat → its last save: { name, state = "saving" | "saved" | "failed", why? }.
+-- Chat → its last save (screens/shell/save_template's).
 M.saves = ui.state("account_sandbox_template_saves", {} :: { [string]: any })
 
 function M.ask_check(chats: { string })
@@ -36,6 +37,8 @@ function M.read(): { [string]: any }
 	return KEPT:get() or {}
 end
 
+M.trimmed = words.trimmed
+
 function M.check(chats: { string })
 	if #chats > 0 then
 		M.ask_check(chats)
@@ -46,35 +49,16 @@ function M.can_save(chat: string?): boolean
 	return chat ~= nil and M.read()[chat] ~= nil
 end
 
--- The engine's words, or what an outcome word means.
-local function why(e: any): string
-	local m = if type(e) == "table" and type(e.message) == "string" then e.message else tostring(e)
-	if m == "offline" or m == "failed" or m == "outdated" or m == "signed_out" or m == "" then
-		return locale.s("shell.sidebar.save_template.couldnt")
-	end
-	return m
-end
-
--- The name as the engine saves it: trimmed.
-function M.trimmed(name: string): string
-	return string.match(name, "^%s*(.-)%s*$") or ""
-end
-
 function M.save(chat: string, name: string)
-	local now = M.saves:peek()[chat]
-	if now and now.state == "saving" then
+	if not words.can_start(M.saves:peek()[chat], name) then
 		return
 	end
-	name = M.trimmed(name)
-	if name == "" then
-		return
-	end
-	M.saves:set_key(chat, { name = name, state = "saving" } :: any)
-	M.ask_save(chat, name):after(function(t: any)
-		local saved = if type(t) == "table" and type(t.name) == "string" then t.name else name
-		M.saves:set_key(chat, { name = saved, state = "saved" } :: any)
+	local save = words.saving(name)
+	M.saves:set_key(chat, save)
+	M.ask_save(chat, save.name):after(function(t: any)
+		M.saves:set_key(chat, words.saved(save, t))
 	end, function(e: any)
-		M.saves:set_key(chat, { name = name, state = "failed", why = why(e) } :: any)
+		M.saves:set_key(chat, words.failed(save, e))
 	end)
 end
 
@@ -84,22 +68,12 @@ function M.saving(chat: string?): boolean
 end
 
 function M.notice(chat: string?): any
-	local s = chat and M.saves:get()[chat]
-	if not s then
-		return nil
-	end
-	if s.state == "saving" then
-		return { tone = "info", spinner = true, text = locale.s("shell.sidebar.save_template.saving", { name = s.name }) }
-	elseif s.state == "saved" then
-		return { tone = "success", dismissable = true, text = locale.s("shell.sidebar.save_template.saved", { name = s.name }) }
-	end
-	return { tone = "danger", dismissable = true, text = s.why or locale.s("shell.sidebar.save_template.couldnt") }
+	return words.notice(chat and M.saves:get()[chat])
 end
 
 function M.dismiss(chat: string?)
-	local s = chat and M.saves:peek()[chat]
-	if s and s.state ~= "saving" then
-		M.saves:set_key(chat :: string, nil :: any)
+	if chat and words.dismissable(M.saves:peek()[chat]) then
+		M.saves:set_key(chat, nil :: any)
 	end
 end
 

@@ -1,9 +1,8 @@
--- Save as template (spec #37, design 21–23): which chats offer it, what's
--- asked of the host, and what the chat's composer says while it saves, once
--- it's saved, and when it isn't. The host's calls are answered here
--- (account/sandbox_templates' `ask_*` fields).
+-- Save as template (spec #37, design 21–23): what a chat's save says on its
+-- composer while it saves, once it's saved, and when it isn't
+-- (screens/shell/save_template, pure functions).
 
-local templates = require("../account/sandbox_templates")
+local words = require("../screens/shell/save_template")
 
 -- (All findable by one filter: `zgx test ui "Save as template:"`.)
 local named_test = test
@@ -11,102 +10,42 @@ local function test(name: string, body: () -> ())
 	named_test(`Save as template: {name}`, body)
 end
 
--- A promise the test settles.
-local function pending(): any
-	local p: any = {}
-	function p.after(_self: any, ok: (any) -> (), err: (any) -> ())
-		p.ok, p.err = ok, err
-	end
-	return p
-end
-
-local function fresh()
-	templates.saves:set({})
-	templates.read = function(): { [string]: any }
-		return { ["chat-a"] = { provider = "docker" } }
-	end
-end
-
-test("only a chat on a sandbox kept here offers it", function()
-	fresh()
-	expect(templates.can_save("chat-a")).to_be(true)
-	expect(templates.can_save("chat-b")).to_be(false)
-	expect(templates.can_save(nil)).to_be(false)
+test("it saves under the name trimmed, and a blank one saves nothing", function()
+	expect(words.trimmed("  reportly-dev ")).to_be("reportly-dev")
+	expect(words.saving(" reportly-dev ").name).to_be("reportly-dev")
+	expect(words.can_start(nil, "reportly-dev")).to_be(true)
+	expect(words.can_start(nil, "   ")).to_be(false)
 end)
 
-test("the chats listed are asked about, none when there are none", function()
-	local asked: { any } = {}
-	templates.ask_check = function(chats: { string })
-		table.insert(asked, chats)
-	end
-	templates.check({})
-	templates.check({ "chat-a", "chat-b" })
-	expect(#asked).to_be(1)
-	expect(asked[1][2]).to_be("chat-b")
+test("while it saves: a spinner naming it, no second save, and it stays", function()
+	local save = words.saving("reportly-dev")
+	local n = words.notice(save)
+	expect(n.spinner).to_be(true)
+	expect(n.text).to_be("Saving “reportly-dev” as a template…")
+	expect(n.dismissable).to_be(nil)
+	expect(words.can_start(save, "other")).to_be(false)
+	expect(words.dismissable(save)).to_be(false)
 end)
 
-test("it saves under the name trimmed, saying so until it's saved", function()
-	fresh()
-	local asked: any = nil
-	local p = pending()
-	templates.ask_save = function(chat: string, name: string): any
-		asked = { chat = chat, name = name }
-		return p
-	end
-	templates.save("chat-a", "  reportly-dev ")
-	expect(asked.chat).to_be("chat-a")
-	expect(asked.name).to_be("reportly-dev")
-	expect(templates.saving("chat-a")).to_be(true)
-	local saving = templates.notice("chat-a")
-	expect(saving.spinner).to_be(true)
-	expect(string.find(saving.text, "reportly-dev", 1, true) ~= nil).to_be(true)
-	-- Saving already: a second Save asks nothing more.
-	asked = nil
-	templates.save("chat-a", "other")
-	expect(asked).to_be(nil)
-	-- (Still saving: it can't be put away.)
-	templates.dismiss("chat-a")
-	expect(templates.saving("chat-a")).to_be(true)
-
-	p.ok({ id = "tmpl_1", name = "reportly-dev" })
-	local saved = templates.notice("chat-a")
-	expect(saved.tone).to_be("success")
-	expect(saved.dismissable).to_be(true)
-	expect(saved.text).to_be("Saved as template reportly-dev")
-	expect(templates.notice("chat-b")).to_be(nil)
-	templates.dismiss("chat-a")
-	expect(templates.notice("chat-a")).to_be(nil)
+test("saved: a check and its name, put away with ×", function()
+	local save = words.saved(words.saving("reportly-dev"), { id = "tmpl_1", name = "reportly-dev" })
+	local n = words.notice(save)
+	expect(n.tone).to_be("success")
+	expect(n.dismissable).to_be(true)
+	expect(n.text).to_be("Saved as template reportly-dev")
+	expect(words.dismissable(save)).to_be(true)
+	expect(words.can_start(save, "again")).to_be(true)
+	-- (No name back: the one asked for.)
+	expect(words.saved(words.saving("x"), nil).name).to_be("x")
+	expect(words.notice(nil)).to_be(nil)
 end)
 
-test("a blank name saves nothing", function()
-	fresh()
-	local asked = false
-	templates.ask_save = function(): any
-		asked = true
-		return pending()
-	end
-	templates.save("chat-a", "   ")
-	expect(asked).to_be(false)
-	expect(templates.notice("chat-a")).to_be(nil)
-end)
-
-test("not saved: the engine's words, or its own when there are none", function()
-	fresh()
-	local p = pending()
-	templates.ask_save = function(): any
-		return p
-	end
-	templates.save("chat-a", "reportly-dev")
-	p.err({ message = "The chat is still working. Save it as a template once it's done." })
-	local busy = templates.notice("chat-a")
+test("not saved: the engine's words, or ours when there are none", function()
+	local save = words.saving("reportly-dev")
+	local busy = words.notice(words.failed(save, { message = "The chat is still working. Save it as a template once it's done." }))
 	expect(busy.tone).to_be("danger")
+	expect(busy.dismissable).to_be(true)
 	expect(busy.text).to_be("The chat is still working. Save it as a template once it's done.")
-	-- Again, offline.
-	local q = pending()
-	templates.ask_save = function(): any
-		return q
-	end
-	templates.save("chat-a", "reportly-dev")
-	q.err({ message = "offline" })
-	expect(templates.notice("chat-a").text).to_be("Couldn’t save the template")
+	expect(words.notice(words.failed(save, { message = "offline" })).text).to_be("Couldn’t save the template")
+	expect(words.notice(words.failed(save, "failed")).text).to_be("Couldn’t save the template")
 end)
