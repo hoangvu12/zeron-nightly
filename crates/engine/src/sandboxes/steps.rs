@@ -161,6 +161,25 @@ pub struct SandboxSteps {
     /// The step script running now, and those that failed.
     #[serde(default)]
     pub scripts: Vec<ScriptRun>,
+    /// Its last start (a new chat's, or Start fresh's), and when it got
+    /// ready: the chat's "Sandbox ready 52s" ("Fresh sandbox ready 58s").
+    /// Kept through sleep and wake; none for a record from before it.
+    #[serde(default)]
+    pub started: Option<Started>,
+}
+
+/// A sandbox's start, from its first step to ready.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Started {
+    /// When it began, epoch ms.
+    pub at: i64,
+    /// When it got ready, epoch ms (none while it starts).
+    #[serde(default)]
+    pub ready_at: Option<i64>,
+    /// It was Start fresh: a new sandbox for a chat that had one.
+    #[serde(default)]
+    pub fresh: bool,
 }
 
 impl SandboxSteps {
@@ -170,6 +189,7 @@ impl SandboxSteps {
         template: Option<String>,
         device_id: &str,
     ) -> Self {
+        let now = crate::now_ms();
         Self {
             chat_id: chat_id.to_owned(),
             provider: provider.to_owned(),
@@ -178,7 +198,7 @@ impl SandboxSteps {
             device_id: device_id.to_owned(),
             state: SandboxState::Starting,
             step: Some(Step::STARTING[0]),
-            since: crate::now_ms(),
+            since: now,
             error: None,
             disk_full: false,
             steps: Step::STARTING
@@ -189,6 +209,11 @@ impl SandboxSteps {
                 })
                 .collect(),
             scripts: Vec::new(),
+            started: Some(Started {
+                at: now,
+                ready_at: None,
+                fresh: false,
+            }),
         }
     }
 
@@ -249,6 +274,9 @@ impl SandboxSteps {
             &self.device_id,
         );
         fresh.sandbox_id = sandbox;
+        if let Some(started) = &mut fresh.started {
+            started.fresh = true;
+        }
         *self = fresh;
     }
 
@@ -290,6 +318,12 @@ impl SandboxSteps {
         self.step = None;
         self.since = crate::now_ms();
         self.error = None;
+        // (Its first time ready since it started: a wake isn't a start.)
+        if let Some(started) = &mut self.started
+            && started.ready_at.is_none()
+        {
+            started.ready_at = Some(self.since);
+        }
     }
 
     /// Run again: the failed step (and what follows) runs once more.
@@ -384,6 +418,40 @@ mod tests {
         assert_eq!(steps.device_id, "device");
         assert_eq!(steps.template.as_deref(), Some("tpl"));
         assert!(steps.steps.iter().all(|s| s.state == StepState::Pending));
+    }
+
+    /// "Sandbox ready 52s": when its start began and when it got ready, a
+    /// wake leaving that be; Start fresh is a start of its own, marked so.
+    #[test]
+    fn a_start_says_when_it_got_ready_and_a_wake_leaves_it_be() {
+        let mut steps = SandboxSteps::new("chat", "fake", None, "device");
+        let began = steps.started.clone().unwrap();
+        assert_eq!(began.ready_at, None);
+        assert!(!began.fresh);
+        steps.begin(Step::Create);
+        steps.ready();
+        let ready = steps.started.clone().unwrap();
+        assert_eq!(ready.at, began.at);
+        assert_eq!(ready.ready_at, Some(steps.since));
+        let json = serde_json::to_value(&steps).unwrap();
+        assert_eq!(json["started"]["readyAt"], steps.since);
+        assert_eq!(json["started"]["fresh"], false);
+        steps.asleep();
+        steps.waking();
+        steps.ready();
+        assert_eq!(steps.started, Some(ready), "a wake isn't a start");
+        steps.gone();
+        steps.fresh(None);
+        let fresh = steps.started.clone().unwrap();
+        assert!(fresh.fresh);
+        assert_eq!(fresh.ready_at, None);
+        steps.ready();
+        assert!(steps.started.unwrap().ready_at.is_some());
+        // A record from before it reads none.
+        let mut old = serde_json::to_value(SandboxSteps::new("c", "fake", None, "d")).unwrap();
+        old.as_object_mut().unwrap().remove("started");
+        let old: SandboxSteps = serde_json::from_value(old).unwrap();
+        assert_eq!(old.started, None);
     }
 
     #[test]
