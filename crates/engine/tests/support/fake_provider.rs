@@ -20,7 +20,7 @@ use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use zeron_engine::sandboxes::{
     Command, CreateSandbox, ErrorKind, Exit, Ops, Placement, ProviderError, RunEvent, RunStream,
-    SandboxProvider, SandboxStatus,
+    SandboxProvider, SandboxStatus, Template,
 };
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, HarnessId, LentSignIn};
 
@@ -62,21 +62,31 @@ pub struct Resident {
 
 struct FakeBox {
     dir: PathBuf,
+    /// Its engine's data folder (`ZERON_DATA_DIR` there): one per sandbox
+    /// made, so a new one under the same name starts apart.
+    data_dir: PathBuf,
     running: bool,
     engine: Option<EngineRuntime>,
-    /// The key of the sign-in its engine was lent.
-    lent_key: Option<String>,
+    /// The sign-in its engine was lent.
+    lent: Option<LentSignIn>,
 }
 
 impl FakeBox {
-    fn new(dir: PathBuf, running: bool) -> Self {
+    fn new(dir: PathBuf, made: usize, running: bool) -> Self {
         Self {
+            data_dir: dir.join(format!("zeron-data-{made}")),
             dir,
             running,
             engine: None,
-            lent_key: None,
+            lent: None,
         }
     }
+}
+
+/// A saved template: a copy of the sandbox's disk.
+struct Saved {
+    template: Template,
+    dir: PathBuf,
 }
 
 #[derive(Default)]
@@ -89,6 +99,7 @@ struct State {
     disk_full: bool,
     /// Sandboxes made so far: each one's engine keeps its data apart.
     made: usize,
+    saved: Vec<Saved>,
 }
 
 pub struct FakeProvider {
@@ -127,7 +138,7 @@ impl FakeProvider {
             .lock()
             .unwrap()
             .boxes
-            .insert("box".into(), FakeBox::new(root.join("box"), true));
+            .insert("box".into(), FakeBox::new(root.join("box"), 0, true));
         Arc::new(provider)
     }
 
@@ -140,7 +151,7 @@ impl FakeProvider {
             .lock()
             .unwrap()
             .boxes
-            .insert("pc".into(), FakeBox::new(root.join("pc"), false));
+            .insert("pc".into(), FakeBox::new(root.join("pc"), 0, false));
         provider.resident = Some(resident);
         Arc::new(provider)
     }
@@ -194,13 +205,39 @@ impl FakeProvider {
 
     /// The key of the sign-in `sandbox`'s engine was lent, once it started.
     pub fn lent_key(&self, sandbox: &str) -> Option<String> {
-        self.state
-            .lock()
-            .unwrap()
-            .boxes
-            .get(sandbox)?
-            .lent_key
-            .clone()
+        self.lent(sandbox).map(|(key, _)| key)
+    }
+
+    /// The sign-in `sandbox`'s engine was lent: `(key, token)`.
+    pub fn lent(&self, sandbox: &str) -> Option<(String, String)> {
+        let state = self.state.lock().unwrap();
+        let lent = state.boxes.get(sandbox)?.lent.as_ref()?;
+        Some((lent.key.clone(), lent.token.clone()))
+    }
+
+    /// `sandbox`'s engine's data folder.
+    pub fn data_dir(&self, sandbox: &str) -> Option<PathBuf> {
+        Some(self.state.lock().unwrap().boxes.get(sandbox)?.data_dir.clone())
+    }
+
+    /// The templates saved, in order.
+    pub fn saved(&self) -> Vec<Template> {
+        let state = self.state.lock().unwrap();
+        state.saved.iter().map(|s| s.template.clone()).collect()
+    }
+
+    /// What template `id` holds: each file's path in the sandbox (`home/…`,
+    /// and `zeron-data/…` for its engine's data) and its bytes.
+    pub fn template_files(&self, id: &str) -> Vec<(String, Vec<u8>)> {
+        let dir = {
+            let state = self.state.lock().unwrap();
+            let saved = state.saved.iter().find(|s| s.template.id == id);
+            saved.expect("a saved template").dir.clone()
+        };
+        let mut files = Vec::new();
+        list_files(&dir, &dir, &mut files);
+        files.sort();
+        files
     }
 
     async fn discard(&self, sandbox: &str) -> bool {
@@ -255,7 +292,7 @@ impl FakeProvider {
 
     /// `zeron-engine headless`, detached: boot an engine from the command's
     /// environment, as the real binary reads its own.
-    fn boot(&self, sandbox: &str, dir: &Path, env: &BTreeMap<String, String>) -> RunStream {
+    fn boot(&self, sandbox: &str, env: &BTreeMap<String, String>) -> RunStream {
         let var = |name: &str| env.get(name).cloned();
         let [lender, key, token] = LentSignIn::ENV.map(var);
         let lent = match (lender, key, token) {
@@ -270,8 +307,8 @@ impl FakeProvider {
             let Some(fake) = state.boxes.get_mut(sandbox) else {
                 return exit_with(1, "the sandbox is gone");
             };
-            fake.lent_key = Some(lent.key.clone());
-            dir.join(format!("zeron-data-{}", state.made))
+            fake.lent = Some(lent.clone());
+            fake.data_dir.clone()
         };
         std::fs::create_dir_all(&data_dir).unwrap();
         if let Some(device) = var(zeron_engine::sandboxes::DEVICE_ID_ENV) {
@@ -280,6 +317,31 @@ impl FakeProvider {
         let config = engine_config(&data_dir, &edge_url, Some(lent));
         self.spawn_engine(sandbox, config);
         futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed()
+    }
+
+    /// `zeron-engine forget-device`: its engine quiesced and stopped, then
+    /// Zeron's identity wiped from its data, as the real command does.
+    async fn forget(&self, sandbox: &str) -> RunStream {
+        let (engine, data_dir) = {
+            let mut state = self.state.lock().unwrap();
+            let Some(fake) = state.boxes.get_mut(sandbox) else {
+                return exit_with(1, "the sandbox is gone");
+            };
+            (fake.engine.take(), fake.data_dir.clone())
+        };
+        if let Some(engine) = engine {
+            if let Err(busy) = engine.core().doc_host.quiesce_for_sleep().await {
+                if let Some(fake) = self.state.lock().unwrap().boxes.get_mut(sandbox) {
+                    fake.engine = Some(engine);
+                }
+                return exit_with(75, &format!("busy: {busy}"));
+            }
+            engine.shutdown().await;
+        }
+        match zeron_engine::sandboxes::forget_device_files(&data_dir) {
+            Ok(()) => futures::stream::iter([Ok(RunEvent::Exit(Exit::code(0)))]).boxed(),
+            Err(err) => exit_with(1, &err.to_string()),
+        }
     }
 
     fn spawn_engine(&self, sandbox: &str, config: EngineConfig) {
@@ -309,6 +371,38 @@ fn writable(dir: &Path) {
             #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             let _ = std::fs::set_permissions(&path, perms);
+        }
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target);
+        } else {
+            // (A file held open, a lock, is copied as far as it reads.)
+            let _ = std::fs::copy(&path, &target);
+        }
+    }
+}
+
+fn list_files(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            list_files(root, &path, out);
+        } else {
+            let name = path.strip_prefix(root).unwrap().to_string_lossy();
+            out.push((name.replace('\\', "/"), std::fs::read(&path).unwrap_or_default()));
         }
     }
 }
@@ -371,7 +465,17 @@ impl SandboxProvider for FakeProvider {
         std::fs::create_dir_all(dir.join("home")).unwrap();
         let mut state = self.state.lock().unwrap();
         state.made += 1;
-        state.boxes.insert(sandbox.clone(), FakeBox::new(dir, true));
+        let fake = FakeBox::new(dir, state.made, true);
+        // From a saved template: its disk, as it was saved.
+        if let Some(id) = &request.template {
+            let saved = state.saved.iter().find(|s| &s.template.id == id);
+            let saved = saved.ok_or_else(|| {
+                ProviderError::new(ErrorKind::NotFound, format!("no template {id}"))
+            })?;
+            copy_dir(&saved.dir.join("home"), &fake.dir.join("home"));
+            copy_dir(&saved.dir.join("zeron-data"), &fake.data_dir);
+        }
+        state.boxes.insert(sandbox.clone(), fake);
         Ok(sandbox)
     }
 
@@ -425,6 +529,32 @@ impl SandboxProvider for FakeProvider {
         Ok(())
     }
 
+    async fn templates(&self) -> Result<Vec<Template>, ProviderError> {
+        Ok(self.saved())
+    }
+
+    /// A copy of the sandbox's whole disk: its home and its engine's data.
+    async fn save_template(&self, sandbox: &str, name: &str) -> Result<Template, ProviderError> {
+        self.record(format!("save {sandbox}: {name}"));
+        let mut state = self.state.lock().unwrap();
+        let fake = state.boxes.get(sandbox).ok_or_else(|| {
+            ProviderError::new(ErrorKind::NotFound, format!("no sandbox {sandbox}"))
+        })?;
+        let id = format!("tmpl-{}", state.saved.len() + 1);
+        let dir = self.root.join("templates").join(&id);
+        copy_dir(&fake.dir.join("home"), &dir.join("home"));
+        copy_dir(&fake.data_dir, &dir.join("zeron-data"));
+        let template = Template {
+            id,
+            name: name.to_owned(),
+        };
+        state.saved.push(Saved {
+            template: template.clone(),
+            dir,
+        });
+        Ok(template)
+    }
+
     async fn run(&self, sandbox: &str, command: Command) -> Result<RunStream, ProviderError> {
         self.record(format!("run {sandbox}: {}", command.args.join(" ")));
         let dir = self.dir(sandbox)?;
@@ -442,8 +572,9 @@ impl SandboxProvider for FakeProvider {
                 .boxed(),
                 // Under its watchdog, as Zeron starts it, or bare.
                 Some("watchdog" | "headless") if command.detach => {
-                    self.boot(sandbox, &dir, &command.env)
+                    self.boot(sandbox, &command.env)
                 }
+                Some(zeron_engine::sandboxes::FORGET_DEVICE) => self.forget(sandbox).await,
                 _ => exit_with(127, "zeron-engine: not found"),
             });
         }

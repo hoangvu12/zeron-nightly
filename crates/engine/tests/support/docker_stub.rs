@@ -62,6 +62,14 @@ pub struct State {
     /// Close this many next connections without answering (a reset).
     pub resets: u32,
     pub username: String,
+    /// `GetOperation` calls a snapshot takes to finish.
+    pub snapshot_polls: u32,
+    /// Snapshots fail with this message.
+    pub snapshot_fails: Option<String>,
+    /// Operations still running: the answer once done, and polls left.
+    pub operations: BTreeMap<String, (Value, u32)>,
+    /// Templates saved from sandboxes (`ListImages` entries).
+    pub images: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -95,6 +103,10 @@ impl DockerStub {
                 runs: VecDeque::new(),
                 resets: 0,
                 username: "vu-test".into(),
+                snapshot_polls: 1,
+                snapshot_fails: None,
+                operations: BTreeMap::new(),
+                images: Vec::new(),
             })),
         };
         let serving = stub.clone();
@@ -332,10 +344,62 @@ impl DockerStub {
         let not_found = (404, json!({"code": "not_found", "message": "Sandbox not found"}));
         let target = body["sandbox"]["id"].as_str().unwrap_or_default().to_owned();
         match rpc {
-            "ImageService/ListImages" => (200, json!({"images": [
-                {"id": "tmpl_001m79a5fdr3jvbrksq53bd183b", "name": "zeron-dev", "status": "IMAGE_STATUS_COMPLETED", "source": "IMAGE_SOURCE_SANDBOX", "totalSizeBytes": "2026708046", "captureMode": "CAPTURE_MODE_DISK", "platform": {"os": "linux", "architecture": "amd64"}},
-                {"id": "tmpl_001m7a3bhe5tz4mrrx1sjf2d3sp", "name": "half-saved", "status": "IMAGE_STATUS_PENDING", "source": "IMAGE_SOURCE_SANDBOX"},
-            ]})),
+            "ImageService/ListImages" => {
+                let mut images = vec![
+                    json!({"id": "tmpl_001m79a5fdr3jvbrksq53bd183b", "name": "zeron-dev", "status": "IMAGE_STATUS_COMPLETED", "source": "IMAGE_SOURCE_SANDBOX", "totalSizeBytes": "2026708046", "captureMode": "CAPTURE_MODE_DISK", "platform": {"os": "linux", "architecture": "amd64"}}),
+                    json!({"id": "tmpl_001m7a3bhe5tz4mrrx1sjf2d3sp", "name": "half-saved", "status": "IMAGE_STATUS_PENDING", "source": "IMAGE_SOURCE_SANDBOX"}),
+                ];
+                images.extend(self.state().images.iter().cloned());
+                (200, json!({"images": images}))
+            }
+            // Recorded 2026-11-16: the operation's target is the template's
+            // id from the start; once done its response is the snapshot,
+            // and the template is listed by `ListImages` under the same id.
+            // The sandbox keeps running.
+            "SnapshotService/CreateSnapshot" => {
+                let mut state = self.state();
+                if !state.boxes.contains_key(&target) {
+                    return not_found;
+                }
+                state.next += 1;
+                let id = format!("tmpl_stub{:04}", state.next);
+                let name = body["name"].as_str().unwrap_or_default().to_owned();
+                let meta = json!({"kind": "OPERATION_KIND_CREATE_SNAPSHOT", "target": id, "name": name,
+                                  "createdAt": "2026-11-16T07:29:50.043072Z", "updatedAt": "2026-11-16T07:29:50.043072Z"});
+                let op_id = format!("op_snap_{id}");
+                let mut done = json!({"id": op_id, "done": true, "metadata": meta});
+                match &state.snapshot_fails {
+                    Some(message) => done["error"] = json!({"code": 13, "message": message}),
+                    None => done["response"] = json!({
+                        "@type": "type.googleapis.com/docker.sbx.v1.Snapshot", "id": id, "name": name,
+                        "sandboxId": target, "status": "SNAPSHOT_STATUS_READY", "totalSizeBytes": "4255527",
+                        "captureMode": body["captureMode"],
+                    }),
+                }
+                let polls = state.snapshot_polls;
+                state.operations.insert(op_id.clone(), (done, polls));
+                (200, json!({"id": op_id, "metadata": meta}))
+            }
+            "OperationService/GetOperation" => {
+                let op_id = body["id"].as_str().unwrap_or_default().to_owned();
+                let mut state = self.state();
+                let Some((done, left)) = state.operations.get_mut(&op_id) else {
+                    return (404, json!({"code": "not_found", "message": "operation not found"}));
+                };
+                if *left > 1 {
+                    *left -= 1;
+                    let running = json!({"id": op_id, "metadata": done["metadata"]});
+                    return (200, running);
+                }
+                let done = done.clone();
+                state.operations.remove(&op_id);
+                if done.get("response").is_some() {
+                    let r = &done["response"];
+                    state.images.push(json!({"id": r["id"], "name": r["name"], "status": "IMAGE_STATUS_COMPLETED",
+                                             "source": "IMAGE_SOURCE_SANDBOX", "captureMode": r["captureMode"]}));
+                }
+                (200, done)
+            }
             "SecretService/ListSecrets" => (200, json!({"secrets": [
                 {"id": "docker", "name": "docker", "serviceType": "docker", "type": "SECRET_TYPE_OAUTH_REFRESH", "scopes": ["offline_access"]},
                 {"id": "docker-sbx:github", "name": "docker-sbx:github", "serviceType": "github", "type": "SECRET_TYPE_TOKEN"},
