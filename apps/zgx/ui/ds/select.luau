@@ -25,7 +25,9 @@ local locale = require("@self/locale")
 -- (An option's label, line and group may be messages, `ui.t`, in a list
 -- given as a table; a function's list reads them as strings, as a state
 -- holds no message. The placeholder, label, hint and name take messages.)
-export type Option = { value: any, label: string | Message, icon: Icon.Name?, description: (string | Message)?, disabled: boolean?, group: (string | Message)? }
+-- `rule`: a rule over it in the menu, setting it apart from those before
+-- (a menu with one drops below the button).
+export type Option = { value: any, label: string | Message, icon: Icon.Name?, description: (string | Message)?, disabled: boolean?, group: (string | Message)?, rule: boolean? }
 export type Props = {
 	value: State<any>,
 	-- The choices: a list, or a function of one, followed as it changes
@@ -45,6 +47,11 @@ export type Props = {
 	on_change: ((value: any) -> ())?,
 	w: number?,
 	w_full: boolean?,
+	-- The menu always drops below the button, never over it.
+	below: boolean?,
+	-- The button only as wide as the chosen name and its chevron, no glyph
+	-- (a row's compact control); its menu drops below, at its end.
+	fit: boolean?,
 }
 
 -- How many rows open over the button; more drop below it. And the height
@@ -56,9 +63,12 @@ local VIEW = 312
 local OVERHANG = 5
 -- Between rows (`zeron.list.gap`, in points for the list's sums).
 local GAP = 2
+-- A fitted button's menu, at least this wide (its names, not the button's).
+local FIT_MENU = 200
 
 return ui.component(function(props: Props): Node
 	local size: control.Size = props.size or "md"
+	local fit = props.fit == true
 	local value = props.value
 	local open = ui.use_state(false)
 	local hovered = ui.use_state(false)
@@ -82,15 +92,19 @@ return ui.component(function(props: Props): Node
 	end
 	-- Whether any option has an icon, or a line under its name; and whether
 	-- the menu opens over the button (short and one line each).
-	local shape = ui.computed(function(): { icons: boolean, tall: boolean, over: boolean }
+	-- (`short`: a few rows dropped below, as tall as they are, no scroll.)
+	local shape = ui.computed(function(): { icons: boolean, tall: boolean, over: boolean, short: boolean }
 		local list = options()
-		local icons, tall, grouped = false, false, false
+		local icons, tall, grouped, ruled = false, false, false, false
 		for _, o in list do
 			icons = icons or o.icon ~= nil
 			tall = tall or o.description ~= nil
 			grouped = grouped or o.group ~= nil
+			ruled = ruled or o.rule == true
 		end
-		return { icons = icons, tall = tall, over = not tall and not grouped and #list <= OVER_MOST }
+		local below = props.below == true or fit or ruled
+		local few = not tall and not grouped and #list <= OVER_MOST
+		return { icons = icons, tall = tall, over = few and not below, short = few and below }
 	end)
 	local function invalid(): boolean
 		local e = control.read(props.error)
@@ -105,7 +119,7 @@ return ui.component(function(props: Props): Node
 		px = control.PAD[size],
 		pr = "$space.2",
 		gap = "$space.2",
-		w_full = true,
+		w_full = not fit,
 		rounded = control.RADIUS[size],
 		border = 1,
 		cursor = function(): any
@@ -151,7 +165,7 @@ return ui.component(function(props: Props): Node
 		end,
 		ui.show(function(): boolean
 				local o = chosen()
-				return o ~= nil and o.icon ~= nil
+				return not fit and o ~= nil and o.icon ~= nil
 			end, ui.div {
 				shrink = 0,
 				y = -0.5,
@@ -164,12 +178,12 @@ return ui.component(function(props: Props): Node
 					size = control.ICON[size],
 				},
 			}),
-		FadeText {
+		(if fit then ui.text else FadeText) {
 			function()
 				local o = chosen()
 				return if o then (control.text(o.label) or "") else (control.text(props.placeholder) or locale.s("ds.select.placeholder"))
 			end,
-			grow = 1,
+			grow = if fit then nil else 1,
 			text_size = control.TEXT[size],
 			color = function()
 				return if chosen() then "$text.primary" else "$zeron.field.placeholder"
@@ -269,9 +283,9 @@ return ui.component(function(props: Props): Node
 			if now.over then
 				return wide + OVERHANG * 2
 			end
-			return math.max(wide, if now.tall then ui.theme.get("zeron.menu.width") :: number else 0)
+			return math.max(wide, if now.tall then ui.theme.get("zeron.menu.width") :: number elseif fit then FIT_MENU else 0)
 		end,
-		placement = { side = "bottom", align = "start", offset = 4 },
+		placement = { side = "bottom", align = if fit then "end" else "start", offset = 4 },
 		open_over = over_id,
 		-- As Zeron's menus open: a quick fade, no travel over the button.
 		on_mount = function(el: Element)
@@ -292,6 +306,9 @@ return ui.component(function(props: Props): Node
 				if group and group ~= heading then
 					heading = group
 					table.insert(items, Menu.Heading { o.group, first = #items == 0 })
+				end
+				if o.rule and #items > 0 then
+					table.insert(items, Menu.Rule {})
 				end
 				table.insert(items, row(i, o, rows, now.icons, tall))
 			end
@@ -318,7 +335,7 @@ return ui.component(function(props: Props): Node
 				end,
 				table.unpack(items),
 			}
-			if over or tall then
+			if over or tall or now.short then
 				return list
 			end
 			return ui.scroll { w_full = true, max_h = VIEW, offset = offset, fade = { 12, 12 }, fade_overflow = true, list }
@@ -332,7 +349,7 @@ return ui.component(function(props: Props): Node
 		size = size,
 		box = menu,
 		disabled = props.disabled,
-		w = if props.w_full then nil else (props.w or 240),
+		w = if props.w_full or fit then nil else (props.w or 240),
 		w_full = props.w_full,
 	}
 end)

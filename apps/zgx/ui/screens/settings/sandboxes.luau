@@ -1,23 +1,28 @@
 -- Settings › Sandboxes (spec #37, ticket #48): one page for every sandbox
 -- provider. Each provider is a card: whether it's connected, with Connect
--- or Disconnect, and once it is, its host device (the device that keeps its
--- key and runs its steps), with a note when that device sleeps. Under them,
--- the user's step scripts as a flat list, one row per script that exists
--- (its name, When, For), Add script, and an editor.
+-- or Disconnect, and its host device (the device that keeps its key and
+-- runs its steps), with a note when that device may sleep. Not connected
+-- yet, the host device is the one it will get (picked there, it moves there
+-- once connected). Under them, the user's step scripts as a flat list, one
+-- row per script that exists (its name, When, For), Add script, and an
+-- editor; connected or not, the page shows all of it.
 --
 -- Everything comes from the engine (src/sandbox_settings.rs): the
--- providers here (`ListSandboxProviders`), each one's host device
--- (`SandboxHost`), and who it's connected as, which only the host device
--- says (asked there). Step scripts are files on the host device, so every
--- script call goes there (`device`): saved from any device, the file
--- changes where the steps run. Read once a visit, again after each change
--- (no polling), but while a provider's own sign-in page waits on the user.
+-- providers here (`ListSandboxProviders`: their ops too, which say which
+-- sign in on their own page), each one's host device (`SandboxHost`), and
+-- who it's connected as, which only the host device says (asked there).
+-- Step scripts are files on the host devices, but every script call goes to
+-- this device's engine, which routes it to the right one(s). Read once a
+-- visit, again after each change (no polling), but while a provider's own
+-- sign-in page waits on the user.
 --
 -- No descriptions on the page: the rows say what they are.
 
 local ds = require("@ds")
 local Icon = require("@ds/icon")
 local Links = require("@ds/links")
+local CodeEditor = require("@ds/code_editor")
+local Syntax = require("@ds/syntax")
 local toast = require("@ds/toast")
 local sandboxes = require("@account/sandboxes")
 local sessions = require("@account/sessions")
@@ -43,8 +48,9 @@ type Script = words.Script
 -- What the page shows: "loading", "ready", or "offline" (no engine).
 local phase = ui.state("settings_sandboxes_phase", "loading")
 -- What the engine says of each provider, by id: its host device, who it's
--- connected as, and (one the picker doesn't list yet) its name and icon.
-type Said = { id: string?, name: string?, icon: string?, host: string?, account: { name: string }? }
+-- connected as, what it can do, and (one the picker doesn't list yet) its
+-- name and icon.
+type Said = { id: string?, name: string?, icon: string?, host: string?, account: { name: string }?, ops: { string }? }
 local said = ui.state("settings_sandboxes_said", {} :: { [string]: Said })
 
 -- The providers, as the picker lists them (account/sandboxes: their names,
@@ -55,12 +61,12 @@ local function merged(of: { [string]: Said }): { Provider }
 	for _, p in sandboxes.providers() do
 		listed[p.id] = true
 		local s = of[p.id] or {}
-		table.insert(out, { id = p.id, name = p.name, icon = sandboxes.icon(p.id), host = s.host, account = s.account })
+		table.insert(out, { id = p.id, name = p.name, icon = sandboxes.icon(p.id), host = s.host, account = s.account, ops = s.ops })
 	end
 	local rest: { Provider } = {}
 	for id, s in of do
 		if not listed[id] then
-			table.insert(rest, { id = id, name = s.name or id, icon = sandboxes.icon(s.icon or id), host = s.host, account = s.account })
+			table.insert(rest, { id = id, name = s.name or id, icon = sandboxes.icon(s.icon or id), host = s.host, account = s.account, ops = s.ops })
 		end
 	end
 	table.sort(rest, function(a: Provider, b: Provider): boolean
@@ -73,8 +79,13 @@ local providers = ui.computed(function(): { Provider }
 	return merged(said:get())
 end)
 local scripts = ui.state("settings_sandboxes_scripts", {} :: { Script })
--- The device the scripts listed are on.
-local scripts_on = ui.state("settings_sandboxes_scripts_on", "")
+-- A script just added: its row's key, lit for a moment.
+local fresh = ui.state("settings_sandboxes_fresh", "")
+-- How long a new script's row stays lit.
+local FRESH_MS = 1600
+-- The host device picked for a provider not connected yet, by id: where it
+-- moves once it's connected.
+local planned = ui.state("settings_sandboxes_planned", {} :: { [string]: string })
 
 -- Connecting: which provider, the key being pasted, the provider's sign-in
 -- page's code while it waits, and whether that's on its way.
@@ -99,9 +110,8 @@ local content = ui.state("settings_sandboxes_content", "")
 local editor_busy = ui.state("settings_sandboxes_editor_busy", false)
 local delete_open = ui.state("settings_sandboxes_delete_open", false)
 
--- Providers whose sign-in which providers have on their own page (OAuth
--- device flow); the rest take a pasted key only.
-local SIGNS_IN_ON_PAGE: { [string]: boolean } = { docker = true }
+-- The script editor's code, this tall (about seven lines; it scrolls past).
+local EDITOR_H = 160
 -- How often a sign-in on the provider's page is looked at while it waits.
 local POLL_MS = 2500
 
@@ -155,29 +165,23 @@ local function device_named(id: string?): sessions.Device?
 	return nil
 end
 
--- The scripts on `device`, read there.
-local function load_scripts(device: string?)
-	local on = device or here() or ""
-	ask("ListStepScripts", {}, on):after(function(list: any)
-		ui.batch(function()
-			scripts_on:set(on)
-			scripts:set(if type(list) == "table" then list else {})
-		end)
+-- The scripts, wherever they are: this device's engine asks the host
+-- devices.
+local function load_scripts()
+	ask("ListStepScripts"):after(function(list: any)
+		scripts:set(if type(list) == "table" then list else {})
 	end, function()
-		ui.batch(function()
-			scripts_on:set(on)
-			scripts:set({})
-		end)
+		scripts:set({})
 	end)
 end
 
 -- Everything again: each provider's host device and account, then the
--- scripts on the host device.
+-- scripts.
 local function load()
 	ask("ListSandboxProviders"):after(function(list: any)
 		local found: { [string]: Said } = {}
 		for _, p in (if type(list) == "table" then list else {}) do
-			found[p.id] = { name = p.name, icon = p.icon, account = p.account }
+			found[p.id] = { name = p.name, icon = p.icon, account = p.account, ops = if type(p.ops) == "table" then p.ops else nil }
 		end
 		for _, p in sandboxes.providers() do
 			found[p.id] = found[p.id] or {}
@@ -195,7 +199,7 @@ local function load()
 				said:set(found)
 				phase:set("ready")
 			end)
-			load_scripts(words.scripts_device(merged(found), here()))
+			load_scripts()
 		end
 		if left == 0 then
 			left = 1
@@ -255,13 +259,28 @@ local function open_connect(id: string)
 	end)
 end
 
-local function connected()
+-- `id` connected, `host` the host device the engine gave it: moved to the
+-- one picked before, if another was.
+local function connected(id: string, host: string?)
+	local want = planned:peek()[id]
 	ui.batch(function()
 		connect_busy:set(false)
 		connect_open:set(false)
 		code:set(nil)
 		token:set("")
+		if want then
+			planned:set_key(id, nil :: any)
+		end
 	end)
+	if want and host and want ~= host then
+		change("SetSandboxHost", { provider = id, deviceId = want }):after(function()
+			load()
+		end, function(err: any)
+			failed(ui.t("settings.sandboxes.couldnt_move"):get())(err)
+			load()
+		end)
+		return
+	end
 	load()
 end
 
@@ -272,7 +291,9 @@ local function connect_with_token()
 		return
 	end
 	connect_busy:set(true)
-	change("ConnectSandboxProvider", { provider = id, token = key }):after(connected, function(err: any)
+	change("ConnectSandboxProvider", { provider = id, token = key }):after(function(answer: any)
+		connected(id, if type(answer) == "table" then answer.hostDeviceId else nil)
+	end, function(err: any)
 		connect_busy:set(false)
 		failed(ui.t("settings.sandboxes.couldnt_connect"):get())(err)
 	end)
@@ -291,7 +312,7 @@ local function connect_on_page()
 		connect_busy:set(false)
 		local shown = if type(answer) == "table" then answer.deviceCode else nil
 		if not shown then
-			connected()
+			connected(id, if type(answer) == "table" then answer.hostDeviceId else nil)
 			return
 		end
 		code:set(shown)
@@ -316,7 +337,7 @@ local function connect_on_page()
 					ask("ListSandboxProviders", {}, device):after(function(list: any)
 						for _, p in (if type(list) == "table" then list else {}) do
 							if p.id == id and p.account and waiting() then
-								connected()
+								connected(id, device)
 								return
 							end
 						end
@@ -360,6 +381,11 @@ local function set_host(id: string, device: string)
 	if not p or p.host == device then
 		return
 	end
+	if p.account == nil then
+		-- Not connected: where it goes once it is.
+		planned:set_key(id, device)
+		return
+	end
 	change("SetSandboxHost", { provider = id, deviceId = device }):after(function()
 		load()
 	end, function(err: any)
@@ -385,24 +411,36 @@ local function host_choices(current: string?): { any }
 	return out
 end
 
--- A provider's card: its row (connected or not), and once connected its host
--- device, with a note when that one sleeps.
+-- The host device a provider shows: its own once connected; before, the one
+-- picked for it, else the one the engine would pick.
+local function shown_host(p: Provider): string
+	if p.account ~= nil and p.host then
+		return p.host
+	end
+	return planned:get()[p.id] or p.host or words.planned_host(sessions.devices:get() :: any) or ""
+end
+
+-- A provider's card: its row (connected or not) and its host device, with a
+-- note when that one may sleep.
 local function provider_card(_p: Provider, _i: number, now: State<Provider>): Node
 	local id = _p.id
 	local function is_connected(): boolean
 		return now:get().account ~= nil
 	end
-	local chosen = ui.use_state(now:peek().host or "")
+	local chosen = ui.use_state(shown_host(now:peek()))
 	ui.effect(function()
-		local h = now:get().host or ""
+		local h = shown_host(now:get())
 		if h ~= chosen:peek() then
 			chosen:set(h)
 		end
 	end)
 	local function sleeper(): sessions.Device?
+		if not is_connected() then
+			return nil
+		end
 		local d = device_named(now:get().host)
 		sessions.devices:get()
-		return if words.sleeps(d) then d else nil
+		return if words.may_sleep(d) then d else nil
 	end
 	local status = ui.row {
 		gap = "$space.2",
@@ -451,11 +489,11 @@ local function provider_card(_p: Provider, _i: number, now: State<Provider>): No
 		icon = "global",
 		control = ds.Select {
 			value = chosen,
-			name = ui.t("settings.sandboxes.host_device"),
+			name = ui.t("settings.sandboxes.host_device_named", { name = _p.name }),
 			size = "sm",
-			w = 200,
+			fit = true,
 			options = function(): { any }
-				return host_choices(now:get().host)
+				return host_choices(chosen:get())
 			end,
 			on_change = function(device: string)
 				set_host(id, device)
@@ -471,7 +509,7 @@ local function provider_card(_p: Provider, _i: number, now: State<Provider>): No
 		ui.text {
 			function(): string
 				local d = sleeper()
-				return if d then ui.t("settings.sandboxes.host_sleeps", { device = d.name }):get() else ""
+				return if d then words.sleep_note(d.name) else ""
 			end,
 			text_size = "$font.size.sm",
 			color = "$text.secondary",
@@ -484,7 +522,8 @@ local function provider_card(_p: Provider, _i: number, now: State<Provider>): No
 			w_full = true,
 			ds.Settings.Row {
 				label = _p.name,
-				lead = ui.div { color = "$text.secondary", Icon { name = words.icon_of(_p.icon) :: any, size = 16 } },
+				-- (Its glyph in the rounded tile, as the host device's.)
+				icon = words.icon_of(_p.icon) :: any,
 				control = ui.row {
 					gap = "$space.4",
 					items = "center",
@@ -495,14 +534,11 @@ local function provider_card(_p: Provider, _i: number, now: State<Provider>): No
 					end, connect),
 				},
 			},
-			ui.show(is_connected, ui.column {
-				w_full = true,
-				ds.Settings.Rule(),
-				host_row,
-				ui.show(function(): boolean
-					return sleeper() ~= nil
-				end, ui.column { w_full = true, ds.Settings.Rule(), note }),
-			}),
+			ds.Settings.Rule(),
+			host_row,
+			ui.show(function(): boolean
+				return sleeper() ~= nil
+			end, ui.column { w_full = true, ds.Settings.Rule(), note }),
 		},
 	}
 end
@@ -534,7 +570,7 @@ local function open_editor(script: Script?)
 	end)
 	if script then
 		editor_busy:set(true)
-		ask("ReadStepScript", { ["for"] = script["for"], hook = script.hook, name = script.name }, scripts_on:peek()):after(function(read: any)
+		ask("ReadStepScript", { ["for"] = script["for"], hook = script.hook, name = script.name }):after(function(read: any)
 			ui.batch(function()
 				content:set(if type(read) == "table" and read.content then read.content else "")
 				editor_busy:set(false)
@@ -576,18 +612,29 @@ local function save()
 	local hook = chosen_hook() :: string
 	local name = if old then old.name else (string.match(file_name:peek(), "^%s*(.-)%s*$") or "")
 	local scope = if old and old.hook == words.SETUP_HOOK then old["for"] else words.scope_of(whom:peek())
-	local device = scripts_on:peek()
 	editor_busy:set(true)
-	change("WriteStepScript", { ["for"] = scope, hook = hook, name = name, content = content:peek() }, device):after(function()
+	change("WriteStepScript", { ["for"] = scope, hook = hook, name = name, content = content:peek() }):after(function()
 		-- Moved (another When or For): the old file goes.
 		if old and (old.hook ~= hook or words.scope_value(old["for"]) ~= words.scope_value(scope)) then
-			change("DeleteStepScript", { ["for"] = old["for"], hook = old.hook, name = old.name }, device)
+			change("DeleteStepScript", { ["for"] = old["for"], hook = old.hook, name = old.name })
 		end
+		-- A new one's row is lit for a moment, so the eye finds it.
+		local key = words.key({ ["for"] = scope, hook = hook, name = name })
 		ui.batch(function()
 			editor_busy:set(false)
 			editor_open:set(false)
+			if not old then
+				fresh:set(key)
+			end
 		end)
-		load_scripts(device)
+		if not old then
+			ui.after(FRESH_MS, function()
+				if fresh:peek() == key then
+					fresh:set("")
+				end
+			end)
+		end
+		load_scripts()
 	end, function(err: any)
 		editor_busy:set(false)
 		failed(ui.t("settings.sandboxes.couldnt_save"):get())(err)
@@ -599,27 +646,37 @@ local function delete_script()
 	if not old then
 		return
 	end
-	local device = scripts_on:peek()
-	change("DeleteStepScript", { ["for"] = old["for"], hook = old.hook, name = old.name }, device):after(function()
+	change("DeleteStepScript", { ["for"] = old["for"], hook = old.hook, name = old.name }):after(function()
 		ui.batch(function()
 			delete_open:set(false)
 			editor_open:set(false)
 		end)
-		load_scripts(device)
+		load_scripts()
 	end, function(err: any)
 		delete_open:set(false)
 		failed(ui.t("settings.sandboxes.couldnt_delete"):get())(err)
 	end)
 end
 
+-- A script's row: on the card's own fill (no raised one of its own), washed
+-- under the pointer, lit for a moment when it's just been added.
 local function script_row(_r: words.Row, _i: number, now: State<words.Row>): Node
-	return ui.button {
+	return ui.row {
 		w_full = true,
+		role = "button",
 		label = _r.name,
+		focusable = true,
+		cursor = "pointer",
 		px = ds.Settings.inset(),
 		py = "$space.3",
 		gap = "$space.3",
 		items = "center",
+		bg = function(): string
+			return if fresh:get() == now:get().key then "$zeron.selected.flat.bg" else "#00000000"
+		end,
+		hover = { bg = "$hover" },
+		active = { bg = "$pressed" },
+		focus = { outline = "$zeron.focus.width", outline_color = "$zeron.focus.ring", outline_offset = -2 },
 		on_click = function()
 			open_editor(now:peek().script)
 		end,
@@ -707,8 +764,86 @@ local function editor(): Node
 		w_full = true,
 		disabled = setup,
 		options = function(): { any }
-			return words.for_options(providers:get(), projects(), scripts_on:get())
+			return words.for_options(providers:get(), projects())
 		end,
+	}
+	-- The file: its name over the code, as an editor's header. A new one's
+	-- name is typed there; an existing one's path is said.
+	local header = ui.row {
+		w_full = true,
+		h = 32,
+		px = "$space.3",
+		items = "center",
+		shrink = 0,
+		border_sides = { 0, 0, 1, 0 },
+		border_color = "$border.subtle",
+		ui.show(
+			function(): boolean
+				return editing:get() == nil
+			end,
+			ui.input {
+				value = file_name,
+				label = ui.t("settings.sandboxes.file_name"),
+				placeholder = "warm-cache.sh",
+				font = "$font.mono",
+				text_size = "$font.size.sm",
+				color = "$text.secondary",
+				placeholder_color = "$zeron.field.placeholder",
+				caret_color = "$accent",
+				bg = "#00000000",
+				border = 0,
+				rounded = 0,
+				px = 0,
+				py = 0,
+				grow = 1,
+				min_w = 0,
+				h_full = true,
+				focus = { border = 0, outline = 0 },
+			}
+		),
+		ui.show(
+			function(): boolean
+				return editing:get() ~= nil
+			end,
+			ds.FadeText {
+				function(): string
+					local old = editing:get()
+					return if old then (old.script or old.name) else ""
+				end,
+				grow = 1,
+				font = "$font.mono",
+				text_size = "$font.size.sm",
+				color = "$text.tertiary",
+			}
+		),
+	}
+	local code_box = ui.column {
+		w_full = true,
+		rounded = "$radius.lg",
+		border = 1,
+		border_color = "$zeron.field.edge",
+		overflow = "hidden",
+		header,
+		ui.column {
+			w_full = true,
+			h = EDITOR_H,
+			py = "$space.2",
+			CodeEditor {
+				value = content,
+				label = ui.t("settings.sandboxes.script"):get(),
+				language = function(): string?
+					local old = editing:get()
+					return Syntax.language(if old then old.name else (file_name:get() ~= "" and file_name:get() or "script.sh"))
+				end,
+				status = false,
+				folding = false,
+				on_save = function()
+					save()
+				end,
+				grow = 1,
+				w_full = true,
+			},
+		},
 	}
 	return ui.column {
 		w_full = true,
@@ -722,37 +857,7 @@ local function editor(): Node
 		ui.show(function(): boolean
 			return when:get() == words.REPLACE and not setup()
 		end, step_select),
-		ui.show(function(): boolean
-			return editing:get() == nil
-		end, ds.TextField {
-			value = file_name,
-			label = ui.t("settings.sandboxes.file_name"),
-			name = ui.t("settings.sandboxes.file_name"),
-			placeholder = "warm-cache.sh",
-			w_full = true,
-		}),
-		ui.show(function(): boolean
-			return editing:get() ~= nil
-		end, ui.text {
-			function(): string
-				local old = editing:get()
-				return if old then (old.script or old.name) else ""
-			end,
-			font = "$font.mono",
-			text_size = "$font.size.sm",
-			color = "$text.tertiary",
-		}),
-		ds.TextArea {
-			value = content,
-			name = ui.t("settings.sandboxes.script"),
-			mono = true,
-			rows = 10,
-			max_rows = 18,
-			w_full = true,
-			on_submit = function()
-				save()
-			end,
-		},
+		code_box,
 		ui.show(function(): boolean
 			return editing:get() ~= nil
 		end, ui.row {
@@ -846,7 +951,6 @@ function M.view(): Node
 						key = function(r: words.Row): string
 							return r.key
 						end,
-						wash = true,
 					}),
 				}
 			),
@@ -871,7 +975,7 @@ function M.view(): Node
 				w_full = true,
 				gap = "$space.3",
 				ui.show(function(): boolean
-					return SIGNS_IN_ON_PAGE[connecting:get()] == true and code:get() == nil
+					return words.signs_in_on_page(connecting_provider()) and code:get() == nil
 				end, ds.Button {
 					tone = "secondary",
 					w_full = true,
@@ -916,6 +1020,19 @@ function M.view(): Node
 						connect_with_token()
 					end,
 				},
+				-- Which kinds of key it takes, where it takes more than one.
+				ui.show(function(): boolean
+					return words.token_hint(connecting:get()) ~= nil
+				end, ui.text {
+					function(): string
+						return words.token_hint(connecting:get()) or ""
+					end,
+					text_size = "$font.size.sm",
+					line_height = "$font.line.sm",
+					color = "$text.tertiary",
+					wrap = true,
+					selectable = true,
+				}),
 			},
 		},
 		ds.Dialog {

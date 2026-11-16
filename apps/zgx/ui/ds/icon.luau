@@ -82,6 +82,7 @@ export type Name =
 	| "side-chat"
 	| "folder-with-files"
 	| "widget"
+	| "layers"
 	-- The emoji picker's kinds (smileys, people, nature, food, travel,
 	-- activities, objects, symbols, flags) and an upload.
 	| "emoji-funny-circle"

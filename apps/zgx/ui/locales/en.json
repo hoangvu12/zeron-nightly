@@ -2327,7 +2327,8 @@
       "connected": "Connected",
       "not_connected": "Not connected",
       "host_device": "Host device",
-      "host_sleeps": "{device} sleeps: its sandboxes can't start or wake until it's back.",
+      "host_device_named": "Host device for {name}",
+      "host_sleeps": "{device} may sleep: its sandboxes can't start or wake while it does.",
       "scripts": "Scripts",
       "add_script": "Add script",
       "when_label": "When",
@@ -2343,6 +2344,9 @@
       "sign_in_on_page": "Sign in with {name}",
       "code_waiting": "Check this code on the page that opened.",
       "token": "Token",
+      "token_hint": {
+        "docker": "A Docker access token, or username:personal-access-token."
+      },
       "disconnect_title": "Disconnect {name}?",
       "disconnect_body": "Sandboxes already made keep running, but Zeron can't reach them until it's connected again.",
       "couldnt_connect": "Couldn't connect",

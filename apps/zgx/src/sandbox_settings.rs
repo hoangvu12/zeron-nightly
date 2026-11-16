@@ -8,9 +8,11 @@
 //!   (connect, disconnect, the host device, a script saved or deleted).
 //!   Refused while a UI template is only a preview.
 //!
-//! `device` sends the call to that device (`targetDeviceId`): step scripts
-//! are files on the host device, and only the host device says who a
-//! provider is connected as. A refusal is the engine's own sentence when it
+//! `device` sends the call to that device (`targetDeviceId`): only the host
+//! device says who a provider is connected as. Step scripts are files on the
+//! host devices, but the page asks this device's engine for them (no
+//! `device`), which routes each call there. A refusal is the engine's own
+//! sentence when it
 //! has one ("The host device is offline, …"), else an outcome word
 //! (`offline`, `outdated`, `failed`).
 
@@ -111,8 +113,11 @@ mod tests {
 
     #[test]
     fn the_page_reads_and_changes_only_the_sandbox_methods() {
-        let read = call("ListStepScripts", json!({}), Some("box"), ASK).unwrap();
+        let read = call("ListSandboxProviders", json!({}), Some("box"), ASK).unwrap();
         assert_eq!(read.params, json!({ "targetDeviceId": "box" }));
+        // Scripts go to this device's engine, which routes them.
+        let scripts = call("ListStepScripts", json!({}), None, ASK).unwrap();
+        assert_eq!(scripts.params, json!({}));
         let here = call("SandboxHost", json!({ "provider": "docker" }), None, ASK).unwrap();
         assert_eq!(here.params, json!({ "provider": "docker" }));
         // A change isn't a read, and nothing else is either.

@@ -26,8 +26,15 @@ end
 
 export type Scope = { kind: string, provider: string?, spaceId: string? }
 export type Script = { ["for"]: Scope, hook: string, name: string, script: string?, path: string?, runsOn: string? }
-export type Provider = { id: string, name: string, icon: string?, account: { name: string }?, host: string? }
+-- `ops`: what it can do, as `ListSandboxProviders` names them ("create",
+-- "connect", "signInPage", …).
+export type Provider = { id: string, name: string, icon: string?, account: { name: string }?, host: string?, ops: { string }? }
 export type Project = { id: string, name: string, device: string? }
+
+-- Every sandbox's glyph (stacked layers) and a project's (the Projects
+-- page's own).
+M.ALL_ICON = "layers"
+M.PROJECT_ICON = "folder-with-files"
 
 -- A project's own Setup script (`<repo>/.zeron/setup.sh`).
 M.SETUP_HOOK = "setup"
@@ -78,13 +85,13 @@ local function moment(hook: string): any?
 	return nil
 end
 
--- When's choices: the moments, then Replace a step… set apart.
+-- When's choices: the moments, then Replace a step… set apart by a rule.
 function M.when_options(): { any }
 	local out = {}
 	for _, m in M.MOMENTS do
 		table.insert(out, { value = m.value, label = say(m.key, m.english) })
 	end
-	table.insert(out, { value = M.REPLACE, label = say("when.replace", "Replace a step…") })
+	table.insert(out, { value = M.REPLACE, label = say("when.replace", "Replace a step…"), rule = true })
 	return out
 end
 
@@ -159,9 +166,9 @@ function M.for_label(scope: Scope, providers: { Provider }?, projects: { Project
 		return if p then p.name else (scope.provider or ""), M.icon_of(p and p.icon)
 	elseif scope.kind == "project" then
 		local p = find(projects, "id", scope.spaceId)
-		return if p then p.name else say("for.project_gone", "A removed project"), "folder"
+		return if p then p.name else say("for.project_gone", "A removed project"), M.PROJECT_ICON
 	end
-	return say("for.all", "All sandboxes"), "widget"
+	return say("for.all", "All sandboxes"), M.ALL_ICON
 end
 
 -- A provider's glyph: the one it carries (the page's providers carry
@@ -191,15 +198,22 @@ function M.rows(scripts: { Script }?, providers: { Provider }?, projects: { Proj
 end
 
 -- For's choices: every sandbox, each provider, each project with its folder
--- on the host device (a script's file lives there).
-function M.for_options(providers: { Provider }?, projects: { Project }?, host: string?): { any }
-	local out = { { value = "all", label = say("for.all", "All sandboxes"), icon = "widget" } }
+-- on a provider's host device (a script's file lives there); with no host
+-- device yet, every project.
+function M.for_options(providers: { Provider }?, projects: { Project }?): { any }
+	local out = { { value = "all", label = say("for.all", "All sandboxes"), icon = M.ALL_ICON } }
+	local hosts: { [string]: boolean } = {}
+	local any_host = false
 	for _, p in providers or {} do
 		table.insert(out, { value = `provider:{p.id}`, label = p.name, icon = M.icon_of(p.icon) })
+		if p.host then
+			hosts[p.host] = true
+			any_host = true
+		end
 	end
 	for _, p in projects or {} do
-		if host == nil or p.device == host then
-			table.insert(out, { value = `project:{p.id}`, label = p.name, icon = "folder" })
+		if not any_host or (p.device and hosts[p.device]) then
+			table.insert(out, { value = `project:{p.id}`, label = p.name, icon = M.PROJECT_ICON })
 		end
 	end
 	return out
@@ -233,22 +247,67 @@ function M.valid_name(name: string): boolean
 	return name ~= "" and name ~= "." and name ~= ".." and string.sub(name, 1, 1) ~= "." and not string.find(name, "[/\\:%z]")
 end
 
--- Whether the host device sleeps: a computer that isn't an always-on
--- `zeron headless` (a laptop, a desktop that's put to sleep).
-function M.sleeps(device: { platform: string, headless: boolean? }?): boolean
+local function phone(device: { platform: string }): boolean
+	return device.platform == "ios" or device.platform == "android"
+end
+
+-- Whether the host device may sleep: a computer that isn't an always-on
+-- `zeron headless`. (A device row doesn't say whether it's a laptop, so
+-- this is a maybe: a desktop may be put to sleep too.)
+function M.may_sleep(device: { platform: string, headless: boolean? }?): boolean
 	if not device then
 		return false
 	end
-	local phone = device.platform == "ios" or device.platform == "android"
-	return device.headless ~= true and not phone
+	return device.headless ~= true and not phone(device)
 end
 
--- The device the scripts are on: the host device of the first provider
--- that has one, else this one (`here`).
-function M.scripts_device(providers: { Provider }?, here: string?): string?
-	for _, p in providers or {} do
-		if p.host then
-			return p.host
+-- The note under a host device that may sleep.
+function M.sleep_note(device: string): string
+	return say("host_sleeps", "{device} may sleep: its sandboxes can't start or wake while it does.", { device = device })
+end
+
+local function has(list: { string }?, item: string): boolean
+	for _, v in list or {} do
+		if v == item then
+			return true
+		end
+	end
+	return false
+end
+
+-- Whether a provider signs in on its own page (a code shown here, approved
+-- there): its ops say `signInPage`. The rest take a pasted key only.
+function M.signs_in_on_page(p: Provider?): boolean
+	return p ~= nil and has(p.ops, "signInPage")
+end
+
+-- What a provider's pasted key may be, where it takes more than one kind
+-- (Docker: an access token, or a username and personal access token that
+-- the engine exchanges at Docker Hub). nil: nothing to say.
+local TOKEN_HINTS: { [string]: { key: string, english: string } } = {
+	docker = { key = "token_hint.docker", english = "A Docker access token, or username:personal-access-token." },
+}
+function M.token_hint(provider: string?): string?
+	local hint = provider and TOKEN_HINTS[provider]
+	return if hint then say(hint.key, hint.english) else nil
+end
+
+-- The host device a provider not connected yet would get, as the engine
+-- picks one (crates/engine sandboxes/host_device `pick_host`): an always-on
+-- server online that can be one, else this device. (Ties go to the first;
+-- the engine's own pick, by how long each has been online, is the one that
+-- counts, and the page shows it once connected.)
+export type HostDevice = { id: string, here: boolean?, online: boolean?, host: boolean?, headless: boolean?, platform: string }
+function M.planned_host(devices: { HostDevice }?): string?
+	local here: string? = nil
+	for _, d in devices or {} do
+		if d.here then
+			here = d.id
+		end
+	end
+	for _, d in devices or {} do
+		if d.host and d.headless and (d.here or d.online ~= false) then
+			return d.id
 		end
 	end
 	return here
