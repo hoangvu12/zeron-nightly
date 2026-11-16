@@ -667,7 +667,7 @@ impl EngineRpc {
             && !routed(params)
             && let Some(answer) = self.ask_place_host(&provider, method, params).await
         {
-            return Some(Ok(answer));
+            return Some(Ok(RpcReply::Value(answer)));
         }
         let kept = self
             .sandboxes
