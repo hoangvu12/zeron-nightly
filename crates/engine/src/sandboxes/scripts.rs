@@ -65,10 +65,8 @@ impl Hook {
             (Timing::Before, step)
         } else if let Some(step) = name.strip_prefix("after-") {
             (Timing::After, step)
-        } else if let Some(step) = name.strip_prefix("instead-of-") {
-            (Timing::InsteadOf, step)
         } else {
-            return None;
+            (Timing::InsteadOf, name.strip_prefix("instead-of-")?)
         };
         let step = Step::ALL.into_iter().find(|s| slug(*s) == step)?;
         Some(Self { timing, step })
