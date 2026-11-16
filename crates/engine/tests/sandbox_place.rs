@@ -271,10 +271,18 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
         .call(methods::LIST_SANDBOX_PROVIDERS, json!({}))
         .await
         .unwrap();
+    // The built-in providers are listed too; this one is the fake.
+    let fake = offered
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "fake")
+        .cloned();
     assert_eq!(
-        offered,
-        json!([{ "id": "fake", "name": "Fake Sandbox", "icon": "box",
-                 "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"] }])
+        fake,
+        Some(json!({ "id": "fake", "name": "Fake Sandbox", "icon": "box",
+                     "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"],
+                     "account": null }))
     );
 
     let path = project(dirs.path(), &origin_url);
@@ -353,7 +361,7 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
     );
     assert_eq!(
         calls.last().unwrap(),
-        "run chat-a: zeron-engine headless",
+        "run chat-a: zeron-engine watchdog",
         "{calls:#?}"
     );
 
@@ -504,7 +512,7 @@ async fn a_failed_clone_shows_its_error_and_runs_again() {
         !provider
             .calls()
             .iter()
-            .any(|c| c.contains("zeron-engine headless")),
+            .any(|c| c.contains("zeron-engine watchdog")),
         "{:#?}",
         provider.calls()
     );

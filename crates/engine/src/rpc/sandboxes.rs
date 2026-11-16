@@ -13,20 +13,21 @@ use zeron_proto::{ChatConfig, SandboxHost};
 use zeron_rpc::{RpcError, RpcReply, methods};
 
 use super::{EngineRpc, parse_params, watch_stream};
-use crate::sandboxes::{Handover, Host, Sandboxes, pick_host};
+use crate::sandboxes::{Credential, Handover, Host, Sandboxes, pick_host};
 
 pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_SANDBOX_PROVIDERS
+            | methods::CONNECT_SANDBOX_PROVIDER
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
+            | methods::CHECK_SANDBOX
+            | methods::START_SANDBOX_FRESH
             | methods::SANDBOX_HOST
-            | methods::CONNECT_SANDBOX_PROVIDER
             | methods::ADOPT_SANDBOX_PROVIDER
             | methods::SET_SANDBOX_HOST
-            | methods::DELETE_SANDBOX
     )
 }
 
@@ -52,7 +53,9 @@ struct ProviderParams {
 #[serde(rename_all = "camelCase")]
 struct ConnectParams {
     provider: String,
-    key: Value,
+    /// A pasted key; without one, the provider's own sign-in page.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -162,7 +165,8 @@ impl EngineRpc {
             methods::SANDBOX_STEPS
                 | methods::WATCH_SANDBOX_STEPS
                 | methods::RUN_SANDBOX_STEPS_AGAIN
-                | methods::DELETE_SANDBOX
+                | methods::CHECK_SANDBOX
+                | methods::START_SANDBOX_FRESH
         ) && !routed(&params)
         {
             let p: ChatParams = parse_params(params.clone())?;
@@ -174,6 +178,40 @@ impl EngineRpc {
         }
         match method {
             methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
+            methods::CONNECT_SANDBOX_PROVIDER => {
+                let p: ConnectParams = parse_params(params)?;
+                let provider = sandboxes.provider_named(&p.provider).ok_or_else(|| {
+                    RpcError::Failed(format!("{} isn't on this device.", p.provider))
+                })?;
+                let failed = |e: crate::sandboxes::ProviderError| RpcError::Failed(e.message);
+                if let Some(token) = p.token.filter(|t| !t.trim().is_empty()) {
+                    let account = provider
+                        .connect(Credential::Token(token))
+                        .await
+                        .map_err(failed)?;
+                    let host = self.settle_host(sandboxes, &p.provider).await?;
+                    return RpcReply::value(&json!({ "account": account, "hostDeviceId": host }));
+                }
+                let code = provider.begin_connect().await.map_err(failed)?.ok_or_else(|| {
+                    RpcError::Failed(format!("{} connects with a pasted key.", provider.name()))
+                })?;
+                let shown = serde_json::to_value(&code).unwrap_or_default();
+                // Approved on the provider's page, in the user's time; then
+                // the key goes to the host device.
+                let rpc = self.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = provider.connect(Credential::DeviceCode(code)).await {
+                        tracing::warn!(provider = provider.id(), %err, "sandboxes: connect didn't finish");
+                        return;
+                    }
+                    if let Some(sandboxes) = rpc.sandboxes.as_ref()
+                        && let Err(err) = rpc.settle_host(sandboxes, provider.id()).await
+                    {
+                        tracing::warn!(provider = provider.id(), %err, "sandboxes: the key didn't reach the host device");
+                    }
+                });
+                RpcReply::value(&serde_json::json!({ "deviceCode": shown }))
+            }
             methods::SANDBOX_STEPS => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.steps(&p.chat_id))
@@ -192,22 +230,9 @@ impl EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&json!({ "ok": true }))
             }
-            methods::DELETE_SANDBOX => {
-                let p: ChatParams = parse_params(params)?;
-                sandboxes
-                    .delete_sandbox(&self.sandbox_host(), &p.chat_id)
-                    .await
-                    .map_err(RpcError::Failed)?;
-                RpcReply::value(&json!({ "ok": true }))
-            }
             methods::SANDBOX_HOST => {
                 let p: ProviderParams = parse_params(params)?;
                 RpcReply::value(&self.workspace.sandbox_host(&p.provider))
-            }
-            methods::CONNECT_SANDBOX_PROVIDER => {
-                let p: ConnectParams = parse_params(params)?;
-                let host = self.connect_provider(sandboxes, p).await?;
-                RpcReply::value(&json!({ "ok": true, "hostDeviceId": host }))
             }
             methods::ADOPT_SANDBOX_PROVIDER => {
                 let mut params = params;
@@ -216,7 +241,7 @@ impl EngineRpc {
                     object.remove("targetDeviceId");
                 }
                 let handover: Handover = parse_params(params)?;
-                self.adopt_provider(sandboxes, handover)?;
+                self.adopt_provider(sandboxes, handover).await?;
                 RpcReply::value(&json!({ "ok": true, "hostDeviceId": self.this_device() }))
             }
             methods::SET_SANDBOX_HOST => {
@@ -224,20 +249,38 @@ impl EngineRpc {
                 let host = self.move_host(sandboxes, p, params).await?;
                 RpcReply::value(&json!({ "ok": true, "hostDeviceId": host }))
             }
+            methods::CHECK_SANDBOX => {
+                let p: ChatParams = parse_params(params)?;
+                RpcReply::value(&sandboxes.check(self.auth.as_ref(), &p.chat_id).await)
+            }
+            methods::START_SANDBOX_FRESH => {
+                let p: ChatParams = parse_params(params)?;
+                sandboxes
+                    .start_fresh(self.sandbox_host(), &p.chat_id)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             _ => Err(RpcError::UnknownMethod(method.to_owned())),
         }
     }
 
-    /// `ConnectSandboxProvider`: the key goes to the provider's host device,
-    /// or else to the one picked, once; this device keeps it only when it's
-    /// that one. Returns the host device.
-    async fn connect_provider(
-        &self,
-        sandboxes: &Sandboxes,
-        p: ConnectParams,
-    ) -> Result<String, RpcError> {
+    /// Whether this device keeps `provider`: it's built in here and the
+    /// registry names no other host device for it.
+    fn keeps(&self, sandboxes: &Sandboxes, provider: &str) -> bool {
+        sandboxes.provider_named(provider).is_some()
+            && self
+                .workspace
+                .sandbox_host(provider)
+                .is_none_or(|host| host.host_device_id == self.this_device())
+    }
+
+    /// `provider` was just connected on this device: its key goes to the
+    /// host device (the one the registry names, else the one picked), once,
+    /// and this device keeps it only when it's that one. The host device.
+    async fn settle_host(&self, sandboxes: &Sandboxes, provider: &str) -> Result<String, RpcError> {
         let me = self.this_device().to_owned();
-        let current = self.workspace.sandbox_host(&p.provider);
+        let current = self.workspace.sandbox_host(provider);
         let target = match &current {
             Some(host) => host.host_device_id.clone(),
             None => {
@@ -258,14 +301,20 @@ impl EngineRpc {
                 pick_host(&devices, online, &me)
             }
         };
-        let handover = Handover {
-            provider: p.provider.clone(),
-            key: p.key,
-            connected_on: Some(me.clone()),
-            grants: Vec::new(),
-            chats: Vec::new(),
-        };
+        let built = sandboxes
+            .provider_named(provider)
+            .ok_or_else(|| RpcError::Failed(format!("{provider} isn't on this device.")))?;
         if target != me {
+            let key = built.export_key().ok_or_else(|| {
+                RpcError::Failed(format!("{} isn't connected on this device.", built.name()))
+            })?;
+            let handover = Handover {
+                provider: provider.to_owned(),
+                key,
+                connected_on: Some(me.clone()),
+                grants: Vec::new(),
+                chats: Vec::new(),
+            };
             let params = route(
                 serde_json::to_value(&handover).map_err(|e| RpcError::Failed(e.to_string()))?,
             );
@@ -274,22 +323,39 @@ impl EngineRpc {
                 .await
                 .and_then(|reply| reply_value(reply, methods::ADOPT_SANDBOX_PROVIDER));
             match sent {
-                Ok(_) => return Ok(target),
+                Ok(_) => {
+                    // The host device keeps it; this one doesn't.
+                    built.forget_key().await;
+                    return Ok(target);
+                }
                 // A device picked just now that can't be reached: this one
-                // keeps it instead. Any other answer stands.
+                // keeps it instead.
                 Err(err) if current.is_none() && unreachable(&err) => {
                     tracing::warn!(device = %target, error = %err,
                         "sandboxes: the picked host device can't be reached; this one keeps the key");
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    built.forget_key().await;
+                    return Err(err);
+                }
             }
         }
-        self.adopt_provider(sandboxes, handover)?;
+        self.workspace.set_sandbox_host(&SandboxHost {
+            provider: provider.to_owned(),
+            host_device_id: me.clone(),
+            connected_on: current
+                .and_then(|host| host.connected_on)
+                .or_else(|| Some(me.clone())),
+        });
         Ok(me)
     }
 
     /// Become the provider's host device ([`Handover`]).
-    fn adopt_provider(&self, sandboxes: &Sandboxes, handover: Handover) -> Result<(), RpcError> {
+    async fn adopt_provider(
+        &self,
+        sandboxes: &Sandboxes,
+        handover: Handover,
+    ) -> Result<(), RpcError> {
         let provider = handover.provider.clone();
         let connected_on = handover.connected_on.clone().or_else(|| {
             self.workspace
@@ -298,6 +364,7 @@ impl EngineRpc {
         });
         sandboxes
             .adopt(handover, self.auth.as_ref())
+            .await
             .map_err(RpcError::Failed)?;
         self.workspace.set_sandbox_host(&SandboxHost {
             provider,
@@ -371,8 +438,51 @@ impl EngineRpc {
             .await?;
         reply_value(reply, methods::ADOPT_SANDBOX_PROVIDER)?;
         // It has everything now; this device lets go.
-        sandboxes.forget(&p.provider, self.auth.as_ref());
+        sandboxes.forget(&p.provider, self.auth.as_ref()).await;
         Ok(target.id)
+    }
+
+    /// A child (subagent, side chat) of a chat on a sandbox shares that
+    /// sandbox, its device and checkout, unless it asks for a place of its
+    /// own. `None`: the parent isn't on a sandbox; create as usual.
+    pub(super) fn create_chat_in_parents_sandbox(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        config: Option<ChatConfig>,
+        parent_chat_id: &str,
+        child_kind: Option<zeron_proto::ChildKind>,
+    ) -> Option<Result<RpcReply, RpcError>> {
+        let parent = self.workspace.chat(parent_chat_id).ok().flatten()?;
+        // This device keeps its sandbox, or this engine is that sandbox's.
+        let kept = self
+            .sandboxes
+            .as_ref()
+            .is_some_and(|s| s.hosts_device(&parent.device_id));
+        let here = self.auth.as_ref().is_some_and(crate::auth::Auth::is_lent)
+            && parent.device_id == self.doc_host.device_id();
+        if !kept && !here {
+            return None;
+        }
+        let created = self
+            .workspace
+            .create_chat_hosted(
+                chat_id,
+                space_id,
+                device_id,
+                Some(&parent.device_id),
+                config,
+                parent.cwd.clone(),
+                Some(parent_chat_id.to_owned()),
+                child_kind,
+            )
+            .map_err(|e| RpcError::Failed(e.to_string()));
+        Some(created.and_then(|_| {
+            RpcReply::value(&serde_json::json!({
+                "ok": true, "deviceId": parent.device_id, "cwd": parent.cwd,
+            }))
+        }))
     }
 
     /// `createChat` on a place: the chat's row names its sandbox's device and
@@ -395,7 +505,7 @@ impl EngineRpc {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         let sandboxes = self.sandboxes()?;
         if let Some(raw) = raw.filter(|raw| !routed(raw))
-            && !sandboxes.keeps(provider)
+            && !self.keeps(sandboxes, provider)
         {
             let target = raw
                 .get("targetDeviceId")

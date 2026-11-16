@@ -2,8 +2,8 @@
 //! device", ADR 0004), at the engine's RPCs: two of the user's devices, a
 //! laptop and an always-on `zeron headless` server, share a scripted edge and
 //! registry. The user connects a fake provider on the laptop; Zeron picks the
-//! server as host device and sends it the key once. The laptop creates and
-//! deletes sandboxes by asking the server (`targetDeviceId` forwarding), and
+//! server as host device and sends it the key once. The laptop creates
+//! sandboxes by asking the server (`targetDeviceId` forwarding), and
 //! moving the host device moves the key while a running sandbox goes on, its
 //! next token lent by the new host device.
 //!
@@ -17,14 +17,13 @@ mod fake_provider;
 mod scripted_edge;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fake_provider::{FakeProvider, engine_config, start_engine};
 use scripted_edge::{ScriptedEdge, USER};
 use serde_json::{Value, json};
 use zeron_engine::EngineRuntime;
-use zeron_engine::sandboxes::SandboxProvider;
 use zeron_rpc::{RpcClient, memory_client, methods};
 
 const ORG: &str = "org_home";
@@ -53,41 +52,25 @@ async fn device(dir: &Path, edge: &ScriptedEdge, headless: bool) -> EngineRuntim
 }
 
 /// The fake cloud account: whichever device holds its key reaches the same
-/// sandboxes. Each device has the provider built in; which keys it was
-/// connected with is recorded per device.
+/// sandboxes. Each device has the provider built in, keeping the key in its
+/// own data dir, as Docker Sandbox does.
 struct Cloud {
     provider: Arc<FakeProvider>,
-    keys: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
 impl Cloud {
     fn new(root: &Path) -> Self {
         Self {
             provider: FakeProvider::cloud(root),
-            keys: Arc::default(),
         }
     }
 
-    /// The provider built into `engine`, waiting for a key.
-    fn build_into(&self, engine: &EngineRuntime) {
-        let provider = self.provider.clone();
-        let keys = self.keys.clone();
-        let device = engine.core().device_id.clone();
-        engine.core().sandboxes.add_factory(
-            "fake",
-            Arc::new(move |key: &Value| {
-                keys.lock().unwrap().push((device.clone(), key.clone()));
-                if key["token"] != SECRET {
-                    return Err("that isn't a fake cloud key".to_string());
-                }
-                Ok(provider.clone() as Arc<dyn SandboxProvider>)
-            }),
-        );
-    }
-
-    /// The devices the key was handed to, in order.
-    fn keyed_on(&self) -> Vec<String> {
-        self.keys.lock().unwrap().iter().map(|(d, _)| d.clone()).collect()
+    /// The provider built into `engine`, whose data is in `dir`.
+    fn build_into(&self, engine: &EngineRuntime, dir: &Path) {
+        engine
+            .core()
+            .sandboxes
+            .register(self.provider.on_device(dir));
     }
 }
 
@@ -276,8 +259,8 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     let cloud = Cloud::new(&dirs.path().join("cloud"));
     let laptop = device(&dirs.path().join("laptop"), &edge, false).await;
     let server = device(&dirs.path().join("server"), &edge, true).await;
-    cloud.build_into(&laptop);
-    cloud.build_into(&server);
+    cloud.build_into(&laptop, &dirs.path().join("laptop"));
+    cloud.build_into(&server, &dirs.path().join("server"));
     let laptop_id = laptop.core().device_id.clone();
     let server_id = server.core().device_id.clone();
     let on_laptop = memory_client(laptop.core().rpc_service());
@@ -292,13 +275,12 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     let connected = on_laptop
         .call(
             methods::CONNECT_SANDBOX_PROVIDER,
-            json!({ "provider": "fake", "key": { "token": SECRET } }),
+            json!({ "provider": "fake", "token": SECRET }),
         )
         .await
         .expect("ConnectSandboxProvider");
     assert_eq!(connected["hostDeviceId"], server_id.as_str(), "{connected:#}");
     assert!(!connected.to_string().contains(SECRET), "the key came back");
-    assert_eq!(cloud.keyed_on(), [server_id.clone()]);
     let host = names_host(&on_laptop, &server_id).await;
     assert_eq!(host["connectedOn"], laptop_id.as_str(), "{host:#}");
     names_host(&on_server, &server_id).await;
@@ -338,7 +320,6 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
         .expect("SetSandboxHost");
     assert_eq!(moved["hostDeviceId"], laptop_id.as_str(), "{moved:#}");
     assert!(!moved.to_string().contains(SECRET), "the key came back");
-    assert_eq!(cloud.keyed_on(), [server_id.clone(), laptop_id.clone()]);
     names_host(&on_server, &laptop_id).await;
     assert!(
         files_holding(&dirs.path().join("server"), SECRET).is_empty(),
@@ -361,12 +342,20 @@ async fn the_host_device_keeps_the_key_and_other_devices_ask_it() {
     let dials = edge.host_dials(&sandbox);
     assert!(dials.iter().all(|d| d.admitted), "{dials:?}");
 
-    // The server deletes the sandbox, by asking the laptop.
+    // The chat is deleted on the server: the laptop, its host device now,
+    // deletes the sandbox.
     on_server
-        .call(methods::DELETE_SANDBOX, json!({ "chatId": "chat-a" }))
+        .call(
+            methods::MUTATE,
+            json!({ "op": "deleteChat", "chatId": "chat-a" }),
+        )
         .await
-        .expect("DeleteSandbox, from the server");
-    assert!(cloud.provider.sandboxes().is_empty(), "{:?}", cloud.provider.calls());
+        .expect("deleteChat, on the server");
+    let gone = eventually(Duration::from_secs(30), async || {
+        cloud.provider.sandboxes().is_empty().then_some(())
+    })
+    .await;
+    assert!(gone.is_some(), "{:?}", cloud.provider.calls());
     assert!(laptop.core().sandboxes.steps("chat-a").is_none());
 }
 
@@ -377,8 +366,8 @@ async fn with_no_headless_device_online_the_device_it_was_connected_on_is_host()
     let cloud = Cloud::new(&dirs.path().join("cloud"));
     let laptop = device(&dirs.path().join("laptop"), &edge, false).await;
     let desktop = device(&dirs.path().join("desktop"), &edge, false).await;
-    cloud.build_into(&laptop);
-    cloud.build_into(&desktop);
+    cloud.build_into(&laptop, &dirs.path().join("laptop"));
+    cloud.build_into(&desktop, &dirs.path().join("desktop"));
     let on_laptop = memory_client(laptop.core().rpc_service());
     let laptop_id = laptop.core().device_id.clone();
     sees_online(&on_laptop, &desktop.core().device_id).await;
@@ -386,19 +375,20 @@ async fn with_no_headless_device_online_the_device_it_was_connected_on_is_host()
     let connected = on_laptop
         .call(
             methods::CONNECT_SANDBOX_PROVIDER,
-            json!({ "provider": "fake", "key": { "token": SECRET } }),
+            json!({ "provider": "fake", "token": SECRET }),
         )
         .await
         .expect("ConnectSandboxProvider");
     assert_eq!(connected["hostDeviceId"], laptop_id.as_str(), "{connected:#}");
-    assert_eq!(cloud.keyed_on(), [laptop_id.clone()]);
+    assert!(!files_holding(&dirs.path().join("laptop"), SECRET).is_empty());
+    assert!(files_holding(&dirs.path().join("desktop"), SECRET).is_empty());
     names_host(&memory_client(desktop.core().rpc_service()), &laptop_id).await;
 
     // A key the provider refuses connects nothing.
     let refused = memory_client(desktop.core().rpc_service())
         .call(
             methods::CONNECT_SANDBOX_PROVIDER,
-            json!({ "provider": "fake", "key": { "token": "wrong" } }),
+            json!({ "provider": "fake", "token": "wrong" }),
         )
         .await;
     assert!(refused.is_err(), "{refused:?}");

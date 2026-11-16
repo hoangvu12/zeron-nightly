@@ -20,7 +20,7 @@ use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use zeron_engine::sandboxes::{
     Command, CreateSandbox, ErrorKind, Exit, Ops, Placement, ProviderError, RunEvent, RunStream,
-    SandboxProvider,
+    Account, Credential, KeySlot, SandboxProvider, SandboxStatus,
 };
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, HarnessId, LentSignIn};
 
@@ -64,6 +64,19 @@ struct FakeBox {
     dir: PathBuf,
     running: bool,
     engine: Option<EngineRuntime>,
+    /// The key of the sign-in its engine was lent.
+    lent_key: Option<String>,
+}
+
+impl FakeBox {
+    fn new(dir: PathBuf, running: bool) -> Self {
+        Self {
+            dir,
+            running,
+            engine: None,
+            lent_key: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -72,6 +85,10 @@ struct State {
     boxes: BTreeMap<String, FakeBox>,
     /// Create waits while this is set.
     create_gate: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Commands find the disk full (Zeron's own engine aside).
+    disk_full: bool,
+    /// Sandboxes made so far: each one's engine keeps its data apart.
+    made: usize,
 }
 
 pub struct FakeProvider {
@@ -85,27 +102,34 @@ pub struct FakeProvider {
     resident: Option<Resident>,
     state: Arc<Mutex<State>>,
     hold: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// Where one device keeps the account's key ([`Self::on_device`]).
+    slot: Option<KeySlot>,
 }
 
 impl FakeProvider {
     /// A full cloud: one sandbox per chat, every operation, templates with
     /// Zeron on them.
     pub fn cloud(root: &Path) -> Arc<Self> {
-        Arc::new(Self::new("fake", Ops::ALL, root))
+        let ops = Ops::CREATE
+            | Ops::START
+            | Ops::STOP
+            | Ops::DELETE
+            | Ops::RUN
+            | Ops::TEMPLATES
+            | Ops::SAVE_TEMPLATE;
+        Arc::new(Self::new("fake", ops, root))
     }
 
     /// An SSH box: `run` only, every chat on the one box.
     pub fn run_only(root: &Path) -> Arc<Self> {
         let mut provider = Self::new("fake-ssh", Ops::RUN, root);
         provider.shared = Some("box".into());
-        provider.state.lock().unwrap().boxes.insert(
-            "box".into(),
-            FakeBox {
-                dir: root.join("box"),
-                running: true,
-                engine: None,
-            },
-        );
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .boxes
+            .insert("box".into(), FakeBox::new(root.join("box"), true));
         Arc::new(provider)
     }
 
@@ -113,14 +137,12 @@ impl FakeProvider {
     pub fn start_only(root: &Path, resident: Resident) -> Arc<Self> {
         let mut provider = Self::new("fake-pc", Ops::START, root);
         provider.shared = Some("pc".into());
-        provider.state.lock().unwrap().boxes.insert(
-            "pc".into(),
-            FakeBox {
-                dir: root.join("pc"),
-                running: false,
-                engine: None,
-            },
-        );
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .boxes
+            .insert("pc".into(), FakeBox::new(root.join("pc"), false));
         provider.resident = Some(resident);
         Arc::new(provider)
     }
@@ -135,7 +157,24 @@ impl FakeProvider {
             resident: None,
             state: Arc::default(),
             hold: Mutex::new(None),
+            slot: None,
         }
+    }
+
+    /// The same cloud as one of the user's devices builds it in: connected
+    /// with a key kept in that device's data dir, as Docker Sandbox is.
+    pub fn on_device(&self, data_dir: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            id: self.id.clone(),
+            ops: self.ops | Ops::CONNECT,
+            root: self.root.clone(),
+            has_zeron: self.has_zeron,
+            shared: self.shared.clone(),
+            resident: None,
+            state: self.state.clone(),
+            hold: Mutex::new(None),
+            slot: Some(KeySlot::open(data_dir, &self.id)),
+        })
     }
 
     /// Hold `create` until [`Self::release_create`].
@@ -159,6 +198,49 @@ impl FakeProvider {
 
     pub fn sandboxes(&self) -> Vec<String> {
         self.state.lock().unwrap().boxes.keys().cloned().collect()
+    }
+
+    /// The user deletes `sandbox` in the provider's own console: its engine
+    /// goes with it.
+    pub async fn delete_outside(&self, sandbox: &str) {
+        self.discard(sandbox).await;
+    }
+
+    /// Commands in its sandboxes find the disk full (or not, again).
+    pub fn set_disk_full(&self, full: bool) {
+        self.state.lock().unwrap().disk_full = full;
+    }
+
+    /// The key of the sign-in `sandbox`'s engine was lent, once it started.
+    pub fn lent_key(&self, sandbox: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .boxes
+            .get(sandbox)?
+            .lent_key
+            .clone()
+    }
+
+    async fn discard(&self, sandbox: &str) -> bool {
+        let removed = self.state.lock().unwrap().boxes.remove(sandbox);
+        let Some(fake) = removed else {
+            return false;
+        };
+        if let Some(engine) = fake.engine {
+            engine.shutdown().await;
+        }
+        // Its checkout goes. (Its engine's data stays: on Windows a file may
+        // still be held a moment, and each sandbox's engine has a data
+        // folder of its own.)
+        let home = fake.dir.join("home");
+        writable(&home);
+        if let Err(err) = std::fs::remove_dir_all(&home)
+            && home.exists()
+        {
+            panic!("the fake couldn't delete {}: {err}", home.display());
+        }
+        true
     }
 
     /// Look inside the engine running in `sandbox`, once it has started.
@@ -202,7 +284,14 @@ impl FakeProvider {
         let Some(edge_url) = var("ZERON_EDGE_URL") else {
             return exit_with(1, "ZERON_EDGE_URL isn't set");
         };
-        let data_dir = dir.join("zeron-data");
+        let data_dir = {
+            let mut state = self.state.lock().unwrap();
+            let Some(fake) = state.boxes.get_mut(sandbox) else {
+                return exit_with(1, "the sandbox is gone");
+            };
+            fake.lent_key = Some(lent.key.clone());
+            dir.join(format!("zeron-data-{}", state.made))
+        };
         std::fs::create_dir_all(&data_dir).unwrap();
         if let Some(device) = var(zeron_engine::sandboxes::DEVICE_ID_ENV) {
             zeron_engine::sandboxes::take_device_id(&data_dir, &device).unwrap();
@@ -221,6 +310,25 @@ impl FakeProvider {
                 fake.engine = Some(engine);
             }
         });
+    }
+}
+
+/// Make everything under `dir` writable (git's objects are read-only, which
+/// Windows won't delete).
+fn writable(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            writable(&path);
+        } else if let Ok(meta) = std::fs::metadata(&path) {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
     }
 }
 
@@ -248,6 +356,49 @@ impl SandboxProvider for FakeProvider {
 
     fn ops(&self) -> Ops {
         self.ops
+    }
+
+    fn account(&self) -> Option<Account> {
+        self.slot.as_ref()?.get().map(|_| Account {
+            name: "fake-account".into(),
+        })
+    }
+
+    async fn connect(&self, credential: Credential) -> Result<Account, ProviderError> {
+        let Credential::Token(token) = credential else {
+            return Err(ProviderError::unsupported("sign in on a page"));
+        };
+        // The keys the fake cloud gives out start with `fake-`.
+        if !token.starts_with("fake-") {
+            return Err(ProviderError::new(
+                ErrorKind::Config,
+                "that isn't a fake cloud key",
+            ));
+        }
+        self.adopt_key(serde_json::json!({ "token": token }).to_string())
+            .await
+    }
+
+    fn export_key(&self) -> Option<String> {
+        self.slot.as_ref()?.get()
+    }
+
+    async fn adopt_key(&self, raw: String) -> Result<Account, ProviderError> {
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or_else(|| ProviderError::unsupported("keep a key"))?;
+        slot.set(&raw)
+            .map_err(|e| ProviderError::new(ErrorKind::Fatal, e.to_string()))?;
+        Ok(Account {
+            name: "fake-account".into(),
+        })
+    }
+
+    async fn forget_key(&self) {
+        if let Some(slot) = &self.slot {
+            slot.clear().unwrap();
+        }
     }
 
     fn placement(&self, _chat_id: &str) -> Placement {
@@ -280,15 +431,30 @@ impl SandboxProvider for FakeProvider {
         let sandbox = request.key.clone();
         let dir = self.root.join(&sandbox);
         std::fs::create_dir_all(dir.join("home")).unwrap();
-        self.state.lock().unwrap().boxes.insert(
-            sandbox.clone(),
-            FakeBox {
-                dir,
-                running: true,
-                engine: None,
-            },
-        );
+        let mut state = self.state.lock().unwrap();
+        state.made += 1;
+        state.boxes.insert(sandbox.clone(), FakeBox::new(dir, true));
         Ok(sandbox)
+    }
+
+    async fn delete(&self, sandbox: &str) -> Result<(), ProviderError> {
+        self.record(format!("delete {sandbox}"));
+        if self.discard(sandbox).await {
+            Ok(())
+        } else {
+            Err(ProviderError::new(
+                ErrorKind::NotFound,
+                format!("no sandbox {sandbox}"),
+            ))
+        }
+    }
+
+    async fn status(&self, sandbox: &str) -> Result<SandboxStatus, ProviderError> {
+        Ok(match self.state.lock().unwrap().boxes.get(sandbox) {
+            None => SandboxStatus::Gone,
+            Some(fake) if fake.running => SandboxStatus::Running,
+            Some(_) => SandboxStatus::Stopped,
+        })
     }
 
     async fn start(&self, sandbox: &str) -> Result<(), ProviderError> {
@@ -337,18 +503,6 @@ impl SandboxProvider for FakeProvider {
         Ok(())
     }
 
-    async fn delete(&self, sandbox: &str) -> Result<(), ProviderError> {
-        self.record(format!("delete {sandbox}"));
-        let removed = self.state.lock().unwrap().boxes.remove(sandbox);
-        let fake = removed.ok_or_else(|| {
-            ProviderError::new(ErrorKind::NotFound, format!("no sandbox {sandbox}"))
-        })?;
-        if let Some(engine) = fake.engine {
-            engine.shutdown().await;
-        }
-        Ok(())
-    }
-
     async fn run(&self, sandbox: &str, command: Command) -> Result<RunStream, ProviderError> {
         self.record(format!("run {sandbox}: {}", command.args.join(" ")));
         let dir = self.dir(sandbox)?;
@@ -364,9 +518,18 @@ impl SandboxProvider for FakeProvider {
                     Ok(RunEvent::Exit(Exit::code(0))),
                 ])
                 .boxed(),
-                Some("headless") if command.detach => self.boot(sandbox, &dir, &command.env),
+                // Under its watchdog, as Zeron starts it, or bare.
+                Some("watchdog" | "headless") if command.detach => {
+                    self.boot(sandbox, &dir, &command.env)
+                }
                 _ => exit_with(127, "zeron-engine: not found"),
             });
+        }
+        if self.state.lock().unwrap().disk_full {
+            return Ok(exit_with(
+                1,
+                &format!("{program}: write error: No space left on device"),
+            ));
         }
         let cwd = command.cwd.map(PathBuf::from).unwrap_or(home.clone());
         let mut child = tokio::process::Command::new(program);
