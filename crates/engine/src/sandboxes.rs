@@ -74,7 +74,7 @@ const SCRIPT_ENV: &str = "ZERON_STEP_SCRIPT";
 /// Where a host-side script's `zeron-sandbox` sends its commands.
 const SANDBOX_RUN_ENV: &str = "ZERON_SANDBOX_RUN";
 /// What every step script sees: which sandbox, for what.
-const PROVIDER_ENV: &str = "ZERON_PROVIDER";
+const SCRIPT_PROVIDER_ENV: &str = "ZERON_PROVIDER";
 const SANDBOX_ENV: &str = "ZERON_SANDBOX";
 const CHAT_ENV: &str = "ZERON_CHAT";
 const REPO_ENV: &str = "ZERON_REPO";
@@ -1148,7 +1148,7 @@ async fn run_script(
     let content = std::fs::read_to_string(&script.path)
         .map_err(|e| format!("Couldn't read {}: {e}", script.shown))?;
     let env = [
-        (PROVIDER_ENV, record.steps.provider.clone()),
+        (SCRIPT_PROVIDER_ENV, record.steps.provider.clone()),
         (
             SANDBOX_ENV,
             record.steps.sandbox_id.clone().unwrap_or_default(),
