@@ -215,6 +215,20 @@ pub mod methods {
     /// lent for. Asked by the sandbox's engine over the relay before its
     /// token runs out; refused once this device stops lending under `key`.
     pub const LEND_TOKEN: &str = "LendToken";
+
+    // Places chats run on: sandbox providers built into the engine
+    // (docs/design/cloud-byo.md). Answered by the device that keeps the
+    // provider; relay-forwardable so the account's other devices ask it.
+    /// `{}` → `[{id, name, icon, ops}]`: the providers this device keeps.
+    pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
+    /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
+    /// state: starting|ready|failed, step, since, error, steps: [{step,
+    /// state}]}`), or `null` for a chat not on a place this device keeps.
+    pub const SANDBOX_STEPS: &str = "SandboxSteps";
+    /// `{chatId}` → stream of `SandboxSteps` (current, then each change).
+    pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
+    /// `{chatId}` → `{ok}`: run a failed step again, and the ones after it.
+    pub const RUN_SANDBOX_STEPS_AGAIN: &str = "RunSandboxStepsAgain";
     /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
     /// error, message, organization?}`: the engine deletes the account at
     /// the edge with its step-up ticket. `error` is `step_up_required` (run

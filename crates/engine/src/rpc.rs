@@ -62,6 +62,7 @@
 mod agent_gate;
 mod device_stats;
 mod remote_plugins;
+mod sandboxes;
 mod voice_chat;
 mod voice_remote;
 use async_trait::async_trait;
@@ -711,6 +712,15 @@ struct CloudHost {
     row_written: bool,
 }
 
+/// `createChat`'s place: a provider and, optionally, one of its templates.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaceParams {
+    provider: String,
+    #[serde(default)]
+    template: Option<String>,
+}
+
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -748,6 +758,10 @@ enum MutateParams {
         /// Cloud machine, cloning the project's GitHub repository.
         #[serde(default)]
         cloud: bool,
+        /// Run on a place (a sandbox provider this device keeps): the chat
+        /// gets a sandbox there, set up by its steps while the call returns.
+        #[serde(default)]
+        place: Option<PlaceParams>,
     },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
@@ -883,6 +897,8 @@ pub struct EngineRpc {
     viewport_focus: crate::desktop_notify::ViewportFocus,
     /// The plugins service (absent in bare test assemblies).
     plugins: Option<crate::plugins::Plugins>,
+    /// Sandbox providers and the chats on them (absent in bare test assemblies).
+    sandboxes: Option<crate::sandboxes::Sandboxes>,
     engine_info: EngineInfo,
 }
 
@@ -944,8 +960,15 @@ impl EngineRpc {
             credentials: None,
             viewport_focus: Default::default(),
             plugins: None,
+            sandboxes: None,
             engine_info,
         }
+    }
+
+    /// Attach the sandbox providers (the Sandbox* methods, `createChat` on a place).
+    pub fn with_sandboxes(mut self, sandboxes: crate::sandboxes::Sandboxes) -> Self {
+        self.sandboxes = Some(sandboxes);
+        self
     }
 
     /// Attach the plugins service (the Plugin* methods).
@@ -1979,6 +2002,7 @@ impl EngineRpc {
                 parent_chat_id,
                 child_kind,
                 cloud: _,
+                place: _,
             } => {
                 // A voice orchestrator is hidden, so the chats it creates are
                 // the user's top-level sessions rather than its side chats.
@@ -2472,6 +2496,11 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
+            // Answered by the device that keeps the provider (the host device).
+            | methods::LIST_SANDBOX_PROVIDERS
+            | methods::SANDBOX_STEPS
+            | methods::WATCH_SANDBOX_STEPS
+            | methods::RUN_SANDBOX_STEPS_AGAIN
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
@@ -2617,6 +2646,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::UPDATE_STATUS
             | methods::WATCH_HARNESS_UPDATES
             | methods::WATCH_PLUGINS
+            | methods::WATCH_SANDBOX_STEPS
     )
 }
 
@@ -3257,6 +3287,9 @@ impl RpcService for EngineRpc {
         }
         if voice_remote::handles(method) {
             return self.voice_remote(method, params).await;
+        }
+        if sandboxes::handles(method) {
+            return Box::pin(self.sandboxes_rpc(method, params)).await;
         }
         // Signing out retires this device's plugin signing key first, while
         // the session can still revoke it on the edge.
@@ -4253,11 +4286,35 @@ impl RpcService for EngineRpc {
                     space_id,
                     device_id,
                     config,
+                    parent_chat_id,
+                    child_kind,
+                    place: Some(place),
+                    ..
+                } = &p
+                {
+                    return Box::pin(self.create_chat_on_place(
+                        chat_id,
+                        space_id.as_deref(),
+                        device_id.as_deref(),
+                        config.clone(),
+                        parent_chat_id.clone(),
+                        *child_kind,
+                        &place.provider,
+                        place.template.clone(),
+                    ))
+                    .await;
+                }
+                if let MutateParams::CreateChat {
+                    chat_id,
+                    space_id,
+                    device_id,
+                    config,
                     branch,
                     cwd,
                     parent_chat_id,
                     child_kind,
                     cloud,
+                    place: None,
                 } = &p
                     && let Some(host) = Box::pin(self.cloud_chat_host(
                         chat_id,

@@ -71,6 +71,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod runner;
+pub mod sandboxes;
 pub mod wake_trace;
 pub mod wake_update;
 pub mod sessions;
@@ -202,6 +203,9 @@ pub struct EngineCore {
     pub local_import: Option<local_import::LocalImporter>,
     /// Plugins under `{data}/plugins/` (the plugins contract).
     pub plugins: plugins::Plugins,
+    /// Places chats run on: the sandbox providers this device keeps and
+    /// the chats on them (docs/design/cloud-byo.md).
+    pub sandboxes: sandboxes::Sandboxes,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -480,6 +484,7 @@ impl EngineCore {
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         plugins.start();
+        let sandboxes = sandboxes::Sandboxes::open(data_dir);
         Ok(Self {
             sessions,
             doc_host,
@@ -500,6 +505,7 @@ impl EngineCore {
             device_id,
             local_import,
             plugins,
+            sandboxes,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -685,7 +691,8 @@ impl EngineCore {
         .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_viewport_focus(self.viewport_focus.clone())
-        .with_plugins(self.plugins.clone());
+        .with_plugins(self.plugins.clone())
+        .with_sandboxes(self.sandboxes.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -1201,6 +1208,14 @@ impl Engine {
                 });
             }
             core.set_cloud(runner::CloudRunner::new(broker, activity, heartbeat));
+        }
+        // A sandbox's engine, like a Cloud machine, comes up with sends
+        // already waiting for it (a chat's first message, queued while its
+        // steps ran): look at every chat it hosts once the registry has synced.
+        if auth.is_lent()
+            && let Err(err) = core.doc_host.enqueue_wakeup("*")
+        {
+            tracing::warn!(error = %err, "sandbox: couldn't schedule the hosted chats' reconcile");
         }
         // The chats as last published (the list every view watches), not a
         // fresh parse of every chat row on each scan.
