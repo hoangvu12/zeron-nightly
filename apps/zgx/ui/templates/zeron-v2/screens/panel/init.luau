@@ -713,6 +713,13 @@ M.Panel = ui.component(function(props: Props): Node
 
 	-- Each tab's box, by id (for bringing the active one into view).
 	local chip_refs: { [string]: any } = {}
+	-- One more each time a tab's node mounts: what looked a tab up before its
+	-- node was there looks again (`chip_refs` is a plain table).
+	local chips_mounted = ui.use_state(0)
+	local function chip_ref(id: string): any
+		chips_mounted:get()
+		return chip_refs[id]
+	end
 
 	-- A tab in the strip.
 	local function chip(tab: Tab, _i: number): Node
@@ -816,6 +823,9 @@ M.Panel = ui.component(function(props: Props): Node
 			ui.row {
 				id = `panel-tab-{id}`,
 				ref = ref,
+				on_mount = function()
+					chips_mounted:set(chips_mounted:peek() + 1)
+				end,
 				-- (What plugins place by, and what's under them: the tab, and a
 				-- file tab's file, as a token.)
 				class = if tab.kind == "files" then "panel-tab file-tab" else "panel-tab",
@@ -1026,7 +1036,7 @@ M.Panel = ui.component(function(props: Props): Node
 			return
 		end
 		for _, t in list do
-			local r = chip_refs[t.id]
+			local r = chip_ref(t.id)
 			if not r or (r.width or 0) <= 0 then
 				return
 			end
@@ -1041,7 +1051,7 @@ M.Panel = ui.component(function(props: Props): Node
 		-- (The tabs' own gap, the strip's hair.)
 		local gap = (ui.theme.get("zeron.space.hair") :: number?) or 2
 		for i, t in list do
-			local r = chip_refs[t.id]
+			local r = chip_ref(t.id)
 			local w = if r then r.width or 0 else 0
 			if t.id ~= a then
 				left += w + gap
@@ -1097,7 +1107,7 @@ M.Panel = ui.component(function(props: Props): Node
 		local gap = (ui.theme.get("zeron.space.hair") :: number?) or 2
 		local w = 0
 		for _, t in list do
-			local r = chip_refs[t.id]
+			local r = chip_ref(t.id)
 			w += (if r then r.width or 0 else 0) + gap
 		end
 		return w + CHIP_H > view + 0.5
