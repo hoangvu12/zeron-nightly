@@ -258,11 +258,15 @@ async fn a_failed_sandbox_says_why() {
     assert!(err.message.contains("deleted 14 days"), "{err}");
 }
 
+/// Boat's reply (status, code, `retryable` hint, permission named) and the
+/// kind it sorts to.
+type ErrorCase = (u16, &'static str, Option<bool>, Option<&'static str>, ErrorKind);
+
 #[tokio::test]
 async fn errors_sort_as_the_edge_sorts_them() {
     let boat = connected().await;
     let id = boat.provider.create(create("chat-x", "1")).await.unwrap();
-    let cases: &[(u16, &str, Option<bool>, Option<&str>, ErrorKind)] = &[
+    let cases: &[ErrorCase] = &[
         (500, "internal", None, None, ErrorKind::Retryable),
         (429, "rate_limited", None, None, ErrorKind::Retryable),
         (409, "sandbox_starting", None, None, ErrorKind::Retryable),
