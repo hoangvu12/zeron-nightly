@@ -66,6 +66,8 @@ export type Session = {
 	agent: Mark.Name?,
 	-- Regular's second line: where it runs and on what.
 	device: string?,
+	-- Its device's glyph leading that line (a sandbox's provider's).
+	device_icon: string?,
 	branch: string?,
 	-- Subagents and side chats working under it (Zeron's "● N" pill beside
 	-- its corner).
@@ -1211,7 +1213,9 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 			return detail(cur(), by)
 		end, function(): boolean
 			return details.branch:get() and cur().branch ~= nil
-		end, second_line, fades)
+		end, second_line, fades, function(): string?
+			return cur().device_icon
+		end)
 		local function strong(): boolean
 			return active(s) or selected:get() == s.id
 		end

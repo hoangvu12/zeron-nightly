@@ -817,6 +817,8 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
         async move {
             if args.field("cloud").is_some_and(Value::truthy) {
                 a.create_on_cloud(args).await
+            } else if args.field("place").is_some_and(|p| !matches!(p, Value::Nil)) {
+                a.create_on_place(args).await
             } else {
                 a.create(args).await.map_err(String::from)
             }
@@ -1280,6 +1282,11 @@ impl Sessions {
                     ("here", Value::Bool(here.as_deref() == Some(id))),
                     ("online", Value::Bool(online)),
                 ];
+                // A sandbox's engine (spec #37): the provider it's of. Lists
+                // hide it and offer the provider instead (`sandbox:<provider>`).
+                if let Some(provider) = sandbox_of(d) {
+                    fields.push(("sandbox", Value::from(provider)));
+                }
                 // When it was last seen, while it's away (Settings → Devices
                 // and the place picker say so). Online, its beat moves every
                 // few seconds and shows nowhere; it going quiet is published
@@ -1547,6 +1554,39 @@ impl Sessions {
         Ok(Value::record([("id", Value::from(id.as_str())), ("cwd", Value::from(cwd))]))
     }
 
+    /// A chat on a place (spec #37): a sandbox of its own from `place`'s
+    /// provider, from its template (none: Blank), cloning the project picked.
+    /// `{ id, device, cwd }`: the sandbox's device and the folder there; or
+    /// the engine's words for why not.
+    async fn create_on_place(&self, args: Value) -> Result<Value, String> {
+        let field = |key: &str| args.field(key).map(text).filter(|s| !s.is_empty());
+        let place = args.field("place").cloned().unwrap_or(Value::Nil);
+        let provider = place.field("provider").map(text).filter(|p| !p.is_empty()).ok_or("invalid")?;
+        let template = place.field("template").map(text).filter(|t| !t.is_empty());
+        let id = field("id").filter(|id| plain_id(id)).unwrap_or_else(new_id);
+        let config = args
+            .field("config")
+            .filter(|c| !matches!(c, Value::Nil))
+            .and_then(|c| serde_json::from_str::<Json>(&c.to_json()).ok());
+        let here = self.here.borrow().clone();
+        let params = place_params(&id, field("project").as_deref(), &provider, template.as_deref(), here.as_deref(), config);
+        let made = engine::get().call("Mutate", params.clone()).await.map_err(|error| {
+            eprintln!("zeron-zgx: sessions: no chat on {provider}: {error}");
+            match engine::outcome(&error) {
+                "failed" => place_words(&error),
+                word => word.to_string(),
+            }
+        })?;
+        crate::chat::made(&params);
+        let device = made["deviceId"].as_str().unwrap_or_default();
+        let cwd = made["cwd"].as_str().unwrap_or_default();
+        Ok(Value::record([
+            ("id", Value::from(id.as_str())),
+            ("device", Value::from(device)),
+            ("cwd", Value::from(cwd)),
+        ]))
+    }
+
     /// A side chat that starts as a copy of `source` (the shipping app's Fork
     /// chat: `ForkSideChat`, made on the source's device, the copy up to its
     /// last finished reply), under `parent` (the source by default): the new
@@ -1627,6 +1667,54 @@ impl Sessions {
             me.publish();
         });
     }
+}
+
+/// Why a chat on a place didn't start: the engine's own sentence (the
+/// provider isn't connected here), else a plain retry.
+fn place_words(error: &str) -> String {
+    let mut words = error.trim();
+    for prefix in ["forwarded:", "failed:"] {
+        while let Some(rest) = words.strip_prefix(prefix) {
+            words = rest.trim();
+        }
+    }
+    let readable = !words.is_empty() && words.len() <= 200 && !words.contains('{');
+    if readable { words.to_string() } else { "The sandbox couldn't be made. Try again.".into() }
+}
+
+/// `createChat` on a place: in `project` (else a projectless chat this device
+/// keeps the row of), on a sandbox of `provider` from `template` (none: Blank).
+pub(crate) fn place_params(
+    id: &str,
+    project: Option<&str>,
+    provider: &str,
+    template: Option<&str>,
+    here: Option<&str>,
+    config: Option<Json>,
+) -> Json {
+    let mut place = json!({ "provider": provider });
+    if let Some(template) = template {
+        place["template"] = Json::from(template);
+    }
+    let mut params = json!({ "op": "createChat", "chatId": id, "place": place });
+    match (project, here) {
+        (Some(project), _) => params["spaceId"] = Json::from(project),
+        (None, Some(here)) => params["deviceId"] = Json::from(here),
+        (None, None) => {}
+    }
+    if let Some(config) = config {
+        params["config"] = config;
+    }
+    params
+}
+
+/// The provider a sandbox's device row names (`sandbox:<provider>`), if it's one.
+pub(crate) fn sandbox_of(d: &Json) -> Option<&str> {
+    d["capabilities"].as_array()?.iter().find_map(|c| {
+        c.as_str()?
+            .strip_prefix(zeron_proto::SANDBOX_CAPABILITY_PREFIX)
+            .filter(|provider| !provider.is_empty())
+    })
 }
 
 /// A device row of Cloud's: the logical Cloud device or a session's machine
@@ -2606,6 +2694,53 @@ mod tests {
     }
 
     use super::rfc3339 as iso;
+
+    /// A sandbox's engine names its provider in its capabilities
+    /// (`sandbox:<provider>`): the scripts see the provider on the device, so
+    /// lists hide it and show one entry per provider. It isn't Cloud: its
+    /// wake and sleep never go to Zeron Cloud. Cloud's own machines stay
+    /// Cloud's, with no provider.
+    #[test]
+    fn a_sandbox_device_names_its_provider_and_isn_t_cloud() {
+        let now = now_seconds();
+        let s = Sessions::default();
+        *s.here.borrow_mut() = Some("here".into());
+        *s.devices.borrow_mut() = json!([
+            { "id": "here", "name": "Laptop", "platform": "macos", "lastSeenAt": iso(now - 1) },
+            { "id": "box-1", "name": "sandbox", "platform": "linux", "lastSeenAt": iso(now - 1),
+              "capabilities": ["message-queue-v1", "sandbox:docker"] },
+            { "id": "cloud-s1", "platform": "cloud", "capabilities": ["cloud-session"] },
+            { "id": "odd", "capabilities": ["sandbox:"] },
+        ]);
+        let v = s.value();
+        let device = |id: &str| v.field("devices").unwrap().list().iter().find(|d| d.field("id").map(crate::auth::text).as_deref() == Some(id)).unwrap().clone();
+        let sandbox = |id: &str| device(id).field("sandbox").map(crate::auth::text);
+        let cloud = |id: &str| device(id).field("cloud").cloned();
+        assert_eq!(sandbox("box-1").as_deref(), Some("docker"));
+        assert_eq!(cloud("box-1"), Some(zgx_script::Value::Bool(false)));
+        assert_eq!(sandbox("here"), None);
+        assert_eq!(sandbox("cloud-s1"), None);
+        assert_eq!(cloud("cloud-s1"), Some(zgx_script::Value::Bool(true)));
+        assert_eq!(sandbox("odd"), None);
+    }
+
+    /// A chat on a place: `createChat` with the provider and the template
+    /// picked (none: Blank), in the project picked, never on Cloud.
+    #[test]
+    fn a_chat_on_a_place_is_made_with_its_provider_and_template() {
+        let made = super::place_params("c1", Some("space-1"), "docker", Some("zeron-dev"), None, None);
+        assert_eq!(
+            made,
+            json!({ "op": "createChat", "chatId": "c1", "spaceId": "space-1",
+                    "place": { "provider": "docker", "template": "zeron-dev" } })
+        );
+        let blank = super::place_params("c2", None, "docker", None, Some("here"), Some(json!({ "harness": "codex" })));
+        assert_eq!(
+            blank,
+            json!({ "op": "createChat", "chatId": "c2", "deviceId": "here",
+                    "place": { "provider": "docker" }, "config": { "harness": "codex" } })
+        );
+    }
 
     #[test]
     fn running_subagents_go_quiet_with_their_row() {

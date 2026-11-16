@@ -639,6 +639,28 @@ impl WorkspaceHost {
         }
     }
 
+    /// This engine runs in a sandbox of `provider` (spec #37): its row says so
+    /// (`sandbox:<provider>`), so device lists show the provider, not it.
+    pub fn advertise_sandbox(&self, provider: &str) {
+        let own = self.inner.config.device_id.clone();
+        let capability = zeron_proto::sandbox_capability(provider);
+        let outcome = self.mutate(|doc| {
+            let Some(mut row) = doc.read_devices()?.into_iter().find(|d| d.id == own) else {
+                return Ok(());
+            };
+            if row.supports(&capability) {
+                return Ok(());
+            }
+            row.capabilities
+                .retain(|c| !c.starts_with(zeron_proto::SANDBOX_CAPABILITY_PREFIX));
+            row.capabilities.push(capability);
+            doc.upsert_device(&row)
+        });
+        if let Err(err) = outcome {
+            tracing::warn!(error = %err, "couldn't mark this device a sandbox");
+        }
+    }
+
     /// Dial-gate verdict for `LinkCache` (park dials to registry-dark peers).
     /// `Dark` requires positive evidence; every ambiguous state — registry
     /// room down or still in its warm-up window, unknown device, heartbeat in

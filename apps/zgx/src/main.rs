@@ -61,6 +61,7 @@ mod plugins;
 mod previews;
 mod projects;
 mod relaunch;
+mod sandboxes;
 mod session_home;
 mod sessions;
 mod settings;
@@ -784,6 +785,9 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         // Cloud and Billing (src/cloud.rs): Settings' pages, the new chat's
         // Cloud choice.
         cloud::install(cx, &host);
+        // Places a chat runs on (src/sandboxes.rs): the device picker's
+        // providers and templates, a sandbox chat's progress line.
+        sandboxes::install(cx, &host);
         // The sessions behind the main window (src/sessions.rs).
         sessions::install(cx, &host);
         // What there is to update, on every device (src/updates.rs).

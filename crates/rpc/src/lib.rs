@@ -221,6 +221,9 @@ pub mod methods {
     // provider; relay-forwardable so the account's other devices ask it.
     /// `{}` → `[{id, name, icon, ops}]`: the providers this device keeps.
     pub const LIST_SANDBOX_PROVIDERS: &str = "ListSandboxProviders";
+    /// `{provider}` → `[{id, name}]`: its account's templates (the template
+    /// picker adds Blank, no template, itself).
+    pub const LIST_SANDBOX_TEMPLATES: &str = "ListSandboxTemplates";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
     /// state: starting|ready|failed, step, since, error, steps: [{step,
     /// state}]}`), or `null` for a chat not on a place this device keeps.

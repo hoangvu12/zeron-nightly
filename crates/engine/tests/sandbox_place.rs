@@ -252,6 +252,25 @@ async fn replied(provider: &FakeProvider, sandbox: &str, chat: &str, within: Dur
     }
 }
 
+/// The sandbox's device row as the host device reads it from the registry,
+/// once the sandbox's engine has written it.
+async fn sandbox_row(host: &EngineRuntime, device: &str) -> zeron_proto::Device {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows = host.core().workspace.read_devices().unwrap_or_default();
+        if let Some(row) = rows.iter().find(|d| d.id == device)
+            && row.sandbox_provider().is_some()
+        {
+            return row.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the host never saw {device} as a sandbox: {rows:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -276,6 +295,16 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
         json!([{ "id": "fake", "name": "Fake Sandbox", "icon": "box",
                  "ops": ["create", "start", "stop", "delete", "run", "templates", "saveTemplate"] }])
     );
+    // Picking it opens its account's templates (the picker adds Blank).
+    let templates = rpc
+        .call(methods::LIST_SANDBOX_TEMPLATES, json!({ "provider": "fake" }))
+        .await
+        .unwrap();
+    assert_eq!(templates, json!([{ "id": "zeron-dev", "name": "zeron-dev" }]));
+    let unknown = rpc
+        .call(methods::LIST_SANDBOX_TEMPLATES, json!({ "provider": "nope" }))
+        .await;
+    assert!(unknown.is_err(), "{unknown:?}");
 
     let path = project(dirs.path(), &origin_url);
     add_project(&rpc, &host, &path).await;
@@ -374,6 +403,26 @@ async fn a_chat_on_a_place_gets_its_own_sandbox_and_runs_its_first_message() {
                 .iter()
                 .all(|d| d.admitted && d.org.as_deref() == Some(ORG)),
         "{hosts:?}"
+    );
+
+    // Its device row names its provider, so lists show "Fake Sandbox", not
+    // the sandbox; it isn't a Zeron Cloud machine.
+    let row = sandbox_row(&host, &device).await;
+    assert_eq!(row.sandbox_provider(), Some("fake"), "{row:?}");
+    assert!(
+        !row.supports(zeron_proto::CLOUD_SESSION_CAPABILITY),
+        "{row:?}"
+    );
+    assert_ne!(row.platform, zeron_proto::CLOUD_PLATFORM);
+    assert_eq!(
+        host.core()
+            .workspace
+            .read_devices()
+            .unwrap()
+            .iter()
+            .find(|d| d.id == host.core().device_id)
+            .and_then(|d| d.sandbox_provider()),
+        None
     );
 
     // Another chat gets a sandbox of its own.

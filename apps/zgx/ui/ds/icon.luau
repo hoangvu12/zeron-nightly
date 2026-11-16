@@ -35,6 +35,8 @@ export type Name =
 	| "access-full"
 	| "monitor"
 	| "cloud"
+	| "docker"
+	| "box"
 	| "wifi-off"
 	| "fast-tier"
 	| "fast-tier-bold"

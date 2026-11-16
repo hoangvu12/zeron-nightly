@@ -34,6 +34,8 @@ local CloudTray = require("@app/screens/chat/cloud_tray")
 local CloudMachine = require("@app/screens/chat/cloud_machine")
 local files = require("@app/screens/files/api")
 local Where = require("@app/screens/chat/where")
+local sandboxes = require("@account/sandboxes")
+local SandboxLine = require("@app/screens/chat/sandbox_line")
 local DropOverlay = require("@ds/drop_overlay")
 local mentions = require("@ds/composer_mentions")
 local Invocations = require("@app/screens/chat/invocations")
@@ -174,6 +176,8 @@ local function Composer(): Node
 	local checkout = ui.state("chat_checkout", "worktree" :: string?)
 	local branch = ui.state("chat_branch", nil :: string?)
 	local project = ui.state("chat_project", nil :: string?)
+	-- On a place: the template picked ("" for Blank).
+	local template = ui.state("chat_template", "" :: string?)
 	local locals: { [string]: State<any> } =
 		{ model = model, effort = effort, fast = fast, options = options, access = access, plan = plan }
 
@@ -466,7 +470,49 @@ local function Composer(): Node
 		checkout = checkout,
 		branch = branch,
 		active = new_chat,
+		template = template,
 	}
+	-- The open chat's sandbox, while it runs on one: its provider (from its
+	-- device's row), its steps followed while it's open.
+	local function sandbox_device(): (string?, string?)
+		local s = open()
+		if not s or not s.device then
+			return nil, nil
+		end
+		for _, d in sessions.devices:get() do
+			if d.id == s.device and d.sandbox then
+				return s.id, d.sandbox
+			end
+		end
+		return nil, nil
+	end
+	ui.effect(function()
+		local chat = sandbox_device()
+		if not chat then
+			return
+		end
+		sandboxes.follow(chat)
+		ui.on_cleanup(function()
+			sandboxes.unfollow(chat)
+		end)
+	end)
+	-- The progress line's clock: ticking only while its sandbox starts.
+	local sandbox_clock = ui.state("chat_sandbox_clock", ui.now() / 1000)
+	ui.effect(function()
+		local chat = sandbox_device()
+		local steps = sandboxes.steps_of(chat)
+		if not steps or steps.state ~= "starting" then
+			return
+		end
+		sandbox_clock:set(ui.now() / 1000)
+		ui.every(1000, function()
+			sandbox_clock:set(ui.now() / 1000)
+		end)
+	end)
+	local function sandbox_line(): any
+		local chat = sandbox_device()
+		return SandboxLine.line(sandboxes.steps_of(chat), sandbox_clock:get())
+	end
 
 	local running = ui.computed(function(): boolean
 		local s = open()
@@ -559,6 +605,12 @@ local function Composer(): Node
 		local s = open()
 		if s and s.notice then
 			return s.notice
+		end
+		-- A sandbox starting (the step it's on, and for how long), or a step
+		-- that failed, with Run again.
+		local starting = sandbox_line()
+		if starting then
+			return starting
 		end
 		-- The connection: this device's, then the chat's host.
 		local host_unreachable, host = false, nil
@@ -984,7 +1036,7 @@ local function Composer(): Node
 			return
 		end
 		local plan = where.plan()
-		-- (`why`: what to say instead, a Cloud chat's reason in words.)
+		-- (`why`: what to say instead, a Cloud chat's or a place's reason in words.)
 		local failed = function(why: string?)
 			own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.composer.didnt_start", dismissable = true }
 			if shared.text:peek() == "" then
@@ -1035,6 +1087,41 @@ local function Composer(): Node
 							failed(why)
 						end)
 					end
+				end)
+			return
+		end
+		-- On a place: made there at once (its sandbox's device and folder
+		-- named from the start), then the first message sent; it waits in
+		-- the chat, the progress line above, and runs once the sandbox is
+		-- ready.
+		if plan.place then
+			own_notice:set { key = "chat.composer.starting", spinner = true }
+			req.project = plan.project
+			req.branch = plan.branch
+			sessions
+				.create({ project = plan.project, place = plan.place })
+				:after(function(made: any)
+					if type(made) ~= "table" or type(made.id) ~= "string" then
+						failed()
+						return
+					end
+					req.session = made.id
+					req.device = if type(made.device) == "string" and made.device ~= "" then made.device else nil
+					req.fresh = true
+					req.message_id = store.new_id()
+					T.sent_here(req.message_id :: string)
+					req.cwd = if type(made.cwd) == "string" and made.cwd ~= "" then made.cwd else nil
+					req.worktree = false
+					own_notice:set(nil)
+					store.open(made.id)
+					slide_next = true
+					route.open_session(made.id)
+					store.send(req):after(function() end, function(_e: any) end)
+				end, function(e: any)
+					local why = if type(e) == "table" and type(e.message) == "string" and string.find(e.message, " ", 1, true)
+						then e.message
+						else nil
+					failed(why)
 				end)
 			return
 		end
@@ -1143,13 +1230,22 @@ local function Composer(): Node
 		local lb = live_branch:get()
 		local name = if lb.key:sub(1, #s.id + 1) == `{s.id}|` then lb.name else (s :: any).branch
 		local on: string? = nil
+		-- (A sandbox reads as its provider, its template after it.)
+		local icon: string?, template_on: string? = nil, nil
 		for _, d in sessions.devices:get() do
 			if d.id == (s :: any).device then
 				on = d.name
+				if d.sandbox then
+					on, icon = sandboxes.name(d.sandbox), sandboxes.icon(d.sandbox)
+					local steps = sandboxes.steps_of(s.id)
+					template_on = steps and steps.template
+				end
 			end
 		end
 		return {
 			device = on,
+			icon = icon :: any,
+			template = template_on,
 			name = name,
 			worktree = path ~= nil and s.cwd ~= nil and s.cwd ~= path,
 			project = project,
@@ -1253,6 +1349,8 @@ local function Composer(): Node
 			end,
 			device = device,
 			devices = where.devices,
+			template = template,
+			templates = where.templates,
 			checkout = checkout,
 			branch = branch,
 			branches = where.branches,
@@ -1416,8 +1514,22 @@ local function Composer(): Node
 			on_dismiss_notice = function()
 				own_notice:set(nil)
 			end,
-			-- (The only notice with an action: a sleeping machine's Wake.)
-			on_notice_action = machine.wake,
+			-- (The notices with an action: a sleeping machine's Wake, and a
+			-- sandbox's failed step's Run again.)
+			on_notice_action = function()
+				local chat = sandbox_device()
+				local steps = sandboxes.steps_of(chat)
+				if chat and steps and steps.state == "failed" then
+					sandboxes.run_again(chat):after(function() end, function(e: any)
+						local why = if type(e) == "table" and type(e.message) == "string" and string.find(e.message, " ", 1, true)
+							then e.message
+							else nil
+						own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.sandbox.run_again_failed", dismissable = true }
+					end)
+					return
+				end
+				machine.wake()
+			end,
 			alerts = machine.alerts,
 			on_alert_action = machine.on_alert,
 			on_dismiss_alert = machine.dismiss,

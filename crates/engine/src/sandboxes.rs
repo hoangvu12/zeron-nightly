@@ -35,6 +35,11 @@ pub const ENGINE_PROGRAM: &str = "zeron-engine";
 /// The device id a sandbox's engine takes on its first start, minted here
 /// so the chat names its host from the start ([`take_device_id`]).
 pub const DEVICE_ID_ENV: &str = "ZERON_SANDBOX_DEVICE_ID";
+/// The provider whose sandbox the engine runs in, kept on its first start
+/// ([`take_provider`]): its device row says so (`sandbox:<provider>`).
+pub const PROVIDER_ENV: &str = "ZERON_SANDBOX_PROVIDER";
+/// Where a sandbox's engine keeps [`PROVIDER_ENV`] (`{data}/sandbox-provider`).
+const PROVIDER_FILE: &str = "sandbox-provider";
 /// The edge the sandbox's engine dials (`zeron_cli::edge_url_from_env`).
 const EDGE_URL_ENV: &str = "ZERON_EDGE_URL";
 /// The chats on places, kept across restarts (`{data}/sandboxes.json`). No
@@ -56,6 +61,24 @@ pub fn take_device_id(data_dir: &Path, device_id: &str) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(data_dir)?;
     std::fs::write(path, device_id.trim())
+}
+
+/// Keep `provider` as the provider this data dir's engine runs a sandbox of
+/// ([`PROVIDER_ENV`]), so it advertises it on every start.
+pub fn take_provider(data_dir: &Path, provider: &str) -> std::io::Result<()> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::write(data_dir.join(PROVIDER_FILE), provider)
+}
+
+/// The provider this data dir's engine runs a sandbox of, if it is one.
+pub fn provider_of(data_dir: &Path) -> Option<String> {
+    let provider = std::fs::read_to_string(data_dir.join(PROVIDER_FILE)).ok()?;
+    let provider = provider.trim();
+    (!provider.is_empty()).then(|| provider.to_owned())
 }
 
 /// A provider as the device picker and Settings list it.
@@ -189,6 +212,20 @@ impl Sandboxes {
                 ops: p.ops().names(),
             })
             .collect()
+    }
+
+    /// `provider_id`'s account templates (Blank, no template, isn't one).
+    pub async fn templates(&self, provider_id: &str) -> Result<Vec<Template>, String> {
+        let provider = self
+            .provider(provider_id)
+            .ok_or_else(|| format!("{provider_id} isn't connected on this device."))?;
+        if !provider.ops().contains(Ops::TEMPLATES) {
+            return Ok(Vec::new());
+        }
+        provider
+            .templates()
+            .await
+            .map_err(|e| format!("Couldn't list {}'s templates: {e}", provider.name()))
     }
 
     fn provider(&self, id: &str) -> Option<Arc<dyn SandboxProvider>> {
@@ -430,6 +467,7 @@ impl Sandboxes {
                     let mut command = Command::new([ENGINE_PROGRAM, "headless"])
                         .env(EDGE_URL_ENV, edge_url(host)?)
                         .env(DEVICE_ID_ENV, &record.steps.device_id)
+                        .env(PROVIDER_ENV, provider.id())
                         .detached();
                     for (name, value) in lent.to_env() {
                         command = command.env(name, value);
@@ -715,5 +753,15 @@ mod tests {
             std::fs::read_to_string(dir.path().join("device-id")).unwrap(),
             "sandbox-1"
         );
+    }
+
+    #[test]
+    fn a_sandbox_remembers_its_provider_and_other_engines_have_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(provider_of(dir.path()), None);
+        take_provider(dir.path(), " ").unwrap();
+        assert_eq!(provider_of(dir.path()), None);
+        take_provider(dir.path(), "docker").unwrap();
+        assert_eq!(provider_of(dir.path()).as_deref(), Some("docker"));
     }
 }

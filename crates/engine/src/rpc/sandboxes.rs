@@ -13,6 +13,7 @@ pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_SANDBOX_PROVIDERS
+            | methods::LIST_SANDBOX_TEMPLATES
             | methods::SANDBOX_STEPS
             | methods::WATCH_SANDBOX_STEPS
             | methods::RUN_SANDBOX_STEPS_AGAIN
@@ -23,6 +24,12 @@ pub(super) fn handles(method: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderParams {
+    provider: String,
 }
 
 impl EngineRpc {
@@ -49,6 +56,14 @@ impl EngineRpc {
         let sandboxes = self.sandboxes()?;
         match method {
             methods::LIST_SANDBOX_PROVIDERS => RpcReply::value(&sandboxes.providers()),
+            methods::LIST_SANDBOX_TEMPLATES => {
+                let p: ProviderParams = parse_params(params)?;
+                let templates = sandboxes
+                    .templates(&p.provider)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&templates)
+            }
             methods::SANDBOX_STEPS => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&sandboxes.steps(&p.chat_id))

@@ -100,6 +100,12 @@ impl Device {
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
     }
+
+    /// The provider whose sandbox this device is (`sandbox:<provider>`), if
+    /// it is one: lists hide it and show its provider instead.
+    pub fn sandbox_provider(&self) -> Option<&str> {
+        crate::sandboxes::sandbox_provider(&self.capabilities)
+    }
 }
 
 /// A synced (device, folder) pair — the unit of organization in the sidebar.
