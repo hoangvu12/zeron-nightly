@@ -785,7 +785,7 @@ fn under_watchdog(args: &[String]) -> Vec<String> {
     const SCRIPT: &str = r#"name="$1"; shift
 dir="$HOME/.zeron/run"; mkdir -p "$dir"
 pid="$dir/$name.pid"; log="$dir/$name.log"
-if [ -s "$pid" ]; then kill -TERM -- "-$(cat "$pid")" 2>/dev/null || true; sleep 1; fi
+if [ -s "$pid" ]; then pkill -TERM -g "$(cat "$pid")" 2>/dev/null || true; sleep 1; fi
 setsid sh -c 'echo $$ >"$0"; log="$1"; shift
 while :; do "$@" >>"$log" 2>&1; code=$?; echo "zeron-watchdog: $1 exited with $code; starting it again" >>"$log"; sleep 2; done' "$pid" "$log" "$@" </dev/null >/dev/null 2>&1 &
 sleep 1
