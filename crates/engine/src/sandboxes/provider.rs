@@ -107,7 +107,7 @@ impl CreateSandbox {
 
 /// A command `run` runs in a sandbox: a program and its arguments (no shell
 /// unless `args` asks for one), with environment and working folder.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Command {
     pub args: Vec<String>,
@@ -120,6 +120,19 @@ pub struct Command {
     /// starts it detached from the call and reports only whether it started:
     /// the stream ends with an exit code of 0 once it has.
     pub detach: bool,
+}
+
+/// The environment's names only: a value may be a secret (a lent sign-in).
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command")
+            .field("args", &self.args)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .field("detach", &self.detach)
+            .finish()
+    }
 }
 
 impl Command {
@@ -495,5 +508,16 @@ mod tests {
     fn a_credential_never_prints_its_secret() {
         let shown = format!("{:?}", Credential::Token("bk_secret".into()));
         assert!(!shown.contains("bk_secret"), "{shown}");
+    }
+
+    #[test]
+    fn a_command_never_prints_its_environments_values() {
+        let command = Command::new(["zeron-engine", "watchdog"])
+            .env("ZERON_LENT_TOKEN", "eyJ-lent-secret")
+            .cwd("/home/agent");
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("eyJ-lent-secret"), "{shown}");
+        assert!(shown.contains("ZERON_LENT_TOKEN"), "{shown}");
+        assert!(shown.contains("watchdog") && shown.contains("/home/agent"), "{shown}");
     }
 }
