@@ -541,8 +541,16 @@ impl EngineCore {
         self.plugins.attach_auth(auth.clone());
         // A chat deleted on any device takes its sandbox (and the sign-in
         // lent it) with it.
+        // Its delete scripts run here too (they need no relay). Held weakly,
+        // so the following doesn't keep the engine alive.
+        let host = sandboxes::Host {
+            workspace: self.workspace.clone(),
+            doc_host: self.doc_host.clone(),
+            auth: Some(auth.clone()),
+            links: None,
+        };
         self.sandboxes
-            .follow_deletions(self.workspace.watch_chats(), auth.clone());
+            .follow_deletions(self.workspace.watch_chats(), host.downgrade());
         *self
             .auth
             .lock()
@@ -1232,6 +1240,11 @@ impl Engine {
                 });
             }
             core.set_cloud(runner::CloudRunner::new(broker, activity, heartbeat));
+        }
+        // A sandbox's engine runs on its template's agents: a send for one
+        // it lacks is refused (#46).
+        if auth.is_lent() {
+            core.sessions.runs_on_a_template();
         }
         // A sandbox's engine, like a Cloud machine, comes up with sends
         // already waiting for it (a chat's first message, queued while its

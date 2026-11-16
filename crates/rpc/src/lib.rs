@@ -231,13 +231,34 @@ pub mod methods {
     pub const CONNECT_SANDBOX_PROVIDER: &str = "ConnectSandboxProvider";
     /// `{chatId}` → `SandboxSteps` (`{chatId, provider, sandboxId, deviceId,
     /// state: starting|ready|failed|gone, step, since, error, diskFull,
-    /// steps: [{step, state}]}`), or `null` for a chat not on a place this
-    /// device keeps.
+    /// steps: [{step, state}], scripts: [{hook, step, name, script, for,
+    /// state: running|failed, since, error}]}`), or `null` for a chat not on
+    /// a place this device keeps. `scripts` holds the step script running
+    /// now and those that failed (a failure holds nothing up; Run again
+    /// runs it again).
     pub const SANDBOX_STEPS: &str = "SandboxSteps";
     /// `{chatId}` → stream of `SandboxSteps` (current, then each change).
     pub const WATCH_SANDBOX_STEPS: &str = "WatchSandboxSteps";
     /// `{chatId}` → `{ok}`: run a failed step again, and the ones after it.
     pub const RUN_SANDBOX_STEPS_AGAIN: &str = "RunSandboxStepsAgain";
+    // Step scripts (docs/design/cloud-byo.md "Step scripts"): files on the
+    // device that keeps the provider (the host device). A script is named
+    // by `{for, hook, name}`: `for` is `{kind: "all"}`, `{kind: "provider",
+    // provider}` or `{kind: "project", spaceId}` (a project on that
+    // device); `hook` is `before-|after-|instead-of-` + a step
+    // (`create`, `start`, `install-zeron`, `sign-in`, `secrets`,
+    // `get-code`, `setup`, `ready`, `sleep`, `wake`, `delete`), or `setup`
+    // for a project's `.zeron/setup.sh` (`name` is then `setup.sh`).
+    /// `{}` → `[{for, hook, name, timing: before|after|insteadOf|step, step,
+    /// runsOn: sandbox|host, script, path}]`: every script there is, by
+    /// `for`, then hook, then name.
+    pub const LIST_STEP_SCRIPTS: &str = "ListStepScripts";
+    /// `{for, hook, name}` → `{content}`.
+    pub const READ_STEP_SCRIPT: &str = "ReadStepScript";
+    /// `{for, hook, name, content}` → `{ok, path}`: create or save it.
+    pub const WRITE_STEP_SCRIPT: &str = "WriteStepScript";
+    /// `{for, hook, name}` → `{ok}`.
+    pub const DELETE_STEP_SCRIPT: &str = "DeleteStepScript";
     /// `{chatId}` → `SandboxSteps`: ask the provider whether the chat's
     /// sandbox is still there (a client opening a chat whose sandbox is
     /// offline); a deleted one reads `state: "gone"`. Never wakes it.

@@ -72,11 +72,30 @@ impl DocHost {
     /// in its doc, then what this device still holds for it.
     pub fn waiting_messages(&self, chat_id: &str) -> Result<Vec<WaitingMessage>, EngineError> {
         let handle = self.open(chat_id)?;
-        let pending: Vec<_> = handle
-            .doc
-            .read_commands()?
-            .into_iter()
-            .filter(|c| c.status == SessionCommandStatus::Pending)
+        let commands = handle.doc.read_commands()?;
+        let run_message = |c: &zeron_doc::SessionCommandEntry| match &c.payload {
+            SessionCommandPayload::Run { message_id, .. } => Some(message_id.clone()),
+            _ => None,
+        };
+        // A send a sandbox refused for an agent its template lacks (#46)
+        // waits, with why, until it's sent again (with the same message id).
+        let refused = |c: &zeron_doc::SessionCommandEntry| {
+            c.status == SessionCommandStatus::Rejected
+                && c.resolution
+                    .as_deref()
+                    .is_some_and(|r| zeron_proto::places::agent_missing(r).is_some())
+                && run_message(c).is_some_and(|message| {
+                    !commands.iter().any(|later| {
+                        later.id != c.id
+                            && later.issued_at >= c.issued_at
+                            && run_message(later).as_ref() == Some(&message)
+                    })
+                })
+        };
+        let pending: Vec<_> = commands
+            .iter()
+            .filter(|c| c.status == SessionCommandStatus::Pending || refused(c))
+            .cloned()
             .collect();
         // (Read on every change to the chat while it's open: the
         // transcript's ids only when a command waits, and shared, not
@@ -108,6 +127,9 @@ impl DocHost {
                 if message_id.as_ref().is_some_and(|id| landed.contains(id)) {
                     return None;
                 }
+                let failure = (c.status == SessionCommandStatus::Rejected)
+                    .then(|| c.resolution.clone())
+                    .flatten();
                 Some(WaitingMessage {
                     expires_at: Some(c.effective_expiry()),
                     id: c.id,
@@ -117,7 +139,7 @@ impl DocHost {
                     issued_by: c.issued_by,
                     sent_at: c.issued_at,
                     held: false,
-                    failure: None,
+                    failure,
                 })
             })
             .collect();
