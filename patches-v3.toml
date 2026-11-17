@@ -135,3 +135,10 @@ note = "A command a child left running with run_command (agent-device-commands, 
 name = "docker-sandbox"
 file = "patches/0019-docker-sandbox.patch"
 note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's key kept by a host device, with templates, sleep and wake, recovery and Start fresh. Desktop only. Regenerated onto main 09766b39 (0.3.7): zeron-v2's .base.json re-recorded for the merged default files (ZERON_V2_BLESS's hashes). work/docker-sandbox-e2e at b53b39c2a (based on the frozen zeron/zgx c1539061b) merged onto everything above as one file, with what that merge needed (both sides of 13 files kept, sandboxes.wake blocked in plugin previews, zeron-v2's .base.json in step). Same code as work/docker-sandbox at 11b9dd156."
+
+# Old peers and Auto (4b983c6c8).
+
+[[patch]]
+name = "auto-mode-old-peers"
+file = "patches/0020-auto-mode-old-peers.patch"
+note = "Devices on engines from before upstream's Auto access mode (4b983c6c8; 0.3.7, and nightlies before it) failed every ListHarnesses against a device listing Auto (unknown variant `auto`), so they couldn't create or message chats there; a chat or run in Auto broke them the same way. \"auto\" no longer goes where they read (zeron_proto::access_wire): the catalog's accessModes lists only the modes they know, with autoAccessMode beside it, and a chat's or a run's access holds supervised (the stricter mode every agent with modes honors) with autoAccess beside it. This build reads Auto back, and still reads a plain \"auto\". The agent gate and zgx, which handle these as raw JSON, go through the same helpers."

@@ -1,0 +1,558 @@
+From 017f6fa0d1b6a19d04a42a1753c93a5b9300cb4c Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hoangvu12@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:36:38 +0000
+Subject: [PATCH] Auto access mode reaches engines from before it
+
+4b983c6c8 added AccessMode::Auto ("auto"). Engines from before it (0.3.7,
+and nightlies before it) fail a whole message holding that value: every
+ListHarnesses against a device listing Auto failed, so no older device
+could create or message chats there. The same held for a chat row's
+config and a run request in Auto.
+
+On the wire "auto" no longer goes where they read (zeron_proto::
+access_wire): a catalog's accessModes lists only the modes they know,
+with autoAccessMode: true beside it; a chat's or a run's access holds
+supervised, with autoAccess: true. Old engines ignore the new fields and
+run Auto as supervised, the stricter mode every agent with modes honors
+(auto-accept-edits is nearer, but an old engine runs a mode its agent
+lacks with full access). This build reads both back into the one value,
+and still reads a plain "auto". The in-memory Vec<AccessMode> and
+AccessMode fields stay as they were (serde flatten; these are only ever
+JSON). The agent gate and zgx, which read and write these as raw JSON,
+go through the same helpers, so the gate's cap sees Auto and never
+writes "auto".
+---
+ apps/zgx/src/chat.rs                |  29 +++--
+ crates/engine/src/registry.rs       |  50 ++++++-
+ crates/engine/src/rpc/agent_gate.rs |  82 +++++++++++-
+ crates/mcp/src/zeron.rs             |   2 +-
+ crates/proto/src/access_wire.rs     | 195 ++++++++++++++++++++++++++++
+ crates/proto/src/agent.rs           |   5 +-
+ crates/proto/src/entities.rs        |   5 +-
+ crates/proto/src/lib.rs             |   1 +
+ 8 files changed, 345 insertions(+), 24 deletions(-)
+ create mode 100644 crates/proto/src/access_wire.rs
+
+diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
+index 6ee5465840c5ca29c525e1f81d281047bdf45134..186f7aa0bdc1c90770e411af1230c4d23f4b758d 100644
+--- a/apps/zgx/src/chat.rs
++++ b/apps/zgx/src/chat.rs
+@@ -1703,7 +1703,11 @@ fn catalog_of(listed: &[Json], by: &HashMap<String, Vec<Json>>, done: bool, devi
+             // It has an auto mode of its own: the access picker offers Auto.
+             (
+                 "auto",
+-                Value::Bool(h["accessModes"].as_array().is_some_and(|m| m.iter().any(|x| x == "auto"))),
++                // (`autoAccessMode`, as it travels: zeron_proto::access_wire.)
++                Value::Bool(
++                    h["autoAccessMode"] == true
++                        || h["accessModes"].as_array().is_some_and(|m| m.iter().any(|x| x == "auto")),
++                ),
+             ),
+         ]));
+         for m in list {
+@@ -2633,8 +2637,8 @@ impl View {
+             "autoApprove": false,
+             "resume": null,
+         });
+-        if let Some(access) = config.get("access") {
+-            request["access"] = access.clone();
++        if config.get("access").is_some() || config.get("autoAccess").is_some() {
++            zeron_proto::access_wire::write(&mut request, zeron_proto::access_wire::read(&config));
+         }
+         if let Some(plan) = config.get("plan") {
+             request["plan"] = plan.clone();
+@@ -3354,13 +3358,16 @@ fn merged_config(config: &Json, args: &Value) -> Json {
+         c["reasoning"] = json!(effort);
+     }
+     if let Some(access) = field("access") {
++        // (Auto as it travels, for engines from before it: zeron_proto::access_wire.)
++        use zeron_proto::{AccessMode, access_wire};
+         match access.as_str() {
+-            "supervised" => c["access"] = json!("supervised"),
+-            "edits" => c["access"] = json!("auto-accept-edits"),
+-            "auto" => c["access"] = json!("auto"),
++            "supervised" => access_wire::write(&mut c, AccessMode::Supervised),
++            "edits" => access_wire::write(&mut c, AccessMode::AutoAcceptEdits),
++            "auto" => access_wire::write(&mut c, AccessMode::Auto),
+             _ => {
+                 if let Some(map) = c.as_object_mut() {
+                     map.remove("access");
++                    map.remove("autoAccess");
+                 }
+             }
+         }
+@@ -5947,11 +5954,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+         Some(m) => Value::from(chats.label_of(harness, Some(m)).unwrap_or_else(|| m.to_owned()).as_str()),
+         None => chats.label_of(harness, None).map_or(Value::Nil, |l| Value::from(l.as_str())),
+     };
+-    let access = match config["access"].as_str() {
+-        Some("supervised") => "supervised",
+-        Some("auto-accept-edits") => "edits",
+-        Some("auto") => "auto",
+-        _ => "full",
++    let access = match zeron_proto::access_wire::read(config) {
++        zeron_proto::AccessMode::Supervised => "supervised",
++        zeron_proto::AccessMode::AutoAcceptEdits => "edits",
++        zeron_proto::AccessMode::Auto => "auto",
++        zeron_proto::AccessMode::FullAccess => "full",
+     };
+     let fast = fast_in(&config["modelOptions"]);
+     let options = options_value(&config["modelOptions"]);
+diff --git a/crates/engine/src/registry.rs b/crates/engine/src/registry.rs
+index 674afff2b85d0c5157bddd2595a4fbcff0b598f7..06abba4c9603c04b956b399cddf6c0f4a9be5a4c 100644
+--- a/crates/engine/src/registry.rs
++++ b/crates/engine/src/registry.rs
+@@ -40,8 +40,10 @@ pub struct HarnessDescriptor {
+     pub enabled: Option<bool>,
+     /// The access modes this harness honors, least to most trusting. Empty
+     /// — a catalog from an engine predating modes — offers no choice: those
+-    /// engines run every chat with full access.
+-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    /// engines run every chat with full access. Auto goes as
++    /// `autoAccessMode` beside it, for engines from before Auto
++    /// ([`zeron_proto::access_wire`]).
++    #[serde(flatten, with = "zeron_proto::access_wire::modes")]
+     pub access_modes: Vec<AccessMode>,
+     /// Whether this harness honors plan mode.
+     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+@@ -1156,6 +1158,50 @@ fn full_registry() -> HarnessRegistry {
+ mod tests {
+     use super::*;
+ 
++    /// An engine from before Auto (0.3.7) lists every device's catalog: it
++    /// parses this one, with no Auto in it, and this build reads Auto back.
++    #[test]
++    fn an_engine_from_before_auto_reads_the_catalog_and_a_new_one_keeps_auto() {
++        #[derive(Debug, PartialEq, Deserialize)]
++        #[serde(rename_all = "kebab-case")]
++        enum OldAccessMode {
++            Supervised,
++            AutoAcceptEdits,
++            FullAccess,
++        }
++        #[derive(Deserialize)]
++        #[serde(rename_all = "camelCase")]
++        struct OldDescriptor {
++            id: HarnessId,
++            #[serde(default)]
++            access_modes: Vec<OldAccessMode>,
++        }
++        let listed = default_registry().descriptors();
++        let claude = listed.iter().find(|d| d.id == HarnessId::ClaudeCode).unwrap();
++        assert_eq!(claude.access_modes, AccessMode::WITH_AUTO);
++        let wire = serde_json::to_value(&listed).unwrap();
++
++        let old: Vec<OldDescriptor> = serde_json::from_value(wire.clone()).unwrap();
++        let old_claude = old.iter().find(|d| d.id == HarnessId::ClaudeCode).unwrap();
++        assert_eq!(
++            old_claude.access_modes,
++            [OldAccessMode::Supervised, OldAccessMode::AutoAcceptEdits, OldAccessMode::FullAccess]
++        );
++
++        let new: Vec<HarnessDescriptor> = serde_json::from_value(wire).unwrap();
++        for (read, sent) in new.iter().zip(&listed) {
++            assert_eq!((read.id, &read.access_modes), (sent.id, &sent.access_modes));
++        }
++        // A catalog from an engine that sent "auto" as is still reads.
++        let plain: HarnessDescriptor = serde_json::from_value(serde_json::json!({
++            "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
++            "steeringMode": "step-boundary", "reasoningLevels": [],
++            "accessModes": ["supervised", "auto-accept-edits", "auto", "full-access"],
++        }))
++        .unwrap();
++        assert_eq!(plain.access_modes, AccessMode::WITH_AUTO);
++    }
++
+     #[test]
+     fn mid_turn_steering_requires_support_and_a_step_boundary() {
+         let mut descriptor = HarnessDescriptor {
+diff --git a/crates/engine/src/rpc/agent_gate.rs b/crates/engine/src/rpc/agent_gate.rs
+index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d06ab5f511 100644
+--- a/crates/engine/src/rpc/agent_gate.rs
++++ b/crates/engine/src/rpc/agent_gate.rs
+@@ -26,7 +26,7 @@
+ //! nothing but still can't forge a header.
+ 
+ use serde_json::{Value, json};
+-use zeron_proto::{AccessMode, Chat, SandboxLevel, agent_messages, cap_access};
++use zeron_proto::{AccessMode, Chat, SandboxLevel, access_wire, agent_messages, cap_access};
+ use zeron_rpc::{Caller, RpcError, methods};
+ 
+ use super::EngineRpc;
+@@ -179,14 +179,14 @@ impl EngineRpc {
+                     if let Some((max_sandbox, max_access)) = calling.as_ref().and_then(|c| c.ceiling) {
+                         let sandbox = serde_json::from_value(config["sandbox"].clone())
+                             .unwrap_or(SandboxLevel::DangerFullAccess);
+-                        let access = serde_json::from_value(config["access"].clone()).unwrap_or_default();
++                        let access = access_wire::read(config);
+                         let (sandbox, access, capped) =
+                             cap_access((sandbox, access), (max_sandbox, max_access));
+                         if capped {
+                             tracing::info!(chat = ?chat, "agents: a new chat's access capped at its creator's");
+                         }
+                         config["sandbox"] = json!(sandbox);
+-                        config["access"] = json!(access);
++                        access_wire::write(config, access);
+                     }
+                     Ok(params)
+                 }
+@@ -218,7 +218,7 @@ impl EngineRpc {
+                             Some(config) => {
+                                 request["harness"] = json!(config.harness);
+                                 request["sandbox"] = json!(config.sandbox);
+-                                request["access"] = json!(config.access);
++                                access_wire::write(request, config.access);
+                                 request["plan"] = json!(config.plan);
+                             }
+                             // A chat set up before configs (or not here yet):
+@@ -230,10 +230,10 @@ impl EngineRpc {
+                                     .unwrap_or((SandboxLevel::DangerFullAccess, AccessMode::FullAccess));
+                                 let sandbox = serde_json::from_value(request["sandbox"].clone())
+                                     .unwrap_or(SandboxLevel::DangerFullAccess);
+-                                let access = serde_json::from_value(request["access"].clone()).unwrap_or_default();
++                                let access = access_wire::read(request);
+                                 let (sandbox, access, _) = cap_access((sandbox, access), ceiling);
+                                 request["sandbox"] = json!(sandbox);
+-                                request["access"] = json!(access);
++                                access_wire::write(request, access);
+                             }
+                         }
+                         if let Some(cwd) = target.and_then(|c| c.cwd.as_deref()) {
+@@ -375,6 +375,76 @@ mod tests {
+         core.sessions.shutdown().await;
+     }
+ 
++    /// Auto goes as `autoAccess` beside an old reader's supervised
++    /// (zeron_proto::access_wire): the cap reads both, and what it writes
++    /// never holds "auto".
++    #[tokio::test]
++    async fn the_cap_reads_and_writes_auto_as_it_travels() {
++        let (_temp, core) = core().await;
++        chat(&core, "careful", "Careful", "danger-full-access", "supervised").await;
++        rpc_create(&core, "auto", "auto").await;
++        let rpc = core.rpc_service();
++        let create = |access: Value| {
++            let mut config = json!({"harness":"codex","sandbox":"danger-full-access"});
++            config.as_object_mut().unwrap().extend(access.as_object().unwrap().clone());
++            json!({"op":"createChat", "chatId":"cloudy", "cloud": true, "config": config})
++        };
++        // Auto asked under a supervised chat: lowered, not let through as
++        // the supervised its old-reader field says.
++        let gated = with_caller(agent("careful"), async {
++            rpc.agent_gate(methods::MUTATE, create(json!({"access":"supervised","autoAccess":true})))
++        })
++        .await
++        .unwrap();
++        assert_eq!(gated["config"]["access"], "supervised");
++        assert!(gated["config"].get("autoAccess").is_none());
++        // More than Auto under an Auto chat: Auto, as it travels.
++        let gated = with_caller(agent("auto"), async {
++            rpc.agent_gate(methods::MUTATE, create(json!({"access":"full-access"})))
++        })
++        .await
++        .unwrap();
++        assert_eq!((&gated["config"]["access"], &gated["config"]["autoAccess"]), (&json!("supervised"), &json!(true)));
++        // A run in an Auto chat runs as the chat is set.
++        let gated = with_caller(agent("careful"), async {
++            rpc.agent_gate(
++                methods::QUEUE_COMMAND,
++                json!({"chatId":"auto", "command":{"kind":"run", "messageId":"m", "request":{"prompt":"hi", "access":"full-access"}}}),
++            )
++        })
++        .await
++        .unwrap();
++        let request = &gated["command"]["request"];
++        assert_eq!((&request["access"], &request["autoAccess"]), (&json!("supervised"), &json!(true)));
++        core.sessions.shutdown().await;
++    }
++
++    /// The person's chat `id` in Auto, created as a client sends it.
++    async fn rpc_create(core: &crate::EngineCore, id: &str, title: &str) {
++        let rpc = core.rpc_service();
++        let config = serde_json::to_value(zeron_proto::ChatConfig {
++            harness: HarnessId::Codex,
++            model: None,
++            reasoning: None,
++            model_options: Default::default(),
++            sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
++            access: zeron_proto::AccessMode::Auto,
++            plan: false,
++        })
++        .unwrap();
++        rpc.handle(
++            methods::MUTATE,
++            json!({"op":"createChat", "chatId":id, "deviceId":core.device_id, "config":config}),
++        )
++        .await
++        .unwrap();
++        rpc.handle(methods::MUTATE, json!({"op":"renameChat", "chatId":id, "title":title}))
++            .await
++            .unwrap();
++        let stored = core.workspace.chat(id).unwrap().unwrap().config.unwrap();
++        assert_eq!(stored.access, zeron_proto::AccessMode::Auto);
++    }
++
+     /// A command, here or on another device, only for an agent whose chat
+     /// runs with full access and no sandbox; the person's own calls pass.
+     #[tokio::test]
+diff --git a/crates/mcp/src/zeron.rs b/crates/mcp/src/zeron.rs
+index bed96f680acd9ff15d00db381d164363b2864c66..792b3a0ff8679208f7db25215dbf50759bcb8908 100644
+--- a/crates/mcp/src/zeron.rs
++++ b/crates/mcp/src/zeron.rs
+@@ -106,7 +106,7 @@ pub struct HarnessInfo {
+     pub installed: bool,
+     #[serde(default)]
+     pub enabled: Option<bool>,
+-    #[serde(default)]
++    #[serde(flatten, with = "zeron_proto::access_wire::modes")]
+     pub access_modes: Vec<zeron_proto::AccessMode>,
+     #[serde(default)]
+     pub supports_plan: bool,
+diff --git a/crates/proto/src/access_wire.rs b/crates/proto/src/access_wire.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d08931fb99fd04f3f97c40e62202bb33e8bc21c
+--- /dev/null
++++ b/crates/proto/src/access_wire.rs
+@@ -0,0 +1,195 @@
++//! How an [`AccessMode`] crosses devices. Engines from before Auto (0.3.7,
++//! and nightlies before 4b983c6c8) know only supervised, auto-accept-edits
++//! and full-access. They fail a whole message that holds any other value:
++//! the harness catalog, a chat row or a run. So "auto" never goes in a field
++//! they read. The catalog's `accessModes` lists only the modes they know,
++//! and `autoAccessMode` says Auto is offered too. A chat's or a run's
++//! `access` holds [`OLD_READER_AUTO`], and `autoAccess` says the mode is
++//! Auto. Old engines ignore the new fields, and this build reads them back
++//! into one value. A plain "auto" (sent by an engine that did) still reads
++//! as Auto.
++
++use std::ops::Not;
++
++use serde::{Deserialize, Deserializer, Serialize, Serializer};
++use serde_json::Value;
++
++use crate::AccessMode;
++
++/// What an engine from before Auto runs instead of Auto: supervised, which
++/// is stricter than Auto and honored by every agent that honors any mode.
++/// (Auto-accept-edits is nearer, but an old engine runs an agent that
++/// lacks a mode with full access.)
++pub const OLD_READER_AUTO: AccessMode = AccessMode::Supervised;
++
++fn for_old_readers(mode: AccessMode) -> AccessMode {
++    if mode == AccessMode::Auto { OLD_READER_AUTO } else { mode }
++}
++
++/// A chat's or a run's `access`, as `#[serde(flatten, with = "access_wire::mode")]`.
++pub mod mode {
++    use super::*;
++
++    #[derive(Serialize, Deserialize)]
++    struct Wire {
++        #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
++        access: AccessMode,
++        #[serde(default, rename = "autoAccess", skip_serializing_if = "Not::not")]
++        auto_access: bool,
++    }
++
++    pub fn serialize<S: Serializer>(mode: &AccessMode, serializer: S) -> Result<S::Ok, S::Error> {
++        Wire {
++            access: for_old_readers(*mode),
++            auto_access: *mode == AccessMode::Auto,
++        }
++        .serialize(serializer)
++    }
++
++    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<AccessMode, D::Error> {
++        let wire = Wire::deserialize(deserializer)?;
++        Ok(if wire.auto_access { AccessMode::Auto } else { wire.access })
++    }
++}
++
++/// A harness catalog's `accessModes`, as `#[serde(flatten, with = "access_wire::modes")]`.
++pub mod modes {
++    use super::*;
++
++    #[derive(Serialize, Deserialize)]
++    struct Wire {
++        #[serde(default, rename = "accessModes", skip_serializing_if = "Vec::is_empty")]
++        access_modes: Vec<AccessMode>,
++        #[serde(default, rename = "autoAccessMode", skip_serializing_if = "Not::not")]
++        auto_access_mode: bool,
++    }
++
++    pub fn serialize<S: Serializer>(modes: &[AccessMode], serializer: S) -> Result<S::Ok, S::Error> {
++        Wire {
++            access_modes: modes.iter().copied().filter(|m| *m != AccessMode::Auto).collect(),
++            auto_access_mode: modes.contains(&AccessMode::Auto),
++        }
++        .serialize(serializer)
++    }
++
++    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<AccessMode>, D::Error> {
++        let Wire { mut access_modes, auto_access_mode } = Wire::deserialize(deserializer)?;
++        if auto_access_mode && !access_modes.contains(&AccessMode::Auto) {
++            // In its place among the modes, least to most trusting.
++            let at = access_modes
++                .iter()
++                .position(|m| *m == AccessMode::FullAccess)
++                .unwrap_or(access_modes.len());
++            access_modes.insert(at, AccessMode::Auto);
++        }
++        Ok(access_modes)
++    }
++}
++
++/// The access mode of a chat's config or a run request held as JSON, read
++/// as [`mode`] reads it. Missing or unknown reads as full access, as
++/// [`AccessMode`]'s default.
++pub fn read(object: &Value) -> AccessMode {
++    mode::deserialize(object).unwrap_or_default()
++}
++
++/// Sets `mode` on a chat's config or a run request held as JSON, as
++/// [`mode`] writes it.
++pub fn write(object: &mut Value, mode: AccessMode) {
++    object["access"] = serde_json::json!(for_old_readers(mode));
++    if mode == AccessMode::Auto {
++        object["autoAccess"] = Value::Bool(true);
++    } else if let Some(map) = object.as_object_mut() {
++        map.remove("autoAccess");
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::json;
++
++    use super::*;
++    use crate::{ChatConfig, HarnessId, RunRequest, SandboxLevel};
++
++    /// [`AccessMode`] as engines from before Auto have it.
++    #[derive(Debug, PartialEq, Deserialize)]
++    #[serde(rename_all = "kebab-case")]
++    enum OldAccessMode {
++        Supervised,
++        AutoAcceptEdits,
++        FullAccess,
++    }
++
++    #[derive(Debug, Deserialize)]
++    struct OldChatConfig {
++        #[serde(default)]
++        access: Option<OldAccessMode>,
++    }
++
++    fn config(access: AccessMode) -> ChatConfig {
++        ChatConfig {
++            harness: HarnessId::ClaudeCode,
++            model: None,
++            reasoning: None,
++            model_options: Default::default(),
++            sandbox: SandboxLevel::WorkspaceWrite,
++            access,
++            plan: false,
++        }
++    }
++
++    #[test]
++    fn an_old_reader_reads_auto_as_supervised_and_a_new_one_round_trips_it() {
++        let wire = serde_json::to_value(config(AccessMode::Auto)).unwrap();
++        assert_eq!((&wire["access"], &wire["autoAccess"]), (&json!("supervised"), &json!(true)));
++        let old: OldChatConfig = serde_json::from_value(wire.clone()).unwrap();
++        assert_eq!(old.access, Some(OldAccessMode::Supervised));
++        let new: ChatConfig = serde_json::from_value(wire).unwrap();
++        assert_eq!(new, config(AccessMode::Auto));
++    }
++
++    #[test]
++    fn other_modes_go_as_before() {
++        for access in AccessMode::ALL {
++            let wire = serde_json::to_value(config(access)).unwrap();
++            assert!(wire.get("autoAccess").is_none());
++            assert_eq!(wire.get("access").is_none(), access == AccessMode::FullAccess);
++            assert_eq!(serde_json::from_value::<ChatConfig>(wire).unwrap().access, access);
++        }
++    }
++
++    #[test]
++    fn a_plain_auto_from_an_engine_that_sent_one_still_reads_as_auto() {
++        let mut wire = serde_json::to_value(config(AccessMode::Supervised)).unwrap();
++        wire["access"] = json!("auto");
++        assert_eq!(serde_json::from_value::<ChatConfig>(wire.clone()).unwrap().access, AccessMode::Auto);
++        assert_eq!(read(&wire), AccessMode::Auto);
++    }
++
++    #[test]
++    fn a_run_request_carries_auto_the_same_way() {
++        let wire = json!({
++            "prompt": "hi", "model": null, "reasoning": null, "cwd": "/",
++            "sandbox": "workspace-write", "resume": null,
++            "access": "supervised", "autoAccess": true,
++        });
++        let request: RunRequest = serde_json::from_value(wire).unwrap();
++        assert_eq!(request.access, AccessMode::Auto);
++        let back = serde_json::to_value(&request).unwrap();
++        assert_eq!((&back["access"], &back["autoAccess"]), (&json!("supervised"), &json!(true)));
++        let old: OldChatConfig = serde_json::from_value(back).unwrap();
++        assert_eq!(old.access, Some(OldAccessMode::Supervised));
++    }
++
++    #[test]
++    fn json_helpers_read_and_write_the_wire_form() {
++        let mut object = json!({ "access": "full-access" });
++        write(&mut object, AccessMode::Auto);
++        assert_eq!(object, json!({ "access": "supervised", "autoAccess": true }));
++        assert_eq!(read(&object), AccessMode::Auto);
++        write(&mut object, AccessMode::AutoAcceptEdits);
++        assert_eq!(object, json!({ "access": "auto-accept-edits" }));
++        assert_eq!(read(&object), AccessMode::AutoAcceptEdits);
++        assert_eq!(read(&json!({})), AccessMode::FullAccess);
++    }
++}
+diff --git a/crates/proto/src/agent.rs b/crates/proto/src/agent.rs
+index b8cc5d78a68173771ed2ab7aa9bff182ae3eb79e..0192592ecf92d32b5200e6e256ebdd8d5c2ab868 100644
+--- a/crates/proto/src/agent.rs
++++ b/crates/proto/src/agent.rs
+@@ -602,8 +602,9 @@ pub struct RunRequest {
+     pub auto_approve: bool,
+     /// What the agent may do without asking (see [`AccessMode`]). Additive +
+     /// serde-defaulted: a request from a client predating modes runs with
+-    /// full access, as every run did then.
+-    #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
++    /// full access, as every run did then. Auto goes as `autoAccess` beside
++    /// it, for hosts from before Auto ([`crate::access_wire`]).
++    #[serde(flatten, with = "crate::access_wire::mode")]
+     pub access: AccessMode,
+     /// Plan mode: the agent explores and proposes a plan instead of
+     /// changing anything. Honored by harnesses that advertise it.
+diff --git a/crates/proto/src/entities.rs b/crates/proto/src/entities.rs
+index 61e7cb546fd9b2a4e4dea0873b9fcea7536cd917..053348ec89595bd0e98c31b0d801f8ad29107e60 100644
+--- a/crates/proto/src/entities.rs
++++ b/crates/proto/src/entities.rs
+@@ -258,8 +258,9 @@ pub struct ChatConfig {
+     pub model_options: serde_json::Map<String, serde_json::Value>,
+     pub sandbox: SandboxLevel,
+     /// The chat's access mode; absent on chats created before modes, which
+-    /// ran with full access.
+-    #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
++    /// ran with full access. Auto goes as `autoAccess` beside it, for
++    /// engines from before Auto ([`crate::access_wire`]).
++    #[serde(flatten, with = "crate::access_wire::mode")]
+     pub access: AccessMode,
+     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+     pub plan: bool,
+diff --git a/crates/proto/src/lib.rs b/crates/proto/src/lib.rs
+index 692ab93601b4d2c0ae466509b40615e31885e22e..0af1bd80f0dafa6e0df42752c2756e44c642fed2 100644
+--- a/crates/proto/src/lib.rs
++++ b/crates/proto/src/lib.rs
+@@ -3,6 +3,7 @@
+ //! Ported from zeron's `packages/control/src/wire.ts` + `packages/harness/src/types.ts`.
+ //! Context occupancy is replicated per chat; billing `Usage` remains a harness passthrough.
+ 
++pub mod access_wire;
+ pub mod agent;
+ pub mod agent_messages;
+ pub mod attachment_mentions;
+-- 
+2.47.3
+
