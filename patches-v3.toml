@@ -142,3 +142,8 @@ note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's 
 name = "auto-mode-old-peers"
 file = "patches/0020-auto-mode-old-peers.patch"
 note = "Devices on engines from before upstream's Auto access mode (4b983c6c8; 0.3.7, and nightlies before it) failed every ListHarnesses against a device listing Auto (unknown variant `auto`), so they couldn't create or message chats there; a chat or run in Auto broke them the same way. \"auto\" no longer goes where they read (zeron_proto::access_wire): the catalog's accessModes lists only the modes they know, with autoAccessMode beside it, and a chat's or a run's access holds supervised (the stricter mode every agent with modes honors) with autoAccess beside it. This build reads Auto back, and still reads a plain \"auto\". The agent gate and zgx, which handle these as raw JSON, go through the same helpers."
+
+[[patch]]
+name = "docker-sign-in"
+file = "patches/0021-docker-sign-in.patch"
+note = "Docker Sandbox's \"Sign in with Docker\" waited forever after the code was approved (the Laptop, 2026-11-17): the registry still named as Docker's host device one the account no longer had, so the key went there, wasn't taken, and was forgotten, which was only logged. A named host device that isn't among the account's devices is now none (once the device list has loaded). The background sign-in's end is listed with the provider (ListSandboxProviders `connect {userCode, error?}`), and Settings › Sandboxes shows a refused sign-in, a key the host device didn't take, or an expired code (its own timeout too) with Try again. Applies on top of docker-sandbox."

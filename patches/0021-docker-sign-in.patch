@@ -1,0 +1,751 @@
+From 9438d431a07f03bfb2a78fd3d42573ade4591a6e Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hoangvu12@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:02:27 +0000
+Subject: [PATCH] Docker sign-in: a gone host device is none, and the dialog
+ hears a failed sign-in
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On the Laptop (2026-11-17) "Sign in with Docker" waited forever after Vu
+approved the code. The registry still named Docker's host device as one
+the account no longer had (written while testing the day before), so the
+key went there once the sign-in finished, wasn't taken, and was forgotten
+on the Laptop. That was only logged (tracing::warn!), and the dialog kept
+asking that device for the account. Docker's own device flow was fine:
+run for real against login.docker.com, the poll took the approval.
+
+- settle_host: a named host device that isn't among the account's devices
+  is none, so the device that connected picks again (only once the device
+  list has loaded, so a real host is never passed over).
+- The background sign-in's end is kept with the provider and listed by
+  ListSandboxProviders as `connect {userCode, error?}`: Docker refusing
+  it, its code running out, or the key not reaching the host device.
+- Settings › Sandboxes asks this device's engine for it while the code
+  shows: a failure or an expired code (its own timeout too) replaces the
+  wait with the reason and Try again, which asks for a new code.
+---
+ apps/zgx/ui/locales/en.json                   |   2 +
+ apps/zgx/ui/locales/zh-Hans.json              |   2 +
+ apps/zgx/ui/sandbox_settings_stub.luau        |  30 ++-
+ apps/zgx/ui/screens/settings/sandboxes.luau   |  84 +++++++--
+ .../zgx/ui/tests/settings_sandboxes.test.luau |  32 ++++
+ crates/engine/src/rpc/sandboxes.rs            |  63 +++++--
+ crates/engine/src/sandboxes.rs                |  57 ++++++
+ crates/engine/tests/docker_sign_in.rs         | 175 ++++++++++++++++++
+ crates/engine/tests/support/docker_stub.rs    |  13 +-
+ 9 files changed, 427 insertions(+), 31 deletions(-)
+ create mode 100644 crates/engine/tests/docker_sign_in.rs
+
+diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
+index 78088dc038c575599aadda9db8406c1b4a423af0..b438670445f2f0c04e3e0c5a4c7229afc20a3f06 100644
+--- a/apps/zgx/ui/locales/en.json
++++ b/apps/zgx/ui/locales/en.json
+@@ -2423,6 +2423,8 @@
+       "connect_title": "Connect {name}",
+       "sign_in_on_page": "Sign in with {name}",
+       "code_waiting": "Check this code on the page that opened.",
++      "code_expired": "The code expired before it was approved.",
++      "sign_in_again": "Try again",
+       "token": "Token",
+       "token_hint": {
+         "docker": "A Docker access token, or username:personal-access-token."
+diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
+index 0410e6a19c99e719ad77992b941e198b72e58361..2a5809758aba431d07166e9f9c08466dad3fabdd 100644
+--- a/apps/zgx/ui/locales/zh-Hans.json
++++ b/apps/zgx/ui/locales/zh-Hans.json
+@@ -2426,6 +2426,8 @@
+       "connect_title": "Connect {name}",
+       "sign_in_on_page": "Sign in with {name}",
+       "code_waiting": "Check this code on the page that opened.",
++      "code_expired": "The code expired before it was approved.",
++      "sign_in_again": "Try again",
+       "token": "Token",
+       "token_hint": {
+         "docker": "Docker 访问令牌，或 username:personal-access-token。"
+diff --git a/apps/zgx/ui/sandbox_settings_stub.luau b/apps/zgx/ui/sandbox_settings_stub.luau
+index 1508575b5d8332e1f6317ab3fcf9ce4648c77f3d..36e38e1c37d4082e55b53efa82ab2eb83110959b 100644
+--- a/apps/zgx/ui/sandbox_settings_stub.luau
++++ b/apps/zgx/ui/sandbox_settings_stub.luau
+@@ -14,6 +14,8 @@
+ -- "" for this one). Commands:
+ --   sandbox_settings_stub.connected  Docker connected, devbox its host device
+ --   sandbox_settings_stub.approve    the Docker sign-in page's code approved
++--   sandbox_settings_stub.refuse     that sign-in failed in the background
++--   sandbox_settings_stub.short_code the next code lasts a second
+ 
+ local M = {}
+ 
+@@ -29,8 +31,11 @@ local providers = {
+ -- Who each is connected as, and its host device.
+ local accounts: { [string]: any } = {}
+ local hosts: { [string]: string } = {}
+--- A Docker sign-in waiting on its page.
++-- A Docker sign-in waiting on its page, how long its code lasts, and this
++-- device's engine's word on it (`connect`, as ListSandboxProviders lists it).
+ local pending: string? = nil
++local code_life = 900
++local attempt: any = nil
+ 
+ local function script(scope: any, hook: string, name: string, shown: string, content: string): any
+ 	return { row = { ["for"] = scope, hook = hook, name = name, script = shown, path = `/home/zeron/{shown}`, runsOn = "sandbox" }, content = content }
+@@ -92,6 +97,8 @@ local engine: { [string]: (p: any, device: string) -> any } = {
+ 			local one = table.clone(p)
+ 			-- (Only the host device keeps the key, so only it says who.)
+ 			one.account = if hosts[p.id] == device then accounts[p.id] else nil
++			-- (This device's engine finishes the sign-in: only it says how.)
++			one.connect = if p.id == "docker" and device == "mac" then attempt else nil
+ 			table.insert(out, one)
+ 		end
+ 		return settled(out)
+@@ -109,7 +116,8 @@ local engine: { [string]: (p: any, device: string) -> any } = {
+ 			return settled(nil, "Boat connects with a pasted key.")
+ 		end
+ 		pending = p.provider
+-		return settled({ deviceCode = { userCode = "WXYZ-1234", verificationUri = "https://login.docker.com/activate", verificationUriComplete = "https://login.docker.com/activate?user_code=WXYZ-1234", expiresIn = 900 } })
++		attempt = { userCode = "WXYZ-1234" }
++		return settled({ deviceCode = { userCode = "WXYZ-1234", verificationUri = "https://login.docker.com/activate", verificationUriComplete = "https://login.docker.com/activate?user_code=WXYZ-1234", expiresIn = code_life } })
+ 	end,
+ 	DisconnectSandboxProvider = function(p)
+ 		accounts[p.provider] = nil
+@@ -181,8 +189,26 @@ ui.command {
+ 		if pending then
+ 			connect(pending)
+ 			pending = nil
++			attempt = nil
+ 		end
+ 	end,
+ }
++ui.command {
++	id = "sandbox_settings_stub.refuse",
++	title = "The Docker sign-in refused in the background",
++	run = function()
++		if attempt then
++			attempt = { userCode = attempt.userCode, error = "Docker didn't sign in: User cancelled the confirmation prompt." }
++			pending = nil
++		end
++	end,
++}
++ui.command {
++	id = "sandbox_settings_stub.short_code",
++	title = "Docker's next sign-in code lasts a second",
++	run = function()
++		code_life = 1
++	end,
++}
+ 
+ return M
+diff --git a/apps/zgx/ui/screens/settings/sandboxes.luau b/apps/zgx/ui/screens/settings/sandboxes.luau
+index 6aec0568e31a093acc98c96c1247c6544ce4ac13..ff5938e9e5191c6dd0151388cb5a80b69d200a9b 100644
+--- a/apps/zgx/ui/screens/settings/sandboxes.luau
++++ b/apps/zgx/ui/screens/settings/sandboxes.luau
+@@ -94,6 +94,9 @@ local connect_open = ui.state("settings_sandboxes_connect_open", false)
+ local token = ui.state("settings_sandboxes_token", "")
+ local code = ui.state("settings_sandboxes_code", nil :: any)
+ local connect_busy = ui.state("settings_sandboxes_connect_busy", false)
++-- Why the sign-in on the provider's page didn't connect (the engine's
++-- words, or its code ran out): shown in place of the wait, with Try again.
++local connect_error = ui.state("settings_sandboxes_connect_error", nil :: string?)
+ -- Disconnecting: which, after a confirm.
+ local disconnecting = ui.state("settings_sandboxes_disconnecting", "")
+ local disconnect_open = ui.state("settings_sandboxes_disconnect_open", false)
+@@ -254,6 +257,7 @@ local function open_connect(id: string)
+ 		connecting:set(id)
+ 		token:set("")
+ 		code:set(nil)
++		connect_error:set(nil)
+ 		connect_busy:set(false)
+ 		connect_open:set(true)
+ 	end)
+@@ -267,6 +271,7 @@ local function connected(id: string, host: string?)
+ 		connect_busy:set(false)
+ 		connect_open:set(false)
+ 		code:set(nil)
++		connect_error:set(nil)
+ 		token:set("")
+ 		if want then
+ 			planned:set_key(id, nil :: any)
+@@ -300,14 +305,19 @@ local function connect_with_token()
+ end
+ 
+ -- The provider's own sign-in page: its code shown, opened in the browser;
+--- the engine finishes in the background, so the page asks the host device
+--- every few seconds until it's connected or the code runs out.
++-- the engine finishes in the background, so the page asks every few seconds
++-- until it's connected, this device's engine says it didn't, or the code
++-- runs out (then it says so, with Try again).
+ local function connect_on_page()
+ 	local id = connecting:peek()
+ 	if id == "" or connect_busy:peek() then
+ 		return
+ 	end
+-	connect_busy:set(true)
++	ui.batch(function()
++		connect_busy:set(true)
++		code:set(nil)
++		connect_error:set(nil)
++	end)
+ 	change("ConnectSandboxProvider", { provider = id }):after(function(answer: any)
+ 		connect_busy:set(false)
+ 		local shown = if type(answer) == "table" then answer.deviceCode else nil
+@@ -321,27 +331,48 @@ local function connect_on_page()
+ 			Links.outside(url)
+ 		end
+ 		local until_at = os.time() + (tonumber(shown.expiresIn) or 900)
+-		-- (Only while this code shows: closed, approved or run out, it stops.)
++		-- (Only while this code shows: closed, approved, failed or run out,
++		-- it stops.)
+ 		local function waiting(): boolean
+ 			-- (A state holds a copy: the code's own words say which.)
+ 			local now = code:peek()
+-			return connect_open:peek() and now ~= nil and now.userCode == shown.userCode and os.time() <= until_at
++			return connect_open:peek() and now ~= nil and now.userCode == shown.userCode and connect_error:peek() == nil
++		end
++		local function stop(why: string)
++			if waiting() then
++				connect_error:set(why)
++			end
+ 		end
+ 		local function look()
+ 			ui.after(POLL_MS, function()
+ 				if not waiting() then
+ 					return
+ 				end
+-				ask("SandboxHost", { provider = id }):after(function(named: any)
+-					local device = if type(named) == "table" then named.hostDeviceId else nil
+-					ask("ListSandboxProviders", {}, device):after(function(list: any)
+-						for _, p in (if type(list) == "table" then list else {}) do
+-							if p.id == id and p.account and waiting() then
+-								connected(id, device)
+-								return
+-							end
++				if os.time() > until_at then
++					stop(ui.t("settings.sandboxes.code_expired"):get())
++					return
++				end
++				-- This device's engine finishes the sign-in: it says when it
++				-- didn't (Docker refused it, the key didn't reach the host).
++				ask("ListSandboxProviders", {}):after(function(here_list: any)
++					for _, p in (if type(here_list) == "table" then here_list else {}) do
++						local attempt = if p.id == id then p.connect else nil
++						if type(attempt) == "table" and attempt.userCode == shown.userCode and attempt.error then
++							stop(attempt.error)
++							return
+ 						end
+-						look()
++					end
++					ask("SandboxHost", { provider = id }):after(function(named: any)
++						local device = if type(named) == "table" then named.hostDeviceId else nil
++						ask("ListSandboxProviders", {}, device):after(function(list: any)
++							for _, p in (if type(list) == "table" then list else {}) do
++								if p.id == id and p.account and waiting() then
++									connected(id, device)
++									return
++								end
++							end
++							look()
++						end, look)
+ 					end, look)
+ 				end, look)
+ 			end)
+@@ -992,7 +1023,30 @@ function M.view(): Node
+ 					},
+ 				}),
+ 				ui.show(function(): boolean
+-					return code:get() ~= nil
++					return code:get() ~= nil and connect_error:get() ~= nil
++				end, ui.column {
++					w_full = true,
++					gap = "$space.2",
++					ui.text {
++						function(): string
++							return connect_error:get() or ""
++						end,
++						text_size = "$font.size.sm",
++						line_height = "$font.line.sm",
++						color = "$text.danger",
++						wrap = true,
++						selectable = true,
++					},
++					ds.Button {
++						tone = "secondary",
++						w_full = true,
++						label = ui.t("settings.sandboxes.sign_in_again"),
++						on_click = connect_on_page,
++						ui.text { ui.t("settings.sandboxes.sign_in_again") },
++					},
++				}),
++				ui.show(function(): boolean
++					return code:get() ~= nil and connect_error:get() == nil
+ 				end, ui.column {
+ 					w_full = true,
+ 					gap = "$space.1",
+diff --git a/apps/zgx/ui/tests/settings_sandboxes.test.luau b/apps/zgx/ui/tests/settings_sandboxes.test.luau
+index 454f7f3578f1251a1c0680429f18c827bcfae58c..b84de406b984be046b861bc1f6580fe60bf5c900 100644
+--- a/apps/zgx/ui/tests/settings_sandboxes.test.luau
++++ b/apps/zgx/ui/tests/settings_sandboxes.test.luau
+@@ -280,6 +280,38 @@ test("Docker connects on its own page: the code shows until it's approved", func
+ 	expect(app:wait(`{PAGE} >> role:button "Disconnect Docker Sandbox"`, { timeout_ms = 15000 })).to_be(true)
+ end)
+ 
++test("a sign-in that failed in the background says why, and Try again shows a new code", function()
++	local app = open()
++	app:click(`{PAGE} >> role:button "Connect Docker Sandbox"`)
++	app:frames(20)
++	app:click('role:dialog >> role:button "Sign in with Docker Sandbox"')
++	app:frames(20)
++	expect(shows(app, "role:dialog", "WXYZ-1234")).to_be(true)
++	app:command("sandbox_settings_stub.refuse")
++	-- This device's engine said it didn't connect: the dialog says so.
++	expect(app:wait('role:dialog >> role:button "Try again"', { timeout_ms = 15000 })).to_be(true)
++	expect(shows(app, "role:dialog", "Docker didn't sign in")).to_be(true)
++	expect(shows(app, "role:dialog", "Check this code")).to_be(false)
++	expect(app:has(`{PAGE} >> role:button "Disconnect Docker Sandbox"`)).to_be(false)
++
++	app:click('role:dialog >> role:button "Try again"')
++	app:frames(20)
++	expect(shows(app, "role:dialog", "Check this code")).to_be(true)
++	expect(app:has('role:dialog >> role:button "Try again"')).to_be(false)
++	app:command("sandbox_settings_stub.approve")
++	expect(app:wait(`{PAGE} >> role:button "Disconnect Docker Sandbox"`, { timeout_ms = 15000 })).to_be(true)
++end)
++
++test("a code that runs out says so, with Try again", function()
++	local app = open({ "sandbox_settings_stub.short_code" })
++	app:click(`{PAGE} >> role:button "Connect Docker Sandbox"`)
++	app:frames(20)
++	app:click('role:dialog >> role:button "Sign in with Docker Sandbox"')
++	app:frames(20)
++	expect(app:wait('role:dialog >> role:button "Try again"', { timeout_ms = 15000 })).to_be(true)
++	expect(shows(app, "role:dialog", "The code expired")).to_be(true)
++end)
++
+ test("Boat, whose ops don't sign in on a page, takes a key only", function()
+ 	local app = open()
+ 	app:click(`{PAGE} >> role:button "Connect Boat"`)
+diff --git a/crates/engine/src/rpc/sandboxes.rs b/crates/engine/src/rpc/sandboxes.rs
+index 3b2b079512b247f36fe2ea5cbbef79ea3083f491..79d5321216d8d2e4aca893979378f6582c621230 100644
+--- a/crates/engine/src/rpc/sandboxes.rs
++++ b/crates/engine/src/rpc/sandboxes.rs
+@@ -169,6 +169,16 @@ fn reply_value(reply: RpcReply, method: &str) -> Result<Value, RpcError> {
+     }
+ }
+ 
++/// Why a sign-in finished on the provider's page still didn't connect: its
++/// key didn't reach the host device (this device let it go).
++fn key_not_sent(name: &str, error: &RpcError) -> String {
++    let why = match error {
++        RpcError::Failed(message) => message.clone(),
++        other => other.to_string(),
++    };
++    format!("Signed in to {name}, but the host device didn't take the key ({why}). Try again.")
++}
++
+ /// The device couldn't be reached (as opposed to answering no).
+ fn unreachable(error: &RpcError) -> bool {
+     match error {
+@@ -301,17 +311,31 @@ impl EngineRpc {
+                 })?;
+                 let shown = serde_json::to_value(&code).unwrap_or_default();
+                 // Approved on the provider's page, in the user's time; then
+-                // the key goes to the host device.
++                // the key goes to the host device. How it ended is listed
++                // with the provider (`connect`), for the page to say.
++                let user_code = code.user_code.clone();
++                sandboxes.connect_began(provider.id(), &user_code);
+                 let rpc = self.clone();
+                 tokio::spawn(async move {
+-                    if let Err(err) = provider.connect(Credential::DeviceCode(code)).await {
+-                        tracing::warn!(provider = provider.id(), %err, "sandboxes: connect didn't finish");
+-                        return;
+-                    }
+-                    if let Some(sandboxes) = rpc.sandboxes.as_ref()
+-                        && let Err(err) = rpc.settle_host(sandboxes, provider.id()).await
+-                    {
+-                        tracing::warn!(provider = provider.id(), %err, "sandboxes: the key didn't reach the host device");
++                    let ended = match provider.connect(Credential::DeviceCode(code)).await {
++                        Err(err) => {
++                            tracing::warn!(provider = provider.id(), %err, "sandboxes: connect didn't finish");
++                            Some(err.message)
++                        }
++                        Ok(_) => match rpc.sandboxes.as_ref() {
++                            Some(sandboxes) => rpc
++                                .settle_host(sandboxes, provider.id())
++                                .await
++                                .err()
++                                .map(|err| {
++                                    tracing::warn!(provider = provider.id(), %err, "sandboxes: the key didn't reach the host device");
++                                    key_not_sent(provider.name(), &err)
++                                }),
++                            None => None,
++                        },
++                    };
++                    if let Some(sandboxes) = rpc.sandboxes.as_ref() {
++                        sandboxes.connect_ended(provider.id(), &user_code, ended);
+                     }
+                 });
+                 RpcReply::value(&serde_json::json!({ "deviceCode": shown }))
+@@ -407,13 +431,26 @@ impl EngineRpc {
+     /// and this device keeps it only when it's that one. The host device.
+     async fn settle_host(&self, sandboxes: &Sandboxes, provider: &str) -> Result<String, RpcError> {
+         let me = self.this_device().to_owned();
+-        let current = self.workspace.sandbox_host(provider);
++        // The device list as it's shown: presence overlaid, so "online"
++        // means what the Devices page says it does.
++        let devices = self.workspace.watch_devices().borrow().clone();
++        // A host device the account no longer has (a test engine, a deleted
++        // sandbox's) is none: its key went with it, and handing it this one
++        // can only fail. (Only once the list is here: it lists this device.)
++        let listed = devices.iter().any(|d| d.id == me);
++        let current = self.workspace.sandbox_host(provider).filter(|host| {
++            let gone = listed
++                && host.host_device_id != me
++                && !devices.iter().any(|d| d.id == host.host_device_id);
++            if gone {
++                tracing::warn!(provider, device = %host.host_device_id,
++                    "sandboxes: the named host device is gone; picking one again");
++            }
++            !gone
++        });
+         let target = match &current {
+             Some(host) => host.host_device_id.clone(),
+             None => {
+-                // The device list as it's shown: presence overlaid, so
+-                // "online" means what the Devices page says it does.
+-                let devices = self.workspace.watch_devices().borrow().clone();
+                 let now = chrono::Utc::now();
+                 let online = |id: &str| {
+                     id == me
+diff --git a/crates/engine/src/sandboxes.rs b/crates/engine/src/sandboxes.rs
+index 583e6ec69ac7c2bd9a84a01433ef7a799e7b2887..a0f25a3e7a13bbc9198bf188b843034b80c80e37 100644
+--- a/crates/engine/src/sandboxes.rs
++++ b/crates/engine/src/sandboxes.rs
+@@ -137,6 +137,23 @@ pub struct ProviderInfo {
+     pub ops: Vec<&'static str>,
+     /// The account it's connected to here; `None` until the user connects.
+     pub account: Option<Account>,
++    /// A sign-in on its own page that this device is finishing in the
++    /// background: still waiting, or why it didn't connect.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub connect: Option<ConnectAttempt>,
++}
++
++/// A sign-in on a provider's page, finished by this device in the
++/// background ([`Sandboxes::connect_began`]). Settings shows its error: the
++/// page alone can't tell a failure from a wait.
++#[derive(Clone, Debug, PartialEq, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ConnectAttempt {
++    /// The code it's for (the one the page shows).
++    pub user_code: String,
++    /// Why it didn't connect; `None` while it waits.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub error: Option<String>,
+ }
+ 
+ /// What `createChat` on a place answers: the chat's host and folder.
+@@ -254,6 +271,8 @@ struct Inner {
+     /// Sandboxes are looked after ([`Sandboxes::keep`]).
+     keeping: AtomicBool,
+     timings: Mutex<SleepTimings>,
++    /// Sign-ins on a provider's page this device is finishing, by provider.
++    connects: Mutex<HashMap<String, ConnectAttempt>>,
+ }
+ 
+ /// The providers this device keeps and the chats on them.
+@@ -302,6 +321,7 @@ impl Sandboxes {
+                 following: AtomicBool::new(false),
+                 keeping: AtomicBool::new(false),
+                 timings: Mutex::default(),
++                connects: Mutex::default(),
+             }),
+         }
+     }
+@@ -360,6 +380,7 @@ impl Sandboxes {
+     }
+ 
+     pub fn providers(&self) -> Vec<ProviderInfo> {
++        let connects = lock(&self.inner.connects).clone();
+         lock(&self.inner.providers)
+             .iter()
+             .map(|p| ProviderInfo {
+@@ -368,10 +389,46 @@ impl Sandboxes {
+                 icon: p.icon().to_owned(),
+                 ops: p.ops().names(),
+                 account: p.account(),
++                connect: connects.get(p.id()).cloned(),
+             })
+             .collect()
+     }
+ 
++    /// A sign-in on `provider`'s page for `user_code` began here: it waits
++    /// (replacing one begun before, whose code the page no longer shows).
++    pub(crate) fn connect_began(&self, provider: &str, user_code: &str) {
++        lock(&self.inner.connects).insert(
++            provider.to_owned(),
++            ConnectAttempt {
++                user_code: user_code.to_owned(),
++                error: None,
++            },
++        );
++    }
++
++    /// That sign-in ended: connected (`None`), or why not. One a newer code
++    /// replaced says nothing.
++    pub(crate) fn connect_ended(&self, provider: &str, user_code: &str, error: Option<String>) {
++        let mut connects = lock(&self.inner.connects);
++        if connects.get(provider).is_none_or(|a| a.user_code != user_code) {
++            return;
++        }
++        match error {
++            Some(error) => {
++                connects.insert(
++                    provider.to_owned(),
++                    ConnectAttempt {
++                        user_code: user_code.to_owned(),
++                        error: Some(error),
++                    },
++                );
++            }
++            None => {
++                connects.remove(provider);
++            }
++        }
++    }
++
+     /// `provider_id`'s account templates (Blank, no template, isn't one).
+     pub async fn templates(&self, provider_id: &str) -> Result<Vec<Template>, String> {
+         let provider = self
+diff --git a/crates/engine/tests/docker_sign_in.rs b/crates/engine/tests/docker_sign_in.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d81fdc372efcdab91589ea1613e5cd743c87103
+--- /dev/null
++++ b/crates/engine/tests/docker_sign_in.rs
+@@ -0,0 +1,175 @@
++//! Signing in to Docker Sandbox on Docker's own page, at the engine's RPCs:
++//! `ConnectSandboxProvider` answers the code at once and finishes in the
++//! background. However that ends, `ListSandboxProviders` says so with the
++//! provider (`connect`), so Settings never waits on a sign-in that already
++//! failed: Docker refusing it, its code running out, or the key not reaching
++//! the host device.
++
++#[path = "support/docker_stub.rs"]
++mod docker_stub;
++#[path = "support/fake_provider.rs"]
++mod fake_provider;
++#[path = "support/scripted_edge.rs"]
++mod scripted_edge;
++
++use std::path::Path;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use docker_stub::DockerStub;
++use fake_provider::{engine_config, start_engine};
++use scripted_edge::{ScriptedEdge, USER};
++use serde_json::{Value, json};
++use zeron_engine::EngineRuntime;
++use zeron_engine::sandboxes::KeySlot;
++use zeron_engine::sandboxes::docker::{DockerProvider, DockerUrls};
++use zeron_rpc::{RpcClient, memory_client, methods};
++
++const ORG: &str = "org_home";
++
++/// A device with Docker Sandbox built in, talking to `stub`.
++async fn device(dir: &Path, edge: &ScriptedEdge, stub: &DockerStub) -> EngineRuntime {
++    std::fs::create_dir_all(dir).unwrap();
++    let session = json!({
++        "refreshToken": edge.seed_session(ORG),
++        "user": { "id": USER, "email": "u@example.com" },
++        "orgId": ORG,
++    });
++    std::fs::write(dir.join("session.json"), session.to_string()).unwrap();
++    let runtime = start_engine(&engine_config(dir, &edge.url, None)).await;
++    let docker = DockerProvider::with_urls(KeySlot::open(dir, "docker"), DockerUrls::all(&stub.url));
++    runtime.core().sandboxes.register(Arc::new(docker));
++    runtime
++}
++
++/// Docker as `rpc`'s device lists it.
++async fn docker_on(rpc: &RpcClient) -> Value {
++    let listed = rpc
++        .call(methods::LIST_SANDBOX_PROVIDERS, json!({}))
++        .await
++        .expect("ListSandboxProviders");
++    listed
++        .as_array()
++        .and_then(|list| list.iter().find(|p| p["id"] == "docker"))
++        .cloned()
++        .expect("Docker is listed")
++}
++
++/// Wait until Docker's row on `rpc`'s device passes `done`.
++async fn until(rpc: &RpcClient, done: impl Fn(&Value) -> bool) -> Value {
++    let deadline = Instant::now() + Duration::from_secs(30);
++    loop {
++        let row = docker_on(rpc).await;
++        if done(&row) {
++            return row;
++        }
++        assert!(Instant::now() < deadline, "never: {row:#}");
++        tokio::time::sleep(Duration::from_millis(100)).await;
++    }
++}
++
++/// The page's code, from `ConnectSandboxProvider` without a token.
++async fn sign_in_on_page(rpc: &RpcClient) -> Value {
++    let answer = rpc
++        .call(methods::CONNECT_SANDBOX_PROVIDER, json!({ "provider": "docker" }))
++        .await
++        .expect("ConnectSandboxProvider");
++    answer["deviceCode"].clone()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_sign_in_docker_refuses_says_why_with_its_code() {
++    let edge = ScriptedEdge::with_registry().await;
++    let stub = DockerStub::start().await;
++    stub.state().refuse_device = Some("access_denied".into());
++    let dir = tempfile::tempdir().unwrap();
++    let laptop = device(dir.path(), &edge, &stub).await;
++    let rpc = memory_client(laptop.core().rpc_service());
++
++    let code = sign_in_on_page(&rpc).await;
++    assert_eq!(code["userCode"], "ABCD-EFGH");
++    // While it waits, it says so.
++    let waiting = docker_on(&rpc).await;
++    assert_eq!(waiting["connect"]["userCode"], "ABCD-EFGH", "{waiting:#}");
++
++    let ended = until(&rpc, |row| row["connect"]["error"].is_string()).await;
++    assert_eq!(ended["connect"]["userCode"], "ABCD-EFGH");
++    let error = ended["connect"]["error"].as_str().unwrap();
++    assert!(error.contains("Docker didn't sign in"), "{error}");
++    assert!(ended["account"].is_null(), "{ended:#}");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_code_that_runs_out_says_so() {
++    let edge = ScriptedEdge::with_registry().await;
++    let stub = DockerStub::start().await;
++    {
++        let mut state = stub.state();
++        state.pending_polls = 1_000;
++        state.code_life = 2;
++    }
++    let dir = tempfile::tempdir().unwrap();
++    let laptop = device(dir.path(), &edge, &stub).await;
++    let rpc = memory_client(laptop.core().rpc_service());
++
++    sign_in_on_page(&rpc).await;
++    let ended = until(&rpc, |row| row["connect"]["error"].is_string()).await;
++    let error = ended["connect"]["error"].as_str().unwrap();
++    assert!(error.contains("expired"), "{error}");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn an_approved_sign_in_connects_and_leaves_nothing_waiting() {
++    let edge = ScriptedEdge::with_registry().await;
++    let stub = DockerStub::start().await;
++    let dir = tempfile::tempdir().unwrap();
++    let laptop = device(dir.path(), &edge, &stub).await;
++    let rpc = memory_client(laptop.core().rpc_service());
++
++    sign_in_on_page(&rpc).await;
++    let connected = until(&rpc, |row| !row["account"].is_null()).await;
++    assert_eq!(connected["account"]["name"], "vu-test");
++    assert!(connected.get("connect").is_none(), "{connected:#}");
++    let host = rpc
++        .call(methods::SANDBOX_HOST, json!({ "provider": "docker" }))
++        .await
++        .expect("SandboxHost");
++    assert_eq!(host["hostDeviceId"], laptop.core().device_id.as_str(), "{host:#}");
++}
++
++/// The Laptop's sign-in on 2026-11-17: the registry still named, as
++/// Docker's host device, one the account no longer has (from testing the
++/// day before). The key was sent there, never taken, and forgotten here,
++/// and the page asked that device forever. A host device that's gone is
++/// none: this one keeps the key.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_host_device_the_account_no_longer_has_is_none() {
++    let edge = ScriptedEdge::with_registry().await;
++    let stub = DockerStub::start().await;
++    let dir = tempfile::tempdir().unwrap();
++    let laptop = device(dir.path(), &edge, &stub).await;
++    let me = laptop.core().device_id.clone();
++    let rpc = memory_client(laptop.core().rpc_service());
++    // (The device list is here: it names this device.)
++    let deadline = Instant::now() + Duration::from_secs(30);
++    while !laptop.core().workspace.watch_devices().borrow().iter().any(|d| d.id == me) {
++        assert!(Instant::now() < deadline, "this device never listed itself");
++        tokio::time::sleep(Duration::from_millis(100)).await;
++    }
++    laptop.core().workspace.set_sandbox_host(&zeron_proto::SandboxHost {
++        provider: "docker".into(),
++        host_device_id: "062cdf75-gone".into(),
++        connected_on: Some("062cdf75-gone".into()),
++    });
++
++    sign_in_on_page(&rpc).await;
++    let connected = until(&rpc, |row| !row["account"].is_null() || row["connect"]["error"].is_string()).await;
++    assert!(connected.get("connect").is_none(), "{connected:#}");
++    assert_eq!(connected["account"]["name"], "vu-test");
++    let host = rpc
++        .call(methods::SANDBOX_HOST, json!({ "provider": "docker" }))
++        .await
++        .expect("SandboxHost");
++    assert_eq!(host["hostDeviceId"], me.as_str(), "{host:#}");
++    assert_eq!(host["connectedOn"], me.as_str(), "{host:#}");
++}
+diff --git a/crates/engine/tests/support/docker_stub.rs b/crates/engine/tests/support/docker_stub.rs
+index ee45aef61717a27030740574968ac1e85ff1ee85..963316ff099842720a8200df76e8e384201f6748 100644
+--- a/crates/engine/tests/support/docker_stub.rs
++++ b/crates/engine/tests/support/docker_stub.rs
+@@ -52,6 +52,11 @@ pub struct State {
+     pub token_life: u64,
+     /// `authorization_pending` answers before the device code is approved.
+     pub pending_polls: u32,
++    /// The device code's poll is refused with this OAuth error instead
++    /// (`access_denied`: the user said no on Docker's page).
++    pub refuse_device: Option<String>,
++    /// `expires_in` of the device codes it gives.
++    pub code_life: u64,
+     /// Hub: `(username, personal access token)` it accepts.
+     pub pat: Option<(String, String)>,
+     /// `GetSandbox` calls a Start/Stop takes to finish.
+@@ -98,6 +103,8 @@ impl DockerStub {
+                 refreshes: 0,
+                 token_life: 900,
+                 pending_polls: 1,
++                refuse_device: None,
++                code_life: 900,
+                 pat: None,
+                 transition_polls: 2,
+                 runs: VecDeque::new(),
+@@ -199,11 +206,12 @@ impl DockerStub {
+ 
+         // Sign-in endpoints need no bearer.
+         if path == "/oauth/device/code" {
++            let life = self.state().code_life;
+             return respond(&mut socket, 200, json!({
+                 "device_code": "dev-code-1", "user_code": "ABCD-EFGH",
+                 "verification_uri": "https://login.docker.com/activate",
+                 "verification_uri_complete": "https://login.docker.com/activate?user_code=ABCD-EFGH",
+-                "expires_in": 900, "interval": 1,
++                "expires_in": life, "interval": 1,
+             })).await;
+         }
+         if path == "/oauth/token" {
+@@ -276,6 +284,9 @@ impl DockerStub {
+         let mut state = self.state();
+         match form["grant_type"].as_str() {
+             Some("urn:ietf:params:oauth:grant-type:device_code") => {
++                if let Some(error) = state.refuse_device.clone() {
++                    return (403, json!({"error": error, "error_description": "User cancelled the confirmation prompt."}));
++                }
+                 if state.pending_polls > 0 {
+                     state.pending_polls -= 1;
+                     return (403, json!({"error": "authorization_pending", "error_description": "User has yet to authorize device code."}));
+-- 
+2.47.3
+
