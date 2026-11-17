@@ -104,15 +104,9 @@ sha = "6a48aacda3164f3bdcd2f388e4ff9a9fd0c04df5"
 note = "A plugin's declared `ui.window`s open in the zgx app (zgx_run::follow_windows, as zgx-run does), so the Design plugin's windows (and #2297's full screen, #2298's scale in them) show. One file, apps/zgx/src/main.rs; on main. Goes after design-plugin-apis, the plugin APIs it serves."
 
 [[patch]]
-name = "agent-device-commands"
-pr = 1458
-sha = "a4e90bbf0ffa842425831d151abdd6e2b1e92ad6"
-note = "Agents run shell commands on any online device (Zeron MCP's run_command, command_output, stop_command, list_commands), with background ones in the chat's background band; Cloud chats reach every device (the edge part only takes effect once upstream deploys it). A `pr` entry now that the base is main (#1458 is on main f6a9bbfc): the PR as written, with main's terminal picker and plugin-preview list, not the zgx-adapted file it was (0014-agent-device-commands). Both devices need this build: the command runs on the target's engine. The child-reports patches below go after it."
-
-[[patch]]
 name = "child-reports-one-rule"
 file = "patches/0014-child-reports-one-rule.patch"
-note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Goes after agent-device-commands (#1458); needs child-reports-held-stop."
+note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Needs #1458 (agents' device commands, upstream since e91a75b02) and child-reports-held-stop."
 
 [[patch]]
 name = "child-reports-holds-and-groups"
@@ -127,7 +121,7 @@ note = "The parent's device reports for a child whose device doesn't (an older Z
 [[patch]]
 name = "child-reports-run-command"
 file = "patches/0017-child-reports-run-command.patch"
-note = "A command a child left running with run_command (agent-device-commands, #1458) never wakes it, so it no longer holds back the follow-up its runtime's own background work wakes it for. An end with only such commands lists them and lets no follow-up through, the parent's note no longer lists that child as still working for it, and a thanks answered under one stays quiet. Applies on top of child-reports-watch."
+note = "A command a child left running with run_command (#1458, upstream) never wakes it, so it no longer holds back the follow-up its runtime's own background work wakes it for. An end with only such commands lists them and lets no follow-up through, the parent's note no longer lists that child as still working for it, and a thanks answered under one stays quiet. Applies on top of child-reports-watch."
 
 # Docker Sandbox, spec #37 (parked: Vu approved the entry, not a build yet).
 
