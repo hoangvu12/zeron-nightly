@@ -1,0 +1,285 @@
+From fc20408532fa07837d79e2281ed8c280daba048c Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hoangvu12@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:13:55 +0700
+Subject: [PATCH] Docker Sandbox: a chat shows its sandbox while it's made, and
+ a Blank picked early stays Blank
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A chat placed on Docker Sandbox from the zeron-dev template (the Laptop,
+2026-11-17) sat on "Sending…" under "Unknown device" with no step line,
+then failed where no one could see it: Docker can't make a sandbox from
+zeron-dev (its own create operation runs out of time, ~4.5 min, and makes
+nothing; zgx-dev and zeron-build-l make one in seconds), so the Create
+step failed after 240 s.
+
+- Until the sandbox's engine signs in, its device had no row, so every
+  device listed the chat under "Unknown device", and the composer, which
+  finds a chat's sandbox by its device row, never followed its steps: no
+  "Creating sandbox", and no "Creating sandbox failed" with Run again. The
+  host device now writes the device a row as the chat is placed: that
+  provider's sandbox (`sandbox:<provider>`, never seen online, never a
+  host device). The sandbox's engine writes its own over it when it
+  starts, and a sandbox's device is forgotten as before when it's gone.
+- The template picker opens as the place is picked, while the account's
+  templates still load, listing only Blank; a Blank picked then was
+  replaced by the first template when the list arrived. Until the list is
+  here no template is picked (nil, sent as Blank), and only that is
+  defaulted, never a pick.
+---
+ apps/zgx/ui/chat_fixture.luau                 | 22 ++++++-
+ apps/zgx/ui/screens/chat/where.luau           | 15 +++--
+ .../zgx/ui/tests/chat_where_sandbox.test.luau | 39 +++++++++++++
+ crates/engine/src/rpc/sandboxes.rs            |  6 ++
+ crates/engine/src/workspace_host.rs           | 28 +++++++++
+ crates/engine/tests/sandbox_place.rs          | 58 +++++++++++++++++++
+ 6 files changed, 163 insertions(+), 5 deletions(-)
+
+diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
+index b192b3300f00d2508348a1e2edd902dc203735f9..82388357a9d57b3626a8fcc69e0621178187d041 100644
+--- a/apps/zgx/ui/chat_fixture.luau
++++ b/apps/zgx/ui/chat_fixture.luau
+@@ -1510,10 +1510,30 @@ end
+ -- got (starting, failed, ready); follows and Run again are noted.
+ do
+ 	local sandboxes = require("@account/sandboxes") :: any
++	local listed = { { id = "zeron-dev", name = "zeron-dev" }, { id = "zgx-dev", name = "zgx-dev" } }
++	-- `sandbox_stub.slow_templates`: the next list waits for
++	-- `sandbox_stub.templates_arrive` (Docker answering in its own time).
++	local slow_templates, held_templates = false, nil :: ((any) -> ())?
+ 	sandboxes.ask_templates = function(provider: string): any
+ 		note(`templates:{provider}`)
+-		return settled({ { id = "zeron-dev", name = "zeron-dev" }, { id = "zgx-dev", name = "zgx-dev" } })
++		if slow_templates then
++			slow_templates = false
++			return { after = function(_self: any, ok: (any) -> (), _bad: (any) -> ())
++				held_templates = ok
++			end }
++		end
++		return settled(listed)
+ 	end
++	ui.command { id = "sandbox_stub.slow_templates", title = "The next templates list is slow", run = function()
++		slow_templates = true
++	end }
++	ui.command { id = "sandbox_stub.templates_arrive", title = "The slow templates list arrives", run = function()
++		local ok = held_templates
++		held_templates = nil
++		if ok then
++			ok(listed)
++		end
++	end }
+ 	-- (sandbox_stub's notes it too, for its own tests.)
+ 	local stub_follow = sandboxes.ask_follow
+ 	sandboxes.ask_follow = function(chat: string)
+diff --git a/apps/zgx/ui/screens/chat/where.luau b/apps/zgx/ui/screens/chat/where.luau
+index 9f20d5ff321aba215adf88ae17c96e29f6a773d1..5458250c00f728734161dc5c09f20059b64e49b4 100644
+--- a/apps/zgx/ui/screens/chat/where.luau
++++ b/apps/zgx/ui/screens/chat/where.luau
+@@ -688,12 +688,19 @@ function M.bind(c: Choices)
+ 			return
+ 		end
+ 		provider_was = provider
+-		if c.template and c.template:peek() ~= sandboxes.BLANK then
+-			c.template:set(sandboxes.BLANK)
+-		end
+ 		if not provider then
++			if c.template and c.template:peek() ~= sandboxes.BLANK then
++				c.template:set(sandboxes.BLANK)
++			end
+ 			return
+ 		end
++		-- None picked yet (nil, which sends as Blank): what the list says
++		-- once it's here, unless the person picks first. Their Blank, picked
++		-- while the list loads, stays Blank (the Laptop, 2026-11-17: it
++		-- became the first template, and the chat waited on that).
++		if c.template and c.template:peek() ~= nil then
++			c.template:set(nil)
++		end
+ 		local was = templates_of:peek()
+ 		if was.provider == provider and was.state == "ready" then
+ 			if c.template then
+@@ -705,7 +712,7 @@ function M.bind(c: Choices)
+ 		sandboxes.templates(provider):after(function(list: any)
+ 			if templates_of:peek().provider == provider then
+ 				-- (The default first, so it's what's remembered, not Blank.)
+-				if c.template and c.template:peek() == sandboxes.BLANK and place_of(c.device:peek()) == provider then
++				if c.template and c.template:peek() == nil and place_of(c.device:peek()) == provider then
+ 					c.template:set(M.default_template(provider, list or {}))
+ 				end
+ 				templates_of:set { provider = provider, state = "ready", list = list or {} }
+diff --git a/apps/zgx/ui/tests/chat_where_sandbox.test.luau b/apps/zgx/ui/tests/chat_where_sandbox.test.luau
+index ea80f450d3e4aabcbb6c6f2d9d842e224517582a..ea3c15f1340a61d58e09796aa55c4b51b40fc9b1 100644
+--- a/apps/zgx/ui/tests/chat_where_sandbox.test.luau
++++ b/apps/zgx/ui/tests/chat_where_sandbox.test.luau
+@@ -322,6 +322,45 @@ test("Blank makes the chat with no template", function()
+ 	expect(app:state("calls")).to_contain("|place:docker:blank")
+ end)
+ 
++test("Blank picked while the templates load stays Blank when they arrive", function()
++	local app = mount("chat_fixture.luau")
++	home(app)
++	app:command("sandbox_stub.offer")
++	app:command("sandbox_stub.slow_templates")
++	settle(app)
++	open_row(app, "Device")
++	app:click('role:option ~"Docker Sandbox"')
++	rested(app)
++	-- Still loading: Blank is all there is, and it's what's picked.
++	expect(showing(app, 'role:option ~"zeron-dev"')).to_be(false)
++	app:click('role:option ~"Blank"')
++	close(app)
++	app:command("sandbox_stub.templates_arrive")
++	rested(app)
++	expect(chosen(app, "Template")).never.to_contain("zeron-dev")
++	app:type('role:textbox "Message"', "hi")
++	app:key("Enter")
++	rested(app)
++	local calls = app:state("calls")
++	expect(calls).to_contain("|place:docker:blank")
++	expect(calls).never.to_contain("|place:docker:zeron-dev")
++end)
++
++test("left alone while the templates load, a place starts on the first listed", function()
++	local app = mount("chat_fixture.luau")
++	home(app)
++	app:command("sandbox_stub.offer")
++	app:command("sandbox_stub.slow_templates")
++	settle(app)
++	open_row(app, "Device")
++	app:click('role:option ~"Docker Sandbox"')
++	rested(app)
++	close(app)
++	app:command("sandbox_stub.templates_arrive")
++	rested(app)
++	expect(chosen(app, "Template")).to_contain("zeron-dev")
++end)
++
+ -- ── The open chat ─────────────────────────────────────────────────────────
+ 
+ local function on_sandbox(case: string): any
+diff --git a/crates/engine/src/rpc/sandboxes.rs b/crates/engine/src/rpc/sandboxes.rs
+index 79d5321216d8d2e4aca893979378f6582c621230..73c8630ab5fe6ab4d788768efa7a8d6eccb2d766 100644
+--- a/crates/engine/src/rpc/sandboxes.rs
++++ b/crates/engine/src/rpc/sandboxes.rs
+@@ -1070,6 +1070,12 @@ impl EngineRpc {
+                 child_kind,
+             )
+             .map_err(failed)?;
++        // Where it runs, from the start: its sandbox's device, as that
++        // provider's, while the steps make it (they can take minutes).
++        if let Some(built) = sandboxes.provider_named(provider) {
++            self.workspace
++                .note_sandbox_device(&placed.device_id, built.name(), provider);
++        }
+         sandboxes
+             .start(self.sandbox_host(), chat_id)
+             .map_err(RpcError::Failed)?;
+diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
+index 2845a0814f7d5daac24b3bec1a562bccafb8e03b..68ba547f3908ac862cb04ff0c4ceac11a2dae27e 100644
+--- a/crates/engine/src/workspace_host.rs
++++ b/crates/engine/src/workspace_host.rs
+@@ -703,6 +703,34 @@ impl WorkspaceHost {
+         }
+     }
+ 
++    /// A chat was just placed on a sandbox of `provider` whose engine hasn't
++    /// signed in yet: its device gets a row of its own now, saying it's that
++    /// provider's sandbox (`sandbox:<provider>`), so every device shows where
++    /// the chat runs ("Docker Sandbox") and follows its steps from the start,
++    /// not an unknown device. Never seen online; the sandbox's engine writes
++    /// its own row over it when it starts. A device with a row keeps it.
++    pub fn note_sandbox_device(&self, device_id: &str, name: &str, provider: &str) {
++        let outcome = self.mutate(|doc| {
++            if doc.read_devices()?.iter().any(|d| d.id == device_id) {
++                return Ok(());
++            }
++            doc.upsert_device(&Device {
++                id: device_id.to_owned(),
++                name: name.to_owned(),
++                platform: "linux".to_owned(),
++                last_seen_at: None,
++                created_at: Some(Utc::now()),
++                version: None,
++                cursor_sdk_version: None,
++                capabilities: vec![zeron_proto::sandbox_capability(provider)],
++                online_since: None,
++            })
++        });
++        if let Err(err) = outcome {
++            tracing::warn!(device = %device_id, error = %err, "couldn't list a sandbox's device before it signs in");
++        }
++    }
++
+     /// Dial-gate verdict for `LinkCache` (park dials to registry-dark peers).
+     /// `Dark` requires positive evidence; every ambiguous state — registry
+     /// room down or still in its warm-up window, unknown device, heartbeat in
+diff --git a/crates/engine/tests/sandbox_place.rs b/crates/engine/tests/sandbox_place.rs
+index a08586ed23fd7331989babd550be866e90c29ef5..3e34002e8aa1c8d2799ef6e1d90308f0d7352964 100644
+--- a/crates/engine/tests/sandbox_place.rs
++++ b/crates/engine/tests/sandbox_place.rs
+@@ -491,3 +491,61 @@ async fn a_sign_in_in_the_projects_origin_never_reaches_the_sandbox_or_its_error
+     let kept = std::fs::read_to_string(host_dir.join("sandboxes.json")).unwrap();
+     assert!(!kept.contains(TOKEN));
+ }
++
++/// While its sandbox is still being made (Docker can take minutes, or fail),
++/// a chat on a place shows where it runs: its device is listed at once as
++/// that provider's sandbox, never seen online, not an unknown device with
++/// no steps (the Laptop, 2026-11-17). Once the sandbox's engine starts, its
++/// own row stands.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_chat_on_a_place_shows_its_sandbox_before_the_sandbox_signs_in() {
++    let edge = ScriptedEdge::with_registry().await;
++    let dirs = tempfile::tempdir().unwrap();
++    let origin_url = dirs.path().join("origin.git");
++    origin(&origin_url);
++    let host = host_device(&dirs.path().join("host"), &edge).await;
++    let provider = FakeProvider::cloud(&dirs.path().join("cloud"));
++    host.core().sandboxes.register(provider.clone());
++    let rpc = memory_client(host.core().rpc_service());
++    let path = project(dirs.path(), &origin_url);
++    add_project(&rpc, &host, &path).await;
++
++    provider.hold_create();
++    let created = create_on_place(&rpc, "chat-early", "fake").await;
++    let device = created["deviceId"].as_str().unwrap().to_owned();
++    let rows = host.core().workspace.read_devices().unwrap();
++    let row = rows
++        .iter()
++        .find(|d| d.id == device)
++        .unwrap_or_else(|| panic!("{device} isn't listed while its sandbox is made: {rows:#?}"));
++    assert_eq!(row.sandbox_provider(), Some("fake"), "{row:#?}");
++    assert_eq!(row.name, "Fake Sandbox");
++    assert!(row.last_seen_at.is_none(), "never seen online: {row:#?}");
++    // (Never a host device: it doesn't say it can be one.)
++    assert!(!row.supports(zeron_proto::capabilities::SANDBOX_HOST_V1), "{row:#?}");
++    // The steps say how far it got, from the start.
++    let making = steps(&rpc, "chat-early").await;
++    assert_eq!(making["step"], "create", "{making:#}");
++
++    provider.release_create();
++    ready(&rpc, "chat-early").await;
++    let own = sandbox_row(&host, &device).await;
++    let deadline = Instant::now() + Duration::from_secs(30);
++    let own = loop {
++        let row = host
++            .core()
++            .workspace
++            .read_devices()
++            .unwrap()
++            .into_iter()
++            .find(|d| d.id == device)
++            .unwrap_or(own.clone());
++        if row.last_seen_at.is_some() {
++            break row;
++        }
++        assert!(Instant::now() < deadline, "the sandbox never wrote its own row: {row:#?}");
++        tokio::time::sleep(Duration::from_millis(200)).await;
++    };
++    assert_eq!(own.sandbox_provider(), Some("fake"), "{own:#?}");
++    assert!(own.version.is_some(), "its engine's own row: {own:#?}");
++}
+-- 
+2.52.0.windows.1
+
