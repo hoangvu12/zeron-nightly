@@ -1,4 +1,4 @@
-From 63fa0e9c04cea1aad129e1475517074ed5f609ff Mon Sep 17 00:00:00 2001
+From a662f11f5d405e53b81f7cc160be90415546b9c3 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
@@ -77,17 +77,17 @@ has to poll, and the person never has to nudge either side.
  crates/mcp/src/tools.rs                      |   24 +-
  crates/proto/src/agent_messages.rs           |  422 +++++-
  docs/mcp.md                                  |    8 +
- 43 files changed, 5969 insertions(+), 213 deletions(-)
+ 43 files changed, 5968 insertions(+), 214 deletions(-)
  create mode 100644 apps/zgx/ui/ds/spawn_group.luau
  create mode 100644 apps/zgx/ui/ds/subagent_row.luau
  create mode 100644 apps/zgx/ui/tests/subagent_reports.test.luau
  create mode 100644 crates/engine/src/session_reports.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965afb8d4d4a 100644
+index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd42c3be89 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
-@@ -4641,6 +4641,13 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -4647,6 +4647,13 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
              if image_note_only(entry) {
                  return None;
              }
@@ -101,7 +101,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
              // A message from another chat: its routing header is the agent's to
              // read; the transcript shows who sent it, over its words.
              let sender = zeron_proto::agent_messages::agent_message_sender(&text);
-@@ -4760,6 +4767,44 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -4766,6 +4773,44 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
      }
  }
  
@@ -146,7 +146,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
  /// A switch side's mark: its agent's, the mock drawn as Claude, as the
  /// shipping app's `harness_brand_icon`.
  fn switch_mark(harness: &str) -> Option<String> {
-@@ -4829,6 +4874,7 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+@@ -4835,6 +4880,7 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
              ("kind", Value::from("tools")),
              ("summary", Value::from(group_summary(group).as_str())),
              ("live", Value::Bool(streaming && group_last == last_ix)),
@@ -154,7 +154,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
              ("tools", Value::List(tools.into())),
          ]));
          group.clear();
-@@ -5155,7 +5201,95 @@ fn is_agent(part: &Json) -> bool {
+@@ -5161,7 +5207,95 @@ fn is_agent(part: &Json) -> bool {
          Some("unknown") => call["name"].as_str(),
          _ => None,
      };
@@ -251,7 +251,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
  }
  
  /// A group's line, as the shipping app writes it (crates/ui transcript.rs
-@@ -5501,7 +5635,9 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
+@@ -5507,7 +5641,9 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
                  }
                  "mcp" => {
                      let tool = s("tool").unwrap_or_default();
@@ -262,7 +262,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
                          ("agent", "Ran a subagent".into(), tool.strip_prefix("Agent: ").map(Into::into))
                      } else {
                          ("exec", "Used".into(), Some(format!("{}.{tool}", s("server").unwrap_or_default())))
-@@ -5551,6 +5687,11 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
+@@ -5575,6 +5711,11 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
              ]),
          ));
      }
@@ -274,7 +274,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
      // What its row opens to (src/tool_details.rs).
      fields.extend(crate::tool_details::tool_fields(part));
      let stats = part["diffStats"].as_array();
-@@ -5783,7 +5924,21 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -5808,7 +5949,21 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          .queue
          .iter()
          .map(|q| {
@@ -297,7 +297,7 @@ index b8e5734fe42ee0b1256fe6e3dd2ec3cf6b17e4fd..24d24e32cb56be27ff7c46f8d599965a
              // When it was queued (seconds): one that waited long is said so
              // before it goes.
              if let Some(ms) = q["issuedAt"].as_f64() {
-@@ -7298,6 +7453,115 @@ mod tests {
+@@ -7323,6 +7478,115 @@ mod tests {
          assert!(matches!(card.field("mark"), Some(Value::Str(s)) if s.as_ref() == mark("codex")));
          CHATS.with(|c| c.chats.borrow_mut().remove("c1"));
      }
@@ -870,18 +870,18 @@ index 16d15fda3bb1a70425ee741282da8d9d36db8178..68ccaa91ba75d32c4a7eed858efaed61
  ui.command { id = "theme_light", title = "Light theme", run = function() ui.theme.follow_system(false); ui.theme.current:set("zeron-light") end }
  ui.command { id = "theme_dark", title = "Dark theme", run = function() ui.theme.follow_system(false); ui.theme.current:set("zeron-dark") end }
 diff --git a/apps/zgx/ui/ds/activity.luau b/apps/zgx/ui/ds/activity.luau
-index 4ecca2770a25c3c4ad02fc8edddfc4c5ac8f493f..4700ea43ac9465869ef8f45bd284b070861bffdf 100644
+index 8a7d8aa077d8e89906eb3ca713caf3f6c73338c1..bd3e9fc6a4180fc0219eeb6c0ece3ab7c7999628 100644
 --- a/apps/zgx/ui/ds/activity.luau
 +++ b/apps/zgx/ui/ds/activity.luau
-@@ -28,6 +28,7 @@ local Markdown = require("@self/markdown")
- local locale = require("@self/locale")
+@@ -29,6 +29,7 @@ local locale = require("@self/locale")
  local ReplyPicture = require("@self/reply_picture")
  local FoldButton = require("@self/fold_button")
+ local Tooltip = require("@self/tooltip")
 +local SubagentRow = require("@self/subagent_row")
  
  -- (`cloud`, `git`: a Cloud machine's own setup steps, the machine and its
  -- checkout.)
-@@ -91,6 +92,9 @@ export type Props = {
+@@ -96,6 +97,9 @@ export type Props = {
  	-- Where a tool's pictures are read from (ds/transcript's
  	-- `shown_pictures`: files on the chat's host). Without it, none show.
  	pictures: ReplyPicture.Pictures?,
@@ -891,7 +891,7 @@ index 4ecca2770a25c3c4ad02fc8edddfc4c5ac8f493f..4700ea43ac9465869ef8f45bd284b070
  	-- A thought being written: `words`, a thought's words as they arrive, by
  	-- its id (nil for one not being written: the reply's draft holds them,
  	-- so a tick of them doesn't build its rows again); `seeded`, whether what
-@@ -574,6 +578,50 @@ local function thought_row(
+@@ -579,6 +583,50 @@ local function thought_row(
  	}
  end
  
@@ -942,7 +942,7 @@ index 4ecca2770a25c3c4ad02fc8edddfc4c5ac8f493f..4700ea43ac9465869ef8f45bd284b070
  -- (A tool that may come to have a result opens: whether it has one isn't
  -- known as its row is made.)
  local OPENS: { [string]: boolean } = { exec = true, read = true, edit = true, write = true, search = true, glob = true, web = true }
-@@ -587,7 +635,7 @@ local COUNTS: { [string]: boolean } = { edit = true, write = true }
+@@ -635,7 +683,7 @@ end
  -- A row is built often (each comes into view, a long group's thousands), so
  -- what can't change once a tool has started is read once as it's made (its
  -- kind, its verb, its glyph); only what a tool's result changes follows it.
@@ -951,10 +951,11 @@ index 4ecca2770a25c3c4ad02fc8edddfc4c5ac8f493f..4700ea43ac9465869ef8f45bd284b070
  	now: () -> Tool,
  	below: () -> boolean,
  	running: () -> boolean,
-@@ -799,6 +847,34 @@ local function row(
+@@ -851,7 +899,33 @@ local function row(
  	}
  end
  
+-
 +local function row(
 +	now: () -> Tool,
 +	below: () -> boolean,
@@ -982,11 +983,10 @@ index 4ecca2770a25c3c4ad02fc8edddfc4c5ac8f493f..4700ea43ac9465869ef8f45bd284b070
 +	end
 +	return tool_line(now, below, running, open_subagent, writing, group, resized, settled, pictures)
 +end
-+
+ 
  return ui.component(function(props: Props): Node
  	local live = props.live or function()
- 		return false
-@@ -953,7 +1029,7 @@ return ui.component(function(props: Props): Node
+@@ -1007,7 +1081,7 @@ return ui.component(function(props: Props): Node
  				return place() < last_branch:get()
  			end, function(): boolean
  				return live() and place() == count:get()
@@ -2789,7 +2789,7 @@ index 2179b2f16f5bbb97ec7cbc050f92a84d4b989544..f4fcd6510bfb6c3006169b7e84ff6dcb
  				id = "statuses",
  				title = "Statuses",
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index bd46a6a85531be8cd04bd86a5d178b1295d88656..f25fe32e6a76a4931f1fac5245eec217d0612cc8 100644
+index 14ec7b88f50ccaf2cb0721ab8177ef12462cacc5..3609b0af49c54f24564c4fbe4ec241601f85c9a8 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
 @@ -49,7 +49,8 @@
@@ -2802,7 +2802,7 @@ index bd46a6a85531be8cd04bd86a5d178b1295d88656..f25fe32e6a76a4931f1fac5245eec217
      },
      "file_tree": {
        "status": {
-@@ -1111,6 +1112,29 @@
+@@ -1127,6 +1128,29 @@
          "attachments": "No attachments match “{q}”"
        },
        "placeholder": "Search files, chats, attachments"
@@ -2833,7 +2833,7 @@ index bd46a6a85531be8cd04bd86a5d178b1295d88656..f25fe32e6a76a4931f1fac5245eec217
    },
    "settings": {
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index 27d1fe97e335685172996bd7397fc7de15406fea..773e288c868b4d976df74cbb8442197ff04960fc 100644
+index e1f3f0bfcfd2288553f61ae57a69dc9c65e64db4..0900b3037570ffc95b06d6f053cb88a2cbe2a091 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
 @@ -49,7 +49,8 @@
@@ -2846,7 +2846,7 @@ index 27d1fe97e335685172996bd7397fc7de15406fea..773e288c868b4d976df74cbb8442197f
      },
      "file_tree": {
        "status": {
-@@ -740,7 +741,10 @@
+@@ -756,7 +757,10 @@
        "new_reply": "新回复",
        "display_failed": "无法显示此内容",
        "image_failed": "无法显示这张图片",
@@ -2858,7 +2858,7 @@ index 27d1fe97e335685172996bd7397fc7de15406fea..773e288c868b4d976df74cbb8442197f
      },
      "user_message": {
        "open_named": "打开 {name}",
-@@ -1111,6 +1115,29 @@
+@@ -1127,6 +1131,29 @@
          "attachments": "没有与“{q}”匹配的附件"
        },
        "placeholder": "搜索文件、对话和附件"
@@ -3495,10 +3495,10 @@ index 94c5137dbd16ce5a49f85d929120fbcf23e5b1d8..1afa0419356317d50f7b47f4e4f0d786
                          token.cancel();
                      } else {
 diff --git a/crates/client/src/session/mod.rs b/crates/client/src/session/mod.rs
-index 06d92e14fe6264ec968686eef78ad569567f3b43..50a9c2acc156d891c449b572f44879179619ae29 100644
+index 66df863f6327722f199f0e09613ade5ced8d2c1b..5c96102731aca384d7a768723327d806160c4971 100644
 --- a/crates/client/src/session/mod.rs
 +++ b/crates/client/src/session/mod.rs
-@@ -1635,7 +1635,7 @@ impl SessionHandle {
+@@ -1636,7 +1636,7 @@ impl SessionHandle {
          let client = self.core.client()?;
          self.core.queue_command(
              &client.config.device_id,
@@ -3557,10 +3557,10 @@ index 1fbfa3d88407ab017ac788c0257b7aa39c837f34..5461f561101e8069fa63e11c090defed
              turn_id: Some("turn-1".into()),
              frontier: None,
 diff --git a/crates/doc/src/rebuild.rs b/crates/doc/src/rebuild.rs
-index 177147d7f7e3f6e2dd181e480fbfbf3d5dc01cbe..2dc2fff746df48865ab8a3734e8ea35dbc82c11e 100644
+index b79f6ed94fd64454b6ba72922cf3e8e45455e04d..fa15315f08b6f39f22f63c08ebfd2de46465fd28 100644
 --- a/crates/doc/src/rebuild.rs
 +++ b/crates/doc/src/rebuild.rs
-@@ -200,7 +200,7 @@ mod tests {
+@@ -201,7 +201,7 @@ mod tests {
      fn command(id: &str, status: SessionCommandStatus) -> SessionCommandEntry {
          SessionCommandEntry {
              id: id.into(),
@@ -5301,7 +5301,7 @@ index 0000000000000000000000000000000000000000..02dd5b9281bc5aa8e5df002e7ba13e1e
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index e7efdca4822aaa6eec95810821e99e7c121ec352..2e617b8647f23b9a7feb50b2faa7c9230fa9c979 100644
+index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c95368b72 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -29,6 +29,7 @@ use zeron_doc::{
@@ -5555,7 +5555,7 @@ index e7efdca4822aaa6eec95810821e99e7c121ec352..2e617b8647f23b9a7feb50b2faa7c923
      }
  
      /// Whether a run of `chat_id` launches without its provider's own
-@@ -4741,6 +4878,10 @@ async fn drive_run(
+@@ -4773,6 +4910,10 @@ async fn drive_run(
      let mut waiting_on = turn.watch_waiting();
      let mut wait: Option<ParkedWait> = None;
      let wake_grace = wake_grace();
@@ -5566,7 +5566,7 @@ index e7efdca4822aaa6eec95810821e99e7c121ec352..2e617b8647f23b9a7feb50b2faa7c923
      // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
      // steerable harness parks here instead of ending the run — the child and
      // its steering mailbox stay warm, and the next user message (dispatch
-@@ -4885,9 +5026,23 @@ async fn drive_run(
+@@ -4917,9 +5058,23 @@ async fn drive_run(
                      continue;
                  }
                  // What a parked wait waits on changed: shown as it is; once
@@ -5593,7 +5593,7 @@ index e7efdca4822aaa6eec95810821e99e7c121ec352..2e617b8647f23b9a7feb50b2faa7c923
                      if let Some(parked) = wait.as_mut() {
                          parked.grace = if on.is_empty() {
                              parked.grace.or_else(|| Some(tokio::time::Instant::now() + wake_grace))
-@@ -5910,8 +6065,9 @@ async fn drive_run(
+@@ -5942,8 +6097,9 @@ async fn drive_run(
                  let outcome = (!pending_steer && turn_was_active).then_some(*status);
                  // A finished turn whose agent waits on background work that
                  // will wake it parks into a wait: Waiting, its completion
@@ -5605,7 +5605,7 @@ index e7efdca4822aaa6eec95810821e99e7c121ec352..2e617b8647f23b9a7feb50b2faa7c923
                  if completed_turn.is_some() && !on.is_empty() {
                      let since = Utc::now();
                      wait = Some(ParkedWait {
-@@ -7719,4 +7875,1152 @@ mod tests {
+@@ -7770,4 +7926,1152 @@ mod tests {
          sessions.ipc_port_ready(limit).await;
          assert_eq!(start.elapsed(), Duration::ZERO);
      }
@@ -6772,7 +6772,7 @@ index 38652acf6df0ff6525ff1823eacbb70a7d0bce7f..c56322812e103c9721519927151f0b99
      }
  
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 6d5e7ce239ff611657dd2327249d3b6a031dfc83..bd3fbaf91a9c4a7b154c248ca1309aa7324ad307 100644
+index fd25890045f8b5bbdc7ea234bf285cd30b6bd652..7cfc12b7bdfc770869b9ef9ccfa25d56b812aadf 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
 @@ -739,7 +739,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
@@ -6784,7 +6784,7 @@ index 6d5e7ce239ff611657dd2327249d3b6a031dfc83..bd3fbaf91a9c4a7b154c248ca1309aa7
      );
  
      wait_for(
-@@ -3575,7 +3575,7 @@ async fn session_row_counts_running_subagents_until_the_run_ends() {
+@@ -3576,7 +3576,7 @@ async fn session_row_counts_running_subagents_until_the_run_ends() {
      queue_as_viewer(
          handle.doc(),
          "subagents-interrupt",
@@ -6937,7 +6937,7 @@ index a4be9e109b60bdc7ca4d004f6d434a2177939261..5f37b345b93d6e59a9cdc695b747c6df
  it lists under your chat's Subagents and in its transcript's subagent block. Use \
  `kind: side` only for a side conversation the person should treat as their own, \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 8997d42843f9a1e5b5486704d085432dbbc41a19..7572be48fbdb8a0578b9b8d8209f51f8abcb71e6 100644
+index 04be0be6aec98eba6d97142768a01a470c369061..5f192a1a7f0927bcd33b09dca30b652e38aa3b2f 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1501,6 +1501,12 @@ impl Tools {

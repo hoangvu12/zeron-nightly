@@ -63,7 +63,7 @@ note = "An agent's send_message to a busy chat no longer stops the command that 
 [[patch]]
 name = "child-chats-report-back"
 file = "patches/0007-child-chats-report-back.patch"
-note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Goes after agent-steers-wait-for-tools, which its tests need."
+note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Goes after agent-steers-wait-for-tools, which its tests need. Regenerated onto main 09766b39 (0.3.7, Auto's reviewer): ds/activity.luau keeps main's Tooltip require beside its SubagentRow, and its tool_line/row split."
 
 [[patch]]
 name = "child-reports-follow-ups"
@@ -86,7 +86,7 @@ note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its t
 [[patch]]
 name = "design-plugin-apis"
 file = "patches/0018-design-plugin-apis.patch"
-note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's plugin APIs (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 fonts, #1379 fetch bytes in base64, #1380 a service's zeron.db, #1398 zeron.write_file and files.write, and a plugin window's memory from its manifest, which was 0013). #1392's base is still the frozen zeron/zgx, and main moved the same Cargo.toml lines (its zgx pin) and the consent fixture, so a `pr` entry conflicts. Its zgx is hoangvu12/zgx 24b35872 (#2110, the combined zgx PR, rebased on zgx main d98f954d), kept on branch nightly-design-24b35872 so a force-push of #2110 can't take it away; main pins zeronsh/zgx d391ea72, which d98f954d is 92 commits ahead of. It carries everything 0012's nightly-design-export (1890c055) did, so that patch is gone. The consent fixture lists both main's draft and #1392's fonts; both lockfiles are regenerated."
+note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's plugin APIs (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 fonts, #1379 fetch bytes in base64, #1380 a service's zeron.db, #1398 zeron.write_file and files.write, and a plugin window's memory from its manifest, which was 0013). #1392's base is still the frozen zeron/zgx, and main moved the same Cargo.toml lines (its zgx pin) and the consent fixture, so a `pr` entry conflicts. Its zgx is hoangvu12/zgx ebebffb01, kept on branch nightly-design-ebebffb0 so a force-push of a PR can't take it away: #2110 at 4914d045a (on zgx main 126357bb5) with #2299's tile fixes cherry-picked on (they sat on #2110's earlier head a37e02b67) and #2285 (middle-mouse press), #2297 (full screen) and #2298 (display scale) merged; main pins zeronsh/zgx d391ea72, which it contains. Before that it was 24b35872 (nightly-design-24b35872). It carries everything 0012's nightly-design-export (1890c055) did, so that patch is gone. The consent fixture lists both main's draft and #1392's fonts; both lockfiles are regenerated."
 # When #1392 moves: in a checkout assembled up to here minus this entry, merge
 # the new head, take main's side of apps/zgx/Cargo.toml with each zgx rev
 # moved to #1392's (and the comment above `zgx =`), union the consent
@@ -96,6 +96,12 @@ note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's pl
 # `git format-patch --full-index`. Keep a new zgx rev on a branch of its own
 # on hoangvu12/zgx (never a force-pushed one), as nightly-design-24b35872 is.
 # Once #1392 is retargeted to main upstream, make this a `pr` entry again.
+
+[[patch]]
+name = "plugin-windows"
+pr = 1485
+sha = "6a48aacda3164f3bdcd2f388e4ff9a9fd0c04df5"
+note = "A plugin's declared `ui.window`s open in the zgx app (zgx_run::follow_windows, as zgx-run does), so the Design plugin's windows (and #2297's full screen, #2298's scale in them) show. One file, apps/zgx/src/main.rs; on main. Goes after design-plugin-apis, the plugin APIs it serves."
 
 [[patch]]
 name = "agent-device-commands"
@@ -128,4 +134,4 @@ note = "A command a child left running with run_command (agent-device-commands, 
 [[patch]]
 name = "docker-sandbox"
 file = "patches/0019-docker-sandbox.patch"
-note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's key kept by a host device, with templates, sleep and wake, recovery and Start fresh. Desktop only. work/docker-sandbox-e2e at b53b39c2a (based on the frozen zeron/zgx c1539061b) merged onto everything above as one file, with what that merge needed (both sides of 13 files kept, sandboxes.wake blocked in plugin previews, zeron-v2's .base.json in step). Same code as work/docker-sandbox at 11b9dd156."
+note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's key kept by a host device, with templates, sleep and wake, recovery and Start fresh. Desktop only. Regenerated onto main 09766b39 (0.3.7): zeron-v2's .base.json re-recorded for the merged default files (ZERON_V2_BLESS's hashes). work/docker-sandbox-e2e at b53b39c2a (based on the frozen zeron/zgx c1539061b) merged onto everything above as one file, with what that merge needed (both sides of 13 files kept, sandboxes.wake blocked in plugin previews, zeron-v2's .base.json in step). Same code as work/docker-sandbox at 11b9dd156."
