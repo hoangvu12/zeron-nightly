@@ -1,4 +1,4 @@
-From d5bc88ce4b4cf657b5e42d45c134225fcb6da64f Mon Sep 17 00:00:00 2001
+From e076403c3ff2e76ef6811784397049d22fcf6c8a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 15:50:23 +0700
 Subject: [PATCH] zgx: a long page in a reply shows its top, not a blown-up

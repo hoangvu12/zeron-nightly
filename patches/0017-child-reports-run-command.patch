@@ -1,4 +1,4 @@
-From e4978411c147bade91d9ff1b99a5dcd984e55972 Mon Sep 17 00:00:00 2001
+From 763b28f1617a49f44d824584ff6636e65539840f Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 19:41:41 +0700
 Subject: [PATCH] engine: a command left running with run_command doesn't hold

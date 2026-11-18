@@ -1,23 +1,21 @@
-From 3a40ee2a1ee500a45b7712dc414c7489820af225 Mon Sep 17 00:00:00 2001
+From 514387738353bb438998837d1e3f88da06791020 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:52:16 +0700
 Subject: [PATCH 01/12] engine: a child's progress message can wait for its end
  instead of waking the parent
 
 ---
- crates/doc/src/queue.rs                | 112 +++++++
- crates/doc/src/schema.rs               |   1 +
- crates/engine/src/doc_host.rs          | 425 ++++++++++++++++++++++---
- crates/engine/src/rpc/agent_gate.rs    |   3 +-
- crates/engine/src/session_reports.rs   |  62 +++-
- crates/engine/src/sessions.rs          | 111 ++++++-
- crates/mcp/src/tools.rs                |  90 +++++-
- crates/proto/src/agent_messages.rs     | 160 ++++++++--
- crates/proto/src/workspace.rs          |   7 +
- crates/ui/examples/appshots-fixture.rs |   2 +
- crates/ui/src/state.rs                 |   1 +
- docs/mcp.md                            |  20 ++
- 12 files changed, 923 insertions(+), 71 deletions(-)
+ crates/doc/src/queue.rs              | 112 +++++++
+ crates/doc/src/schema.rs             |   1 +
+ crates/engine/src/doc_host.rs        | 425 ++++++++++++++++++++++++---
+ crates/engine/src/rpc/agent_gate.rs  |   3 +-
+ crates/engine/src/session_reports.rs |  62 +++-
+ crates/engine/src/sessions.rs        | 111 ++++++-
+ crates/mcp/src/tools.rs              |  90 +++++-
+ crates/proto/src/agent_messages.rs   | 160 ++++++++--
+ crates/proto/src/workspace.rs        |   7 +
+ docs/mcp.md                          |  20 ++
+ 10 files changed, 920 insertions(+), 71 deletions(-)
 
 diff --git a/crates/doc/src/queue.rs b/crates/doc/src/queue.rs
 index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf5817935e699ef1 100644
@@ -1468,7 +1466,7 @@ index 0d9bffc258b662192aa34b2f017b0aef900d6759..3c8b583ae50c61e19ad0fc3383dffad6
          assert!(outgoing_messages(&call("send_message", serde_json::json!({ "chat": "a" }))).is_none());
          assert!(outgoing_messages(&call("read_chat", serde_json::json!({ "chat": "a", "text": "x" }))).is_none());
 diff --git a/crates/proto/src/workspace.rs b/crates/proto/src/workspace.rs
-index 73e7f88ea1c386bb384ef989578431692ce14445..ee34ba7a7a6d747d749bcf03a1d0c9287ab534f5 100644
+index 91e0c8e3badb97d65cde23dc1ccdd34d2a70c7a2..3f0dad93c4a509333bb794a9b6e9f478740e595d 100644
 --- a/crates/proto/src/workspace.rs
 +++ b/crates/proto/src/workspace.rs
 @@ -56,6 +56,11 @@ pub mod capabilities {
@@ -1491,7 +1489,7 @@ index 73e7f88ea1c386bb384ef989578431692ce14445..ee34ba7a7a6d747d749bcf03a1d0c928
          crate::voice::remote::CAPABILITY,
      ];
  
-@@ -169,6 +175,7 @@ mod tests {
+@@ -195,6 +201,7 @@ mod tests {
                      "update-ability-v1",
                      "attachment-store-v1",
                      "child-reports",
@@ -1499,38 +1497,6 @@ index 73e7f88ea1c386bb384ef989578431692ce14445..ee34ba7a7a6d747d749bcf03a1d0c928
                      "voice-client-media-v1"
                  ],
              })
-diff --git a/crates/ui/examples/appshots-fixture.rs b/crates/ui/examples/appshots-fixture.rs
-index 8888032ce2e3d9a6deda83bfdb45bd73cde24cc2..4b028cf3defd99e8d5279c0682c28bf177d7132c 100644
---- a/crates/ui/examples/appshots-fixture.rs
-+++ b/crates/ui/examples/appshots-fixture.rs
-@@ -145,6 +145,7 @@ fn main() -> anyhow::Result<()> {
-             issued_at: 1788900000000,
-             edited_at: None,
-             delivery_gate: None,
-+            held: Vec::new(),
-         },
-         zeron_doc::QueuedMessage {
-             id: "queued-text".into(),
-@@ -155,6 +156,7 @@ fn main() -> anyhow::Result<()> {
-             issued_at: 1788900000001,
-             edited_at: None,
-             delivery_gate: None,
-+            held: Vec::new(),
-         },
-     ];
-     let failure = Arc::new(std::sync::Mutex::new(None));
-diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
-index febe3bec2190e4a902c48523da087d8911d90e6a..398da2aae30488c64323f1e58e6d4447d13fb444 100644
---- a/crates/ui/src/state.rs
-+++ b/crates/ui/src/state.rs
-@@ -8179,6 +8179,7 @@ mod tests {
-             issued_at: 0,
-             edited_at: None,
-             delivery_gate: None,
-+            held: Vec::new(),
-         };
-         state.push_echo("c1", echo("held"));
-         state.push_echo("c1", echo("sent"));
 diff --git a/docs/mcp.md b/docs/mcp.md
 index 0f829bddce8b35426b8334cb12dca7cce46a3a41..a22878afb902f134bbc3b7201eb237817d88a9bb 100644
 --- a/docs/mcp.md
@@ -1566,7 +1532,7 @@ index 0f829bddce8b35426b8334cb12dca7cce46a3a41..a22878afb902f134bbc3b7201eb23781
 2.55.0.windows.2
 
 
-From 6af2cbd8fa8dd451b4efe0af5bf6397512a04d5f Mon Sep 17 00:00:00 2001
+From a3884e1ecf4ffd1d9aa8914d72339c4d83b45da2 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:35:55 +0700
 Subject: [PATCH 02/12] engine: a report the parent's agent already read with
@@ -2068,7 +2034,7 @@ index a22878afb902f134bbc3b7201eb237817d88a9bb..dbc74eb5c8ed8fda72b6600c8eb3204f
 2.55.0.windows.2
 
 
-From 479076623518f39c1b7bbfc0bdda76b468d70226 Mon Sep 17 00:00:00 2001
+From e7a7c36f6fa424f1f4614f08826062f394d18ab6 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:39:25 +0700
 Subject: [PATCH 03/12] engine: a child that keeps coming back is paused after
@@ -2103,7 +2069,7 @@ index 91527d0f9c2bf3da0ea993dc8bb2857d104c84ab..6390aad4967dc55fecb09c7fc7682dea
                      // Sent again (a restart, a retry): it's here already.
                      let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 0c803cb9a08330d59d5a6722ff95ade3dfc90f49..71d4ba51893d06dee3470d7d466ffaf79c5ae0ad 100644
+index 5d2ae23321f5bbcab2756902b088c06a03e88365..3313c83bca0b8aff8acd4b48ab6197a463ac11b2 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -354,6 +354,14 @@ impl EngineCore {
@@ -2795,7 +2761,7 @@ index dbc74eb5c8ed8fda72b6600c8eb3204f7fc2c902..bc6c25959faf1f455034c99dccd8bc8a
 2.55.0.windows.2
 
 
-From 429bb15936eec225296185aa778b238b3ecebba3 Mon Sep 17 00:00:00 2001
+From f0cd3d6f1e93f5e24cd24a13c2c579ef8e7fafd5 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:34:37 +0700
 Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
@@ -2898,7 +2864,7 @@ index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455f
 2.55.0.windows.2
 
 
-From 4c5b98cb922c55101c76678e5e432a16bc6aedb4 Mon Sep 17 00:00:00 2001
+From 323c7f27e4641049c32d24616d0c816220368703 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:44:58 +0700
 Subject: [PATCH 05/12] engine: a child's FYIs never wake the parent alone, and
@@ -3430,7 +3396,7 @@ index bc6c25959faf1f455034c99dccd8bc8a7ecd5679..ee4d4ddcb66bf65be0cb03cfe7e4bf26
 2.55.0.windows.2
 
 
-From 99ae53a040475ec3e89d015bb7dc87a5dd6e1c3b Mon Sep 17 00:00:00 2001
+From 132c7d17e4b7ed03fcf78b6690cb6bd803416e58 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:53:13 +0700
 Subject: [PATCH 06/12] engine: while the person talks to the parent, its
@@ -4306,7 +4272,7 @@ index ee4d4ddcb66bf65be0cb03cfe7e4bf261fe5f2be..ed689748e3528cf3e95c73cc6ed6bb33
 2.55.0.windows.2
 
 
-From 4218e2ebe26744a42de07354b5b70e3878191815 Mon Sep 17 00:00:00 2001
+From 34ebe37a7412f71123164134bce2f36f7ee08a13 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:57:27 +0700
 Subject: [PATCH 07/12] engine: the parent's host decides a child's pause, by
@@ -5560,7 +5526,7 @@ index ed689748e3528cf3e95c73cc6ed6bb33a8fb62c2..a9fcd29560ce5a3fd44257723904ab37
 2.55.0.windows.2
 
 
-From 715c240776e84601c15d5d9b7a1ca71c0a9e553e Mon Sep 17 00:00:00 2001
+From c3b70b4d3ac30d2ee895a26fc013fafb1dc42741 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:05:23 +0700
 Subject: [PATCH 08/12] engine: a parent can ask to hear from a group of
@@ -7367,7 +7333,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
      async fn wait_on_background_is_offered_only_where_the_runtime_wakes_its_agent() {
          let world = Arc::new(World::default());
 diff --git a/crates/proto/src/workspace.rs b/crates/proto/src/workspace.rs
-index ee34ba7a7a6d747d749bcf03a1d0c9287ab534f5..cb296456f05e0f8c4f245004a1d6192cef51d611 100644
+index 3f0dad93c4a509333bb794a9b6e9f478740e595d..f467e84fa68ab180c3654b7a42940e31a1600458 100644
 --- a/crates/proto/src/workspace.rs
 +++ b/crates/proto/src/workspace.rs
 @@ -61,6 +61,11 @@ pub mod capabilities {
@@ -7390,7 +7356,7 @@ index ee34ba7a7a6d747d749bcf03a1d0c9287ab534f5..cb296456f05e0f8c4f245004a1d6192c
          crate::voice::remote::CAPABILITY,
      ];
  
-@@ -176,6 +182,7 @@ mod tests {
+@@ -202,6 +208,7 @@ mod tests {
                      "attachment-store-v1",
                      "child-reports",
                      "child-reports-fyi",
@@ -7474,7 +7440,7 @@ index a9fcd29560ce5a3fd44257723904ab376f9f9312..375bea5f0983b2753803b350a21f0782
 2.55.0.windows.2
 
 
-From 6a9974e1709b82f74df16000f706fa960b5e6be0 Mon Sep 17 00:00:00 2001
+From 70a0f6d8212263b8ee04152e1beea88a87b4a462 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:15:30 +0700
 Subject: [PATCH 09/12] engine: report groups work with the person-active hold
@@ -7546,7 +7512,7 @@ index a97ffc90c3c2ad33a5e6df20655ca19a990023c9..3e6d71717ecc6ca81fbb85b63856b913
 2.55.0.windows.2
 
 
-From 971054f5478ea7f6b02fe05fa405d470bf5edee8 Mon Sep 17 00:00:00 2001
+From 1c7dbaa7d00bafe4dc8ee0cfdbc9509f8c229920 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:15:22 +0700
 Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
@@ -7598,7 +7564,7 @@ index 2e3aa9ee4889be0deb44972a47b67fdb4bd72fbc..989f41d4b731421c2b6bc5628faf6508
 2.55.0.windows.2
 
 
-From 34561be9aba888557e9bfcd83997058de8d0446f Mon Sep 17 00:00:00 2001
+From 6f7cab8e24d2a047942ce7c432a6e09f6499c583 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:20:48 +0700
 Subject: [PATCH 11/12] engine: held reports survive a restart between the
@@ -7835,7 +7801,7 @@ index 989f41d4b731421c2b6bc5628faf6508cce494b0..6a3bb9910fb85d451e5f01d419b7d583
 2.55.0.windows.2
 
 
-From 2af59805673da41df1a5dc5d3af5f8789a664c76 Mon Sep 17 00:00:00 2001
+From 4c5320573f02dd0f859321473b23083fe20d7edc Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:23:32 +0700
 Subject: [PATCH 12/12] engine: a group member's follow-up brings its held end

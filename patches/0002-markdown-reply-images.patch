@@ -1,4 +1,4 @@
-From 59d0659a6553b71a33425d05394fa5649fa15b3c Mon Sep 17 00:00:00 2001
+From aa265c7bbf9dfc90420d30feed87d69b9fac9b02 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 5 Nov 2026 23:19:58 +0700
 Subject: [PATCH] Markdown images in replies: any local folder, kept when the
@@ -39,12 +39,11 @@ a_finished_replys_images_outlive_their_files, zeron-mcp (59).
  crates/engine/src/uploads.rs      | 230 +---------------
  crates/engine/tests/e2e.rs        | 130 +++++++--
  crates/mcp/src/jsonrpc.rs         |   6 +-
- crates/ui/src/reply_images.rs     |  50 ++--
- 8 files changed, 636 insertions(+), 365 deletions(-)
+ 7 files changed, 603 insertions(+), 348 deletions(-)
  create mode 100644 crates/engine/src/reply_images.rs
 
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index ae97d64fa2748144d34de89e155414ef539e9058..ab7799f8271783c6740f75eb3c6757822159f0b5 100644
+index 28796896f404c36bc8e9913498d4a213bbcace4a..9131b180b5a1fb03def7f575e10fd824bce2f456 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -70,6 +70,7 @@ pub mod profile;
@@ -1229,95 +1228,6 @@ index 543294e4998bc7d21dd4dc088d87d884ba114e94..8534ee609b78b1e1d749711f05f55fa7
  
  /// Appended to [`INSTRUCTIONS`] where the agent is offered
  /// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
-diff --git a/crates/ui/src/reply_images.rs b/crates/ui/src/reply_images.rs
-index 6a2b4a2211ed3b6c7af7b76e6965ca6f03b7959d..28486d6c82a48be5195b3d4bf97d67ce78b363d2 100644
---- a/crates/ui/src/reply_images.rs
-+++ b/crates/ui/src/reply_images.rs
-@@ -2,15 +2,16 @@
- //! one an agent showed with `show_image`) and a local image a reply names in
- //! Markdown (`![alt](path)`) share one look: the image row.
- //!
--//! A Markdown image is drawn in place, never copied, and only when it is a
--//! path on the chat's host — absolute, or relative to the chat's folder — of
--//! a PNG, JPEG, WebP, or GIF by name. No URL is ever fetched (`http:`,
--//! `file:`, `data:` …), and `~`, network and device paths are refused. The
--//! host reads it with `ReadChatImageChunk`, from strictly inside that one
--//! chat's folder (never home or above it, Zeron's data, or another chat's
--//! folder) and never through a link, checks its first bytes, and the UI
--//! decodes it within the shared raster limits. Anything refused or
--//! unreadable keeps the reply's ordinary rendering — a link — as before.
-+//! A Markdown image is drawn in place when it is a path on the chat's host
-+//! (absolute, `~/…`, or relative to the chat's folder) of a PNG, JPEG, WebP,
-+//! or GIF by name. No URL is ever fetched (`http:`, `file:`, `data:` …), and
-+//! network and device paths are refused. The host reads it with
-+//! `ReadChatImageChunk` from any local folder, or from the copy it kept when
-+//! the reply finished (the engine's `reply_images`), checks its first bytes,
-+//! and the UI decodes it within the shared raster limits. A path only the
-+//! host can expand (`~`, a projectless chat's folder) goes as written.
-+//! Anything refused or unreadable keeps the reply's ordinary rendering — a
-+//! link — as before.
- 
- use std::collections::{HashMap, HashSet};
- use std::sync::Arc;
-@@ -30,17 +31,24 @@ pub(crate) const MAX_LOADS: usize = 4;
- pub(crate) fn markdown_image(source: &str, cwd: Option<&str>) -> Option<(String, &'static str)> {
-     let source = source.trim();
-     if source.is_empty()
--        || source.starts_with('~')
-         || has_scheme(source)
-         || crate::tool_images::is_remote_or_device_path(source)
-     {
-         return None;
-     }
-     let mime = raster_mime(source)?;
-+    if source.starts_with('~') {
-+        return Some((source.to_owned(), mime));
-+    }
-     let path = crate::tool_images::resolve_path(source, cwd);
--    // A relative path needs a folder to resolve against; a home-relative
--    // folder (a projectless chat's) can't be expanded here.
--    crate::tool_images::is_host_absolute(&path).then_some((path, mime))
-+    // A home-relative folder (a projectless chat's) can't be expanded here:
-+    // the host joins the path to it.
-+    let path = if crate::tool_images::is_host_absolute(&path) {
-+        path
-+    } else {
-+        source.to_owned()
-+    };
-+    Some((path, mime))
- }
- 
- /// `http:`, `file:`, `data:`, `javascript:`…; a drive letter (`C:\`) is not one.
-@@ -248,7 +256,6 @@ mod tests {
-             "file:///tmp/a.png",
-             "data:image/png;base64,iVBORw0KGgo=",
-             "javascript:alert(1).png",
--            "~/Pictures/a.png",
-             r"\\host\share\a.png",
-             "//host/share/a.png",
-             "C:a.png",
-@@ -259,9 +266,18 @@ mod tests {
-         ] {
-             assert_eq!(image(source), None, "{source:?}");
-         }
--        // Relative paths need the chat's folder, and one the UI can expand.
--        assert_eq!(markdown_image("a.png", None), None);
--        assert_eq!(markdown_image("a.png", Some("~/.zeron/scratch/x")), None);
-+        // What only the host can expand goes as written, for it to resolve.
-+        for (source, cwd) in [
-+            ("a.png", None),
-+            ("a.png", Some("~/.zeron/scratch/x")),
-+            ("~/Pictures/a.png", cwd),
-+        ] {
-+            assert_eq!(
-+                markdown_image(source, cwd),
-+                Some((source.into(), "image/png")),
-+                "{source:?} in {cwd:?}"
-+            );
-+        }
-     }
- 
-     #[test]
 -- 
 2.55.0.windows.2
 

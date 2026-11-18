@@ -1,4 +1,4 @@
-From 9a55e9f8138b1f33400dd882e95bc73bb67fa2d3 Mon Sep 17 00:00:00 2001
+From e1e97b8dda290dfd9d02e14bf56738a5e577a572 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 9 Nov 2026 11:46:29 +0700
 Subject: [PATCH] An agent's message to a busy chat waits for the command it

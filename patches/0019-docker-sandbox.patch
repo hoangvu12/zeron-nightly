@@ -1,4 +1,4 @@
-From d9652cbe53c3cefe0fb2341895f1d38fbed8a364 Mon Sep 17 00:00:00 2001
+From e62042f37d23eb3b37a23f9ccda8f63ab7223bdd Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hoangvu12@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 05:19:11 +0700
 Subject: [PATCH] Docker Sandbox (#37)
@@ -148,12 +148,6 @@ plugin previews, and zeron-v2's .base.json brought in step.
  crates/sync/src/registry.rs                   |   87 +
  crates/sync/tests/registry_client.rs          |    1 +
  crates/sync/tests/transport_reliability.rs    |    1 +
- crates/ui/src/background_tray.rs              |    1 +
- crates/ui/src/cloud.rs                        |    9 +-
- crates/ui/src/pull_requests.rs                |    1 +
- crates/ui/src/shell/side_chats.rs             |    1 +
- crates/ui/src/shell/spaces.rs                 |    1 +
- crates/ui/src/state.rs                        |   26 +
  crates/update/src/lib.rs                      |   17 +-
  ...ndboxes-borrow-the-host-devices-sign-in.md |   14 +
  ...box-providers-are-built-into-the-engine.md |   13 +
@@ -161,7 +155,7 @@ plugin previews, and zeron-v2's .base.json brought in step.
  scripts/ci/test-core.sh                       |   15 +-
  scripts/live-docker-sandbox.sh                |   19 +
  scripts/smoke-docker-sandbox.ps1              |   71 +
- 150 files changed, 26121 insertions(+), 165 deletions(-)
+ 144 files changed, 26085 insertions(+), 162 deletions(-)
  create mode 100644 apps/zgx/src/sandbox_settings.rs
  create mode 100644 apps/zgx/src/sandbox_template_save.rs
  create mode 100644 apps/zgx/src/sandboxes.rs
@@ -454,10 +448,10 @@ index e7132e86a89ccd8a0b0be699fda2cb1c80584f05..e191f093c23f2ff3779a9ea2b4035d5b
      fn an_outbox_send_reads_as_its_words_or_its_files() {
          let trailer = "\n\nAttached images (local files — open them to view):\n- /tmp/up/a.png\n- /tmp/up/b.pdf";
 diff --git a/apps/zgx/src/engine/mod.rs b/apps/zgx/src/engine/mod.rs
-index 7f2742591f8012dadcf47a14ae312e309ce27859..36f4b33816714a39a2455df9aafd916841e5cc05 100644
+index 0fbaae88d963ecfdc0e32fb6405a8b4aa237a474..e903c6f4a0ee6c46a7b50134404780556153f80b 100644
 --- a/apps/zgx/src/engine/mod.rs
 +++ b/apps/zgx/src/engine/mod.rs
-@@ -468,6 +468,44 @@ pub fn outcome(error: &str) -> &'static str {
+@@ -488,6 +488,44 @@ pub fn outcome(error: &str) -> &'static str {
      }
  }
  
@@ -3230,7 +3224,7 @@ index 61230b3cb933fb3a7608cf79c5b101ef585dedd1..7dcb492010cce773f46e636c9174069a
  					local list = ui.scroll {
  						w_full = true,
 diff --git a/apps/zgx/ui/ds/icon.luau b/apps/zgx/ui/ds/icon.luau
-index 7bd21d073f7f323316535f7707f57ffd92b05d6b..3a2f424e5258106f977de3afdd3b0af1a616e25d 100644
+index 4a56ee71c1600040102dd8556f39896ff75b406f..ad2a204eb25ad46bd4b858e22e53feb6bed73961 100644
 --- a/apps/zgx/ui/ds/icon.luau
 +++ b/apps/zgx/ui/ds/icon.luau
 @@ -35,6 +35,9 @@ export type Name =
@@ -3665,7 +3659,7 @@ index ab60001aef2264e224058bae7f5af93fac06e3b2..9bc688812a6e37575c6ed09c4b9f8389
  						hook = "chat.message.prompt",
  						-- What it is, for a plugin's selector (and the
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3bda2b32f 100644
+index 33856cf787b236db4ad4445c6f1f5b4efb1ee04c..50bfb4d764eeef8131709bac5256d57bcf2e1636 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
 @@ -670,6 +670,18 @@
@@ -3687,7 +3681,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
        }
      },
      "markdown": {
-@@ -2400,6 +2412,78 @@
+@@ -2405,6 +2417,78 @@
          "description": "Parakeet v3 · {total} MB",
          "remove": "Remove"
        }
@@ -3766,7 +3760,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
      }
    },
    "common": {
-@@ -2477,7 +2561,8 @@
+@@ -2482,7 +2566,8 @@
          "delete": "Delete…",
          "rename": "Rename…",
          "remove": "Remove…",
@@ -3776,7 +3770,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
        },
        "project": {
          "rename_title": "Rename project",
-@@ -2552,6 +2637,14 @@
+@@ -2557,6 +2642,14 @@
          "rename_title": "Rename session",
          "name": "Name",
          "name_placeholder": "Session name"
@@ -3791,7 +3785,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
        }
      },
      "boundary": {
-@@ -3011,6 +3104,9 @@
+@@ -3016,6 +3109,9 @@
        "blocked": {
          "project_gone": "That project is no longer there. Pick another, or none.",
          "cloud_needs_project": "Cloud chats work in a project. Pick one Cloud can open."
@@ -3801,7 +3795,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
        }
      },
      "composer": {
-@@ -3124,6 +3220,23 @@
+@@ -3129,6 +3225,23 @@
        "outbox_uploading": "Uploading…",
        "outbox_failed": "Didn't send"
      },
@@ -3825,7 +3819,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
      "turn_state": {
        "interrupted": "Interrupted",
        "waking": "Waking its Cloud machine…",
-@@ -3144,9 +3257,52 @@
+@@ -3149,9 +3262,52 @@
        "setup_summary": "Set up the Cloud machine",
        "woke_summary": "Woke the Cloud machine",
        "unreachable": "Interrupted — can't reach {host}"
@@ -3879,7 +3873,7 @@ index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3
        "plugin": "Plugin",
        "browser": "Browser",
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06aaadfbb2 100644
+index 1f9f0220f9e5db2145f0faaf63787ef41dc39ec1..99224adfaabb5698e661313e5dbe94dc2a169f2a 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
 @@ -670,6 +670,18 @@
@@ -3901,7 +3895,7 @@ index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06
        }
      },
      "markdown": {
-@@ -2403,6 +2415,78 @@
+@@ -2408,6 +2420,78 @@
          "description": "Parakeet v3 · {total} MB",
          "remove": "移除"
        }
@@ -3980,7 +3974,7 @@ index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06
      }
    },
    "common": {
-@@ -2480,7 +2564,8 @@
+@@ -2485,7 +2569,8 @@
          "delete": "删除…",
          "rename": "重命名…",
          "remove": "移除…",
@@ -3990,7 +3984,7 @@ index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06
        },
        "project": {
          "rename_title": "重命名项目",
-@@ -2555,6 +2640,14 @@
+@@ -2560,6 +2645,14 @@
          "rename_title": "重命名会话",
          "name": "名称",
          "name_placeholder": "会话名称"
@@ -4005,7 +3999,7 @@ index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06
        }
      },
      "boundary": {
-@@ -3014,6 +3107,9 @@
+@@ -3019,6 +3112,9 @@
        "blocked": {
          "project_gone": "该项目已不存在。请选择其他项目或不选择项目。",
          "cloud_needs_project": "Cloud 对话需要在项目中运行。请选择 Cloud 可以打开的项目。"
@@ -4015,7 +4009,7 @@ index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06
        }
      },
      "composer": {
-@@ -3127,6 +3223,23 @@
+@@ -3132,6 +3228,23 @@
        "outbox_uploading": "正在上传…",
        "outbox_failed": "未发送"
      },
@@ -4039,7 +4033,7 @@ index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06
      "turn_state": {
        "interrupted": "已中断",
        "waking": "正在唤醒 Cloud 机器…",
-@@ -3147,9 +3260,52 @@
+@@ -3152,9 +3265,52 @@
        "setup_summary": "已设置 Cloud 机器",
        "woke_summary": "已唤醒 Cloud 机器",
        "unreachable": "已中断——无法连接到{host}"
@@ -9957,7 +9951,7 @@ index 080af70f1c39b14d2205c2d468549a4f1ba8b01a..4d4c2e6ccf9ac46e1f50a545f7843e14
              capabilities: Vec::new(),
          }
 diff --git a/crates/engine/src/auth.rs b/crates/engine/src/auth.rs
-index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f2d098987 100644
+index 18c1b8ce80b73d85a6637b88168b834d37746e9b..63cf15b2090739ee47ebc24e34cf7d9efc0b3fe7 100644
 --- a/crates/engine/src/auth.rs
 +++ b/crates/engine/src/auth.rs
 @@ -5,11 +5,18 @@
@@ -10205,7 +10199,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
      /// Whether this is a Cloud runner (enrolled key, no WorkOS session).
      pub fn is_runner(&self) -> bool {
          self.inner.runner.is_some()
-@@ -575,6 +747,9 @@ impl Auth {
+@@ -582,6 +754,9 @@ impl Auth {
          if let Some(runner) = &self.inner.runner {
              return Some(runner.user_id().to_string());
          }
@@ -10215,7 +10209,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() {
              let dev = &self.inner.config.dev_user_id;
              return Some(dev.split('@').next().unwrap_or(dev).to_string());
-@@ -590,6 +765,9 @@ impl Auth {
+@@ -597,6 +772,9 @@ impl Auth {
          if self.inner.runner.is_some() {
              return self.runner_access_token().await;
          }
@@ -10225,7 +10219,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() {
              return Ok(self.inner.config.dev_user_id.clone());
          }
-@@ -633,6 +811,9 @@ impl Auth {
+@@ -640,6 +818,9 @@ impl Auth {
      pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
          let auth = self.clone();
          tokio::spawn(async move {
@@ -10235,7 +10229,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
              if auth.inner.workos.is_none() && auth.inner.runner.is_none() {
                  return;
              }
-@@ -705,6 +886,7 @@ impl Auth {
+@@ -712,6 +893,7 @@ impl Auth {
      /// account or on signing in, and whether it asks afresh rather than
      /// going on as the account the browser is already signed into.
      pub async fn start_sign_in_with(&self, options: SignInOptions) -> Result<String, EngineError> {
@@ -10243,7 +10237,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() {
              return Ok(String::new()); // dev mode: nothing to do (TS parity)
          }
-@@ -738,6 +920,7 @@ impl Auth {
+@@ -745,6 +927,7 @@ impl Auth {
      /// Finish a headless sign-in with the pasted `state.code` string. The state half
      /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
      pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
@@ -10251,7 +10245,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() {
              return Ok(());
          }
-@@ -794,6 +977,7 @@ impl Auth {
+@@ -801,6 +984,7 @@ impl Auth {
      /// to open, as [`Self::start_sign_in`]; a sign-in as anyone else is
      /// refused when it lands.
      pub async fn start_step_up(&self) -> Result<String, EngineError> {
@@ -10259,7 +10253,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() || self.user_id().is_none() {
              return Err(EngineError::Other("Sign in first".into()));
          }
-@@ -881,6 +1065,11 @@ impl Auth {
+@@ -888,6 +1072,11 @@ impl Auth {
              tracing::info!("auth: sign-out ignored on a Cloud runner");
              return;
          }
@@ -10271,7 +10265,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          let mut sign_in = lock(&self.inner.sign_in);
          self.clear_session(&mut sign_in);
      }
-@@ -921,6 +1110,7 @@ impl Auth {
+@@ -928,6 +1117,7 @@ impl Auth {
      /// Each user creates one: if we already did (a double-submit, a retry, or an
      /// earlier session), the edge answers 409 with that org and we continue in it.
      pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
@@ -10279,7 +10273,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() {
              return Ok(());
          }
-@@ -961,6 +1151,7 @@ impl Auth {
+@@ -968,6 +1158,7 @@ impl Auth {
      /// Scope the session to an org: one refresh with `organizationId`; the state follows
      /// the returned token's `org_id` claim.
      pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
@@ -10287,7 +10281,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          if self.inner.workos.is_none() {
              return Ok(());
          }
-@@ -1110,6 +1301,7 @@ impl Auth {
+@@ -1117,6 +1308,7 @@ impl Auth {
              refresh_token: result.refresh_token,
              user: result.user.clone(),
              org_id: org_id.clone(),
@@ -10295,7 +10289,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          };
          self.persist(Some(&session));
          *lock(&self.inner.stored) = Some(session);
-@@ -1267,16 +1459,18 @@ impl Auth {
+@@ -1274,16 +1466,18 @@ impl Auth {
          if let Some(runner) = self.inner.runner.clone() {
              return self.refresh_runner_locked(&runner).await;
          }
@@ -10318,7 +10312,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
          #[derive(Serialize)]
          #[serde(rename_all = "camelCase")]
          struct RefreshBody<'a> {
-@@ -1366,6 +1560,7 @@ impl Auth {
+@@ -1373,6 +1567,7 @@ impl Auth {
                      let changed = session.org_id != org_id;
                      session.refresh_token = tokens.refresh_token;
                      session.org_id = org_id.clone();
@@ -10326,7 +10320,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
                      (session.user.clone(), changed)
                  }
                  None => return Ok(None), // signed out mid-refresh
-@@ -1510,6 +1705,390 @@ impl Auth {
+@@ -1517,6 +1712,390 @@ impl Auth {
          Ok(Some(token.access_token))
      }
  
@@ -10717,7 +10711,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
      fn session_file(&self) -> PathBuf {
          self.inner.config.data_dir.join("session.json")
      }
-@@ -1762,6 +2341,8 @@ fn page(message: &str) -> String {
+@@ -1769,6 +2348,8 @@ fn page(message: &str) -> String {
  
  #[derive(Debug, Default, Deserialize)]
  struct JwtClaims {
@@ -10726,7 +10720,7 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
      #[serde(default)]
      exp: Option<i64>,
      #[serde(default)]
-@@ -1802,6 +2383,12 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+@@ -1809,6 +2390,12 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
      Some(out)
  }
  
@@ -11060,7 +11054,7 @@ index c9db6c62121552b150c2f6ca8a0a2ddc732d56d7..576e534ec6039d4449a8ff37d3f03d5b
              })
              .collect();
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 71d4ba51893d06dee3470d7d466ffaf79c5ae0ad..67a90ccdaac203db9604d360af26e64ea71a450a 100644
+index 3313c83bca0b8aff8acd4b48ab6197a463ac11b2..167dffc24c5fdb4f4e033e34957cb776dab90878 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -75,6 +75,7 @@ pub mod repos;
@@ -11247,7 +11241,7 @@ index 71d4ba51893d06dee3470d7d466ffaf79c5ae0ad..67a90ccdaac203db9604d360af26e64e
              WorkspaceScope::Synced
          } else if !auth.workos_enabled() {
              WorkspaceScope::Development
-@@ -1151,6 +1231,17 @@ impl Engine {
+@@ -1153,6 +1233,17 @@ impl Engine {
              )?,
          };
          core.set_auth(auth.clone());
@@ -11265,7 +11259,7 @@ index 71d4ba51893d06dee3470d7d466ffaf79c5ae0ad..67a90ccdaac203db9604d360af26e64e
          // Agents' commits credit Zeron (always on Cloud, else per the
          // device's setting).
          core.registry
-@@ -1216,6 +1307,19 @@ impl Engine {
+@@ -1218,6 +1309,19 @@ impl Engine {
              }
              core.set_cloud(runner::CloudRunner::new(broker, activity, heartbeat));
          }
@@ -11285,7 +11279,7 @@ index 71d4ba51893d06dee3470d7d466ffaf79c5ae0ad..67a90ccdaac203db9604d360af26e64e
          // The chats as last published (the list every view watches), not a
          // fresh parse of every chat row on each scan.
          let preview_chats = core.workspace.watch_chats();
-@@ -1363,6 +1467,18 @@ impl Engine {
+@@ -1365,6 +1469,18 @@ impl Engine {
                  Some(zeron_rpc::CallerProof { device: proof_device.clone(), key, signature })
              }));
              let links = zeron_rpc::LinkCache::new(link_config);
@@ -11304,7 +11298,7 @@ index 71d4ba51893d06dee3470d7d466ffaf79c5ae0ad..67a90ccdaac203db9604d360af26e64e
              let links_for_presence = links.clone();
              core.workspace
                  .set_peer_alive_hook(Arc::new(move |device_id: &str| {
-@@ -1427,6 +1543,7 @@ impl Engine {
+@@ -1429,6 +1545,7 @@ impl Engine {
              .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
  
          let runtime = Self::assemble_runtime(&config, auth, profile).await?;
@@ -22630,7 +22624,7 @@ index 0000000000000000000000000000000000000000..2eed210d52e82895cc49699a098cef9d
 +    assert!(local.call(methods::SIGN_IN, json!({})).await.is_err());
 +}
 diff --git a/crates/engine/tests/local_first.rs b/crates/engine/tests/local_first.rs
-index 11ca7523ea8f4a1f772e919b7d8f4470120800af..16765775dbf5d85887f4caa6074b35a3e376ab4a 100644
+index 45959695d2408cc2be399a30b3a1a299583fbf2a..2278548584da281e097d4a2a9beb9b714eafdebe 100644
 --- a/crates/engine/tests/local_first.rs
 +++ b/crates/engine/tests/local_first.rs
 @@ -28,6 +28,7 @@ fn config(
@@ -28915,7 +28909,7 @@ index 0000000000000000000000000000000000000000..a28ac048a46958c5bc89fbbbb8486fd8
 +    }
 +}
 diff --git a/crates/proto/src/workspace.rs b/crates/proto/src/workspace.rs
-index 442fb53a2fb5d2357e9533b1000a3ef5d8a892c6..21abdf62ce765a13e9f9bd89c36087ca254d7a53 100644
+index 9435b7e29f3153de261562fc794a9544636aa299..546ca51d4dc5f05e8b896674b37eee5aa19c4df3 100644
 --- a/crates/proto/src/workspace.rs
 +++ b/crates/proto/src/workspace.rs
 @@ -72,6 +72,14 @@ pub mod capabilities {
@@ -28941,7 +28935,7 @@ index 442fb53a2fb5d2357e9533b1000a3ef5d8a892c6..21abdf62ce765a13e9f9bd89c36087ca
      ];
  
      pub fn current() -> Vec<String> {
-@@ -191,7 +200,8 @@ mod tests {
+@@ -217,7 +226,8 @@ mod tests {
                      "child-reports-fyi",
                      "child-reports-groups",
                      "child-reports-watch",
@@ -29302,175 +29296,6 @@ index a7a40f59682af12665da583491fe1ac9537e14ef..ed0dad4b2aa732b2f1472fa4412ecf37
                  cursor_sdk_version: None,
                  capabilities: Vec::new(),
              })
-diff --git a/crates/ui/src/background_tray.rs b/crates/ui/src/background_tray.rs
-index 8ebf53c6d102f1c2318bdd2df8e2f9a451ba9651..519a7f0495002d9e1b9b3c37f0487c66303aee49 100644
---- a/crates/ui/src/background_tray.rs
-+++ b/crates/ui/src/background_tray.rs
-@@ -853,6 +853,7 @@ mod tests {
-                 last_seen_at: Some(chrono::Utc::now()),
-                 created_at: None,
-                 version: None,
-+                online_since: None,
-                 cursor_sdk_version: None,
-                 capabilities: if capable {
-                     vec![zeron_proto::capabilities::BACKGROUND_TASKS_V1.into()]
-diff --git a/crates/ui/src/cloud.rs b/crates/ui/src/cloud.rs
-index 9b9383b0743d7904fb8d82996a5747c0ebf6943e..01dd41c72de798cf0228c4dc4bbd49dc7f77f951 100644
---- a/crates/ui/src/cloud.rs
-+++ b/crates/ui/src/cloud.rs
-@@ -54,10 +54,11 @@ pub fn is_cloud_session_device(device: &Device) -> bool {
-         .any(|c| c == zeron_proto::CLOUD_SESSION_CAPABILITY)
- }
- 
--/// Whether a device belongs in device lists and pickers: everything but the
--/// per-session machines, which the logical Cloud device stands for.
-+/// Whether a device belongs in device lists and pickers: everything but one
-+/// chat's machines (Cloud's per-session ones, which the logical Cloud device
-+/// stands for, and sandboxes, which their provider stands for).
- pub fn is_listed(device: &Device) -> bool {
--    !is_cloud_session_device(device)
-+    !zeron_proto::is_one_chats_machine(&device.capabilities)
- }
- 
- /// The glyph for a device row, chip or crumb.
-@@ -581,6 +582,8 @@ mod tests {
-         assert!(is_listed(&account) && is_cloud_account(&account));
-         assert!(!is_listed(&machine) && is_cloud_session_device(&machine));
-         assert!(is_listed(&laptop) && !is_cloud(&laptop));
-+        let sandbox = device("sbx", "linux", Some("sandbox:docker"));
-+        assert!(!is_listed(&sandbox));
-         assert_eq!(device_glyph("cloud-a", "cloud"), icons::CLOUD);
-         assert_eq!(device_glyph("abc", "macos"), icons::LAPTOP);
-         assert_eq!(device_glyph("abc", "ios"), icons::SMARTPHONE);
-diff --git a/crates/ui/src/pull_requests.rs b/crates/ui/src/pull_requests.rs
-index a63405eb7c72ba863d9eb8eba059e83709643172..4bf64c51f192786f9d9a48579597160fb2aeef60 100644
---- a/crates/ui/src/pull_requests.rs
-+++ b/crates/ui/src/pull_requests.rs
-@@ -3630,6 +3630,7 @@ mod tests {
-             last_seen_at: None,
-             created_at: None,
-             version: None,
-+            online_since: None,
-             cursor_sdk_version: None,
-             capabilities: Vec::new(),
-         }
-diff --git a/crates/ui/src/shell/side_chats.rs b/crates/ui/src/shell/side_chats.rs
-index 32666233fa9bf7b4e2f2aa954f3cdabe689a9199..64086cbaaf1ef6e5d04c630536c88c0278676298 100644
---- a/crates/ui/src/shell/side_chats.rs
-+++ b/crates/ui/src/shell/side_chats.rs
-@@ -921,6 +921,7 @@ mod tests {
-                         last_seen_at: Some(Utc::now()),
-                         created_at: None,
-                         version: None,
-+                        online_since: None,
-                         cursor_sdk_version: None,
-                         capabilities: Vec::new(),
-                     }];
-diff --git a/crates/ui/src/shell/spaces.rs b/crates/ui/src/shell/spaces.rs
-index bc1ab00bcbfe6b44f8ecdbb747153d635ab79c16..64600962a2ed038f8a19a73454975f2af9da9bb2 100644
---- a/crates/ui/src/shell/spaces.rs
-+++ b/crates/ui/src/shell/spaces.rs
-@@ -2992,6 +2992,7 @@ fn add_space_cloud_device(state: &crate::state::AppState) -> Option<Device> {
-         last_seen_at: None,
-         created_at: None,
-         version: None,
-+        online_since: None,
-         cursor_sdk_version: None,
-         capabilities: Vec::new(),
-     })
-diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
-index 398da2aae30488c64323f1e58e6d4447d13fb444..8302b2e7651200ebcaad0e2283ca08ad48058ba0 100644
---- a/crates/ui/src/state.rs
-+++ b/crates/ui/src/state.rs
-@@ -187,6 +187,21 @@ use zeron_engine::deferred::{
-     DeferredEngine, DeferredState as DeferredEngineState, wait as wait_for_deferred_engine,
- };
- 
-+/// Wait (up to 2 s) until nothing answers on `port` any more. Closing the
-+/// IPC listener isn't always enough: a program the engine was starting at
-+/// that moment holds a copy of it from its fork until its exec (seen on
-+/// Linux CI), and a retry or another viewport must find the port free.
-+async fn wait_until_released(port: u16) {
-+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-+    while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-+        if std::time::Instant::now() >= deadline {
-+            tracing::warn!(port, "the IPC port still answers after shutdown");
-+            return;
-+        }
-+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-+    }
-+}
-+
- /// Start the app's background engine when no engine serves the port, and
- /// attach to it, rather than embedding one (set once at startup by the app;
- /// tests and fixtures embed).
-@@ -295,6 +310,8 @@ impl EngineHandle {
-             default_harness: config.default_harness,
-             org_id: config.org_id,
-             workos_client_id: config.workos_client_id,
-+            // The app is never a sandbox.
-+            lent_sign_in: None,
-         };
-         let launching = LAUNCH_BACKGROUND_ENGINE.load(std::sync::atomic::Ordering::SeqCst);
-         if Self::should_launch_background(launching, engine_config.ipc_port).await
-@@ -383,6 +400,9 @@ impl EngineHandle {
-             && let Err(message) = wait_for_deferred_engine(&mut state_rx).await
-         {
-             handle.shutdown().await;
-+            if let Some(port) = served_ipc_port.filter(|port| *port != 0) {
-+                wait_until_released(port).await;
-+            }
-             return Err(anyhow::anyhow!(message));
-         }
-         Ok(handle)
-@@ -6096,6 +6116,7 @@ mod tests {
-             last_seen_at: None,
-             created_at: None,
-             version: None,
-+            online_since: None,
-             cursor_sdk_version: None,
-             capabilities: Vec::new(),
-         }
-@@ -6792,6 +6813,7 @@ mod tests {
-             last_seen_at: None,
-             created_at: None,
-             version: version.map(str::to_string),
-+            online_since: None,
-             cursor_sdk_version: None,
-             capabilities: if capable {
-                 vec![zeron_proto::capabilities::ATTACHMENT_STORE_V1.to_string()]
-@@ -8671,6 +8693,7 @@ mod tests {
-             last_seen_at: None,
-             created_at: None,
-             version: Some("0.2.12".into()),
-+            online_since: None,
-             cursor_sdk_version: None,
-             capabilities: Vec::new(),
-         }];
-@@ -8694,6 +8717,7 @@ mod tests {
-                 last_seen_at: None,
-                 created_at: None,
-                 version: Some("0.2.31".into()),
-+                online_since: None,
-                 cursor_sdk_version: None,
-                 capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
-             },
-@@ -8704,6 +8728,7 @@ mod tests {
-                 last_seen_at: None,
-                 created_at: None,
-                 version: Some("0.2.31".into()),
-+                online_since: None,
-                 cursor_sdk_version: None,
-                 capabilities: Vec::new(),
-             },
-@@ -8731,6 +8756,7 @@ mod tests {
-             last_seen_at: Some(now),
-             created_at: None,
-             version: None,
-+            online_since: None,
-             cursor_sdk_version: None,
-             capabilities: Vec::new(),
-         }];
 diff --git a/crates/update/src/lib.rs b/crates/update/src/lib.rs
 index 48f467d50434ecc34232b510e31fcec3e66a5727..7279070a50a260b62123bdec61767a023a3bf014 100644
 --- a/crates/update/src/lib.rs

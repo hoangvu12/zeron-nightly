@@ -1,4 +1,4 @@
-From 40559f3f1c6d18de7f388ba315cd0d568b41b0b0 Mon Sep 17 00:00:00 2001
+From 9c373feccf260bdbd87860cec25b802a1113a93b Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:38:38 +0700
 Subject: [PATCH] zgx on Windows: no console window, and the ui folder beside

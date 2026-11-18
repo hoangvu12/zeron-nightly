@@ -1,4 +1,4 @@
-From 36f273a023eb280ecfad21e5d6cd4d118654c61d Mon Sep 17 00:00:00 2001
+From 9387da5b45b04290d0459333c4629c53dc088088 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hoangvu12@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 14:02:27 +0000
 Subject: [PATCH] Docker sign-in: a gone host device is none, and the dialog
@@ -38,10 +38,10 @@ run for real against login.docker.com, the poll took the approval.
  create mode 100644 crates/engine/tests/docker_sign_in.rs
 
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index e6f19c9c1f81c1c9c484dfbaacebbaf3bda2b32f..4ecd80215308e88a0892a876bd1108ddf9830583 100644
+index 50bfb4d764eeef8131709bac5256d57bcf2e1636..4e4f193635bdd49aee6e7c3b714884b4c1c761de 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
-@@ -2442,6 +2442,8 @@
+@@ -2447,6 +2447,8 @@
        "connect_title": "Connect {name}",
        "sign_in_on_page": "Sign in with {name}",
        "code_waiting": "Check this code on the page that opened.",
@@ -51,10 +51,10 @@ index e6f19c9c1f81c1c9c484dfbaacebbaf3bda2b32f..4ecd80215308e88a0892a876bd1108dd
        "token_hint": {
          "docker": "A Docker access token, or username:personal-access-token."
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index 4bae5afc6cf2dd7c96f1bfe0c66b2e06aaadfbb2..65d71e0a369e55ef0f43561444f8e27d0432bef6 100644
+index 99224adfaabb5698e661313e5dbe94dc2a169f2a..0fb5375933d37dc9cbb3ed556fd7ff5b8647bee6 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
-@@ -2445,6 +2445,8 @@
+@@ -2450,6 +2450,8 @@
        "connect_title": "Connect {name}",
        "sign_in_on_page": "Sign in with {name}",
        "code_waiting": "Check this code on the page that opened.",

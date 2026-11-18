@@ -1,4 +1,4 @@
-From 93a1e78c4354675d24ddaef992c358cb2573cef5 Mon Sep 17 00:00:00 2001
+From 10ad9bec1ee31474192c580ec512b338a11db01b Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
@@ -2788,7 +2788,7 @@ index 2179b2f16f5bbb97ec7cbc050f92a84d4b989544..f4fcd6510bfb6c3006169b7e84ff6dcb
  				id = "statuses",
  				title = "Statuses",
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index ff0b3c46fb289a453706e97dd6ba85e8d029afe9..4bfa57b9cb17ed44f35beb8f60dfdec4bf8d93fd 100644
+index d63b6be29a9cc7de88eb4a572b5cd9fa3e2698a9..3f2e039606f49dab2a6faa70100584a8aa6f4dc9 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
 @@ -49,7 +49,8 @@
@@ -2832,7 +2832,7 @@ index ff0b3c46fb289a453706e97dd6ba85e8d029afe9..4bfa57b9cb17ed44f35beb8f60dfdec4
    },
    "settings": {
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index ac52ad25ec892e85e6bbb47d8c5573f57b3d61fc..9386143845925f6d212f6f96fad0e066e8687b7c 100644
+index 39a2817deb68951657860c1221ae86dde395931d..50f7fd7763006ac167a0fcc52bda722abcddb581 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
 @@ -49,7 +49,8 @@
@@ -3984,7 +3984,7 @@ index 722b498bdf153dba612b3bb2e33efb210d63bba6..6587e3235348d7a92143e1d18dfd2f57
      /// live steerable run — deliver the durable command as the next turn.
      /// After an engine restart `last_request` is empty too, so rebuild the run
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index ab7799f8271783c6740f75eb3c6757822159f0b5..0c803cb9a08330d59d5a6722ff95ade3dfc90f49 100644
+index 9131b180b5a1fb03def7f575e10fd824bce2f456..5d2ae23321f5bbcab2756902b088c06a03e88365 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
 @@ -377,6 +377,7 @@ impl EngineCore {

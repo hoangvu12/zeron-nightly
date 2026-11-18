@@ -1,4 +1,4 @@
-From cec4868a0350d4aabce16bc0106387b22625200d Mon Sep 17 00:00:00 2001
+From 7542856da5bfdc7153a16814bff0c11256369609 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 15 Nov 2026 20:53:51 +0700
 Subject: [PATCH 1/2] engine: child reports follow one rule: the first turn
@@ -2197,7 +2197,7 @@ index 9b16a411f7d31e9e7d5b7390e23334e39a542168..2d761c2e5cf2f7ae4ab4f0449a5e0d61
      });
  }
 diff --git a/crates/proto/src/workspace.rs b/crates/proto/src/workspace.rs
-index 0ffb2d50f28df261f5a61ab9cf5114eed7d54be5..73e7f88ea1c386bb384ef989578431692ce14445 100644
+index 7e6d1eee0a1ab9273dd1334e8ae21ecc581300d3..91e0c8e3badb97d65cde23dc1ccdd34d2a70c7a2 100644
 --- a/crates/proto/src/workspace.rs
 +++ b/crates/proto/src/workspace.rs
 @@ -50,6 +50,12 @@ pub mod capabilities {
@@ -2221,7 +2221,7 @@ index 0ffb2d50f28df261f5a61ab9cf5114eed7d54be5..73e7f88ea1c386bb384ef98957843169
          crate::voice::remote::CAPABILITY,
      ];
  
-@@ -161,6 +168,7 @@ mod tests {
+@@ -187,6 +194,7 @@ mod tests {
                      "zgx-interface-v1",
                      "update-ability-v1",
                      "attachment-store-v1",
@@ -2270,7 +2270,7 @@ index 53453f39460e6068d1c831337f971a07bc40c230..0f829bddce8b35426b8334cb12dca7cc
 2.55.0.windows.2
 
 
-From 65b30ee5e7722210da74823c14c6d3e07eb61fec Mon Sep 17 00:00:00 2001
+From 946711192a0daaf5bece1da3aceb8cf7c23d176c Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:23:23 +0700
 Subject: [PATCH 2/2] mcp: a subagent on a host that won't report back says so
