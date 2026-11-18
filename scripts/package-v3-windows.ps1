@@ -138,7 +138,7 @@ try {
     Copy-Item -LiteralPath 'dist/windows/zeron.ico', 'LICENSE', 'THIRD_PARTY_NOTICES.md' -Destination $stage
     $licenses = Join-Path $stage 'licenses/fonts'
     New-Item -ItemType Directory -Force -Path $licenses | Out-Null
-    Copy-Item -Path 'crates/ui/assets/fonts/licenses/*', 'apps/zgx/fonts/*-OFL.txt' -Destination $licenses
+    Copy-Item -Path 'assets/fonts/licenses/*', 'apps/zgx/fonts/*-OFL.txt' -Destination $licenses
     Copy-Item -LiteralPath 'crates/voice/NOTICE.md' -Destination (Join-Path $stage 'licenses/parakeet-v3.txt')
     if ($ReleasesUrl) {
         Write-Utf8 (Join-Path $stage 'zeron-update.json') (@{ releases_url = $ReleasesUrl; installer = $true } | ConvertTo-Json)
