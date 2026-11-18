@@ -1,4 +1,4 @@
-From 2e4d0e1fac5464e469f8ad06d669b0d5da948a95 Mon Sep 17 00:00:00 2001
+From 59d0659a6553b71a33425d05394fa5649fa15b3c Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 5 Nov 2026 23:19:58 +0700
 Subject: [PATCH] Markdown images in replies: any local folder, kept when the
@@ -44,10 +44,10 @@ a_finished_replys_images_outlive_their_files, zeron-mcp (59).
  create mode 100644 crates/engine/src/reply_images.rs
 
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 610da782f7fe1b8351822fade8cddc431095d77a..18b301478aeb260d3568425047d7c79f4d28d16f 100644
+index ae97d64fa2748144d34de89e155414ef539e9058..ab7799f8271783c6740f75eb3c6757822159f0b5 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -67,6 +67,7 @@ pub mod profile;
+@@ -70,6 +70,7 @@ pub mod profile;
  pub mod project_actions;
  pub mod registry;
  pub mod remote_terminals;
@@ -485,7 +485,7 @@ index 0000000000000000000000000000000000000000..ea93405787190af78ed48429e56cda7a
 +    }
 +}
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe097d01a73 100644
+index 62627a97f278b5eaeb82b8c8462de55ce3e42e9e..92a91805ef20e02ab0c4a983438df0c598cd4c6f 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -409,43 +409,20 @@ struct OpenTerminalParams {
@@ -540,7 +540,7 @@ index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe0
  }
  
  /// A cwd the user (or a project-less chat) meant as "host home", not a folder.
-@@ -1459,12 +1436,10 @@ impl EngineRpc {
+@@ -1510,12 +1487,10 @@ impl EngineRpc {
          self.file_search_root(p).await
      }
  
@@ -557,7 +557,7 @@ index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe0
          let refused = |why: &str| RpcError::BadParams(why.into());
          let chat = self
              .workspace
-@@ -1474,20 +1449,10 @@ impl EngineRpc {
+@@ -1525,20 +1500,10 @@ impl EngineRpc {
          if chat.device_id != self.doc_host.device_id() {
              return Err(refused("chat belongs to another device"));
          }
@@ -580,7 +580,7 @@ index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe0
      }
  
      /// Accept only a checkout already named by a local chat or contained in a
-@@ -5693,9 +5658,16 @@ impl RpcService for EngineRpc {
+@@ -6066,9 +6031,16 @@ impl RpcService for EngineRpc {
              }
              methods::READ_CHAT_IMAGE_CHUNK => {
                  let p: ReadChatImageChunkParams = parse_params(params)?;
@@ -599,7 +599,7 @@ index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe0
                  })
                  .await
                  .map_err(|e| RpcError::Failed(e.to_string()))?
-@@ -5705,7 +5677,7 @@ impl RpcService for EngineRpc {
+@@ -6078,7 +6050,7 @@ impl RpcService for EngineRpc {
              methods::READ_TOOL_OUTPUT => {
                  let p: ReadToolOutputParams = parse_params(params)?;
                  // Only the host has the journal; the same chat check as a
@@ -608,7 +608,7 @@ index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe0
                  // its root chat's.
                  let chat_id = crate::tool_output::journal_chat(&p.chat_id);
                  let chat = self
-@@ -6669,58 +6641,24 @@ mod tests {
+@@ -7073,58 +7045,24 @@ mod tests {
      }
  
      #[test]
@@ -677,10 +677,10 @@ index 4914e63bac071f554af5477a6cd7cf7b403e0a36..a59bedfe9dd180e1f0c72bccd4695fe0
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 6f5f098d1f6b17f9658a4274295cb55c0097397c..50fb469d3965643e9d01ab397272afc15eb5d664 100644
+index 361eb4e21fc02fca4d6ad9e728fc1f05b7724a9d..c1edb7276d2490b370f98b141e52019e1243eaaa 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -2905,6 +2905,27 @@ impl Inner {
+@@ -3257,6 +3257,27 @@ impl Inner {
          }
      }
  
@@ -708,7 +708,7 @@ index 6f5f098d1f6b17f9658a4274295cb55c0097397c..50fb469d3965643e9d01ab397272afc1
      /// Record the chat's harness-native session id (and its cwd): live-process
      /// cache plus the durable workspace chat row — the row is what survives an
      /// engine restart (zeron sessions.ts:1039).
-@@ -5038,7 +5059,9 @@ async fn drive_run(
+@@ -5632,7 +5653,9 @@ async fn drive_run(
                          ) {
                              tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
                          }
@@ -719,7 +719,7 @@ index 6f5f098d1f6b17f9658a4274295cb55c0097397c..50fb469d3965643e9d01ab397272afc1
                      }
                      folded.clear();
                      dirty = false;
-@@ -5593,7 +5616,9 @@ async fn drive_run(
+@@ -6189,7 +6212,9 @@ async fn drive_run(
              ) {
                  tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
              }
@@ -730,7 +730,7 @@ index 6f5f098d1f6b17f9658a4274295cb55c0097397c..50fb469d3965643e9d01ab397272afc1
              folded.clear();
              dirty = false;
              entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
-@@ -5732,7 +5757,9 @@ async fn drive_run(
+@@ -6328,7 +6353,9 @@ async fn drive_run(
                  ) {
                      tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
                  }
@@ -1033,10 +1033,10 @@ index bd8aed720805287f66f1e32d48c560611f20acb1..58a2320887d41ac6eb37dcf8c3302e71
          Some(("png", "image/png"))
      } else if bytes.starts_with(b"\xff\xd8\xff") {
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 4741290df41600828e0e829a291a5ac2d817607c..e9954e23be971c4ff23ea0c815ed9de422c51f82 100644
+index 9c27707caa10ad3944132a4b6c0df935139a339c..26269d1af7e0dd8cb98de1fb821e2bc61c6259da 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
-@@ -3844,11 +3844,11 @@ async fn publish_image_lands_in_the_live_turn() {
+@@ -3845,11 +3845,11 @@ async fn publish_image_lands_in_the_live_turn() {
      core.shutdown().await;
  }
  
@@ -1052,7 +1052,7 @@ index 4741290df41600828e0e829a291a5ac2d817607c..e9954e23be971c4ff23ea0c815ed9de4
      use base64::Engine as _;
      let dir = tempfile::tempdir().unwrap();
      let core = assemble(
-@@ -3874,14 +3874,6 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+@@ -3875,14 +3875,6 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
      let folder = |path: &std::path::Path| Some(path.to_string_lossy().into_owned());
      for (chat, device, cwd) in [
          ("ours", here.as_str(), folder(ours.path())),
@@ -1067,7 +1067,7 @@ index 4741290df41600828e0e829a291a5ac2d817607c..e9954e23be971c4ff23ea0c815ed9de4
          ("remote", "another-device", folder(ours.path())),
          (
              "scratch",
-@@ -3893,13 +3885,14 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+@@ -3894,13 +3886,14 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
              .create_chat(chat, None, Some(device), None, cwd)
              .unwrap();
      }
@@ -1084,7 +1084,7 @@ index 4741290df41600828e0e829a291a5ac2d817607c..e9954e23be971c4ff23ea0c815ed9de4
      let data = chunk["data"].as_str().unwrap();
      assert_eq!(
          base64::engine::general_purpose::STANDARD
-@@ -3908,29 +3901,116 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
+@@ -3909,29 +3902,116 @@ async fn chat_images_come_only_from_their_chats_own_folder() {
          png
      );
      assert_eq!(chunk["mimeType"], "image/png");
@@ -1213,19 +1213,19 @@ index 4741290df41600828e0e829a291a5ac2d817607c..e9954e23be971c4ff23ea0c815ed9de4
  /// (`ReadToolOutput`), redacted as the doc's ten-line tail is; the doc says
  /// how many lines there are. Only the chat's host answers, and only for a
 diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
-index f381d325fd13d6bc383ab8677c4661014cec9a8d..a4be9e109b60bdc7ca4d004f6d434a2177939261 100644
+index 543294e4998bc7d21dd4dc088d87d884ba114e94..8534ee609b78b1e1d749711f05f55fa797bf7819 100644
 --- a/crates/mcp/src/jsonrpc.rs
 +++ b/crates/mcp/src/jsonrpc.rs
-@@ -68,8 +68,10 @@ your final reply. Zeron renders it with its own native interface and enforces it
- content sits directly on the chat with no cards or boxed panels, text uses the interface font \
- and type scale, and colors are theme tokens that work on frosted glass or opaque, light or dark. \
- The reader sees the visual above that reply, so don't announce or restate it. To show the \
--reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
--draw images through `show_visual`.";
-+reader an image file (a screenshot, a rendered PNG), write it into your reply as Markdown, \
-+`![alt](path)`, with its local path (absolute, or relative to your working folder; wrap a path \
-+with spaces in angle brackets, `![alt](<path>)`). Zeron draws it in place and keeps a copy. \
-+Don't draw images through `show_visual`.";
+@@ -45,8 +45,10 @@ For parallel work, start every chat before waiting on any: `create_chats` or `se
+ (or `wait: false`, then `wait_for_turn`).\n\
+ \n\
+ Where `show_visual` is offered and a chart, table, diagram, dashboard, or 3D view would say \
+-more than prose, show one with it before your final reply, and don't restate it there. Show \
+-an image file with `show_image`.";
++more than prose, show one with it before your final reply, and don't restate it there. To show \
++an image file (a screenshot, a rendered PNG), write it into your reply as Markdown, `![alt](path)`, \
++with its local path (absolute, or relative to your working folder; `![alt](<path>)` if it has \
++spaces): Zeron draws it in place and keeps a copy.";
  
  /// Appended to [`INSTRUCTIONS`] where the agent is offered
  /// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
@@ -1319,5 +1319,5 @@ index 6a2b4a2211ed3b6c7af7b76e6965ca6f03b7959d..28486d6c82a48be5195b3d4bf97d67ce
  
      #[test]
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

@@ -1,4 +1,4 @@
-From fc20408532fa07837d79e2281ed8c280daba048c Mon Sep 17 00:00:00 2001
+From 2679bcf6c5dedee6b1880cdb498b07d284c1abab Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hoangvu12@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 22:13:55 +0700
 Subject: [PATCH] Docker Sandbox: a chat shows its sandbox while it's made, and
@@ -37,10 +37,10 @@ step failed after 240 s.
  6 files changed, 163 insertions(+), 5 deletions(-)
 
 diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
-index b192b3300f00d2508348a1e2edd902dc203735f9..82388357a9d57b3626a8fcc69e0621178187d041 100644
+index 7dfbf1cc994a7e60dd60605ba6db6f703a94c154..8fe9919c094e04ac4ad4b9e4d721c0396ea48732 100644
 --- a/apps/zgx/ui/chat_fixture.luau
 +++ b/apps/zgx/ui/chat_fixture.luau
-@@ -1510,10 +1510,30 @@ end
+@@ -1539,10 +1539,30 @@ end
  -- got (starting, failed, ready); follows and Run again are noted.
  do
  	local sandboxes = require("@account/sandboxes") :: any
@@ -176,10 +176,10 @@ index 79d5321216d8d2e4aca893979378f6582c621230..73c8630ab5fe6ab4d788768efa7a8d6e
              .start(self.sandbox_host(), chat_id)
              .map_err(RpcError::Failed)?;
 diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
-index 2845a0814f7d5daac24b3bec1a562bccafb8e03b..68ba547f3908ac862cb04ff0c4ceac11a2dae27e 100644
+index 1b77962d781f3a83b6dbdb4d2cf473bc610a3fa7..84e5c13c9c4a6d8571c0ea8a4af7798c7c8a40be 100644
 --- a/crates/engine/src/workspace_host.rs
 +++ b/crates/engine/src/workspace_host.rs
-@@ -703,6 +703,34 @@ impl WorkspaceHost {
+@@ -721,6 +721,34 @@ impl WorkspaceHost {
          }
      }
  
@@ -281,5 +281,5 @@ index a08586ed23fd7331989babd550be866e90c29ef5..3e34002e8aa1c8d2799ef6e1d90308f0
 +    assert!(own.version.is_some(), "its engine's own row: {own:#?}");
 +}
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

@@ -1,4 +1,4 @@
-From 1914a61c58d3700b57eafa505faef0bbc46a566d Mon Sep 17 00:00:00 2001
+From 71a2cb748bd5075aa7bcc43b042eafb994410d0c Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 06:29:50 +0700
 Subject: [PATCH] Windows: updates by installer for an install of more than
@@ -24,10 +24,10 @@ rest behind.
  3 files changed, 109 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/engine/manager.rs b/apps/zgx/src/engine/manager.rs
-index 9180c2487a05a5b0ccf2f698992cf7937359fe6d..e4f96f5e8eb57bf1562cb4c4bcc097930c6f6035 100644
+index 86f54a05d88109285a5032314c6f9be3f9b4677a..14e9c919bdce8f59f795e3b3e6c4df93e7db3c59 100644
 --- a/apps/zgx/src/engine/manager.rs
 +++ b/apps/zgx/src/engine/manager.rs
-@@ -328,6 +328,17 @@ impl Spawner {
+@@ -343,6 +343,17 @@ impl Spawner {
  /// Zeron.app's engine, started as Zeron.app starts it (crates/launch).
  fn launch(config: &Config) -> std::io::Result<()> {
      let exe = std::env::current_exe()?;
@@ -206,5 +206,5 @@ index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b
  
      #[test]
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

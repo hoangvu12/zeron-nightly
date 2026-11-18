@@ -35,8 +35,9 @@ note = "v3 updates itself on Windows: it downloads the release's installer and r
 [[patch]]
 name = "large-plain-folder-index"
 pr = 1196
+enabled = false
 sha = "82a0a07bbe01b51521340a97c7e656741c0953c1"
-note = "Walk-based index for large plain folders, kept current with a watch; disk roots refused. Stacked on #1184."
+note = "Walk-based index for large plain folders, kept current with a watch; disk roots refused. Stacked on #1184. Off since 2026-11-18: main's #1495 (the perf merge, 348adf79c) rewrote home_index.rs (a bounded, cancellable walk; a packed index) and workspace_search.rs, which #1184/#1196 build on, so the PR conflicts there. Rebase #1184 and #1196 onto main, move `sha`, and turn it back on."
 
 [[patch]]
 name = "warm-chats-parked-cap"
@@ -48,7 +49,7 @@ note = "Keeps the 3 most recently focused chats' CLIs warm and stops older idle 
 [[patch]]
 name = "markdown-reply-images"
 file = "patches/0002-markdown-reply-images.patch"
-note = "Markdown images in replies from any local folder, kept when the reply finishes. The engine part serves v3 too."
+note = "Markdown images in replies from any local folder, kept when the reply finishes. The engine part serves v3 too. Regenerated onto main 2e72f94e6: main shortened the MCP instructions (crates/mcp/src/jsonrpc.rs), so its image sentence (\"Show an image file with `show_image`\") is the one replaced with the Markdown one."
 
 [[patch]]
 name = "relay-image-reads"
@@ -63,7 +64,7 @@ note = "An agent's send_message to a busy chat no longer stops the command that 
 [[patch]]
 name = "child-chats-report-back"
 file = "patches/0007-child-chats-report-back.patch"
-note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Goes after agent-steers-wait-for-tools, which its tests need. Regenerated onto main 09766b39 (0.3.7, Auto's reviewer): ds/activity.luau keeps main's Tooltip require beside its SubagentRow, and its tool_line/row split."
+note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Goes after agent-steers-wait-for-tools, which its tests need. Regenerated onto main 2e72f94e6 (#1495's perf merge, #1458): its report-back lines go into main's shorter MCP instructions; run_journal.rs's last_append sits on main's RunJournal beside its flusher; ds/transcript.luau's report cards and spawn blocks go into main's windowed blocks_of (its `block`); ds/activity.luau's subagent_child goes to main's Tree; screens/chat/session.luau's children and agent_mark go on main's one Transcript."
 
 [[patch]]
 name = "child-reports-follow-ups"
@@ -86,7 +87,7 @@ note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its t
 [[patch]]
 name = "design-plugin-apis"
 file = "patches/0018-design-plugin-apis.patch"
-note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's plugin APIs (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 fonts, #1379 fetch bytes in base64, #1380 a service's zeron.db, #1398 zeron.write_file and files.write, and a plugin window's memory from its manifest, which was 0013). #1392's base is still the frozen zeron/zgx, and main moved the same Cargo.toml lines (its zgx pin) and the consent fixture, so a `pr` entry conflicts. Its zgx is hoangvu12/zgx ebebffb01, kept on branch nightly-design-ebebffb0 so a force-push of a PR can't take it away: #2110 at 4914d045a (on zgx main 126357bb5) with #2299's tile fixes cherry-picked on (they sat on #2110's earlier head a37e02b67) and #2285 (middle-mouse press), #2297 (full screen) and #2298 (display scale) merged; main pins zeronsh/zgx d391ea72, which it contains. Before that it was 24b35872 (nightly-design-24b35872). It carries everything 0012's nightly-design-export (1890c055) did, so that patch is gone. The consent fixture lists both main's draft and #1392's fonts; both lockfiles are regenerated."
+note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's plugin APIs (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 fonts, #1379 fetch bytes in base64, #1380 a service's zeron.db, #1398 zeron.write_file and files.write, and a plugin window's memory from its manifest, which was 0013). #1392's base is still the frozen zeron/zgx, and main moved the same Cargo.toml lines (its zgx pin) and the consent fixture, so a `pr` entry conflicts. Its zgx is hoangvu12/zgx 9a65480ee, kept on branch nightly-design-9a65480e so a force-push of a PR can't take it away: ebebffb01 (nightly-design-ebebffb0: #2110 at 4914d045a, on zgx main 126357bb5, with #2299's tile fixes cherry-picked on, as they sat on #2110's earlier head a37e02b67, and #2285 (middle-mouse press), #2297 (full screen) and #2298 (display scale) merged) with main's pin, zeronsh/zgx b80a8af1c, merged in. Before that it was ebebffb01, and 24b35872 (nightly-design-24b35872) before that. Regenerated onto main 2e72f94e6: plugins/mod.rs gives a plugin's window its memory, then main's reload (held until the window's first load); the root Cargo.lock takes smallvec 1.16.5, which the zgx merge asks for. Known (2026-11-18): with main's transcript (#1495) on this zgx, transcript_scroll_tests' a_synced_chat_scrolled_up_from_its_end_passes_through_every_message fails its LastRowsDroppedOnce case (a synced chat republished without its last two rows, then whole, mid-scroll: the view is empty for two steps). It passes on main's own zgx, and with the old main on ebebffb01; it fails on ebebffb01 and 9a65480ee alike, so it's the fork against #1495, not the b80a8af1c merge. To fix in the fork. It carries everything 0012's nightly-design-export (1890c055) did, so that patch is gone. The consent fixture lists both main's draft and #1392's fonts; both lockfiles are regenerated."
 # When #1392 moves: in a checkout assembled up to here minus this entry, merge
 # the new head, take main's side of apps/zgx/Cargo.toml with each zgx rev
 # moved to #1392's (and the comment above `zgx =`), union the consent
@@ -128,14 +129,14 @@ note = "A command a child left running with run_command (#1458, upstream) never 
 [[patch]]
 name = "docker-sandbox"
 file = "patches/0019-docker-sandbox.patch"
-note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's key kept by a host device, with templates, sleep and wake, recovery and Start fresh. Desktop only. Regenerated onto main 09766b39 (0.3.7): zeron-v2's .base.json re-recorded for the merged default files (ZERON_V2_BLESS's hashes). work/docker-sandbox-e2e at b53b39c2a (based on the frozen zeron/zgx c1539061b) merged onto everything above as one file, with what that merge needed (both sides of 13 files kept, sandboxes.wake blocked in plugin previews, zeron-v2's .base.json in step). Same code as work/docker-sandbox at 11b9dd156."
+note = "Docker Sandbox (#37): chats run in Docker cloud sandboxes, a provider's key kept by a host device, with templates, sleep and wake, recovery and Start fresh. Desktop only. Regenerated onto main 09766b39 (0.3.7): zeron-v2's .base.json re-recorded for the merged default files (ZERON_V2_BLESS's hashes). work/docker-sandbox-e2e at b53b39c2a (based on the frozen zeron/zgx c1539061b) merged onto everything above as one file, with what that merge needed (both sides of 13 files kept, sandboxes.wake blocked in plugin previews, zeron-v2's .base.json in step). Same code as work/docker-sandbox at 11b9dd156. Regenerated onto main 2e72f94e6 (#1458's Cloud reach, #1495's warm start and one transcript): the composer keeps both (ds/composer's Fixed has Cloud's cloud and reach and a place's icon and template; work_in takes reach and templates; the fixed chip's glyph is a place's, then Cloud's, then a worktree's); MutateParams' CreateChat has cloud_reach and place; plugin previews block both sides' actions; the one Transcript reads shown_messages (a sandbox's ready line); zeron-v2's .base.json re-recorded (sidebar, composer, panel/init)."
 
 # Old peers and Auto (4b983c6c8).
 
 [[patch]]
 name = "auto-mode-old-peers"
 file = "patches/0020-auto-mode-old-peers.patch"
-note = "Devices on engines from before upstream's Auto access mode (4b983c6c8; 0.3.7, and nightlies before it) failed every ListHarnesses against a device listing Auto (unknown variant `auto`), so they couldn't create or message chats there; a chat or run in Auto broke them the same way. \"auto\" no longer goes where they read (zeron_proto::access_wire): the catalog's accessModes lists only the modes they know, with autoAccessMode beside it, and a chat's or a run's access holds supervised (the stricter mode every agent with modes honors) with autoAccess beside it. This build reads Auto back, and still reads a plain \"auto\". The agent gate and zgx, which handle these as raw JSON, go through the same helpers."
+note = "Devices on engines from before upstream's Auto access mode (4b983c6c8; 0.3.7, and nightlies before it) failed every ListHarnesses against a device listing Auto (unknown variant `auto`), so they couldn't create or message chats there; a chat or run in Auto broke them the same way. \"auto\" no longer goes where they read (zeron_proto::access_wire): the catalog's accessModes lists only the modes they know, with autoAccessMode beside it, and a chat's or a run's access holds supervised (the stricter mode every agent with modes honors) with autoAccess beside it. This build reads Auto back, and still reads a plain \"auto\". The agent gate and zgx, which handle these as raw JSON, go through the same helpers. Regenerated onto main 2e72f94e6: zgx's run request is main's run_request (which its warm start uses too), so access_wire writes it there."
 
 [[patch]]
 name = "docker-sign-in"

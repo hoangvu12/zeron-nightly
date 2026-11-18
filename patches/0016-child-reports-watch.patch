@@ -1,4 +1,4 @@
-From 5fe82055782a15b65fd410c972dc63224f71dae4 Mon Sep 17 00:00:00 2001
+From 0d808656e0cb5dfd7028c2abb5a374f82007c239 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 1/4] engine: the parent's host reports for children whose host
@@ -14,10 +14,10 @@ A parent's host now watches children hosted on a device without child-reports: o
  5 files changed, 819 insertions(+), 14 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8 100644
+index 52603d109de924ad06ba54f0b1594cc7410d0b77..b4338de5a541ac47ad0249b623f3d6ffa4ba9155 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -254,6 +254,26 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
+@@ -260,6 +260,26 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
      }
  }
  
@@ -44,7 +44,7 @@ index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3
  /// This engine run, as a [`ReportGroup`] says which one opened it.
  pub(crate) fn this_run() -> &'static str {
      static RUN: OnceLock<String> = OnceLock::new();
-@@ -1194,6 +1214,14 @@ impl ChatDocHandle {
+@@ -1222,6 +1242,14 @@ impl ChatDocHandle {
          &self.doc
      }
  
@@ -59,7 +59,7 @@ index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3
      pub fn writer(&self) -> DocWriter {
          self.writers.fetch_add(1, Ordering::AcqRel);
          DocWriter {
-@@ -6941,12 +6969,16 @@ impl DocHost {
+@@ -7039,12 +7067,16 @@ impl DocHost {
                  if report {
                      // Its wait call returned the reply: kept in the ledger,
                      // so the child knows it was heard, but never read again.
@@ -76,7 +76,7 @@ index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3
                          return Ok((SessionCommandStatus::Applied, Some("an answer to a thanks".into())));
                      }
                      // Sent again (a restart, a retry): it's here already.
-@@ -7325,6 +7357,12 @@ impl DocHost {
+@@ -7423,6 +7455,12 @@ impl DocHost {
              (None, None) => return Ok(()),
          };
          let mut held = held_report(kind, &child, message_id, held_at);
@@ -89,7 +89,7 @@ index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3
          // A member's end waits for the rest of its group; a failure doesn't.
          if status == Some(zeron_proto::agent_messages::ReportStatus::Finished) {
              held.group = group_of_end(&handle.doc.report_groups(), &held);
-@@ -7352,6 +7390,66 @@ impl DocHost {
+@@ -7450,6 +7488,66 @@ impl DocHost {
          Ok(())
      }
  
@@ -157,10 +157,10 @@ index 0cf84da25669e7e04645be53315cc7e87e278643..157eeec8fa4b0fbcf1ea3c956b167db3
      /// (a follow-up to that end): the child leaves the group, and its end is
      /// filed as any report held ([`Self::let_go`]) before `held` is, so the
 diff --git a/crates/engine/src/run_journal.rs b/crates/engine/src/run_journal.rs
-index e5b91a29a328e0b8b1e93f7644b0f75c80b17b28..fd978a46601e38d1a843c83a7df82054b49c0332 100644
+index fa93b6141be5b696b4bc3c65d59cc8212161c1c9..37d2672c07be91fadb415406ba671361af04a3ae 100644
 --- a/crates/engine/src/run_journal.rs
 +++ b/crates/engine/src/run_journal.rs
-@@ -171,12 +171,23 @@ impl RunJournal {
+@@ -335,12 +335,23 @@ impl RunJournal {
      /// follow now (epoch millis), kept beside the journals: the first call
      /// stamps `now_ms`. A report owed from before it is history.
      pub fn child_reports_since(&self, now_ms: i64) -> i64 {
@@ -187,7 +187,7 @@ index e5b91a29a328e0b8b1e93f7644b0f75c80b17b28..fd978a46601e38d1a843c83a7df82054
          now_ms
      }
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 7e6aaad3713ccd898a8cc037bb73f8330eccaa42..4ad7623055ee7299cb6839ea9a2c30cbcd5eed7c 100644
+index a87b90d9f565d6ea1f7ef8481ffecfa8de680579..3b75dd1979f0b7de9b74344ef9733e125ea5e564 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -26,20 +26,24 @@
@@ -769,7 +769,7 @@ index 7e6aaad3713ccd898a8cc037bb73f8330eccaa42..4ad7623055ee7299cb6839ea9a2c30cb
          .into_iter()
          .filter_map(|stage| Some((rest.strip_suffix(stage)?.strip_suffix('-')?, stage.to_owned())))
          .collect();
-@@ -2724,7 +3188,7 @@ mod tests {
+@@ -2725,7 +3189,7 @@ mod tests {
      #[test]
      fn a_reports_key_reads_from_both_ends() {
          let (child, asked) = ("kid-a-0b1c", "5f0e7a3c-9d2b-4c1e-8a6f-1b2c3d4e5f60");
@@ -779,10 +779,10 @@ index 7e6aaad3713ccd898a8cc037bb73f8330eccaa42..4ad7623055ee7299cb6839ea9a2c30cb
              assert_eq!(report_key_parts(&key, child), Some((asked.to_owned(), stage.to_owned())), "{key}");
          }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index cc6704dfd6d29eb9eb2857860425751f7f63a032..2d2704b620adbffc1a5113f6985b51bb08ae66a5 100644
+index 69d71b7f05ff410d8023e6cd378219b25ffdcafe..66d7a39ca72df6008f2c879a0ccadbc0d9c21dc5 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -527,6 +527,9 @@ impl SessionsEngine {
+@@ -687,6 +687,9 @@ impl SessionsEngine {
              let Some(host) = engine.inner.doc_host() else {
                  return;
              };
@@ -792,7 +792,7 @@ index cc6704dfd6d29eb9eb2857860425751f7f63a032..2d2704b620adbffc1a5113f6985b51bb
              let floor = engine.inner.journal.child_reports_since(now_ms()) - reports::OWED_FLOOR_MARGIN_MS;
              let stopped = std::mem::take(&mut *lock(&engine.inner.boot_stops));
              // Revived, or on its way to it: it reports as it settles.
-@@ -544,6 +547,23 @@ impl SessionsEngine {
+@@ -704,6 +707,23 @@ impl SessionsEngine {
          });
      }
  
@@ -816,7 +816,7 @@ index cc6704dfd6d29eb9eb2857860425751f7f63a032..2d2704b620adbffc1a5113f6985b51bb
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -8136,6 +8156,7 @@ mod tests {
+@@ -8653,6 +8673,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
          unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
@@ -824,7 +824,7 @@ index cc6704dfd6d29eb9eb2857860425751f7f63a032..2d2704b620adbffc1a5113f6985b51bb
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9477,6 +9498,209 @@ mod tests {
+@@ -9994,6 +10015,209 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1068,10 +1068,10 @@ index cb296456f05e0f8c4f245004a1d6192cef51d611..442fb53a2fb5d2357e9533b1000a3ef5
                  ],
              })
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 
 
-From 3d74229d4fab9db119f28b107d05a87448fee110 Mon Sep 17 00:00:00 2001
+From 67e72b5daacc75528de3bb5aa1b0fafb80dbc551 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 14:59:05 +0700
 Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
@@ -1082,7 +1082,7 @@ Subject: [PATCH 2/4] mcp: a child its parent's host reports for is said to
  1 file changed, 71 insertions(+), 17 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 4c18701772a8c278927787cc657d02c6a8920bf4..d1d5eefa88aaf9a705e28ff60e86cd1dacb041ac 100644
+index ca12a8a194e63410ca2522a25fbb1ba78652b868..f7f354edee53a3452d72aa1ba79c9389aeb8dd81 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
 @@ -1085,8 +1085,8 @@ impl Tools {
@@ -1239,10 +1239,10 @@ index 4c18701772a8c278927787cc657d02c6a8920bf4..d1d5eefa88aaf9a705e28ff60e86cd1d
      async fn wait_on_an_idle_chat_returns_immediately() {
          let world = Arc::new(World::default());
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 
 
-From ebf544d861b0b21d5247b6a2db6158d19cfe2d3d Mon Sep 17 00:00:00 2001
+From a14fb9d8f8ce6246cbe79e38c1fb7dfdf8a54e61 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 15:37:33 +0700
 Subject: [PATCH 3/4] engine: the parent's watch reports only the turn its
@@ -1256,10 +1256,10 @@ Success evidence now needs the named answer to be the last after the parent's me
  3 files changed, 319 insertions(+), 56 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e8023d241 100644
+index b4338de5a541ac47ad0249b623f3d6ffa4ba9155..024e1c702d9fc0bc72d98182809ce4578c28eb65 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -256,9 +256,10 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
+@@ -262,9 +262,10 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
  
  /// Whether a parent's ledger (`commands`) has the report `held` (filed
  /// under `key`) kept from its agent already under another mark: another
@@ -1273,7 +1273,7 @@ index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e
  fn kept_already(commands: &[SessionCommandEntry], held: &HeldReport, key: &str) -> bool {
      held.stage != "stopped"
          && !held.asked.is_empty()
-@@ -266,7 +267,8 @@ fn kept_already(commands: &[SessionCommandEntry], held: &HeldReport, key: &str)
+@@ -272,7 +273,8 @@ fn kept_already(commands: &[SessionCommandEntry], held: &HeldReport, key: &str)
              SessionCommandPayload::Run { message_id, .. } => {
                  message_id != key
                      && (message_id.ends_with(crate::sessions::REPORT_WAITED)
@@ -1283,7 +1283,7 @@ index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e
                      && crate::sessions::report_key_parts(message_id, &held.child)
                          .is_some_and(|(asked, stage)| asked == held.asked && stage == held.stage)
              }
-@@ -7411,12 +7413,12 @@ impl DocHost {
+@@ -7509,12 +7511,12 @@ impl DocHost {
          }
          let same = |h: &HeldReport| h.kind == HeldKind::Report && h.child == child && h.asked == asked && h.stage == stage;
          let mut dropped = false;
@@ -1299,7 +1299,7 @@ index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e
              if rest.is_empty() {
                  handle.doc.take_queued(&row.id)?;
                  lock(&handle.held_sends).remove(&row.id);
-@@ -7430,6 +7432,7 @@ impl DocHost {
+@@ -7528,6 +7530,7 @@ impl DocHost {
                  let theirs: Vec<usize> =
                      reports.iter().enumerate().filter(|(_, r)| r.sender.chat_id == child).map(|(i, _)| i).collect();
                  let [one] = theirs.as_slice() else {
@@ -1308,7 +1308,7 @@ index 157eeec8fa4b0fbcf1ea3c956b167db3d7fd80d8..3ec330961aff0961be3ee6066119432e
                  };
                  let kept: Vec<&str> =
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 4ad7623055ee7299cb6839ea9a2c30cbcd5eed7c..46c4a4fc888e05f5fa76e294b0c9d35b569b55d8 100644
+index 3b75dd1979f0b7de9b74344ef9733e125ea5e564..4b9a6c2a90ca97e8580c92a36c9e6d0068df59b6 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -730,10 +730,85 @@ const WATCH_IDLE_MS: i64 = 5 * 60 * 1000;
@@ -1713,10 +1713,10 @@ index 4ad7623055ee7299cb6839ea9a2c30cbcd5eed7c..46c4a4fc888e05f5fa76e294b0c9d35b
          }
      };
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 2d2704b620adbffc1a5113f6985b51bb08ae66a5..effbe6c19667dfc5e01c8899b28e71c0577e1fbd 100644
+index 66d7a39ca72df6008f2c879a0ccadbc0d9c21dc5..c61be02446a7c843f89a14a05d67d87008db3739 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -8157,6 +8157,7 @@ mod tests {
+@@ -8674,6 +8674,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
          unsafe { std::env::set_var("ZERON_REPORT_GROUP_HOLD_MS", "3000") };
          unsafe { std::env::set_var("ZERON_REPORT_UNSYNCED_MS", "3000") };
@@ -1724,7 +1724,7 @@ index 2d2704b620adbffc1a5113f6985b51bb08ae66a5..effbe6c19667dfc5e01c8899b28e71c0
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9546,6 +9547,36 @@ mod tests {
+@@ -10063,6 +10064,36 @@ mod tests {
              self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
          }
  
@@ -1761,7 +1761,7 @@ index 2d2704b620adbffc1a5113f6985b51bb08ae66a5..effbe6c19667dfc5e01c8899b28e71c0
          /// `kid-r`'s registry row from the laptop: `status`, its last turn
          /// having ended `outcome` `ago` ms ago, its last finished answer
          /// `completed`.
-@@ -9701,6 +9732,78 @@ mod tests {
+@@ -10218,6 +10249,78 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1841,10 +1841,10 @@ index 2d2704b620adbffc1a5113f6985b51bb08ae66a5..effbe6c19667dfc5e01c8899b28e71c0
          /// The person stops `chat` (no agent's Stop).
          fn person_stops(&self, chat: &str) {
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 
 
-From 0e4d5263edd481b1ea8a115501f8c76bbb174fe4 Mon Sep 17 00:00:00 2001
+From e67e4939cb16aa49f931b75055a73d5556250694 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 17:51:08 +0700
 Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
@@ -1856,7 +1856,7 @@ Subject: [PATCH 4/4] engine: the parent's watch files only the turn it read,
  2 files changed, 224 insertions(+), 29 deletions(-)
 
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 46c4a4fc888e05f5fa76e294b0c9d35b569b55d8..b32ff234ea8f5e44d709ce0a7b65d6e5d0e5b053 100644
+index 4b9a6c2a90ca97e8580c92a36c9e6d0068df59b6..6939110a65663f8e51d0acf17c6eee863896acaf 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -297,22 +297,41 @@ pub(super) async fn report_turn_end(
@@ -2138,10 +2138,10 @@ index 46c4a4fc888e05f5fa76e294b0c9d35b569b55d8..b32ff234ea8f5e44d709ce0a7b65d6e5
      }
      let first = match *settled {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index effbe6c19667dfc5e01c8899b28e71c0577e1fbd..f6155626a4b1c8355d4e4464913c1ad4dffe6d79 100644
+index c61be02446a7c843f89a14a05d67d87008db3739..2d9f4fb7143e7708ec4b00888aebb03993f03ec1 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -9519,11 +9519,17 @@ mod tests {
+@@ -10036,11 +10036,17 @@ mod tests {
  
          /// The laptop's device row, its Zeron having `caps`, online.
          fn laptop(&self, caps: &[&str]) {
@@ -2160,7 +2160,7 @@ index effbe6c19667dfc5e01c8899b28e71c0577e1fbd..f6155626a4b1c8355d4e4464913c1ad4
                  created_at: None,
                  version: None,
                  cursor_sdk_version: None,
-@@ -9577,6 +9583,25 @@ mod tests {
+@@ -10094,6 +10100,25 @@ mod tests {
              self.core.doc_host.open("kid-r").unwrap().doc().push_message(&entry).unwrap();
          }
  
@@ -2186,7 +2186,7 @@ index effbe6c19667dfc5e01c8899b28e71c0577e1fbd..f6155626a4b1c8355d4e4464913c1ad4
          /// `kid-r`'s registry row from the laptop: `status`, its last turn
          /// having ended `outcome` `ago` ms ago, its last finished answer
          /// `completed`.
-@@ -9804,6 +9829,83 @@ mod tests {
+@@ -10321,6 +10346,83 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -2271,5 +2271,5 @@ index effbe6c19667dfc5e01c8899b28e71c0577e1fbd..f6155626a4b1c8355d4e4464913c1ad4
          /// The person stops `chat` (no agent's Stop).
          fn person_stops(&self, chat: &str) {
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

@@ -1,4 +1,4 @@
-From ba1a204f2dfdd9178e5463e5c89859af72419ec3 Mon Sep 17 00:00:00 2001
+From d9652cbe53c3cefe0fb2341895f1d38fbed8a364 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hoangvu12@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 05:19:11 +0700
 Subject: [PATCH] Docker Sandbox (#37)
@@ -32,7 +32,7 @@ plugin previews, and zeron-v2's .base.json brought in step.
  apps/zgx/ui/assets/icons/ui/layers.svg        |    1 +
  apps/zgx/ui/chat_fixture.luau                 |  118 +-
  apps/zgx/ui/ds/agent_menu.luau                |  220 +++
- apps/zgx/ui/ds/composer.luau                  |  308 ++-
+ apps/zgx/ui/ds/composer.luau                  |  309 ++-
  apps/zgx/ui/ds/composer_band.luau             |  289 +++
  apps/zgx/ui/ds/composer_dock.luau             |   15 +-
  apps/zgx/ui/ds/dropdown.luau                  |   18 +-
@@ -161,7 +161,7 @@ plugin previews, and zeron-v2's .base.json brought in step.
  scripts/ci/test-core.sh                       |   15 +-
  scripts/live-docker-sandbox.sh                |   19 +
  scripts/smoke-docker-sandbox.ps1              |   71 +
- 150 files changed, 26120 insertions(+), 165 deletions(-)
+ 150 files changed, 26121 insertions(+), 165 deletions(-)
  create mode 100644 apps/zgx/src/sandbox_settings.rs
  create mode 100644 apps/zgx/src/sandbox_template_save.rs
  create mode 100644 apps/zgx/src/sandboxes.rs
@@ -308,10 +308,10 @@ index 8530b9b35864d64bc396993393a41c8910cbf5a0..519406fa56587a45fc19782da79f4d97
          EngineCommand::Plugin(command) => {
              let runtime = tokio::runtime::Runtime::new()?;
 diff --git a/apps/zeron/src/lib.rs b/apps/zeron/src/lib.rs
-index 265c0d7d5e6feadd6fa2428ad92a2d5319ae77da..7557712b648cd1391d7f0fec6e5c2fe597967c4a 100644
+index f65d6147514e3eeb2717b060845373be1e9dd025..d14a4d9d57beed90379ab8ba2498a0644fdaa530 100644
 --- a/apps/zeron/src/lib.rs
 +++ b/apps/zeron/src/lib.rs
-@@ -46,6 +46,8 @@ pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
+@@ -49,6 +49,8 @@ pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
          // Real auth against production by default; see
          // `workos_client_id_from_env` for the dev-mode escape hatches.
          workos_client_id: workos_client_id_from_env(&edge_token),
@@ -321,10 +321,10 @@ index 265c0d7d5e6feadd6fa2428ad92a2d5319ae77da..7557712b648cd1391d7f0fec6e5c2fe5
      }
  }
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047bdf45134 100644
+index e7132e86a89ccd8a0b0be699fda2cb1c80584f05..e191f093c23f2ff3779a9ea2b4035d5bdc9cfccc 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
-@@ -2013,12 +2013,24 @@ impl View {
+@@ -2292,12 +2292,24 @@ impl View {
          });
          // (An engine from before it ends the watch at once: nothing waits, as before.)
          let weak = Rc::downgrade(self);
@@ -350,7 +350,7 @@ index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047
                  }
                  view.publish_session();
              }
-@@ -4686,6 +4698,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -5178,6 +5190,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
                  ("text", Value::from(words.as_str())),
                  ("attachments", crate::appshots::tag_attachments(carried_value(&paths, &quotes, &picks, &comments, &chats), &shots)),
                  ("at", stamp(created as i64).map_or(Value::Nil, |at| Value::from(at.as_str()))),
@@ -360,7 +360,7 @@ index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047
                  ("copy", copy_value(&words)),
                  ("sender", sender),
              ]))
-@@ -6010,6 +6025,8 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -6505,6 +6520,8 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          ("ask", ask),
          ("queue", Value::List(queue.into())),
          ("waiting", waiting_value(&open.waiting)),
@@ -369,7 +369,7 @@ index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047
          // A new chat on Cloud before its machine is known (`chat.creating`).
          ("cloud", Value::Bool(chat["cloud"].as_bool() == Some(true))),
          ("todos", todos(open)),
-@@ -6252,6 +6269,37 @@ fn waiting_value(items: &[Json]) -> Value {
+@@ -6747,6 +6764,37 @@ fn waiting_value(items: &[Json]) -> Value {
      )
  }
  
@@ -407,7 +407,7 @@ index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047
  /// Whether a device's agent is one its composer offers. On a Cloud session's
  /// machine, one Cloud has no account for still is: the chat already runs it, so
  /// its model must read as itself (a new chat on Cloud, picked by the logical
-@@ -7587,6 +7635,17 @@ mod tests {
+@@ -8249,6 +8297,17 @@ mod tests {
          assert!(zeron_spawned(&theirs).is_none());
      }
  
@@ -425,7 +425,7 @@ index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047
      #[test]
      fn a_prompts_attached_passages_show_as_chips_on_the_sent_message() {
          let text = "Why this one?\n\nSelected from this conversation:\n- GPT-5.5, Sep 8, 1:43 PM: Layout dominates.\n  Paint is second.\n- You: the first ask\n\nAttached images (local files — open them to view):\n- /tmp/shot.png";
-@@ -8058,6 +8117,27 @@ mod tests {
+@@ -8747,6 +8806,27 @@ mod tests {
          assert!(out[1]["failure"].as_str().unwrap().starts_with("too many files"));
      }
  
@@ -454,10 +454,10 @@ index 619f2fbcb45f6eafbccc007ee43366cd42c3be89..6ee5465840c5ca29c525e1f81d281047
      fn an_outbox_send_reads_as_its_words_or_its_files() {
          let trailer = "\n\nAttached images (local files — open them to view):\n- /tmp/up/a.png\n- /tmp/up/b.pdf";
 diff --git a/apps/zgx/src/engine/mod.rs b/apps/zgx/src/engine/mod.rs
-index d4f8e76e302884b8f72678984f6956693581bb6c..17bde54a22ec50cc5894d769205aef28f39871b8 100644
+index 7f2742591f8012dadcf47a14ae312e309ce27859..36f4b33816714a39a2455df9aafd916841e5cc05 100644
 --- a/apps/zgx/src/engine/mod.rs
 +++ b/apps/zgx/src/engine/mod.rs
-@@ -439,6 +439,44 @@ pub fn outcome(error: &str) -> &'static str {
+@@ -468,6 +468,44 @@ pub fn outcome(error: &str) -> &'static str {
      }
  }
  
@@ -503,12 +503,12 @@ index d4f8e76e302884b8f72678984f6956693581bb6c..17bde54a22ec50cc5894d769205aef28
  mod tests {
      use super::*;
 diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
-index 176519420b52994049966af9be9b5ad9e8e8db3d..012a7e0fe32affb80df750229209c255db2af9bd 100644
+index 9ee1afc3e4d55e00169830b43c7ebebe8af2b745..394cd272d45815264af6c965cffa3ff679dd8f12 100644
 --- a/apps/zgx/src/main.rs
 +++ b/apps/zgx/src/main.rs
-@@ -61,6 +61,9 @@ mod plugins;
- mod previews;
+@@ -62,6 +62,9 @@ mod previews;
  mod projects;
+ mod quit_prompt;
  mod relaunch;
 +mod sandbox_settings;
 +mod sandbox_template_save;
@@ -516,7 +516,7 @@ index 176519420b52994049966af9be9b5ad9e8e8db3d..012a7e0fe32affb80df750229209c255
  mod session_home;
  mod sessions;
  mod settings;
-@@ -821,6 +824,10 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
+@@ -850,6 +853,10 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
          // Cloud and Billing (src/cloud.rs): Settings' pages, the new chat's
          // Cloud choice.
          cloud::install(cx, &host);
@@ -527,7 +527,7 @@ index 176519420b52994049966af9be9b5ad9e8e8db3d..012a7e0fe32affb80df750229209c255
          // The sessions behind the main window (src/sessions.rs).
          sessions::install(cx, &host);
          // What there is to update, on every device (src/updates.rs).
-@@ -831,6 +838,8 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
+@@ -860,6 +867,8 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
          files::install(cx, &host);
          // The composer's `/` commands and `$` skills, from the engine.
          completion::install(&host);
@@ -536,7 +536,7 @@ index 176519420b52994049966af9be9b5ad9e8e8db3d..012a7e0fe32affb80df750229209c255
          // What a tool row opens to: its whole output or diff, fetched.
          tool_details::install(&host);
          // Appshots: the frontmost window, captured on its shortcut.
-@@ -848,6 +857,9 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
+@@ -877,6 +886,9 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
          visuals::install(cx, &host);
          // Settings' account, organization and engine calls (src/settings.rs).
          settings::install(cx, &host);
@@ -547,10 +547,10 @@ index 176519420b52994049966af9be9b5ad9e8e8db3d..012a7e0fe32affb80df750229209c255
          // (src/fonts.rs).
          fonts::install(&host);
 diff --git a/apps/zgx/src/plugins/preview.rs b/apps/zgx/src/plugins/preview.rs
-index 778d9678ca0ce524691a55580344a20e0211297d..47a0f602b31f94290af4bfdaa27323931978f942 100644
+index cab28f7a6fda4f4caf4bba72c707597751db3b29..0f75599c0194ada22706e1fb527e96fcb0ffd00a 100644
 --- a/apps/zgx/src/plugins/preview.rs
 +++ b/apps/zgx/src/plugins/preview.rs
-@@ -102,9 +102,16 @@ pub const BLOCKED: &[&str] = &[
+@@ -102,12 +102,19 @@ pub const BLOCKED: &[&str] = &[
      "billing.checkout",
      // (Each runs a machine, or says which one new chats run on: credits.)
      "cloud.wake",
@@ -560,6 +560,9 @@ index 778d9678ca0ce524691a55580344a20e0211297d..47a0f602b31f94290af4bfdaa2732393
 +    "sandboxes.fresh",
 +    "sandboxes.wake",
      "cloud.set_machine",
+     // (What a Cloud chat reaches: the person's own choice.)
+     "cloud.set_reach",
+     "cloud.set_session_reach",
 +    // (A sandbox provider's key, its host device, the user's step scripts.)
 +    "sandbox_settings.change",
 +    // (Restarts Zeron in a sandbox, and saves it at the provider.)
@@ -1222,10 +1225,10 @@ index 0000000000000000000000000000000000000000..33de3e986a1b48056a9fade3cae16ccf
 +    }
 +}
 diff --git a/apps/zgx/src/sessions.rs b/apps/zgx/src/sessions.rs
-index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e44031256f51 100644
+index 23f4aff4899926adc7252113d48e46f8c8383fa8..8cadbef13abbba044e09f66f638ee8d82e9e7296 100644
 --- a/apps/zgx/src/sessions.rs
 +++ b/apps/zgx/src/sessions.rs
-@@ -853,6 +853,8 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+@@ -855,6 +855,8 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
          async move {
              if args.field("cloud").is_some_and(Value::truthy) {
                  a.create_on_cloud(args).await
@@ -1234,7 +1237,7 @@ index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e440
              } else {
                  a.create(args).await.map_err(String::from)
              }
-@@ -987,20 +989,24 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+@@ -989,20 +991,24 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
  /// The other devices online now, as the sidebar judges it (a Cloud one's no
  /// place to look at ahead of time).
  pub(crate) fn other_devices_online() -> Vec<String> {
@@ -1272,7 +1275,7 @@ index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e440
  }
  
  #[derive(Clone, Copy)]
-@@ -1315,7 +1321,18 @@ impl Sessions {
+@@ -1317,7 +1323,18 @@ impl Sessions {
                      ("cloud", Value::Bool(is_cloud(d))),
                      ("here", Value::Bool(here.as_deref() == Some(id))),
                      ("online", Value::Bool(online)),
@@ -1291,7 +1294,7 @@ index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e440
                  // When it was last seen, while it's away (Settings → Devices
                  // and the place picker say so). Online, its beat moves every
                  // few seconds and shows nowhere; it going quiet is published
-@@ -1583,6 +1600,39 @@ impl Sessions {
+@@ -1588,6 +1605,39 @@ impl Sessions {
          Ok(Value::record([("id", Value::from(id.as_str())), ("cwd", Value::from(cwd))]))
      }
  
@@ -1331,7 +1334,7 @@ index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e440
      /// A side chat that starts as a copy of `source` (the shipping app's Fork
      /// chat: `ForkSideChat`, made on the source's device, the copy up to its
      /// last finished reply), under `parent` (the source by default): the new
-@@ -1665,6 +1715,47 @@ impl Sessions {
+@@ -1670,6 +1720,47 @@ impl Sessions {
      }
  }
  
@@ -1379,7 +1382,7 @@ index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e440
  /// A device row of Cloud's: the logical Cloud device or a session's machine
  /// (`zeron_proto::is_cloud_device` and the Cloud capabilities).
  pub(crate) fn is_cloud(d: &Json) -> bool {
-@@ -1677,6 +1768,13 @@ pub(crate) fn is_cloud(d: &Json) -> bool {
+@@ -1682,6 +1773,13 @@ pub(crate) fn is_cloud(d: &Json) -> bool {
              .is_some_and(|c| c.iter().any(|c| matches!(c.as_str(), Some("cloud-session" | "cloud-account"))))
  }
  
@@ -1393,7 +1396,7 @@ index 8ddf85be853a718d5270582b63dd99a3eb893087..f0ed80e771a5c3d30bca0dd84841e440
  /// Why the engine didn't remove a device, as a word for the page.
  fn removal_refused(error: &str) -> Outcome {
      if error.contains("this_device") {
-@@ -2694,8 +2792,97 @@ mod tests {
+@@ -2699,8 +2797,97 @@ mod tests {
          }
      }
  
@@ -1867,7 +1870,7 @@ index 0000000000000000000000000000000000000000..4cfc1440c26129fa85f99f2effcde557
 @@ -0,0 +1 @@
 +<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4.979 9.685C2.993 8.891 2 8.494 2 8s.993-.89 2.979-1.685l2.808-1.123C9.773 4.397 10.767 4 12 4s2.227.397 4.213 1.192l2.808 1.123C21.007 7.109 22 7.506 22 8s-.993.89-2.979 1.685l-2.808 1.124C14.227 11.603 13.233 12 12 12s-2.227-.397-4.213-1.191z"/><path stroke-linecap="round" d="m5.766 10l-.787.315C2.993 11.109 2 11.507 2 12s.993.89 2.979 1.685l2.808 1.124C9.773 15.603 10.767 16 12 16s2.227-.397 4.213-1.191l2.808-1.124C21.007 12.891 22 12.493 22 12s-.993-.89-2.979-1.685L18.234 10"/><path stroke-linecap="round" d="m5.766 14l-.787.315C2.993 15.109 2 15.507 2 16s.993.89 2.979 1.685l2.808 1.124C9.773 19.603 10.767 20 12 20s2.227-.397 4.213-1.192l2.808-1.123C21.007 16.891 22 16.494 22 16s-.993-.89-2.979-1.685L18.234 14"/></g></svg>
 diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
-index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc203735f9 100644
+index 7476a5904f87d343f1b2f7479af3fdbfb0477142..7dfbf1cc994a7e60dd60605ba6db6f703a94c154 100644
 --- a/apps/zgx/ui/chat_fixture.luau
 +++ b/apps/zgx/ui/chat_fixture.luau
 @@ -15,6 +15,8 @@ local sessions = require("@account/sessions")
@@ -1879,10 +1882,10 @@ index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc
  
  local EFFORT = {
  	{ value = "low", label = "Low" },
-@@ -330,8 +332,34 @@ ui.command {
- 		SEND_FAILS:set(true)
- 	end,
- }
+@@ -348,8 +350,34 @@ end
+ stub.warm_taken = function(id: string)
+ 	note(`warm_taken:{id}`)
+ end
 +-- The open session's last send refused by its sandbox (#46): the agent
 +-- picked, Codex, isn't on its template. The host's `refused`, the chat as
 +-- it ran with Codex.
@@ -1914,7 +1917,7 @@ index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc
  	-- A send carries no time of its own: the host starts its clock when it
  	-- gets it (a message held back goes with its week starting then).
  	if req.at or req.issued_at or req.sent_at or req.expires_at then
-@@ -1318,7 +1346,7 @@ end }
+@@ -1336,7 +1364,7 @@ end }
  local function seed()
  	local chats: { any } = {}
  	for id, m in META do
@@ -1923,7 +1926,7 @@ index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc
  	end
  	table.sort(chats, function(a, b)
  		return (a.id :: string) < (b.id :: string)
-@@ -1332,6 +1360,9 @@ local function seed()
+@@ -1350,6 +1378,9 @@ local function seed()
  			-- (Its beat a day ahead: up however long the fixture runs.)
  			{ id = "box", name = "Build box", platform = "linux", here = false, online = true, seen = ui.now() / 1000 + 86400 },
  			{ id = "old", name = "Old laptop", platform = "macos", here = false, online = false, seen = ui.now() / 1000 - 3 * 3600 },
@@ -1933,7 +1936,7 @@ index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc
  		},
  		projects = {
  			{ id = "atlas", name = "Atlas", device = "mac", path = "/tmp/atlas", git = true, github = "acme/atlas" },
-@@ -1440,14 +1471,21 @@ sessions_stub.create = function(req: any)
+@@ -1469,14 +1500,21 @@ sessions_stub.create = function(req: any)
  	made_chats += 1
  	local id = req.id or `new{made_chats}`
  	note(`create:{req.project or "none"}:{req.config and req.config.model or ""}`)
@@ -1956,7 +1959,7 @@ index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc
  	-- On Cloud: made on a machine of its own, its checkout of the repository.
  	if req.cloud then
  		if CLOUD_CREATE_FAILS:peek() then
-@@ -1466,6 +1504,60 @@ sessions_stub.create = function(req: any)
+@@ -1495,6 +1533,60 @@ sessions_stub.create = function(req: any)
  	end
  	return settled(id)
  end
@@ -2017,7 +2020,7 @@ index 68ccaa91ba75d32c4a7eed858efaed612f17be83..b192b3300f00d2508348a1e2edd902dc
  sessions_stub.archive = function(id: string)
  	note(`archive:{id}`)
  end
-@@ -2509,6 +2601,28 @@ ui.command {
+@@ -2589,6 +2681,28 @@ ui.command {
  		store.catalog:set({ state = "ready", complete = true, harnesses = c.harnesses, models = models } :: any)
  	end,
  }
@@ -2273,7 +2276,7 @@ index 0000000000000000000000000000000000000000..18a0a77b9e321ca05bf6504d7b8e9256
 +
 +return AgentMenu
 diff --git a/apps/zgx/ui/ds/composer.luau b/apps/zgx/ui/ds/composer.luau
-index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d8884cbf0ab 100644
+index 2e2bbcb87780d07dad92dd580fb33a5700b70b3c..b3b4abc7061953f1bb290881e5d28042a1e67e85 100644
 --- a/apps/zgx/ui/ds/composer.luau
 +++ b/apps/zgx/ui/ds/composer.luau
 @@ -25,7 +25,9 @@
@@ -2303,7 +2306,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  local ask = require("@self/composer_ask")
  local mentions = require("@self/composer_mentions")
  local locale = require("@self/locale")
-@@ -70,13 +74,16 @@ type ViewGeometry = {
+@@ -71,13 +75,16 @@ type ViewGeometry = {
  -- it and the window's size (either may be missing).
  export type Usage = context_usage.Usage
  
@@ -2322,24 +2325,27 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	you: boolean?,
  	offline: boolean?,
  	description: string?,
-@@ -96,10 +103,14 @@ export type Notice = {
+@@ -97,6 +104,8 @@ export type Notice = {
  	-- Worth knowing, not worth raising: read with the deck's alerts once
  	-- they're open, never putting up the pill on its own.
  	quiet: boolean?,
 +	-- Its glyph in place of its tone's (ds/composer_dock's Alert `icon`).
 +	icon: string?,
  }
--export type Answer = { values: { string }, text: string }
-+export type Answer ={ values: { string }, text: string }
- -- Where an existing chat works (`branch_fixed`).
--export type Fixed = { device: string?, name: string?, worktree: boolean, project: string?, hue: string?, src: string?, emoji: string? }
-+-- (`icon`: where it runs, as a glyph: a place's provider's; `template`: the
-+-- one its sandbox started from.)
-+export type Fixed = { device: string?, name: string?, worktree: boolean, project: string?, hue: string?, src: string?, emoji: string?, icon: Icon.Name?, template: string? }
+ export type Answer = { values: { string }, text: string }
+ -- Where an existing chat works (`branch_fixed`). On Cloud (`cloud`): a
+@@ -112,6 +121,10 @@ export type Fixed = {
+ 	emoji: string?,
+ 	cloud: boolean?,
+ 	reach: string?,
++	-- Where it runs, as a glyph (a place's provider's), and the template
++	-- its sandbox started from.
++	icon: Icon.Name?,
++	template: string?,
+ }
  export type Sizes = { rest: number, target: number, presented: number, active: boolean, ready: boolean, settling: boolean, context: number }
  export type Props = {
- 	on_sizes: ((sizes: Sizes) -> ())?,
-@@ -131,6 +142,12 @@ export type Props = {
+@@ -144,6 +157,12 @@ export type Props = {
  	-- auto-review): the picker offers Auto.
  	access_auto: (() -> boolean)?,
  	plan: State<boolean>?,
@@ -2352,7 +2358,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	-- The model (a ModelPicker: its agents' tabs, its models, its reasoning,
  	-- Fast mode and its other options' picks).
  	model: State<string?>,
-@@ -171,6 +188,11 @@ export type Props = {
+@@ -184,6 +203,11 @@ export type Props = {
  	-- choosing the device and the checkout.
  	device: State<string?>?,
  	devices: ({ Device } | State<{ Device }> | () -> { Device })?,
@@ -2364,7 +2370,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	checkout: State<string?>?,
  	branch: State<string?>?,
  	branches: ({ Dropdown.Item } | State<{ Dropdown.Item }> | () -> { Dropdown.Item })?,
-@@ -263,6 +285,11 @@ export type Props = {
+@@ -283,6 +307,11 @@ export type Props = {
  	notice: State<Notice?>?,
  	on_notice_action: (() -> ())?,
  	on_dismiss_notice: (() -> ())?,
@@ -2376,7 +2382,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	-- Dictating: the track over the controls; the mic starts and stops it,
  	-- Escape or the × cancels.
  	dictating: State<boolean>?,
-@@ -394,6 +421,16 @@ local function ACCESS(auto: boolean, chosen: string?): { Dropdown.Item }
+@@ -414,6 +443,16 @@ local function ACCESS(auto: boolean, chosen: string?): { Dropdown.Item }
  	return items
  end
  
@@ -2393,14 +2399,12 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  -- Plan mode's row at the access panel's foot: an item's shape, its icon on
  -- its title's line, its switch (centred) where the check would be. The row
  -- (or the switch) flips it.
-@@ -485,7 +522,14 @@ local function submenu(
- 	search: string?,
- 	actions: { Dropdown.Action }?,
+@@ -580,7 +619,12 @@ local function submenu(
  	-- Choices named by the row but not listed (one an action picks).
--	unlisted: ({ Choice } | () -> { Choice })?
-+	unlisted: ({ Choice } | () -> { Choice })?,
-+	-- Told of each pick (the one already chosen too).
-+	on_choose: ((value: string) -> ())?,
+ 	unlisted: ({ Choice } | () -> { Choice })?,
+ 	-- Told of a pick, after `value` takes it.
+-	on_choose: ((v: string) -> ())?
++	on_choose: ((v: string) -> ())?,
 +	-- Handed its open state, as its row is made (to open it from elsewhere).
 +	on_menu: ((open: State<boolean>) -> ())?,
 +	-- Its panel's own: rows over its list (`head`), a title over the list,
@@ -2409,14 +2413,14 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  ): Node
  	local function current(): Choice
  		local v = value:get()
-@@ -508,8 +552,18 @@ local function submenu(
+@@ -604,9 +648,18 @@ local function submenu(
  			end
  		end
  	end
 +	local o = opts or {}
  	return Dropdown {
  		on_open = close_siblings,
-+		on_choose = on_choose,
+ 		on_choose = on_choose,
 +		head = o.head,
 +		list_heading = o.list_heading :: any,
 +		check = o.check,
@@ -2428,7 +2432,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  		value = value,
  		items = choices,
  		actions = actions,
-@@ -524,6 +578,9 @@ local function submenu(
+@@ -621,6 +674,9 @@ local function submenu(
  		trigger = function(menu: Dropdown.Menu): Node
  			own = menu.open
  			table.insert(siblings, menu.open)
@@ -2438,7 +2442,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  			return ui.menu_item(Menu.look {
  				label = label,
  				bg = function()
-@@ -634,6 +691,21 @@ local function on_cloud(device: State<string?>?, devices: any): boolean
+@@ -701,6 +757,21 @@ local function on_cloud(device: State<string?>?, devices: any): boolean
  	return false
  end
  
@@ -2458,14 +2462,14 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
 +end
 +
  -- The head of where-it-works's panel: "Work in", then the device it runs
- -- on, the project there and the checkout, each a row opening its choices
- -- beside the panel (the project's with "New project" under them).
-@@ -643,9 +715,26 @@ local function work_in(
- 	on_new_project: (() -> ())?,
- 	checkout: State<string?>?,
+ -- on, the project there and the checkout (on Cloud, what its machine
+ -- reaches instead), each a row opening its choices beside the panel (the
+@@ -713,9 +784,26 @@ local function work_in(
  	device: State<string?>?,
--	devices: ({ Device } | State<{ Device }> | () -> { Device })?
-+	devices: ({ Device } | State<{ Device }> | () -> { Device })?,
+ 	devices: ({ Device } | State<{ Device }> | () -> { Device })?,
+ 	reach: State<string?>?,
+-	reach_default: (() -> string?)?
++	reach_default: (() -> string?)?,
 +	template: State<string?>?,
 +	templates: any
  ): Node
@@ -2488,7 +2492,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	local rows: { Node } = {
  		Menu.Heading { locale.t("ds.composer.work_in") },
  	}
-@@ -654,7 +743,7 @@ local function work_in(
+@@ -724,7 +812,7 @@ local function work_in(
  		local function choices(): { Choice }
  			local out: { Choice } = {}
  			for _, d in list_of(devices) :: { Device } do
@@ -2497,7 +2501,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  				table.insert(out, {
  					value = d.value,
  					label = d.label,
-@@ -663,7 +752,9 @@ local function work_in(
+@@ -733,7 +821,9 @@ local function work_in(
  					warn = d.offline,
  					description = d.description,
  					disabled = d.disabled,
@@ -2508,7 +2512,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  			end
  			return out
  		end
-@@ -671,7 +762,69 @@ local function work_in(
+@@ -741,7 +831,69 @@ local function work_in(
  			rows,
  			ui.show(function(): boolean
  				return #choices() > 0
@@ -2579,7 +2583,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  		)
  	end
  	if project and projects then
-@@ -735,7 +888,7 @@ local function work_in(
+@@ -805,7 +957,7 @@ local function work_in(
  		table.insert(
  			rows,
  			ui.show(function(): boolean
@@ -2588,7 +2592,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  			end, submenu(siblings, locale.t("ds.composer.checkout.label"), checkout, CHECKOUTS, 2))
  		)
  	end
-@@ -786,6 +939,9 @@ end
+@@ -915,6 +1067,9 @@ end
  type Place = {
  	-- The device it runs on, by name (nil: none to say).
  	device: (() -> string?)?,
@@ -2598,7 +2602,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	-- The project (nil: none named), and whether it works in one at all.
  	project: () -> Project?,
  	in_project: () -> boolean,
-@@ -812,13 +968,19 @@ local function place_line(p: Place): { Child }
+@@ -941,13 +1096,19 @@ local function place_line(p: Place): { Child }
  	end
  	-- The name's and the branch's own widths, measured unseen: each keeps
  	-- its least of itself, or all of a shorter one (never padded out).
@@ -2619,7 +2623,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	local function branch_min(): number
  		return math.min(BRANCH_FLOOR, math.ceil(branch_natural.width or BRANCH_FLOOR))
  	end
-@@ -830,7 +992,9 @@ local function place_line(p: Place): { Child }
+@@ -959,7 +1120,9 @@ local function place_line(p: Place): { Child }
  				on_measures(
  					if has_project() or not p.in_project() then name_w else 0,
  					if p.in_project() then branch_w else 0,
@@ -2630,7 +2634,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  				)
  			end
  		end)
-@@ -871,6 +1035,16 @@ local function place_line(p: Place): { Child }
+@@ -1000,6 +1163,16 @@ local function place_line(p: Place): { Child }
  			pointer_events = "none",
  			aria_hidden = true,
  		},
@@ -2647,7 +2651,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  		ui.presence(lead, function(kind: string): Node
  			-- (Its kind named, for tests: "place-lead-worktree".)
  			return ui.div { class = `place-lead-{kind}`, Icon { name = kind :: Icon.Name, size = 12 } }
-@@ -900,6 +1074,31 @@ local function place_line(p: Place): { Child }
+@@ -1029,6 +1202,31 @@ local function place_line(p: Place): { Child }
  				Icon { name = "alt-arrow-right-bold", size = 10 },
  			},
  		}),
@@ -2679,7 +2683,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  		ui.show(function(): boolean
  			return unfolded() and (has_project() or not p.in_project())
  		end, FadeText {
-@@ -1405,7 +1604,7 @@ return ui.component(function(props: Props): Node
+@@ -1536,7 +1734,7 @@ return ui.component(function(props: Props): Node
  	end)
  
  	local model = ui.presence(side, function(at: string): Node
@@ -2688,7 +2692,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  			model = props.model,
  			effort = props.effort,
  			fast = props.fast,
-@@ -1426,6 +1625,24 @@ return ui.component(function(props: Props): Node
+@@ -1557,6 +1755,24 @@ return ui.component(function(props: Props): Node
  				return model_fold(fold:get())
  			end,
  		}
@@ -2713,7 +2717,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	end)
  
  	-- The access mode: its icon and name; with plan mode on, "Plan" after it
-@@ -1459,6 +1676,21 @@ return ui.component(function(props: Props): Node
+@@ -1590,6 +1806,21 @@ return ui.component(function(props: Props): Node
  			extra = if plan then plan_row(plan) else nil,
  			placement = { side = "bottom", align = "start", offset = 6 },
  		}
@@ -2735,16 +2739,18 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  	end
  	local mic = ui.show(dictating, Button {
  		tone = "accent",
-@@ -2072,7 +2304,7 @@ return ui.component(function(props: Props): Node
- 			-- Built for each chip it heads (a node lives in one place).
- 			local function head_node(): Node?
- 				return if checkout or props.device or props.project
--					then work_in(props.project, props.projects :: any, props.on_new_project, checkout, props.device, props.devices :: any)
-+					then work_in(props.project, props.projects :: any, props.on_new_project, checkout, props.device, props.devices :: any, props.template, props.templates)
+@@ -2211,7 +2442,9 @@ return ui.component(function(props: Props): Node
+ 						props.device,
+ 						props.devices :: any,
+ 						props.reach,
+-						props.reach_default
++						props.reach_default,
++						props.template,
++						props.templates
+ 					)
  					else nil
  			end
- 			-- In a project, its refs: the branch chip, its search and its
-@@ -2115,6 +2347,15 @@ return ui.component(function(props: Props): Node
+@@ -2255,6 +2488,15 @@ return ui.component(function(props: Props): Node
  				if on_cloud(props.device, props.devices) then
  					return "cloud"
  				end
@@ -2760,9 +2766,9 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  				local chosen = chosen_project()
  				if chosen and chosen.plain then
  					return nil
-@@ -2137,6 +2378,19 @@ return ui.component(function(props: Props): Node
- 				end
- 				return nil
+@@ -2300,6 +2542,19 @@ return ui.component(function(props: Props): Node
+ 					table.unpack(place_line(place)),
+ 				}
  			end
 +			-- On a place, the template picked, by name.
 +			local function chosen_template(): string?
@@ -2780,36 +2786,42 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  			local picker = Dropdown {
  				value = props.branch,
  				label = locale.t("ds.composer.branch.label") :: any,
-@@ -2169,6 +2423,7 @@ return ui.component(function(props: Props): Node
- 						on_click = menu.toggle,
- 						table.unpack(place_line {
- 							device = chosen_device,
-+							template = chosen_template,
- 							project = chosen_project,
- 							in_project = in_project,
- 							branch = branch_name,
-@@ -2200,6 +2455,10 @@ return ui.component(function(props: Props): Node
- 							local f = fixed()
- 							return if f then f.device else nil
- 						end,
-+						template = function(): string?
-+							local f = fixed()
-+							return if f then f.template else nil
-+						end,
- 						project = function(): Project?
- 							local f = fixed()
- 							if f and f.project then
-@@ -2216,6 +2475,9 @@ return ui.component(function(props: Props): Node
- 						end,
- 						glyph = function(): Icon.Name?
- 							local f = fixed()
-+							if f and f.icon then
-+								return f.icon
-+							end
- 							return if f and f.worktree then "worktree" else nil
- 						end,
- 						folded = folded,
-@@ -2323,6 +2585,7 @@ return ui.component(function(props: Props): Node
+@@ -2313,6 +2568,7 @@ return ui.component(function(props: Props): Node
+ 				trigger = function(menu: Dropdown.Menu): Node
+ 					return chip(menu, locale.t("ds.composer.branch.label"), {
+ 						device = chosen_device,
++						template = chosen_template,
+ 						project = chosen_project,
+ 						in_project = in_project,
+ 						branch = branch_name,
+@@ -2346,6 +2602,10 @@ return ui.component(function(props: Props): Node
+ 								local f = fixed()
+ 								return if f then f.device else nil
+ 							end,
++							template = function(): string?
++								local f = fixed()
++								return if f then f.template else nil
++							end,
+ 							project = function(): Project?
+ 								local f = fixed()
+ 								if f and f.project then
+@@ -2360,10 +2620,13 @@ return ui.component(function(props: Props): Node
+ 								local f = fixed()
+ 								return if f and f.name then f.name else locale.s("ds.composer.branch.no_ref")
+ 							end,
+-							-- Where it runs off the branch: Cloud's machine, a
+-							-- worktree, or the project's own folder.
++							-- Where it runs off the branch: a place's provider, Cloud's
++							-- machine, a worktree, or the project's own folder.
+ 							glyph = function(): Icon.Name?
+ 								local f = fixed()
++								if f and f.icon then
++									return f.icon
++								end
+ 								if f and f.cloud then
+ 									return "cloud"
+ 								end
+@@ -2475,6 +2738,7 @@ return ui.component(function(props: Props): Node
  					spinner = n.spinner,
  					dismissable = n.dismissable == true,
  					quiet = n.quiet == true,
@@ -2817,7 +2829,7 @@ index c6a6fb2c124142aa7e952594f1d7eb7f2aa4c78b..0ffc6d40bdd2182739f5944858057d88
  				})
  			end
  			if props.alerts then
-@@ -2459,7 +2722,20 @@ return ui.component(function(props: Props): Node
+@@ -2611,7 +2875,20 @@ return ui.component(function(props: Props): Node
  					return if material.see_through() then "$zeron.composer.rest" else "$zeron.composer.shadow"
  				end,
  			},
@@ -3279,10 +3291,10 @@ index 2ebc91f732d475c8ac45b23f29c23ab9771c57ee..9bee2374da3eb5b389451a97594f40d2
  	["lightbulb-minimalistic"] = [==[<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"><path d="M10 19.5H14M10.6667 22H13.3333"/><path d="M7.41058 13.6805L8.51463 14.7196C8.82437 15.0112 9 15.4177 9 15.843C9 16.482 9.518 17 10.157 17H13.843C14.482 17 15 16.482 15 15.843C15 15.4177 15.1756 15.0112 15.4854 14.7196L16.5894 13.6805C18.1306 12.2187 18.9912 10.2984 18.9999 8.30193L19 8.21807C19 4.8069 15.866 2 12 2C8.13401 2 5 4.8069 5 8.21807L5.00007 8.30193C5.00875 10.2984 5.86939 12.2187 7.41058 13.6805Z"/></g></svg>]==],
  	["list"] = [==[<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="M20 7H4m11 5H4m5 5H4"/></svg>]==],
 diff --git a/apps/zgx/ui/ds/locale_en.luau b/apps/zgx/ui/ds/locale_en.luau
-index 936047ee3e82f5fc4831d2b61357222f73e600b2..3c7c47cc8a2b6267ad9aa0df4d00ec839e3cb711 100644
+index ee7b94968233780874e102ced035970d4f67f4fb..fd4efa27cc9ae15961df0844ffd78160f6b30af6 100644
 --- a/apps/zgx/ui/ds/locale_en.luau
 +++ b/apps/zgx/ui/ds/locale_en.luau
-@@ -518,6 +518,12 @@ return {
+@@ -523,6 +523,12 @@ return {
  	["ds.composer.context.capacity"] = "{n} token capacity",
  	["ds.composer.context.waiting"] = "Waiting for context usage",
  	["ds.composer.context.unreported"] = "Context usage not reported by this agent yet",
@@ -3504,7 +3516,7 @@ index eb7a4e77c77ae2bedd18e245915f4d6533aae262..8782174bbc5892f9d4f042c489f87198
  		},
  	}
 diff --git a/apps/zgx/ui/ds/sidebar.luau b/apps/zgx/ui/ds/sidebar.luau
-index 437918e9dc254372ed15da26721f1daa0d667936..b7b4f0e7e66d08b68b3c5d3f24acf0908d13128c 100644
+index 0af48c008486ca90a871c2b17b14a868e849627c..06f374d4bda81f1eb77287fbbd45289fe495bc94 100644
 --- a/apps/zgx/ui/ds/sidebar.luau
 +++ b/apps/zgx/ui/ds/sidebar.luau
 @@ -77,6 +77,8 @@ export type Session = {
@@ -3563,7 +3575,7 @@ index ea75f7db50a4e969b405e8020ce3df54d1abdd1a..4c067022ea60fadb0b11bf7a02955e56
  			return node
  		end
 diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
-index f172ee16bd06abebaf8d49f5a0a3c6feab769dcf..ded3b8fa7aa4bc23288f15389563b202e934e260 100644
+index ab60001aef2264e224058bae7f5af93fac06e3b2..9bc688812a6e37575c6ed09c4b9f8389216c8d51 100644
 --- a/apps/zgx/ui/ds/transcript.luau
 +++ b/apps/zgx/ui/ds/transcript.luau
 @@ -67,9 +67,11 @@ export type Tool = Activity.Tool
@@ -3591,7 +3603,7 @@ index f172ee16bd06abebaf8d49f5a0a3c6feab769dcf..ded3b8fa7aa4bc23288f15389563b202
  	-- A reply's model, for naming who said a selection.
  	model: string?,
  	tools: { Tool }?,
-@@ -112,6 +117,11 @@ export type Message = {
+@@ -115,6 +120,11 @@ export type Message = {
  	-- reply; several, when they landed together. (Zeron's notes under them
  	-- are its agent's, never shown.)
  	reports: { Report }?,
@@ -3603,7 +3615,7 @@ index f172ee16bd06abebaf8d49f5a0a3c6feab769dcf..ded3b8fa7aa4bc23288f15389563b202
  }
  export type Report = { chat: string, title: string, status: string, body: string }
  -- A chat as it's listed now: its title and agent's mark, and for a child of
-@@ -386,6 +396,31 @@ local function switch_side(name: string?, mark: Mark.Name?): Node
+@@ -437,6 +447,31 @@ local function switch_side(name: string?, mark: Mark.Name?): Node
  	}
  end
  
@@ -3635,7 +3647,7 @@ index f172ee16bd06abebaf8d49f5a0a3c6feab769dcf..ded3b8fa7aa4bc23288f15389563b202
  local function seam(m: Message): Node
  	return ui.row {
  		role = "group",
-@@ -2261,7 +2296,7 @@ local function Transcript(props: Props): Node
+@@ -2712,7 +2747,7 @@ local function Transcript(props: Props): Node
  				max_w = measure,
  				min_w = 0,
  				-- Anywhere on a message shows its lane (Zeron's entry hover).
@@ -3644,7 +3656,7 @@ index f172ee16bd06abebaf8d49f5a0a3c6feab769dcf..ded3b8fa7aa4bc23288f15389563b202
  					then nil
  					else function(inside: boolean)
  						if inside then
-@@ -2272,6 +2307,7 @@ local function Transcript(props: Props): Node
+@@ -2723,6 +2758,7 @@ local function Transcript(props: Props): Node
  					end,
  				if m.role == "switch" then seam(m)
  					elseif m.role == "report" then report(m, state, props)
@@ -3653,10 +3665,10 @@ index f172ee16bd06abebaf8d49f5a0a3c6feab769dcf..ded3b8fa7aa4bc23288f15389563b202
  						hook = "chat.message.prompt",
  						-- What it is, for a plugin's selector (and the
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b4a423af0 100644
+index 0c434144cfba4b8b6d82f16886b6edd45d60a6e1..e6f19c9c1f81c1c9c484dfbaacebbaf3bda2b32f 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
-@@ -663,6 +663,18 @@
+@@ -670,6 +670,18 @@
          "capacity": "{n} token capacity",
          "waiting": "Waiting for context usage",
          "unreported": "Context usage not reported by this agent yet"
@@ -3675,7 +3687,7 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
        }
      },
      "markdown": {
-@@ -2381,6 +2393,78 @@
+@@ -2400,6 +2412,78 @@
          "description": "Parakeet v3 · {total} MB",
          "remove": "Remove"
        }
@@ -3754,7 +3766,7 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
      }
    },
    "common": {
-@@ -2458,7 +2542,8 @@
+@@ -2477,7 +2561,8 @@
          "delete": "Delete…",
          "rename": "Rename…",
          "remove": "Remove…",
@@ -3764,7 +3776,7 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
        },
        "project": {
          "rename_title": "Rename project",
-@@ -2533,6 +2618,14 @@
+@@ -2552,6 +2637,14 @@
          "rename_title": "Rename session",
          "name": "Name",
          "name_placeholder": "Session name"
@@ -3779,7 +3791,7 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
        }
      },
      "boundary": {
-@@ -2992,6 +3085,9 @@
+@@ -3011,6 +3104,9 @@
        "blocked": {
          "project_gone": "That project is no longer there. Pick another, or none.",
          "cloud_needs_project": "Cloud chats work in a project. Pick one Cloud can open."
@@ -3789,7 +3801,7 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
        }
      },
      "composer": {
-@@ -3105,6 +3201,23 @@
+@@ -3124,6 +3220,23 @@
        "outbox_uploading": "Uploading…",
        "outbox_failed": "Didn't send"
      },
@@ -3813,7 +3825,7 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
      "turn_state": {
        "interrupted": "Interrupted",
        "waking": "Waking its Cloud machine…",
-@@ -3125,9 +3238,52 @@
+@@ -3144,9 +3257,52 @@
        "setup_summary": "Set up the Cloud machine",
        "woke_summary": "Woke the Cloud machine",
        "unreachable": "Interrupted — can't reach {host}"
@@ -3867,10 +3879,10 @@ index 89420ff4a5d410d7b7f532c45d5e085861293d39..78088dc038c575599aadda9db8406c1b
        "plugin": "Plugin",
        "browser": "Browser",
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b72e58361 100644
+index 50d2546283dd63f97c6efd86079d89fa07e298d9..4bae5afc6cf2dd7c96f1bfe0c66b2e06aaadfbb2 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
-@@ -663,6 +663,18 @@
+@@ -670,6 +670,18 @@
          "capacity": "容量 {n} tokens",
          "waiting": "正在等待上下文用量",
          "unreported": "此智能体尚未报告上下文用量"
@@ -3889,7 +3901,7 @@ index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b
        }
      },
      "markdown": {
-@@ -2384,6 +2396,78 @@
+@@ -2403,6 +2415,78 @@
          "description": "Parakeet v3 · {total} MB",
          "remove": "移除"
        }
@@ -3968,7 +3980,7 @@ index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b
      }
    },
    "common": {
-@@ -2461,7 +2545,8 @@
+@@ -2480,7 +2564,8 @@
          "delete": "删除…",
          "rename": "重命名…",
          "remove": "移除…",
@@ -3978,7 +3990,7 @@ index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b
        },
        "project": {
          "rename_title": "重命名项目",
-@@ -2536,6 +2621,14 @@
+@@ -2555,6 +2640,14 @@
          "rename_title": "重命名会话",
          "name": "名称",
          "name_placeholder": "会话名称"
@@ -3993,7 +4005,7 @@ index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b
        }
      },
      "boundary": {
-@@ -2995,6 +3088,9 @@
+@@ -3014,6 +3107,9 @@
        "blocked": {
          "project_gone": "该项目已不存在。请选择其他项目或不选择项目。",
          "cloud_needs_project": "Cloud 对话需要在项目中运行。请选择 Cloud 可以打开的项目。"
@@ -4003,7 +4015,7 @@ index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b
        }
      },
      "composer": {
-@@ -3108,6 +3204,23 @@
+@@ -3127,6 +3223,23 @@
        "outbox_uploading": "正在上传…",
        "outbox_failed": "未发送"
      },
@@ -4027,7 +4039,7 @@ index bed617e098d3ae7d757d19db3d3af59efef535e8..0410e6a19c99e719ad77992b941e198b
      "turn_state": {
        "interrupted": "已中断",
        "waking": "正在唤醒 Cloud 机器…",
-@@ -3128,9 +3241,52 @@
+@@ -3147,9 +3260,52 @@
        "setup_summary": "已设置 Cloud 机器",
        "woke_summary": "已唤醒 Cloud 机器",
        "unreachable": "已中断——无法连接到{host}"
@@ -4421,11 +4433,11 @@ index 0000000000000000000000000000000000000000..cac401165cf0bb5d13ab873774f2e5ee
 +
 +return {}
 diff --git a/apps/zgx/ui/screens/chat/composer.luau b/apps/zgx/ui/screens/chat/composer.luau
-index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b37243628 100644
+index 4e4af4688974bc91144e08445154a3ddd55ff22c..a8861e4028a88c5bdf982b391860b96a2043f741 100644
 --- a/apps/zgx/ui/screens/chat/composer.luau
 +++ b/apps/zgx/ui/screens/chat/composer.luau
-@@ -30,9 +30,13 @@ local shared = require("@app/screens/chat/shared")
- local sessions = require("@account/sessions")
+@@ -32,10 +32,14 @@ local sessions = require("@account/sessions")
+ local cloud = require("@account/cloud")
  local LinkNotice = require("@app/screens/chat/link_notice")
  local CloudTray = require("@app/screens/chat/cloud_tray")
 +local SandboxTray = require("@app/screens/chat/sandbox_tray")
@@ -4433,21 +4445,22 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  local Held = require("@app/screens/chat/held")
  local CloudMachine = require("@app/screens/chat/cloud_machine")
  local Where = require("@app/screens/chat/where")
+ local Warm = require("@app/screens/chat/warm")
 +local sandboxes = require("@account/sandboxes")
 +local SandboxLine = require("@app/screens/chat/sandbox_line")
  local DropOverlay = require("@ds/drop_overlay")
  local Asks = require("@app/screens/chat/asks")
  local Invocations = require("@app/screens/chat/invocations")
-@@ -189,6 +193,8 @@ local function Composer(): Node
- 	local checkout = ui.state("chat_checkout", "worktree" :: string?)
- 	local branch = ui.state("chat_branch", nil :: string?)
- 	local project = ui.state("chat_project", nil :: string?)
+@@ -195,6 +199,8 @@ local function Composer(): Node
+ 	-- On Cloud, what a new chat's machine reaches (nil: the account's
+ 	-- default, Settings → Cloud). Each new chat starts from the default.
+ 	local reach = ui.state("chat_reach", nil :: string?)
 +	-- On a place: the template picked ("" for Blank).
 +	local template = ui.state("chat_template", "" :: string?)
  	local locals: { [string]: State<any> } =
  		{ model = model, effort = effort, fast = fast, options = options, access = access, plan = plan }
  
-@@ -424,6 +430,12 @@ local function Composer(): Node
+@@ -430,6 +436,12 @@ local function Composer(): Node
  			local p = route.project:get()
  			d = if p then p.device else nil
  		end
@@ -4460,7 +4473,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  		return d
  	end
  	-- Whether the catalog shown is `d`'s (one of this device's says none).
-@@ -452,6 +464,11 @@ local function Composer(): Node
+@@ -458,6 +470,11 @@ local function Composer(): Node
  			return
  		end
  		local d = run_device()
@@ -4472,7 +4485,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  		if d == Where.CLOUD then
  			if (cat :: any).device ~= Where.CLOUD then
  				return
-@@ -473,6 +490,22 @@ local function Composer(): Node
+@@ -479,6 +496,22 @@ local function Composer(): Node
  			end
  		end
  	end)
@@ -4495,11 +4508,17 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  	-- Where a new chat works (screens/chat/where): the devices, the chosen
  	-- one's projects, its refs, kept in step and remembered; how it's sent.
  	local where = Where.bind {
-@@ -481,7 +514,70 @@ local function Composer(): Node
+@@ -487,6 +520,7 @@ local function Composer(): Node
  		checkout = checkout,
  		branch = branch,
  		active = new_chat,
 +		template = template,
+ 	}
+ 	-- A new chat's agent, started as the person opens it or types (see
+ 	-- screens/chat/warm), with the send's own choices.
+@@ -540,6 +574,68 @@ local function Composer(): Node
+ 			return req
+ 		end,
  	}
 +	-- The open chat's sandbox, while it runs on one: its provider (from its
 +	-- device's row), its steps followed while it's open.
@@ -4566,7 +4585,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  	-- (A new chat's project, for what follows the route: its panel.)
  	ui.effect(function()
  		if new_chat() then
-@@ -552,6 +648,21 @@ local function Composer(): Node
+@@ -610,6 +706,21 @@ local function Composer(): Node
  		end
  		return out
  	end)
@@ -4588,7 +4607,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  	-- Its own goes as the chat changes (kept: a reload isn't a change).
  	local notice_for = ui.state("chat_notice_for", "?")
  	ui.effect(function()
-@@ -592,6 +703,14 @@ local function Composer(): Node
+@@ -650,6 +761,14 @@ local function Composer(): Node
  			return CloudMachine.sending_last(store.messages)
  		end,
  	}
@@ -4603,7 +4622,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  	-- This device's outbox for the chat (#1256): sends uploading or stopped,
  	-- each removable where the engine can take one back. Whether it can is
  	-- asked once a chat has one, by taking out a send that isn't there (an
-@@ -705,9 +824,11 @@ local function Composer(): Node
+@@ -763,9 +882,11 @@ local function Composer(): Node
  		if s and s.notice then
  			return s.notice
  		end
@@ -4617,7 +4636,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  			for _, d in sessions.devices:get() or {} do
  				if d.id == s.device then
  					host_unreachable, host = d.online == false, d.name
-@@ -723,6 +844,85 @@ local function Composer(): Node
+@@ -781,6 +902,85 @@ local function Composer(): Node
  		}
  	end)
  
@@ -4703,7 +4722,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  	-- The models looked up once: not again on each reload after a lookup
  	-- that failed (the composer made again).
  	local looked_up = ui.state("chat_catalog_asked", false)
-@@ -947,7 +1147,11 @@ local function Composer(): Node
+@@ -1019,7 +1219,11 @@ local function Composer(): Node
  			-- before): nothing of the host's (its copy of the prompt, the
  			-- engine's) can reach the list before the glide is ready, and
  			-- the prompt is there once, whoever adds it first.
@@ -4716,7 +4735,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  			-- (To the transcript at its foot: in a split, the focused pane's,
  			-- which shows its lane's list, the prompt joining it there too.)
  			local lane = foot_lane(id)
-@@ -999,7 +1203,7 @@ local function Composer(): Node
+@@ -1071,7 +1275,7 @@ local function Composer(): Node
  			return
  		end
  		local plan = where.plan()
@@ -4725,7 +4744,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  		local failed = function(why: string?)
  			own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.composer.didnt_start", dismissable = true }
  			if shared.text:peek() == "" then
-@@ -1053,6 +1257,41 @@ local function Composer(): Node
+@@ -1128,6 +1332,41 @@ local function Composer(): Node
  				end)
  			return
  		end
@@ -4767,7 +4786,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  		own_notice:set { key = "chat.composer.starting", spinner = true }
  		-- Made where the project is (or on the device chosen), then its first
  		-- message run there, as the shipping app starts one (the send sets
-@@ -1158,13 +1397,22 @@ local function Composer(): Node
+@@ -1244,15 +1483,24 @@ local function Composer(): Node
  		local lb = live_branch:get()
  		local name = if lb.key:sub(1, #s.id + 1) == `{s.id}|` then lb.name else (s :: any).branch
  		local on: string? = nil
@@ -4783,14 +4802,16 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
 +				end
  			end
  		end
+ 		-- On Cloud: its machine's session (a side chat shares its parent's).
+ 		local machine = if cloud.on_device((s :: any).device) then cloud.session_for(s.id, (s :: any).device) else nil
  		return {
  			device = on,
 +			icon = icon :: any,
 +			template = template_on,
  			name = name,
- 			worktree = path ~= nil and s.cwd ~= nil and s.cwd ~= path,
- 			project = project,
-@@ -1218,6 +1466,8 @@ local function Composer(): Node
+ 			cloud = cloud.on_device((s :: any).device),
+ 			reach = if machine then machine.reach else nil,
+@@ -1308,6 +1556,8 @@ local function Composer(): Node
  				return store.offers_auto(model:get())
  			end,
  			plan = plan,
@@ -4799,7 +4820,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  			model = model,
  			effort = effort,
  			fast = fast,
-@@ -1238,6 +1488,10 @@ local function Composer(): Node
+@@ -1328,6 +1578,10 @@ local function Composer(): Node
  				if s and s.model == model:get() then
  					return s.model_label
  				end
@@ -4810,7 +4831,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  				return nil
  			end,
  			-- A session naming no model runs its agent's own: the catalog's
-@@ -1283,6 +1537,8 @@ local function Composer(): Node
+@@ -1373,6 +1627,8 @@ local function Composer(): Node
  			end,
  			device = device,
  			devices = where.devices,
@@ -4819,7 +4840,7 @@ index 7979b1eac402eb1159314941031a962c52252782..d7454dbc330f9cdeaa7994888f318a7b
  			checkout = checkout,
  			branch = branch,
  			branches = where.branches,
-@@ -1434,6 +1690,9 @@ local function Composer(): Node
+@@ -1534,6 +1790,9 @@ local function Composer(): Node
  			on_notice_action = machine.wake,
  			alerts = machine.alerts,
  			on_alert_action = machine.on_alert,
@@ -5301,7 +5322,7 @@ index 0000000000000000000000000000000000000000..751ca1682ff04bdfd027e014d7f47eb1
 +
 +return M
 diff --git a/apps/zgx/ui/screens/chat/session.luau b/apps/zgx/ui/screens/chat/session.luau
-index 2e609abff312bf45a66fbd9b742af7530bcdfc00..22f869c2b8ff353ec208b32c2ecd3fdb06b9702d 100644
+index 7eaad3b642f4d8176fe722b4901c2b52fe9645a5..d7c63c4e00b507e5c435c42a3385a960706ee475 100644
 --- a/apps/zgx/ui/screens/chat/session.luau
 +++ b/apps/zgx/ui/screens/chat/session.luau
 @@ -24,6 +24,8 @@ local LinkChips = require("@app/screens/chat/link_chips")
@@ -5335,17 +5356,17 @@ index 2e609abff312bf45a66fbd9b742af7530bcdfc00..22f869c2b8ff353ec208b32c2ecd3fdb
  	ui.effect(function()
  		local want = which()
  		waited:set("")
-@@ -279,7 +296,7 @@ local function Session(id: Id?): Node
- 							end,
- 							side = 20,
- 							fade_lead = 12,
--							messages = store.messages,
-+							messages = shown_messages,
- 							offset = offset,
- 							-- Made again (a reload, a template saved), it comes
- 							-- back where it was.
+@@ -278,7 +295,7 @@ local function Session(id: Id?): Node
+ 						end,
+ 						side = 20,
+ 						fade_lead = 12,
+-						messages = store.messages,
++						messages = shown_messages,
+ 						offset = offset,
+ 						-- Made again (a reload, a template saved), it comes
+ 						-- back where it was.
 diff --git a/apps/zgx/ui/screens/chat/store.luau b/apps/zgx/ui/screens/chat/store.luau
-index 70585778806e61d6b3176fae824a6b1ac14142ad..24fb0206a39b305f26ceb0d59cf76e6fe49070a5 100644
+index f60b45989f4d3fc4419b3cf815ec00c778e56dce..0359f77ce53e6fe779b028f8644e386518066d1b 100644
 --- a/apps/zgx/ui/screens/chat/store.luau
 +++ b/apps/zgx/ui/screens/chat/store.luau
 @@ -82,7 +82,12 @@ export type Session = {
@@ -5686,7 +5707,7 @@ index 0000000000000000000000000000000000000000..5ee062887f50d375d31ee7902655029d
 +
 +return M
 diff --git a/apps/zgx/ui/screens/panel/init.luau b/apps/zgx/ui/screens/panel/init.luau
-index 62439e38fcde2e6891dbd511b8cc3297b83ba099..a722344343e5a3cca25042844fa738039b1df295 100644
+index 5d71c81762f8f7367ca190f4c8373884f6850caf..44059c5a3f51089bfae3631b32fa109faeb3329e 100644
 --- a/apps/zgx/ui/screens/panel/init.luau
 +++ b/apps/zgx/ui/screens/panel/init.luau
 @@ -80,6 +80,7 @@ local state = require("@app/screens/panel/state")
@@ -7445,10 +7466,10 @@ index 731dff8b18f223cc7f4ed48c27265bbb9b75a467..c00e489c26a8d34860f54862e30bbd41
  		sleep_dialog(),
  		project_dialogs(),
 diff --git a/apps/zgx/ui/settings_stub.luau b/apps/zgx/ui/settings_stub.luau
-index 3d0e4b6e717ae3a5173d9bc47cbcc2b576d9871e..176534384da2f54aee91b5bc038b340077f5eb42 100644
+index 890c735931ab89e5475722f0b3a0a27377445973..0450835e1551583e2043ec0b36669ec4477c0c29 100644
 --- a/apps/zgx/ui/settings_stub.luau
 +++ b/apps/zgx/ui/settings_stub.luau
-@@ -362,6 +362,13 @@ local answers: { [string]: (arg: any) -> any } = {
+@@ -363,6 +363,13 @@ local answers: { [string]: (arg: any) -> any } = {
  		local name = string.match(arg.path, "[^/]+$") or arg.path
  		return settled({ path = arg.path, name = name, w = 512, h = 512 })
  	end,
@@ -7462,7 +7483,7 @@ index 3d0e4b6e717ae3a5173d9bc47cbcc2b576d9871e..176534384da2f54aee91b5bc038b3400
  }
  
  local function detail(arg: any): string
-@@ -631,6 +638,8 @@ ui.command {
+@@ -632,6 +639,8 @@ ui.command {
  -- Cloud, Billing and GitHub for Cloud (Settings → Cloud and → Billing),
  -- the same way: none until `cloud_stub.offer`.
  require("./cloud_stub")
@@ -7472,7 +7493,7 @@ index 3d0e4b6e717ae3a5173d9bc47cbcc2b576d9871e..176534384da2f54aee91b5bc038b3400
  require("./registry_stub")
  
 diff --git a/apps/zgx/ui/shell_fixture.luau b/apps/zgx/ui/shell_fixture.luau
-index 955d0f0e370b642bddb14072db5ed8363f21329c..26eff94b3209a54165a6e02151e2c9b98ca3945d 100644
+index 23268be4fa0b6d396bcde468850ed47277ab2b50..f72f06008d0e0c35982c05efec85122f696ff582 100644
 --- a/apps/zgx/ui/shell_fixture.luau
 +++ b/apps/zgx/ui/shell_fixture.luau
 @@ -253,8 +253,10 @@ ui.shared("agent_icons", {} :: { [string]: string }):set({
@@ -7489,24 +7510,24 @@ index 955d0f0e370b642bddb14072db5ed8363f21329c..26eff94b3209a54165a6e02151e2c9b9
  	projects = {
  		{ id = "atlas", name = "Atlas", device = "mac", path = "/work/atlas", git = true },
 diff --git a/apps/zgx/ui/templates/zeron-v2/.base.json b/apps/zgx/ui/templates/zeron-v2/.base.json
-index 9f28e1fc7774ce9cc2fd8ed939365bd10ecff1fb..5f8d5e139360aa46957aa097ca54f6fc8f002cc0 100644
+index 000c318b15645e818a4040b055c96dfaae6fc94e..6e5c0e3744fbcf68a91302a37ebf630deeeafe7e 100644
 --- a/apps/zgx/ui/templates/zeron-v2/.base.json
 +++ b/apps/zgx/ui/templates/zeron-v2/.base.json
 @@ -1,9 +1,9 @@
  {
--  "ds/sidebar.luau": "f2abf7b60b5f4d00",
-+  "ds/sidebar.luau": "de52a4ea46c6a31b",
+-  "ds/sidebar.luau": "6d5d8113d5768620",
++  "ds/sidebar.luau": "b41b1b7532df7673",
    "ds/tokens.luau": "296d1ea72675de0c",
--  "screens/chat/composer.luau": "5a4b142a88915b87",
-+  "screens/chat/composer.luau": "4883d41b98d4e010",
-   "screens/chat/lane_tab.luau": "43f35502c5d8818d",
--  "screens/panel/init.luau": "3d5e0c712c4dda56",
-+  "screens/panel/init.luau": "2f78238184885e5d",
-   "screens/shell/init.luau": "c7b26c3a1ccf9a32",
+-  "screens/chat/composer.luau": "7d4cc540ce993b96",
++  "screens/chat/composer.luau": "2c69873ec552adc6",
+   "screens/chat/lane_tab.luau": "c73af1b7c16fd56e",
+-  "screens/panel/init.luau": "a0df0db6e977845f",
++  "screens/panel/init.luau": "b95f29bcb664c22b",
+   "screens/shell/init.luau": "302aa5fc3350cd0a",
    "screens/shell/page.luau": "c1debbce640a5d45",
    "screens/shell/view.luau": "95dec891b31add1d"
 diff --git a/apps/zgx/ui/templates/zeron-v2/ds/sidebar.luau b/apps/zgx/ui/templates/zeron-v2/ds/sidebar.luau
-index 75a83175ec3f889cbf0a3ac21128956f6248ede8..f525665c3f66f8c9edcfc8a382f2586d31177c17 100644
+index 20434b8e741d4667c1de7991244e06e3195031fe..f5d2cd35ad155c847e6d0aed025d6c8f1b9d91c3 100644
 --- a/apps/zgx/ui/templates/zeron-v2/ds/sidebar.luau
 +++ b/apps/zgx/ui/templates/zeron-v2/ds/sidebar.luau
 @@ -66,6 +66,8 @@ export type Session = {
@@ -7530,11 +7551,11 @@ index 75a83175ec3f889cbf0a3ac21128956f6248ede8..f525665c3f66f8c9edcfc8a382f2586d
  			return active(s) or selected:get() == s.id
  		end
 diff --git a/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau b/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
-index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85fbf549e8 100644
+index 09932f33f6a440c60be59001c575af8d0448fce1..cb19ac5d9d9e55865a9bc81f07cdcc6363259810 100644
 --- a/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
 +++ b/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
-@@ -32,9 +32,13 @@ local shared = require("@app/screens/chat/shared")
- local sessions = require("@account/sessions")
+@@ -33,10 +33,14 @@ local sessions = require("@account/sessions")
+ local cloud = require("@account/cloud")
  local LinkNotice = require("@app/screens/chat/link_notice")
  local CloudTray = require("@app/screens/chat/cloud_tray")
 +local SandboxTray = require("@app/screens/chat/sandbox_tray")
@@ -7542,21 +7563,22 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  local CloudMachine = require("@app/screens/chat/cloud_machine")
  local files = require("@app/screens/files/api")
  local Where = require("@app/screens/chat/where")
+ local Warm = require("@app/screens/chat/warm")
 +local sandboxes = require("@account/sandboxes")
 +local SandboxLine = require("@app/screens/chat/sandbox_line")
  local DropOverlay = require("@ds/drop_overlay")
  local mentions = require("@ds/composer_mentions")
- local Invocations = require("@app/screens/chat/invocations")
-@@ -189,6 +193,8 @@ local function Composer(): Node
- 	local checkout = ui.state("chat_checkout", "worktree" :: string?)
- 	local branch = ui.state("chat_branch", nil :: string?)
- 	local project = ui.state("chat_project", nil :: string?)
+ local Draft = require("@ds/draft_text")
+@@ -195,6 +199,8 @@ local function Composer(): Node
+ 	-- On Cloud, what a new chat's machine reaches (nil: the account's
+ 	-- default, Settings → Cloud). Each new chat starts from the default.
+ 	local reach = ui.state("chat_reach", nil :: string?)
 +	-- On a place: the template picked ("" for Blank).
 +	local template = ui.state("chat_template", "" :: string?)
  	local locals: { [string]: State<any> } =
  		{ model = model, effort = effort, fast = fast, options = options, access = access, plan = plan }
  
-@@ -424,6 +430,12 @@ local function Composer(): Node
+@@ -430,6 +436,12 @@ local function Composer(): Node
  			local p = route.project:get()
  			d = if p then p.device else nil
  		end
@@ -7569,7 +7591,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  		return d
  	end
  	-- Whether the catalog shown is `d`'s (one of this device's says none).
-@@ -452,6 +464,11 @@ local function Composer(): Node
+@@ -458,6 +470,11 @@ local function Composer(): Node
  			return
  		end
  		local d = run_device()
@@ -7581,7 +7603,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  		if d == Where.CLOUD then
  			if (cat :: any).device ~= Where.CLOUD then
  				return
-@@ -473,6 +490,22 @@ local function Composer(): Node
+@@ -479,6 +496,22 @@ local function Composer(): Node
  			end
  		end
  	end)
@@ -7604,11 +7626,17 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  	-- Where a new chat works (screens/chat/where): the devices, the chosen
  	-- one's projects, its refs, kept in step and remembered; how it's sent.
  	local where = Where.bind {
-@@ -481,7 +514,70 @@ local function Composer(): Node
+@@ -487,6 +520,7 @@ local function Composer(): Node
  		checkout = checkout,
  		branch = branch,
  		active = new_chat,
 +		template = template,
+ 	}
+ 	-- A new chat's agent, started as the person opens it or types (see
+ 	-- screens/chat/warm), with the send's own choices.
+@@ -540,6 +574,68 @@ local function Composer(): Node
+ 			return req
+ 		end,
  	}
 +	-- The open chat's sandbox, while it runs on one: its provider (from its
 +	-- device's row), its steps followed while it's open.
@@ -7675,7 +7703,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  
  	local running = ui.computed(function(): boolean
  		local s = open()
-@@ -543,6 +639,14 @@ local function Composer(): Node
+@@ -601,6 +697,14 @@ local function Composer(): Node
  			return CloudMachine.sending_last(store.messages)
  		end,
  	}
@@ -7690,7 +7718,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  	-- A line above it: one of its own (a send that failed), else the
  	-- session's.
  	local own_notice = ui.state("chat_own_notice", nil :: any)
-@@ -575,9 +679,11 @@ local function Composer(): Node
+@@ -633,9 +737,11 @@ local function Composer(): Node
  		if s and s.notice then
  			return s.notice
  		end
@@ -7704,7 +7732,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  			for _, d in sessions.devices:get() or {} do
  				if d.id == s.device then
  					host_unreachable, host = d.online == false, d.name
-@@ -593,6 +699,85 @@ local function Composer(): Node
+@@ -651,6 +757,85 @@ local function Composer(): Node
  		}
  	end)
  
@@ -7790,7 +7818,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  	-- The models looked up once: not again on each reload after a lookup
  	-- that failed (the composer made again).
  	local looked_up = ui.state("chat_catalog_asked", false)
-@@ -995,7 +1180,7 @@ local function Composer(): Node
+@@ -1067,7 +1252,7 @@ local function Composer(): Node
  			return
  		end
  		local plan = where.plan()
@@ -7799,7 +7827,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  		local failed = function(why: string?)
  			own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.composer.didnt_start", dismissable = true }
  			if shared.text:peek() == "" then
-@@ -1049,6 +1234,41 @@ local function Composer(): Node
+@@ -1124,6 +1309,41 @@ local function Composer(): Node
  				end)
  			return
  		end
@@ -7841,7 +7869,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  		own_notice:set { key = "chat.composer.starting", spinner = true }
  		-- Made where the project is (or on the device chosen), then its first
  		-- message run there, as the shipping app starts one (the send sets
-@@ -1154,13 +1374,22 @@ local function Composer(): Node
+@@ -1240,15 +1460,24 @@ local function Composer(): Node
  		local lb = live_branch:get()
  		local name = if lb.key:sub(1, #s.id + 1) == `{s.id}|` then lb.name else (s :: any).branch
  		local on: string? = nil
@@ -7857,14 +7885,16 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
 +				end
  			end
  		end
+ 		-- On Cloud: its machine's session (a side chat shares its parent's).
+ 		local machine = if cloud.on_device((s :: any).device) then cloud.session_for(s.id, (s :: any).device) else nil
  		return {
  			device = on,
 +			icon = icon :: any,
 +			template = template_on,
  			name = name,
- 			worktree = path ~= nil and s.cwd ~= nil and s.cwd ~= path,
- 			project = project,
-@@ -1216,6 +1445,8 @@ local function Composer(): Node
+ 			cloud = cloud.on_device((s :: any).device),
+ 			reach = if machine then machine.reach else nil,
+@@ -1306,6 +1535,8 @@ local function Composer(): Node
  				return store.offers_auto(model:get())
  			end,
  			plan = plan,
@@ -7873,7 +7903,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  			model = model,
  			effort = effort,
  			fast = fast,
-@@ -1233,6 +1464,10 @@ local function Composer(): Node
+@@ -1323,6 +1554,10 @@ local function Composer(): Node
  				if s and s.model == model:get() then
  					return s.model_label
  				end
@@ -7884,7 +7914,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  				return nil
  			end,
  			-- A session naming no model runs its agent's own: the catalog's
-@@ -1278,6 +1513,8 @@ local function Composer(): Node
+@@ -1368,6 +1603,8 @@ local function Composer(): Node
  			end,
  			device = device,
  			devices = where.devices,
@@ -7893,7 +7923,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  			checkout = checkout,
  			branch = branch,
  			branches = where.branches,
-@@ -1445,6 +1682,9 @@ local function Composer(): Node
+@@ -1545,6 +1782,9 @@ local function Composer(): Node
  			on_notice_action = machine.wake,
  			alerts = machine.alerts,
  			on_alert_action = machine.on_alert,
@@ -7904,7 +7934,7 @@ index 0a8589c601a3f4880763fba1d76963d2e1c00982..e8363e7427b991fc104600e599666d85
  			disabled = function(): boolean
  				local s = store.session:get()
 diff --git a/apps/zgx/ui/templates/zeron-v2/screens/panel/init.luau b/apps/zgx/ui/templates/zeron-v2/screens/panel/init.luau
-index 791512dc11fab791495b3302e39f056636728f27..78182f83dd5e2e43e03fa9600dc9aae580b369d0 100644
+index 25ad27e9d8a6b8be8bf8abf6b96284c75940a6f3..d8cae24c94cb9f618636ee6dc8187bf410912320 100644
 --- a/apps/zgx/ui/templates/zeron-v2/screens/panel/init.luau
 +++ b/apps/zgx/ui/templates/zeron-v2/screens/panel/init.luau
 @@ -66,6 +66,7 @@ local state = require("@app/screens/panel/state")
@@ -10710,10 +10740,10 @@ index 32d02022d7da4bbda92102140813c69f9e39b498..13dad9406653b121e876361ff28eef3f
      let mut out = String::with_capacity(input.len());
      for byte in input.bytes() {
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862b0d0b910 100644
+index 024e1c702d9fc0bc72d98182809ce4578c28eb65..0fd1143bcfe85e13ecf5c8656ef863b87bd11f03 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -637,6 +637,10 @@ struct DocHostInner {
+@@ -646,6 +646,10 @@ struct DocHostInner {
      /// terminalizes the latter as Rejected instead of leaving a forever-
      /// Pending entry no retry could ever reach (2026-08-19 swallowed-send).
      executing: Mutex<HashSet<String>>,
@@ -10724,7 +10754,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
      /// Peer links (engine assembly, edge runtimes only) — the transport that
      /// pushes queued attachment bytes to a remote host.
      links: OnceLock<Arc<zeron_rpc::LinkCache>>,
-@@ -1613,6 +1617,7 @@ impl DocHost {
+@@ -1642,6 +1646,7 @@ impl DocHost {
                  store_looks: Mutex::new(HashMap::new()),
                  connectivity_grace: Mutex::new(DegradeGrace::default()),
                  executing: Mutex::new(HashSet::new()),
@@ -10732,7 +10762,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
                  links: OnceLock::new(),
                  http: reqwest::Client::builder()
                      .pool_max_idle_per_host(2)
-@@ -5749,6 +5754,77 @@ impl DocHost {
+@@ -5846,6 +5851,77 @@ impl DocHost {
          Ok(())
      }
  
@@ -10810,7 +10840,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
      /// Persist remote host discovery separately from the outgoing room rows.
      /// A row ACK does not prove a cold host has been told to open its room.
      fn nudge_remote_host(&self, chat_id: &str) {
-@@ -5819,9 +5895,22 @@ impl DocHost {
+@@ -5916,9 +5992,22 @@ impl DocHost {
                      return; // the normal path won while we were retrying
                  }
                  match host.relay_command(&target, &chat, &entry).await {
@@ -10834,7 +10864,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
                          return;
                      }
                      Err(err) => {
-@@ -5920,7 +6009,7 @@ impl DocHost {
+@@ -6017,7 +6106,7 @@ impl DocHost {
          target: &str,
          chat_id: &str,
          entry: &SessionCommandEntry,
@@ -10843,7 +10873,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
          let supported = self
              .workspace()
              .and_then(|ws| ws.read_devices().ok())
-@@ -5954,11 +6043,21 @@ impl DocHost {
+@@ -6051,11 +6140,21 @@ impl DocHost {
                  Err(format!("relay call failed: {err}"))
              }
              Ok(Ok(reply)) => Ok(match reply.get("outcome").and_then(|v| v.as_str()) {
@@ -10870,7 +10900,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
              }),
          }
      }
-@@ -6057,7 +6156,13 @@ impl DocHost {
+@@ -6154,7 +6253,13 @@ impl DocHost {
                  // Rejected: execute failed or the sweep terminalized a crash
                  // window. Expired: the entry outlived its TTL undelivered —
                  // an explicit user retry is exactly the consent to re-send.
@@ -10885,7 +10915,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
                  // Its clock ran out unexecuted (its host would mark it
                  // Expired), or is about to: the same consent applies.
                  SessionCommandStatus::Pending if ending(c) => {
-@@ -6159,6 +6264,20 @@ impl DocHost {
+@@ -6256,6 +6361,20 @@ impl DocHost {
          chat_id: &str,
          entry: SessionCommandEntry,
      ) -> Result<&'static str, EngineError> {
@@ -10906,7 +10936,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
          let handle = self.open(chat_id)?;
          // The sender sequences attachment transfers BEFORE the relay; refuse
          // (retryably) rather than run without the images.
-@@ -6194,29 +6313,30 @@ impl DocHost {
+@@ -6291,29 +6410,30 @@ impl DocHost {
              },
          );
          if matches!(disposition, CommandDisposition::Skip) {
@@ -10944,7 +10974,7 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
                      Err(err) => Err(err),
                  },
              },
-@@ -6933,6 +7053,13 @@ impl DocHost {
+@@ -7031,6 +7151,13 @@ impl DocHost {
                      );
                  }
                  let harness = self.harness_for_request(chat_id, &request);
@@ -10959,10 +10989,10 @@ index 3ec330961aff0961be3ee6066119432e8023d241..637e676676b50fc6ba9b23439dd89862
                  // later dispatch falls back to the engine default), so stamp
                  // what this run actually executes with. Claimed rows and
 diff --git a/crates/engine/src/doc_host/relay.rs b/crates/engine/src/doc_host/relay.rs
-index 14b5645aefbb71ad10b24adb8cf34ca2ef17d122..b421b350e8e5341fca720c5994f567d7d9777fbe 100644
+index a9e4017439e8827e4fb058b2938e4e88c019ea93..5b868bf59b25439e257bf1fb5e4ad24f547a7784 100644
 --- a/crates/engine/src/doc_host/relay.rs
 +++ b/crates/engine/src/doc_host/relay.rs
-@@ -1059,6 +1059,7 @@ mod tests {
+@@ -1107,6 +1107,7 @@ mod tests {
              last_seen_at: Some(chrono::Utc::now()),
              created_at: None,
              version: None,
@@ -11030,18 +11060,18 @@ index c9db6c62121552b150c2f6ca8a0a2ddc732d56d7..576e534ec6039d4449a8ff37d3f03d5b
              })
              .collect();
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00fd35b16d4 100644
+index 71d4ba51893d06dee3470d7d466ffaf79c5ae0ad..67a90ccdaac203db9604d360af26e64ea71a450a 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -73,6 +73,7 @@ pub mod repos;
+@@ -75,6 +75,7 @@ pub mod repos;
  pub mod rpc;
  pub mod run_journal;
  pub mod runner;
 +pub mod sandboxes;
  pub mod wake_trace;
  pub mod wake_update;
- pub mod sessions;
-@@ -92,7 +93,8 @@ mod worktree_settings;
+ pub mod self_schedule;
+@@ -95,7 +96,8 @@ mod worktree_settings;
  
  pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
  pub use auth::{
@@ -11051,7 +11081,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
  };
  pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
  pub use diff_sync::{
-@@ -172,6 +174,9 @@ pub struct EngineConfig {
+@@ -175,6 +177,9 @@ pub struct EngineConfig {
      pub org_id: Option<String>,
      /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
      pub workos_client_id: Option<String>,
@@ -11061,7 +11091,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
  }
  
  /// The assembled engine core — also constructible without the IPC server for tests
-@@ -203,6 +208,9 @@ pub struct EngineCore {
+@@ -206,6 +211,9 @@ pub struct EngineCore {
      pub local_import: Option<local_import::LocalImporter>,
      /// Plugins under `{data}/plugins/` (the plugins contract).
      pub plugins: plugins::Plugins,
@@ -11071,7 +11101,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
      workspace_scope: WorkspaceScope,
      /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
      auth: std::sync::Mutex<Option<Auth>>,
-@@ -310,6 +318,10 @@ impl EngineCore {
+@@ -321,6 +329,10 @@ impl EngineCore {
                  local_only: matches!(profile.scope(), WorkspaceScope::Local),
              },
          )?;
@@ -11082,7 +11112,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          doc_host.set_workspace(workspace.clone());
          doc_host.set_sessions(sessions.clone());
          sessions.follow_chat_deletions(workspace.watch_chats());
-@@ -496,6 +508,7 @@ impl EngineCore {
+@@ -507,6 +519,7 @@ impl EngineCore {
          }));
          let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
          plugins.start();
@@ -11090,7 +11120,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          Ok(Self {
              sessions,
              doc_host,
-@@ -517,6 +530,7 @@ impl EngineCore {
+@@ -528,6 +541,7 @@ impl EngineCore {
              device_id,
              local_import,
              plugins,
@@ -11098,7 +11128,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
              workspace_scope: profile.scope(),
              auth: std::sync::Mutex::new(None),
              links: std::sync::Mutex::new(None),
-@@ -551,6 +565,18 @@ impl EngineCore {
+@@ -563,6 +577,18 @@ impl EngineCore {
      /// Attach the auth service (before building the RPC service / relays).
      pub fn set_auth(&self, auth: Auth) {
          self.plugins.attach_auth(auth.clone());
@@ -11117,7 +11147,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          *self
              .auth
              .lock()
-@@ -576,11 +602,46 @@ impl EngineCore {
+@@ -588,11 +614,46 @@ impl EngineCore {
          .clone()
      }
  
@@ -11164,7 +11194,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          *self
              .links
              .lock()
-@@ -686,7 +747,8 @@ impl EngineCore {
+@@ -698,7 +759,8 @@ impl EngineCore {
          .with_commands(self.commands.clone())
          .with_harness_updates(self.harness_updates.clone())
          .with_viewport_focus(self.viewport_focus.clone())
@@ -11174,7 +11204,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          if let Some(links) = self.links() {
              rpc = rpc.with_links(links);
          }
-@@ -878,6 +940,17 @@ impl EngineRuntime {
+@@ -890,6 +952,17 @@ impl EngineRuntime {
          &self.core
      }
  
@@ -11192,7 +11222,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
      pub fn workspace_scope(&self) -> WorkspaceScope {
          self.core.workspace_scope()
      }
-@@ -947,6 +1020,12 @@ impl Engine {
+@@ -959,6 +1032,12 @@ impl Engine {
              Ok(None) => {}
              Err(err) => tracing::error!(error = %err, "runner identity unusable; ignoring it"),
          }
@@ -11205,7 +11235,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
          auth_config.workos_client_id = config.workos_client_id.clone();
          if let Ok(base) = std::env::var("ZERON_WORKOS_API_BASE")
-@@ -968,8 +1047,9 @@ impl Engine {
+@@ -980,8 +1059,9 @@ impl Engine {
  
      /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
      pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
@@ -11217,7 +11247,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
              WorkspaceScope::Synced
          } else if !auth.workos_enabled() {
              WorkspaceScope::Development
-@@ -1139,6 +1219,17 @@ impl Engine {
+@@ -1151,6 +1231,17 @@ impl Engine {
              )?,
          };
          core.set_auth(auth.clone());
@@ -11235,7 +11265,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          // Agents' commits credit Zeron (always on Cloud, else per the
          // device's setting).
          core.registry
-@@ -1204,6 +1295,19 @@ impl Engine {
+@@ -1216,6 +1307,19 @@ impl Engine {
              }
              core.set_cloud(runner::CloudRunner::new(broker, activity, heartbeat));
          }
@@ -11255,7 +11285,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          // The chats as last published (the list every view watches), not a
          // fresh parse of every chat row on each scan.
          let preview_chats = core.workspace.watch_chats();
-@@ -1348,6 +1452,18 @@ impl Engine {
+@@ -1363,6 +1467,18 @@ impl Engine {
                  Some(zeron_rpc::CallerProof { device: proof_device.clone(), key, signature })
              }));
              let links = zeron_rpc::LinkCache::new(link_config);
@@ -11274,7 +11304,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
              let links_for_presence = links.clone();
              core.workspace
                  .set_peer_alive_hook(Arc::new(move |device_id: &str| {
-@@ -1412,6 +1528,7 @@ impl Engine {
+@@ -1427,6 +1543,7 @@ impl Engine {
              .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
  
          let runtime = Self::assemble_runtime(&config, auth, profile).await?;
@@ -11283,7 +11313,7 @@ index 2dce3da2d8bc6bb4771e44befb0330f51e404e8a..5b6134929f3ecb4980002c3373d1c00f
          // a running service; restart into it once no run or terminal is live.
          if let Some(updater) = runtime.core().updater() {
 diff --git a/crates/engine/src/plugins/mod.rs b/crates/engine/src/plugins/mod.rs
-index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67ef0f3108 100644
+index 5d85561a864eee876a4f9e28863d3515d099930e..8f8e0c28851686f0aa3c6ab57b58ffc39c9f2d92 100644
 --- a/crates/engine/src/plugins/mod.rs
 +++ b/crates/engine/src/plugins/mod.rs
 @@ -105,6 +105,9 @@ pub const BUILTIN_AUTHOR: &str = "zeron";
@@ -11296,7 +11326,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
  /// A peer's word (`CheckPluginKey`) looks this device's key up at most this often.
  const OWN_KEY_CHECK_APART: Duration = Duration::from_secs(5);
  /// Until those checks can run (auth not ready, the edge not answering).
-@@ -234,6 +237,9 @@ struct Inner {
+@@ -240,6 +243,9 @@ struct Inner {
      lookups: Mutex<HashSet<String>>,
      entries: Mutex<Vec<Entry>>,
      scanned: AtomicBool,
@@ -11306,7 +11336,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
      list_tx: watch::Sender<serde_json::Value>,
      tools_tx: watch::Sender<serde_json::Value>,
      scan_lock: tokio::sync::Mutex<()>,
-@@ -521,6 +527,7 @@ impl Plugins {
+@@ -530,6 +536,7 @@ impl Plugins {
                  lookups: Mutex::new(HashSet::new()),
                  entries: Mutex::new(Vec::new()),
                  scanned: AtomicBool::new(false),
@@ -11314,7 +11344,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
                  list_tx,
                  tools_tx,
                  scan_lock: tokio::sync::Mutex::new(()),
-@@ -616,6 +623,10 @@ impl Plugins {
+@@ -627,6 +634,10 @@ impl Plugins {
      /// Follow `auth`: the account for lookups, and on every sign-in change a
      /// key registration and a rescan.
      pub fn attach_auth(&self, auth: crate::Auth) {
@@ -11325,7 +11355,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
          let for_account = auth.clone();
          self.set_account(move || for_account.user_id());
          let for_step_up = auth.clone();
-@@ -950,8 +961,20 @@ impl Plugins {
+@@ -972,8 +983,20 @@ impl Plugins {
          }
      }
  
@@ -11346,7 +11376,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
          let account = account.to_owned();
          let step_up = lock(&self.inner.step_up).clone().and_then(|f| f());
          match keys::ensure_registered(
-@@ -1081,7 +1104,7 @@ impl Plugins {
+@@ -1103,7 +1126,7 @@ impl Plugins {
          });
          let this = self.clone();
          let _ = tokio::task::spawn_blocking(move || {
@@ -11355,7 +11385,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
                  this.resign_all_own();
              }
          })
-@@ -1165,6 +1188,7 @@ impl Plugins {
+@@ -1189,6 +1212,7 @@ impl Plugins {
          let account = self.account();
          let can_look_up = self.directory().is_some() && account.is_some();
          let now = now_secs();
@@ -11363,7 +11393,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
          let mut owed = Vec::new();
          let mut entries: Vec<Entry> = scan::plugin_dirs(&self.inner.plugins_dir)
              .into_iter()
-@@ -1192,7 +1216,16 @@ impl Plugins {
+@@ -1216,7 +1240,16 @@ impl Plugins {
                          }
                      }
                  };
@@ -11381,7 +11411,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
              })
              .collect();
          // Zeron's own, from the app's folder of them. A folder of yours by
-@@ -1842,6 +1875,9 @@ impl Plugins {
+@@ -1867,6 +1900,9 @@ impl Plugins {
              }
              methods::NEW_PLUGIN => {
                  let p: NewParams = parse_params(params)?;
@@ -11391,7 +11421,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
                  manifest::check_id(&p.id).map_err(failed)?;
                  if p.name.trim().is_empty() {
                      return Err(failed("It needs a name"));
-@@ -1875,7 +1911,7 @@ impl Plugins {
+@@ -1900,7 +1936,7 @@ impl Plugins {
                          guides::plugin_readme(p.name.trim(), &guide),
                      );
                      // Own before it's signed: the watcher's re-sign sees it as own.
@@ -11400,7 +11430,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
                      this.update_state(|state| {
                          state.own.insert(id.clone());
                      })
-@@ -1937,7 +1973,7 @@ impl Plugins {
+@@ -1962,7 +1998,7 @@ impl Plugins {
                  let id_for_sign = id.clone();
                  let dir_for_sign = dir.clone();
                  let files = tokio::task::spawn_blocking(move || -> Result<usize, String> {
@@ -11409,7 +11439,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
                      if let Some(id) = &id_for_sign {
                          let own = lock(&this.inner.state).own.contains(id);
                          if !own {
-@@ -2251,7 +2287,7 @@ impl Plugins {
+@@ -2276,7 +2312,7 @@ impl Plugins {
                                      path
                                  }
                              };
@@ -11418,7 +11448,7 @@ index bf590930421591cf3b9ef97f19926defbdf3a680..cb75950dc3432b9c52e75681408eae67
                              template_packages::export(&dir, id, &path, &key)
                          }
                          methods::IMPORT_TEMPLATE => {
-@@ -2391,9 +2427,9 @@ impl Plugins {
+@@ -2416,9 +2452,9 @@ impl Plugins {
                  } else {
                      None
                  };
@@ -11495,7 +11525,7 @@ index 04f6207c9f86e90c3926fd76f5f0336ac366050a..674afff2b85d0c5157bddd2595a4fbcf
          self.order().retain(|id| keep(*id));
      }
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf364b8995f 100644
+index 9154d0f6b25a9cf473f09efacaaa47b665aaca4e..6284aff73285076b0f3123faaa49b1243537cd0e 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -62,6 +62,7 @@
@@ -11522,10 +11552,10 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
  /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
  #[derive(Debug, Deserialize)]
  #[serde(tag = "op", rename_all = "camelCase")]
-@@ -790,6 +800,10 @@ enum MutateParams {
-         /// Cloud machine, cloning the project's GitHub repository.
+@@ -795,6 +805,10 @@ enum MutateParams {
+         /// another device, it is ignored.
          #[serde(default)]
-         cloud: bool,
+         cloud_reach: Option<zeron_proto::CloudReach>,
 +        /// Run on a place (a sandbox provider this device keeps): the chat
 +        /// gets a sandbox there, set up by its steps while the call returns.
 +        #[serde(default)]
@@ -11533,7 +11563,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
      },
      /// Create a space (device + folder pair). Idempotent by id; a live
      /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
-@@ -927,6 +941,8 @@ pub struct EngineRpc {
+@@ -932,6 +946,8 @@ pub struct EngineRpc {
      viewport_focus: crate::desktop_notify::ViewportFocus,
      /// The plugins service (absent in bare test assemblies).
      plugins: Option<crate::plugins::Plugins>,
@@ -11542,7 +11572,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
      engine_info: EngineInfo,
  }
  
-@@ -989,10 +1005,17 @@ impl EngineRpc {
+@@ -994,10 +1010,17 @@ impl EngineRpc {
              credentials: None,
              viewport_focus: Default::default(),
              plugins: None,
@@ -11560,15 +11590,15 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
      /// Attach the plugins service (the Plugin* methods).
      pub fn with_plugins(mut self, plugins: crate::plugins::Plugins) -> Self {
          self.plugins = Some(plugins);
-@@ -2134,6 +2157,7 @@ impl EngineRpc {
-                 parent_chat_id,
+@@ -2143,6 +2166,7 @@ impl EngineRpc {
                  child_kind,
                  cloud: _,
+                 cloud_reach: _,
 +                place: _,
              } => {
+                 tracing::debug!(target: "first_word", chat = %chat_id, "create chat");
                  // A voice orchestrator is hidden, so the chats it creates are
-                 // the user's top-level sessions rather than its side chats.
-@@ -2586,6 +2610,12 @@ fn forward_deadline(method: &str) -> std::time::Duration {
+@@ -2597,6 +2621,12 @@ fn forward_deadline(method: &str) -> std::time::Duration {
          methods::CREATE_WORKTREE => Duration::from_secs(120),
          // The longest a command may run there, and the reply's way back.
          methods::RUN_COMMAND => crate::commands::MAX_TIMEOUT + Duration::from_secs(30),
@@ -11581,7 +11611,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
          // Allow the adapter discovery budget plus relay and shutdown overhead.
          methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
          _ => Duration::from_secs(30),
-@@ -2629,6 +2659,25 @@ fn forwardable(method: &str) -> bool {
+@@ -2672,6 +2702,25 @@ fn forwardable(method: &str) -> bool {
              | methods::LIST_SKILLS
              | methods::LIST_COMMANDS
              | methods::QUEUE_COMMAND
@@ -11607,7 +11637,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
              | methods::TAKE_PROJECT_ACTION_SETUP
              | methods::WATCH_DOC_MESSAGES
              // The queue lives on the chat doc, and only its host may send from
-@@ -2782,6 +2831,7 @@ fn is_stream_method(method: &str) -> bool {
+@@ -2825,6 +2874,7 @@ fn is_stream_method(method: &str) -> bool {
              | methods::UPDATE_STATUS
              | methods::WATCH_HARNESS_UPDATES
              | methods::WATCH_PLUGINS
@@ -11615,7 +11645,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
      )
  }
  
-@@ -3142,6 +3192,7 @@ impl AuthRpc {
+@@ -3185,6 +3235,7 @@ impl AuthRpc {
                  | methods::SIGN_OUT
                  | methods::ACCESS_TOKEN
                  | methods::STEP_UP
@@ -11623,7 +11653,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
                  | methods::DELETE_ACCOUNT
                  | methods::LIST_ORGS
                  | methods::CREATE_ORG
-@@ -3190,6 +3241,21 @@ impl RpcService for AuthRpc {
+@@ -3233,6 +3284,21 @@ impl RpcService for AuthRpc {
                      .map_err(|e| RpcError::Failed(e.to_string()))?;
                  RpcReply::value(&serde_json::json!({ "url": url }))
              }
@@ -11645,7 +11675,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
              methods::DELETE_ACCOUNT => {
                  #[derive(Deserialize)]
                  struct P {
-@@ -3215,6 +3281,9 @@ impl RpcService for AuthRpc {
+@@ -3258,6 +3324,9 @@ impl RpcService for AuthRpc {
                  }
              }
              methods::SIGN_IN_HEADLESS => {
@@ -11655,7 +11685,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
                  let url = self.auth.start_headless_sign_in();
                  RpcReply::value(&serde_json::json!({ "url": url }))
              }
-@@ -3340,6 +3409,10 @@ impl RpcService for EngineRpc {
+@@ -3383,6 +3452,10 @@ impl RpcService for EngineRpc {
                  let reply = self.forward(&target, method, params).await;
                  return reply.map_err(|error| remote_plugins::older_engine(&target, method, error));
              }
@@ -11666,7 +11696,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
              // Settings → Providers' Cloud: its logins live in the vault.
              if crate::cloud_accounts::is_cloud_accounts_target(&target)
                  && crate::cloud_accounts::handles(method)
-@@ -3411,6 +3484,9 @@ impl RpcService for EngineRpc {
+@@ -3454,6 +3527,9 @@ impl RpcService for EngineRpc {
          if voice_remote::handles(method) {
              return self.voice_remote(method, params).await;
          }
@@ -11676,7 +11706,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
          // Signing out retires this device's plugin signing key first, while
          // the session can still revoke it on the edge.
          if method == methods::SIGN_OUT
-@@ -3640,12 +3716,12 @@ impl RpcService for EngineRpc {
+@@ -3730,12 +3806,12 @@ impl RpcService for EngineRpc {
              }
              methods::RELAY_COMMAND => {
                  let p: RelayCommandParams = parse_params(params)?;
@@ -11692,7 +11722,7 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
              }
              methods::FORK_SIDE_CHAT => {
                  #[derive(Deserialize)]
-@@ -4462,7 +4538,58 @@ impl RpcService for EngineRpc {
+@@ -4567,7 +4643,58 @@ impl RpcService for EngineRpc {
                  RpcReply::value(&self.harness_updates()?.set_policy(p.harness, p.policy))
              }
              methods::MUTATE => {
@@ -11751,10 +11781,10 @@ index 8242e7a49bc8fb762ac4d7f18c21203ca1abbd03..762da5abb969f619643115589f26ecf3
                  if let MutateParams::CreateChat {
                      chat_id,
                      space_id,
-@@ -4473,6 +4600,7 @@ impl RpcService for EngineRpc {
-                     parent_chat_id,
+@@ -4579,6 +4706,7 @@ impl RpcService for EngineRpc {
                      child_kind,
                      cloud,
+                     cloud_reach,
 +                    place: None,
                  } = &p
                      && let Some(host) = Box::pin(self.cloud_chat_host(
@@ -20674,10 +20704,10 @@ index 0000000000000000000000000000000000000000..2743f5c414ea9be956fdb0dd657c28c3
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 0ada5b870c6e1d954d1737ae65445379588214c2..a3e276c2d8d2fe79a9a386cd0971a082d77c97e0 100644
+index c302da0327d242b31c5c49235dcb3c02893248af..182024422faeeaef5f38f2796b9a6aca11ae0fe0 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -369,6 +369,8 @@ struct Inner {
+@@ -379,6 +379,8 @@ struct Inner {
      /// Posts a desktop banner, as the engine's own are (absent in bare
      /// tests): a child's reports paused ([`reports::keeps_paused`]).
      notifier: Mutex<Option<Notifier>>,
@@ -20685,9 +20715,9 @@ index 0ada5b870c6e1d954d1737ae65445379588214c2..a3e276c2d8d2fe79a9a386cd0971a082
 +    on_template: std::sync::atomic::AtomicBool,
  }
  
- /// Turn-start hook: called with `(chat_id, cwd)`.
-@@ -432,10 +434,42 @@ impl SessionsEngine {
-                 plugins: OnceLock::new(),
+ /// How long a runtime parked between turns with nothing pending keeps its
+@@ -555,10 +557,42 @@ impl SessionsEngine {
+                 warm_leases: Mutex::new(None),
                  reported: Arc::default(),
                  notifier: Mutex::new(None),
 +                on_template: std::sync::atomic::AtomicBool::new(false),
@@ -20729,7 +20759,7 @@ index 0ada5b870c6e1d954d1737ae65445379588214c2..a3e276c2d8d2fe79a9a386cd0971a082
      pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
          self.inner.voice.clone()
      }
-@@ -9585,6 +9619,7 @@ mod tests {
+@@ -10051,6 +10085,7 @@ mod tests {
                  version: None,
                  cursor_sdk_version: None,
                  capabilities: caps.iter().map(|c| (*c).to_owned()).collect(),
@@ -20738,10 +20768,10 @@ index 0ada5b870c6e1d954d1737ae65445379588214c2..a3e276c2d8d2fe79a9a386cd0971a082
          }
  
 diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
-index 3b2c9449da364cede93a5a04edfafa06431c67c3..2845a0814f7d5daac24b3bec1a562bccafb8e03b 100644
+index 0a7290464bb99a4d04b1a8227559d5218daeac3d..1b77962d781f3a83b6dbdb4d2cf473bc610a3fa7 100644
 --- a/crates/engine/src/workspace_host.rs
 +++ b/crates/engine/src/workspace_host.rs
-@@ -407,6 +407,9 @@ impl WorkspaceHost {
+@@ -425,6 +425,9 @@ impl WorkspaceHost {
              // Every boot restamps the running binary's version (fleet staleness
              // on the Devices page; workspace version — same for every crate).
              version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -20751,7 +20781,7 @@ index 3b2c9449da364cede93a5a04edfafa06431c67c3..2845a0814f7d5daac24b3bec1a562bcc
              cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
              capabilities: device_capabilities(),
          })?;
-@@ -630,6 +633,45 @@ impl WorkspaceHost {
+@@ -648,6 +651,45 @@ impl WorkspaceHost {
          *lock(&self.inner.peer_alive) = Some(hook);
      }
  
@@ -20797,7 +20827,7 @@ index 3b2c9449da364cede93a5a04edfafa06431c67c3..2845a0814f7d5daac24b3bec1a562bcc
      /// Test seam: write a foreign device row (the relay version gate and the
      /// dial gate read these; production rows arrive via registry sync).
      #[doc(hidden)]
-@@ -639,6 +681,28 @@ impl WorkspaceHost {
+@@ -657,6 +699,28 @@ impl WorkspaceHost {
          }
      }
  
@@ -21352,10 +21382,10 @@ index a654167f7f00c4a47c5a5314702cc373867c6753..75c30b1dde03c79decea99455a49598d
          capabilities: if capable {
              zeron_proto::capabilities::current()
 diff --git a/crates/engine/tests/cloud_rpc.rs b/crates/engine/tests/cloud_rpc.rs
-index 229b739a298d129d32cfc6a6dd6c3d87f618515d..a85aabd2d828309cc3f43aeedf08178182c4bf08 100644
+index 18ad02db552a3fb3c743400999f26dd708784686..cdd98a0e94bae644c9f9d36161e69fc368cf7dba 100644
 --- a/crates/engine/tests/cloud_rpc.rs
 +++ b/crates/engine/tests/cloud_rpc.rs
-@@ -717,6 +717,7 @@ async fn catalogs_for_cloud_devices_are_answered_here() {
+@@ -764,6 +764,7 @@ async fn catalogs_for_cloud_devices_are_answered_here() {
          last_seen_at: None,
          created_at: None,
          version: None,
@@ -21378,10 +21408,10 @@ index 46780a858227a3c3ec45935c0ab0ba8d4200355f..d43e88e8c2cb2ec490db68360476f3c0
  use std::sync::{Arc, Mutex};
  use std::time::Duration;
 diff --git a/crates/engine/tests/device_routing.rs b/crates/engine/tests/device_routing.rs
-index 4b087f9b8aa51372b896572acc73c948dc8e8f1a..af4ffc5fca8894e01fecfe8164ec2d387c416b03 100644
+index 2f3eab1fb1a1ae09a6bb51eb779c560c4e26438a..7f78e7fe64f29123e362a6065113a095862a9810 100644
 --- a/crates/engine/tests/device_routing.rs
 +++ b/crates/engine/tests/device_routing.rs
-@@ -2679,6 +2679,7 @@ fn device_row(id: &str, version: &str, seen_hours_ago: i64) -> zeron_proto::Devi
+@@ -2729,6 +2729,7 @@ fn device_row(id: &str, version: &str, seen_hours_ago: i64) -> zeron_proto::Devi
          last_seen_at: Some(chrono::Utc::now() - chrono::Duration::hours(seen_hours_ago)),
          created_at: None,
          version: Some(version.into()),
@@ -28922,7 +28952,7 @@ index 442fb53a2fb5d2357e9533b1000a3ef5d8a892c6..21abdf62ce765a13e9f9bd89c36087ca
              })
          );
 diff --git a/crates/rpc/src/device_room.rs b/crates/rpc/src/device_room.rs
-index 0f971320a70297abfdb21b6b863eff4f62902b46..a4c42f925bc2fc58ee84b4790288aaecd1cb1eda 100644
+index bfe4fad4a2142ef10d945a8d5be19d791ee910ab..4201e6553589bad6f490bc92c63468a69055bf8f 100644
 --- a/crates/rpc/src/device_room.rs
 +++ b/crates/rpc/src/device_room.rs
 @@ -737,6 +737,82 @@ async fn handle_host_frame(
@@ -29009,10 +29039,10 @@ index 0f971320a70297abfdb21b6b863eff4f62902b46..a4c42f925bc2fc58ee84b4790288aaec
  // Client link
  // ---------------------------------------------------------------------------
 diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
-index 0e0d50515995d2e0c428e956567a3db2148d318f..763b213cced0a1ec93588b777508bec11ba9d876 100644
+index a0030ecb26ad63d871a883358e0c87ecae9de9f5..76e67b2136545fa8f9b676c4116e934c9fc59fa5 100644
 --- a/crates/rpc/src/lib.rs
 +++ b/crates/rpc/src/lib.rs
-@@ -210,6 +210,100 @@ pub mod methods {
+@@ -225,6 +225,100 @@ pub mod methods {
      /// exchange leaves the engine a one-time step-up ticket, kept in memory
      /// and never handed out. Needed before `DeleteAccount`.
      pub const STEP_UP: &str = "StepUp";
@@ -29113,7 +29143,7 @@ index 0e0d50515995d2e0c428e956567a3db2148d318f..763b213cced0a1ec93588b777508bec1
      /// `{confirm}` (the account's email) → `{ok: true}`, or `{ok: false,
      /// error, message, organization?}`: the engine deletes the account at
      /// the edge with its step-up ticket. `error` is `step_up_required` (run
-@@ -1465,6 +1559,11 @@ mod tests {
+@@ -1505,6 +1599,11 @@ mod tests {
              methods::APPLY_UPDATE,
              methods::ACCESS_TOKEN,
              methods::STEP_UP,
@@ -29442,7 +29472,7 @@ index 398da2aae30488c64323f1e58e6d4447d13fb444..8302b2e7651200ebcaad0e2283ca08ad
              capabilities: Vec::new(),
          }];
 diff --git a/crates/update/src/lib.rs b/crates/update/src/lib.rs
-index 067653bbd38472e8f9b2f759cd85a8a3f7e37cd5..e6ab4962059b1d9aee8617d3acd0be4098fbd898 100644
+index 48f467d50434ecc34232b510e31fcec3e66a5727..7279070a50a260b62123bdec61767a023a3bf014 100644
 --- a/crates/update/src/lib.rs
 +++ b/crates/update/src/lib.rs
 @@ -1468,6 +1468,10 @@ fn in_service_cgroup(cgroups: &str, unit: &str) -> bool {
@@ -29465,7 +29495,7 @@ index 067653bbd38472e8f9b2f759cd85a8a3f7e37cd5..e6ab4962059b1d9aee8617d3acd0be40
              Self::System
          } else {
              Self::User
-@@ -3139,6 +3143,17 @@ mod tests {
+@@ -3204,6 +3208,17 @@ mod tests {
          assert_eq!(resolve_service_unit(Some("  "), None), "zeron.service");
      }
  
@@ -29981,5 +30011,5 @@ index 0000000000000000000000000000000000000000..229501cdc750109ac6dc70eae6ecaf1d
 +    Remove-Item Env:ZERON_DOCKER_SMOKE_TOKEN -ErrorAction SilentlyContinue
 +}
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

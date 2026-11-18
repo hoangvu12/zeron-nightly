@@ -1,4 +1,4 @@
-From 0c1fd343e68a2c03721cd3a0e4963b8e90d84f2e Mon Sep 17 00:00:00 2001
+From 40559f3f1c6d18de7f388ba315cd0d568b41b0b0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 05:38:38 +0700
 Subject: [PATCH] zgx on Windows: no console window, and the ui folder beside
@@ -15,10 +15,10 @@ install on Windows keeps ui and plugins-builtin beside zeron.exe.
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
-index e3431f7b86145693343acb825631a90027b4121b..5895430de6c96dc6fa3cc211f3ac3abad79671b0 100644
+index 16fd5a0c54a651b3279dcf7021ad989f4c255d38..f140fd42a3c1aca6b9e4dc38acec3c50991291ce 100644
 --- a/apps/zgx/src/main.rs
 +++ b/apps/zgx/src/main.rs
-@@ -1338,7 +1338,8 @@ fn ui_dir() -> PathBuf {
+@@ -1363,7 +1363,8 @@ fn ui_dir() -> PathBuf {
  /// The packaged scripts of the install this executable runs from, if any:
  /// `Contents/Resources/ui` of a macOS bundle, `ui` beside it on Linux (the
  /// tarball's, scripts/package-linux.sh), `beta\<version>\ui` beside it on
@@ -28,7 +28,7 @@ index e3431f7b86145693343acb825631a90027b4121b..5895430de6c96dc6fa3cc211f3ac3aba
  fn bundled_ui() -> Option<PathBuf> {
      static BUNDLED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
      BUNDLED
-@@ -1348,7 +1349,8 @@ fn bundled_ui() -> Option<PathBuf> {
+@@ -1373,7 +1374,8 @@ fn bundled_ui() -> Option<PathBuf> {
              let ui = if cfg!(target_os = "macos") {
                  dir.parent()?.join("Resources").join("ui")
              } else if cfg!(windows) {
@@ -39,5 +39,5 @@ index e3431f7b86145693343acb825631a90027b4121b..5895430de6c96dc6fa3cc211f3ac3aba
                  dir.join("ui")
              };
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

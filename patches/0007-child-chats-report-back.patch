@@ -1,4 +1,4 @@
-From a662f11f5d405e53b81f7cc160be90415546b9c3 Mon Sep 17 00:00:00 2001
+From 93a1e78c4354675d24ddaef992c358cb2573cef5 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Sun, 8 Nov 2026 23:17:07 +0700
 Subject: [PATCH] Child chats report back to the chat that made them
@@ -45,7 +45,7 @@ has to poll, and the person never has to nudge either side.
  apps/zgx/ui/ds/spawn_group.luau              |  535 +++++++
  apps/zgx/ui/ds/status.luau                   |   11 +-
  apps/zgx/ui/ds/subagent_row.luau             |  368 +++++
- apps/zgx/ui/ds/transcript.luau               |  426 +++++-
+ apps/zgx/ui/ds/transcript.luau               |  423 +++++-
  apps/zgx/ui/gallery.luau                     |   41 +
  apps/zgx/ui/locales/en.json                  |   26 +-
  apps/zgx/ui/locales/zh-Hans.json             |   31 +-
@@ -62,10 +62,11 @@ has to poll, and the person never has to nudge either side.
  crates/doc/src/rebuild.rs                    |    2 +-
  crates/engine/src/doc_host.rs                |  333 ++++-
  crates/engine/src/lib.rs                     |    1 +
+ crates/engine/src/managed.rs                 |    2 +-
  crates/engine/src/rpc.rs                     |    2 +-
  crates/engine/src/rpc/agent_gate.rs          |   66 +-
  crates/engine/src/run_journal.rs             |   19 +
- crates/engine/src/session_reports.rs         | 1136 +++++++++++++++
+ crates/engine/src/session_reports.rs         | 1137 +++++++++++++++
  crates/engine/src/sessions.rs                | 1322 +++++++++++++++++-
  crates/engine/tests/adapter_chaos_live.rs    |    2 +-
  crates/engine/tests/e2e.rs                   |    4 +-
@@ -73,21 +74,22 @@ has to poll, and the person never has to nudge either side.
  crates/engine/tests/runtime_survival.rs      |   14 +-
  crates/engine/tests/runtime_survival_live.rs |    2 +-
  crates/engine/tests/unarchive_on_send.rs     |    2 +-
- crates/mcp/src/jsonrpc.rs                    |    8 +
+ crates/mcp/src/jsonrpc.rs                    |   10 +-
  crates/mcp/src/tools.rs                      |   24 +-
  crates/proto/src/agent_messages.rs           |  422 +++++-
+ crates/sync/src/held_sends.rs                |    2 +-
  docs/mcp.md                                  |    8 +
- 43 files changed, 5968 insertions(+), 214 deletions(-)
+ 45 files changed, 5969 insertions(+), 217 deletions(-)
  create mode 100644 apps/zgx/ui/ds/spawn_group.luau
  create mode 100644 apps/zgx/ui/ds/subagent_row.luau
  create mode 100644 apps/zgx/ui/tests/subagent_reports.test.luau
  create mode 100644 crates/engine/src/session_reports.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd42c3be89 100644
+index acd1902cdb24d36aafde14f4014a82ecd31bb0b0..e7132e86a89ccd8a0b0be699fda2cb1c80584f05 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
-@@ -4647,6 +4647,13 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -5139,6 +5139,13 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
              if image_note_only(entry) {
                  return None;
              }
@@ -101,7 +103,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
              // A message from another chat: its routing header is the agent's to
              // read; the transcript shows who sent it, over its words.
              let sender = zeron_proto::agent_messages::agent_message_sender(&text);
-@@ -4766,6 +4773,44 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -5261,6 +5268,44 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
      }
  }
  
@@ -146,7 +148,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
  /// A switch side's mark: its agent's, the mock drawn as Claude, as the
  /// shipping app's `harness_brand_icon`.
  fn switch_mark(harness: &str) -> Option<String> {
-@@ -4835,6 +4880,7 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+@@ -5330,6 +5375,7 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
              ("kind", Value::from("tools")),
              ("summary", Value::from(group_summary(group).as_str())),
              ("live", Value::Bool(streaming && group_last == last_ix)),
@@ -154,7 +156,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
              ("tools", Value::List(tools.into())),
          ]));
          group.clear();
-@@ -5161,7 +5207,95 @@ fn is_agent(part: &Json) -> bool {
+@@ -5656,7 +5702,95 @@ fn is_agent(part: &Json) -> bool {
          Some("unknown") => call["name"].as_str(),
          _ => None,
      };
@@ -251,7 +253,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
  }
  
  /// A group's line, as the shipping app writes it (crates/ui transcript.rs
-@@ -5507,7 +5641,9 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
+@@ -6002,7 +6136,9 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
                  }
                  "mcp" => {
                      let tool = s("tool").unwrap_or_default();
@@ -262,7 +264,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
                          ("agent", "Ran a subagent".into(), tool.strip_prefix("Agent: ").map(Into::into))
                      } else {
                          ("exec", "Used".into(), Some(format!("{}.{tool}", s("server").unwrap_or_default())))
-@@ -5575,6 +5711,11 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
+@@ -6070,6 +6206,11 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
              ]),
          ));
      }
@@ -274,7 +276,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
      // What its row opens to (src/tool_details.rs).
      fields.extend(crate::tool_details::tool_fields(part));
      let stats = part["diffStats"].as_array();
-@@ -5808,7 +5949,21 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -6303,7 +6444,21 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          .queue
          .iter()
          .map(|q| {
@@ -297,7 +299,7 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
              // When it was queued (seconds): one that waited long is said so
              // before it goes.
              if let Some(ms) = q["issuedAt"].as_f64() {
-@@ -7323,6 +7478,115 @@ mod tests {
+@@ -7985,6 +8140,115 @@ mod tests {
          assert!(matches!(card.field("mark"), Some(Value::Str(s)) if s.as_ref() == mark("codex")));
          CHATS.with(|c| c.chats.borrow_mut().remove("c1"));
      }
@@ -414,10 +416,10 @@ index 4659a35fc3d720d0a2f152c4e1b6d4eec47ac313..619f2fbcb45f6eafbccc007ee43366cd
      fn a_prompts_attached_passages_show_as_chips_on_the_sent_message() {
          let text = "Why this one?\n\nSelected from this conversation:\n- GPT-5.5, Sep 8, 1:43 PM: Layout dominates.\n  Paint is second.\n- You: the first ask\n\nAttached images (local files — open them to view):\n- /tmp/shot.png";
 diff --git a/apps/zgx/src/sessions.rs b/apps/zgx/src/sessions.rs
-index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3eb893087 100644
+index 872508e79908d48e218b25d2090880c524fdd4e5..23f4aff4899926adc7252113d48e46f8c8383fa8 100644
 --- a/apps/zgx/src/sessions.rs
 +++ b/apps/zgx/src/sessions.rs
-@@ -474,10 +474,11 @@ fn deleted_with(chats: &[Json], root: &str) -> (u32, u32) {
+@@ -476,10 +476,11 @@ fn deleted_with(chats: &[Json], root: &str) -> (u32, u32) {
  }
  
  /// A parent's side chats: their ids in the list's order, their rows newest
@@ -430,7 +432,7 @@ index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3
      working: u32,
  }
  
-@@ -485,9 +486,13 @@ impl Kids {
+@@ -487,9 +488,13 @@ impl Kids {
      /// Its rows as now built, newest first, and how many work.
      fn sort(&mut self, rows: &HashMap<String, Row>) {
          let mut list: Vec<(f64, Value)> = Vec::with_capacity(self.ids.len());
@@ -445,7 +447,7 @@ index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3
              // (Under way: running, or waiting on work that will wake it.)
              if matches!(row.with.status, Some("working" | "waiting")) {
                  self.working += 1;
-@@ -570,7 +575,7 @@ impl Layout {
+@@ -572,7 +577,7 @@ impl Layout {
                  child_row(rows, c, id, parent, live(id), at);
                  let i = *layout.parent_at.entry(parent.clone()).or_insert_with(|| {
                      layout.parents.push(parent.clone());
@@ -454,7 +456,7 @@ index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3
                      layout.kids.len() - 1
                  });
                  layout.kids[i].ids.push(id.to_owned());
-@@ -581,7 +586,7 @@ impl Layout {
+@@ -583,7 +588,7 @@ impl Layout {
              kids.sort(rows);
          }
          layout.children = layout.children_value();
@@ -463,7 +465,7 @@ index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3
          // Archived, the most recently moved first (Settings → Archived), by
          // when each moved as its row was last built.
          // (Each entry by its own place: a list naming a chat twice, which
-@@ -650,10 +655,18 @@ fn child_row(rows: &mut HashMap<String, Row>, c: &Json, id: &str, parent: &str,
+@@ -652,10 +657,18 @@ fn child_row(rows: &mut HashMap<String, Row>, c: &Json, id: &str, parent: &str,
          .filter(|t| !t.trim().is_empty())
          .or(c["lastMessagePreview"].as_str().filter(|t| !t.trim().is_empty()))
          .unwrap_or("New side chat");
@@ -482,7 +484,7 @@ index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3
          ("device", Value::from(c["deviceId"].as_str().unwrap_or_default())),
          ("status", status.map_or(Value::Nil, Value::from)),
          ("updated", Value::from(updated as f64)),
-@@ -1458,7 +1471,7 @@ impl Sessions {
+@@ -1460,7 +1473,7 @@ impl Sessions {
                  _ => continue,
              };
              let Some(c) = entry(id, &mut index) else { continue };
@@ -491,7 +493,7 @@ index f446abc04e6b6447f7c066f56a80ddf3f9c88683..8ddf85be853a718d5270582b63dd99a3
              let value = top_row(&mut rows, c, id, known, live(id), at, side_chats, working);
              if !matches!((&list[pos], &value), (Value::Map(a), Value::Map(b)) if Rc::ptr_eq(a, b)) {
                  list[pos] = value;
-@@ -2499,12 +2512,38 @@ mod tests {
+@@ -2504,12 +2517,38 @@ mod tests {
          // Started by a Zeron chat, which kind; the person's, none.
          assert_eq!(kids[1].field("child_kind").map(crate::auth::text).as_deref(), Some("subagent"));
          assert!(kids[0].field("child_kind").is_none_or(|k| matches!(k, zgx_script::Value::Nil)));
@@ -560,10 +562,10 @@ index 7940c4c685c92d1f45994e0568745647491c363c..80fea1ae9354053e15ad69135967c946
  -- `github`: its GitHub repository (`owner/name`), the one a Cloud chat of it
  -- clones.
 diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
-index 16d15fda3bb1a70425ee741282da8d9d36db8178..68ccaa91ba75d32c4a7eed858efaed612f17be83 100644
+index 299b460f191472d405920bff12b3e1c4eb281f61..7476a5904f87d343f1b2f7479af3fdbfb0477142 100644
 --- a/apps/zgx/ui/chat_fixture.luau
 +++ b/apps/zgx/ui/chat_fixture.luau
-@@ -908,6 +908,305 @@ ui.command {
+@@ -926,6 +926,305 @@ ui.command {
  	end,
  }
  
@@ -870,7 +872,7 @@ index 16d15fda3bb1a70425ee741282da8d9d36db8178..68ccaa91ba75d32c4a7eed858efaed61
  ui.command { id = "theme_light", title = "Light theme", run = function() ui.theme.follow_system(false); ui.theme.current:set("zeron-light") end }
  ui.command { id = "theme_dark", title = "Dark theme", run = function() ui.theme.follow_system(false); ui.theme.current:set("zeron-dark") end }
 diff --git a/apps/zgx/ui/ds/activity.luau b/apps/zgx/ui/ds/activity.luau
-index 8a7d8aa077d8e89906eb3ca713caf3f6c73338c1..bd3e9fc6a4180fc0219eeb6c0ece3ab7c7999628 100644
+index 8e05f0bc4eeb84b0a998c825edda24314eb8f2a9..51ac4f5590c2cf535c6af3af59c9053767800bf3 100644
 --- a/apps/zgx/ui/ds/activity.luau
 +++ b/apps/zgx/ui/ds/activity.luau
 @@ -29,6 +29,7 @@ local locale = require("@self/locale")
@@ -986,15 +988,15 @@ index 8a7d8aa077d8e89906eb3ca713caf3f6c73338c1..bd3e9fc6a4180fc0219eeb6c0ece3ab7
  
  return ui.component(function(props: Props): Node
  	local live = props.live or function()
-@@ -1007,7 +1081,7 @@ return ui.component(function(props: Props): Node
- 				return place() < last_branch:get()
- 			end, function(): boolean
- 				return live() and place() == count:get()
--			end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures)
-+			end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures, props.subagent_child)
- 		end
- 		-- (A call arriving joins as a row joining a `ui.each` does; the rest
- 		-- are made as they come into view, as they were.)
+@@ -1017,7 +1091,7 @@ return ui.component(function(props: Props): Node
+ 					return place() < last_branch:get()
+ 				end, function(): boolean
+ 					return live() and place() == count:get()
+-				end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures)
++				end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures, props.subagent_child)
+ 			end
+ 			-- (A call arriving joins as a row joining a `ui.each` does; the rest
+ 			-- are made as they come into view, as they were.)
 diff --git a/apps/zgx/ui/ds/composer_dock.luau b/apps/zgx/ui/ds/composer_dock.luau
 index 2803c899f4e28e7e53a3bf4f60ad022b0f74d5bf..a55452c0568876681b5ffbde37a29f8cfa3fdfb8 100644
 --- a/apps/zgx/ui/ds/composer_dock.luau
@@ -1225,7 +1227,7 @@ index 0722a344a4952121efd2079d7b66e4d75aea5187..2e69cc8345843a64eb6ee325aaac2c7a
  	decode = require("@self/decode"),
  	effects = require("@self/effects"),
 diff --git a/apps/zgx/ui/ds/locale_en.luau b/apps/zgx/ui/ds/locale_en.luau
-index 797581c81ecaa49c07d483dedbc631e764e63d44..936047ee3e82f5fc4831d2b61357222f73e600b2 100644
+index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..ee7b94968233780874e102ced035970d4f67f4fb 100644
 --- a/apps/zgx/ui/ds/locale_en.luau
 +++ b/apps/zgx/ui/ds/locale_en.luau
 @@ -43,6 +43,7 @@ return {
@@ -1236,7 +1238,7 @@ index 797581c81ecaa49c07d483dedbc631e764e63d44..936047ee3e82f5fc4831d2b61357222f
  	["ds.file_tree.status.modified"] = "Modified",
  	["ds.file_tree.status.added"] = "Added",
  	["ds.file_tree.status.untracked"] = "Untracked",
-@@ -896,6 +897,25 @@ return {
+@@ -901,6 +902,25 @@ return {
  	["ds.mention_launcher.none.chats"] = "No chats match “{q}”",
  	["ds.mention_launcher.none.attachments"] = "No attachments match “{q}”",
  	["ds.mention_launcher.placeholder"] = "Search files, chats, attachments",
@@ -1804,7 +1806,7 @@ index 0000000000000000000000000000000000000000..2da0da541beb8688ef16fee9f80cd263
 +	end,
 +}) :: any
 diff --git a/apps/zgx/ui/ds/status.luau b/apps/zgx/ui/ds/status.luau
-index 3f51f9497afb3ccc80eff9ac81c54ca9a4e1474f..f78742b9fc1be10db4e7179350065c17c74686be 100644
+index d93a1cba3d0b72d3dccdce80b75739e5235fc701..550f7dcfd299e67b5960a6e89d06039d8163f17f 100644
 --- a/apps/zgx/ui/ds/status.luau
 +++ b/apps/zgx/ui/ds/status.luau
 @@ -13,7 +13,7 @@ local locale = require("@self/locale")
@@ -2219,7 +2221,7 @@ index 0000000000000000000000000000000000000000..d2bf10683963b1ff24cf7fefc34a3a61
 +	end,
 +}) :: any
 diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
-index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6feab769dcf 100644
+index 38e793b3dd753511d63da88e4b7fc65340cdc6db..ab60001aef2264e224058bae7f5af93fac06e3b2 100644
 --- a/apps/zgx/ui/ds/transcript.luau
 +++ b/apps/zgx/ui/ds/transcript.luau
 @@ -43,6 +43,7 @@
@@ -2250,7 +2252,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  	text: string,
  	-- A person's: what came with it.
  	attachments: { UserMessage.Attachment }?,
-@@ -103,7 +107,17 @@ export type Message = {
+@@ -106,7 +110,17 @@ export type Message = {
  	to_mark: Mark.Name?,
  	-- A person's that another chat sent: which, and its title when it was sent.
  	sender: { chat: string, title: string }?,
@@ -2268,7 +2270,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  
  export type Props = {
  	messages: State<{ Message }>,
-@@ -176,9 +190,16 @@ export type Props = {
+@@ -187,9 +201,16 @@ export type Props = {
  	open_link: ((target: string) -> ())?,
  	-- A chat as it's listed now: its title and agent's mark. Nil for one that
  	-- isn't listed, which a message from it can't open.
@@ -2286,7 +2288,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  	-- Those links' context menus where they aren't the web's (ds/markdown's
  	-- `link_menu`).
  	link_menu: ((target: string) -> { Markdown.LinkEntry }?)?,
-@@ -635,6 +656,16 @@ type View = {
+@@ -686,6 +707,16 @@ type View = {
  	open_subagent: ((sub: any) -> ())?,
  	-- A message text's find (its key: `<id>:u`, `<id>:<block>`, `<id>:r`).
  	find: ((key: string) -> any)?,
@@ -2303,8 +2305,8 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  }
  
  -- A reply's thought being written, for its row (ds/activity's `thought`): the
-@@ -654,41 +685,299 @@ local function thought_of(m: Message, now: () -> Message, draft: State<Draft>?):
- 	}
+@@ -813,41 +844,296 @@ local function aside_blocks(id: string): { Block }
+ 	return if ok and type(list) == "table" then list else {}
  end
  
 +-- A message's time of day alone ("2:14 PM" of "Sep 8, 2:14 PM"), for a row
@@ -2574,9 +2576,9 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
 +	}
 +end
 +
- local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message, draft: State<Draft>?, view: View?): Node
- 	local shown = ui.computed(list)
- 	return ui.each(shown, function(b: Block, _i: number, brow: State<Block>): Node
+ -- (`aside`: the reply's blocks are the host's, its runs said by its row.)
+ local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message, draft: State<Draft>?, view: View?, aside: boolean?): Node
+ 	local function block(b: Block, brow: State<Block>): Node
 -		if b.kind == "tools" or b.kind == "work" then
 -			return Activity {
 -				key = `{m.id}:{b.id}`,
@@ -2609,9 +2611,6 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
 -					end
 -					else nil,
 -			}
-+		-- Children started together (a Zeron `create_chats`, a harness's
-+		-- subagents side by side): one block of them, live. (A group can
-+		-- become one as a second spawn joins it while the reply is written.)
 +		if b.kind == "tools" then
 +			return ui.presence(function(): string
 +				return if brow:get().spawn then "spawn" else "tools"
@@ -2635,7 +2634,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  		end
  		-- An agent's visual: built once, followed by the host (src/visuals.rs).
  		if b.kind == "visual" then
-@@ -825,6 +1114,9 @@ local function reply(
+@@ -1250,6 +1536,9 @@ local function reply(
  				key = m.id,
  				open_subagent = if view then view.open_subagent else nil,
  				pictures = if view then view.shown_pictures else nil,
@@ -2645,7 +2644,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  				thought = thought_of(m, now, draft),
  				tools = function()
  					return now().tools or {}
-@@ -936,6 +1228,59 @@ local named_sending: { [string]: (push: () -> (), landing: string?) -> () } = {}
+@@ -1361,6 +1650,59 @@ local named_sending: { [string]: (push: () -> (), landing: string?) -> () } = {}
  local function Transcript(props: Props): Node
  	opened_at = ui.now()
  	local messages = props.messages
@@ -2705,7 +2704,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  	-- (Its own kept states, by its name: a side chat's beside the chat
  	-- page's never shares the chat page's glide, runway or hover.)
  	local kept = if props.name then `.{props.name}` else ""
-@@ -1836,8 +2181,12 @@ local function Transcript(props: Props): Node
+@@ -2290,8 +2632,12 @@ local function Transcript(props: Props): Node
  			rows[m.id] = nil
  		end)
  		-- Zeron's gaps: a message opens 16 under the lane of the one before;
@@ -2719,7 +2718,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  			if mine and index:get() > 1 then
  				local prev = messages:at(index:get() - 1)
  				if prev and prev.role == "switch" then
-@@ -1922,6 +2271,7 @@ local function Transcript(props: Props): Node
+@@ -2376,6 +2722,7 @@ local function Transcript(props: Props): Node
  						end
  					end,
  				if m.role == "switch" then seam(m)
@@ -2727,7 +2726,7 @@ index 8606ca686d1aee558d3200b8c13bbbd85e6c3e01..f172ee16bd06abebaf8d49f5a0a3c6fe
  					elseif mine then ui.column {
  						hook = "chat.message.prompt",
  						-- What it is, for a plugin's selector (and the
-@@ -1947,7 +2297,7 @@ local function Transcript(props: Props): Node
+@@ -2401,7 +2748,7 @@ local function Transcript(props: Props): Node
  						strip(m, state, hovered),
  						waiting_line(state, props.on_retry, props.turn_state),
  					}
@@ -2789,7 +2788,7 @@ index 2179b2f16f5bbb97ec7cbc050f92a84d4b989544..f4fcd6510bfb6c3006169b7e84ff6dcb
  				id = "statuses",
  				title = "Statuses",
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 14ec7b88f50ccaf2cb0721ab8177ef12462cacc5..3609b0af49c54f24564c4fbe4ec241601f85c9a8 100644
+index ff0b3c46fb289a453706e97dd6ba85e8d029afe9..4bfa57b9cb17ed44f35beb8f60dfdec4bf8d93fd 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
 @@ -49,7 +49,8 @@
@@ -2802,7 +2801,7 @@ index 14ec7b88f50ccaf2cb0721ab8177ef12462cacc5..3609b0af49c54f24564c4fbe4ec24160
      },
      "file_tree": {
        "status": {
-@@ -1127,6 +1128,29 @@
+@@ -1134,6 +1135,29 @@
          "attachments": "No attachments match “{q}”"
        },
        "placeholder": "Search files, chats, attachments"
@@ -2833,7 +2832,7 @@ index 14ec7b88f50ccaf2cb0721ab8177ef12462cacc5..3609b0af49c54f24564c4fbe4ec24160
    },
    "settings": {
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index e1f3f0bfcfd2288553f61ae57a69dc9c65e64db4..0900b3037570ffc95b06d6f053cb88a2cbe2a091 100644
+index ac52ad25ec892e85e6bbb47d8c5573f57b3d61fc..9386143845925f6d212f6f96fad0e066e8687b7c 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
 @@ -49,7 +49,8 @@
@@ -2846,7 +2845,7 @@ index e1f3f0bfcfd2288553f61ae57a69dc9c65e64db4..0900b3037570ffc95b06d6f053cb88a2
      },
      "file_tree": {
        "status": {
-@@ -756,7 +757,10 @@
+@@ -763,7 +764,10 @@
        "new_reply": "新回复",
        "display_failed": "无法显示此内容",
        "image_failed": "无法显示这张图片",
@@ -2858,7 +2857,7 @@ index e1f3f0bfcfd2288553f61ae57a69dc9c65e64db4..0900b3037570ffc95b06d6f053cb88a2
      },
      "user_message": {
        "open_named": "打开 {name}",
-@@ -1127,6 +1131,29 @@
+@@ -1134,6 +1138,29 @@
          "attachments": "没有与“{q}”匹配的附件"
        },
        "placeholder": "搜索文件、对话和附件"
@@ -3038,31 +3037,31 @@ index cc05f75f82921156f23c23d9caf57a07782785bf..0694eb9b3d745c0f5edfe3e174ffd555
  	if string.sub(ref, 1, #CHILD) == CHILD then
  		local id = string.sub(ref, #CHILD + 1)
 diff --git a/apps/zgx/ui/screens/chat/session.luau b/apps/zgx/ui/screens/chat/session.luau
-index 5701d38b856adaeffd0298123fc674e9db2331cd..2e609abff312bf45a66fbd9b742af7530bcdfc00 100644
+index 911499ac37886940088e1ae5c95c893b272d5db8..7eaad3b642f4d8176fe722b4901c2b52fe9645a5 100644
 --- a/apps/zgx/ui/screens/chat/session.luau
 +++ b/apps/zgx/ui/screens/chat/session.luau
-@@ -303,6 +303,16 @@ local function Session(id: Id?): Node
- 							end,
- 							on_mention = shared.mention,
- 							chat_of = shared.chat_of,
-+							-- (Which chats its Zeron spawns made.)
-+							children = function(): { { id: string, created: number } }
-+								return sessions.children(which())
-+							end,
-+							-- (Its harness's own subagents run on its agent.)
-+							agent_mark = function(): string?
-+								local s = which()
-+								local c = if s then shared.chat_of(s) else nil
-+								return if c then c.mark else nil
-+							end,
- 							open_sender = function(chat: string, title: string)
- 								local s = which()
- 								if s then
+@@ -306,6 +306,16 @@ local function Session(id: Id?): Node
+ 						end,
+ 						on_mention = shared.mention,
+ 						chat_of = shared.chat_of,
++						-- (Which chats its Zeron spawns made.)
++						children = function(): { { id: string, created: number } }
++							return sessions.children(which())
++						end,
++						-- (Its harness's own subagents run on its agent.)
++						agent_mark = function(): string?
++							local s = which()
++							local c = if s then shared.chat_of(s) else nil
++							return if c then c.mark else nil
++						end,
+ 						open_sender = function(chat: string, title: string)
+ 							local s = which()
+ 							if s then
 diff --git a/apps/zgx/ui/screens/chat/shared.luau b/apps/zgx/ui/screens/chat/shared.luau
-index 53a6dba096aedb77ce4d8ae62abd6ad02ec03939..e9638ab53330d396056d968e4661aa28b8049dc9 100644
+index 97cbe659a5b7906a4d8254a9bfc316a326ad91d8..e75f728239a6c48be1c5c84ade25241811094da3 100644
 --- a/apps/zgx/ui/screens/chat/shared.luau
 +++ b/apps/zgx/ui/screens/chat/shared.luau
-@@ -697,7 +697,7 @@ end
+@@ -742,7 +742,7 @@ end
  
  -- A chat as it's listed now, for what says who sent a message: its title (its
  -- short id, untitled) and its agent's mark. Nil for one that isn't listed.
@@ -3071,7 +3070,7 @@ index 53a6dba096aedb77ce4d8ae62abd6ad02ec03939..e9638ab53330d396056d968e4661aa28
  	local now = sessions.now:get()
  	local found: any = nil
  	for _, c in now.chats do
-@@ -731,7 +731,25 @@ function M.chat_of(id: string): { title: string, mark: string? }?
+@@ -776,7 +776,25 @@ function M.chat_of(id: string): { title: string, mark: string? }?
  		return nil
  	end
  	local title = string.match(string.gsub(found.title or "", "%s+", " "), "^%s*(.-)%s*$") or ""
@@ -3570,10 +3569,10 @@ index b79f6ed94fd64454b6ba72922cf3e8e45455e04d..fa15315f08b6f39f22f63c08ebfd2de4
              issued_at: 9,
              based_on: None,
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302c2b2114f 100644
+index 722b498bdf153dba612b3bb2e33efb210d63bba6..6587e3235348d7a92143e1d18dfd2f57abb736a2 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -125,6 +125,43 @@ const ATTACHMENT_WAIT_MAX_MS: i64 = ATTACHMENT_WAIT_MAX.as_millis() as i64;
+@@ -131,6 +131,43 @@ const ATTACHMENT_WAIT_MAX_MS: i64 = ATTACHMENT_WAIT_MAX.as_millis() as i64;
  /// (the happy path is event-driven — UploadCommit kicks the drain — this
  /// timer only covers the give-up transition and missed kicks).
  const ATTACHMENT_WAIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
@@ -3617,7 +3616,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
  
  /// Transfer attempt outcome: transient failures retry (the link may heal),
  /// permanent ones stop (the host actively refused, or the bytes are gone).
-@@ -330,6 +367,12 @@ struct DocHostInner {
+@@ -336,6 +373,12 @@ struct DocHostInner {
      /// deferred on in-transit attachment bytes re-checks on a cadence, and
      /// each deferral must not stack another timer.
      drain_waiting: Mutex<HashSet<String>>,
@@ -3630,7 +3629,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
      /// Uploads store (engine assembly) — resolves `pending://` attachment
      /// refs and jails transfer reads to the uploads dir.
      uploads: OnceLock<crate::uploads::Uploads>,
-@@ -1295,6 +1338,8 @@ impl DocHost {
+@@ -1323,6 +1366,8 @@ impl DocHost {
                  seeding: Mutex::new(HashSet::new()),
                  seed_waiting: Mutex::new(HashSet::new()),
                  drain_waiting: Mutex::new(HashSet::new()),
@@ -3639,7 +3638,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
                  uploads: OnceLock::new(),
                  connectivity: OnceLock::new(),
                  connectivity_started: AtomicBool::new(false),
-@@ -1358,7 +1403,7 @@ impl DocHost {
+@@ -1387,7 +1432,7 @@ impl DocHost {
  
      /// The sessions engine, once wired. `None` before assembly or after
      /// `shutdown_workers` — callers treat both as "executor unavailable".
@@ -3648,7 +3647,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
          lock(&self.inner.sessions).clone()
      }
  
-@@ -4282,10 +4327,15 @@ impl DocHost {
+@@ -4379,10 +4424,15 @@ impl DocHost {
              turn_id: Some(m.id.clone()),
              frontier: None,
          });
@@ -3668,7 +3667,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
          let entry = SessionCommandEntry {
              id: id.clone(),
              payload,
-@@ -4989,6 +5039,12 @@ impl DocHost {
+@@ -5086,6 +5136,12 @@ impl DocHost {
              if sessions.turn_in_flight(&handle.chat_id) {
                  return; // All queued messages wait, including rows from older clients.
              }
@@ -3681,7 +3680,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
              // A row from another device names its images by `pending://` ref
              // while the bytes chase it over the peer link. Hold it (in order)
              // until they land — UploadCommit re-drains — rather than handing
-@@ -5014,8 +5070,26 @@ impl DocHost {
+@@ -5111,8 +5167,26 @@ impl DocHost {
                  return;
              };
              lock(&handle.steered_rows).retain(|row| row != &item.id);
@@ -3709,7 +3708,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
                  tracing::warn!(chat = %handle.chat_id, error = %err, "queued send failed");
                  handle.queue_paused.store(true, Ordering::Release);
                  let _ = handle.doc.insert_queued(0, &item);
-@@ -6453,6 +6527,60 @@ impl DocHost {
+@@ -6551,6 +6625,60 @@ impl DocHost {
                  // A run on another provider than the live turn's (a stale
                  // client, another device's switch) waits for the turn: the
                  // provider never changes by killing a turn mid-flight.
@@ -3770,7 +3769,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
                  let other_provider = sessions.live_harness(chat_id).is_some_and(|live| live != harness);
                  // Sent before the turn now running had started: the sender never
                  // saw that turn, so it can't be a steer into it. Two messages sent
-@@ -6505,8 +6633,11 @@ impl DocHost {
+@@ -6603,8 +6731,11 @@ impl DocHost {
                  .await?;
                  // A fresh user-authored turn is the deliberate action that
                  // thaws a queue frozen by Cancel. Clear only after dispatch
@@ -3784,7 +3783,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
                  Ok((SessionCommandStatus::Applied, None))
              }
              SessionCommandPayload::Steer {
-@@ -6524,7 +6655,7 @@ impl DocHost {
+@@ -6622,7 +6753,7 @@ impl DocHost {
                  )
                  .await
              }
@@ -3793,7 +3792,7 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
                  self.await_earlier_prompts(sessions, handle, &entry.id)
                      .await;
                  *lock(&handle.stopped_by) = Some(entry.id.clone());
-@@ -6701,6 +6832,190 @@ impl DocHost {
+@@ -6799,6 +6930,190 @@ impl DocHost {
          Ok(())
      }
  
@@ -3985,10 +3984,10 @@ index b1d8a9b28c8e69b7ed66f16fdf26e209dc41c155..2eec3d0afc7c43e714d87284c8f69302
      /// live steerable run — deliver the durable command as the next turn.
      /// After an engine restart `last_request` is empty too, so rebuild the run
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 18b301478aeb260d3568425047d7c79f4d28d16f..9fbb31df579c62e0fd98bd08f04feeacfbdd6176 100644
+index ab7799f8271783c6740f75eb3c6757822159f0b5..0c803cb9a08330d59d5a6722ff95ade3dfc90f49 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -363,6 +363,7 @@ impl EngineCore {
+@@ -377,6 +377,7 @@ impl EngineCore {
                  Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
                  Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
              }
@@ -3996,8 +3995,21 @@ index 18b301478aeb260d3568425047d7c79f4d28d16f..9fbb31df579c62e0fd98bd08f04feeac
              doc_host.boot_recovery_finished();
          }
          doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
+diff --git a/crates/engine/src/managed.rs b/crates/engine/src/managed.rs
+index 644a5a3e26e6c1ec0d37d4057e939498ccb5edc0..121d89380b2a49ad219a67f17fc2428e38fb9ae5 100644
+--- a/crates/engine/src/managed.rs
++++ b/crates/engine/src/managed.rs
+@@ -136,7 +136,7 @@ impl RpcService for ManagedRpc {
+                     for chat in sessions.chats_with_work() {
+                         match doc_host.queue_command(
+                             &chat,
+-                            zeron_doc::SessionCommandPayload::Interrupt {},
++                            zeron_doc::SessionCommandPayload::Interrupt { stopped_by: None },
+                         ) {
+                             Ok(_) => stopped += 1,
+                             Err(err) => tracing::warn!(chat, error = %err, "couldn't stop a chat as the app quit"),
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 210c85a10e556059aa75587786c5ee461a868352..04d7e196aae5cc13a63929ba1ebe185861f643bb 100644
+index 0ec6869b1961beac8ffb609b93e6babb0a7816b0..22035672a7b53b327148b37c9a4656d63c289e61 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
 @@ -59,7 +59,7 @@
@@ -4010,10 +4022,10 @@ index 210c85a10e556059aa75587786c5ee461a868352..04d7e196aae5cc13a63929ba1ebe1858
  mod remote_plugins;
  mod voice_chat;
 diff --git a/crates/engine/src/rpc/agent_gate.rs b/crates/engine/src/rpc/agent_gate.rs
-index 018fded0740e32f887d98dbb47b12e8178336bea..6a64539f0e0d84386223feb723d51ed4e2ba7b11 100644
+index 4fc336aa5e369028979e479eb311449682c0911e..5a20160012cd08a233633ce850140b9fbbec8fb7 100644
 --- a/crates/engine/src/rpc/agent_gate.rs
 +++ b/crates/engine/src/rpc/agent_gate.rs
-@@ -36,7 +36,7 @@ pub(super) struct Calling {
+@@ -43,7 +43,7 @@ pub(super) struct Calling {
  }
  
  /// The `Title (short-id)` label a header names a chat by.
@@ -4022,7 +4034,7 @@ index 018fded0740e32f887d98dbb47b12e8178336bea..6a64539f0e0d84386223feb723d51ed4
      let short: String = id.chars().take(8).collect();
      match chat.and_then(|c| c.title.as_deref()).map(str::trim).filter(|t| !t.is_empty()) {
          Some(title) => format!("{title} ({short})"),
-@@ -87,11 +87,21 @@ impl EngineRpc {
+@@ -98,11 +98,21 @@ impl EngineRpc {
          }
          let chats = self.workspace.read_chats().unwrap_or_default();
          let calling = chat.as_deref().map(|id| self.calling(id, &chats));
@@ -4044,8 +4056,8 @@ index 018fded0740e32f887d98dbb47b12e8178336bea..6a64539f0e0d84386223feb723d51ed4
 +                relation,
              )
          };
-         match method {
-@@ -168,6 +178,14 @@ impl EngineRpc {
+         if command {
+@@ -197,6 +207,14 @@ impl EngineRpc {
                          let prompt = command["prompt"].as_str().unwrap_or_default();
                          command["prompt"] = json!(attributed(&target_id, prompt));
                      }
@@ -4060,7 +4072,7 @@ index 018fded0740e32f887d98dbb47b12e8178336bea..6a64539f0e0d84386223feb723d51ed4
                      "respondInput" => {
                          let approves = command["answers"].as_array().into_iter().flatten().any(|answer| {
                              answer["labels"]
-@@ -397,6 +415,50 @@ mod tests {
+@@ -606,6 +624,50 @@ mod tests {
          core.sessions.shutdown().await;
      }
  
@@ -4112,37 +4124,41 @@ index 018fded0740e32f887d98dbb47b12e8178336bea..6a64539f0e0d84386223feb723d51ed4
      /// mark is pinned to the one its MCP server runs in; one that runs in
      /// none can't mark any. Sleep is the person's: no agent sets it.
 diff --git a/crates/engine/src/run_journal.rs b/crates/engine/src/run_journal.rs
-index 636da386fd5c5ea43707e10066dcba42df63c55c..43dcd248ad042c5df95d0cda3610b0a0220b6057 100644
+index 9fe50725f94e66b585361dbf35d075cb8ddde3fd..96cfc8b38b903a842e9f448901d53ba58381d632 100644
 --- a/crates/engine/src/run_journal.rs
 +++ b/crates/engine/src/run_journal.rs
-@@ -48,6 +48,9 @@ struct ChatJournal {
- pub struct RunJournal {
+@@ -133,6 +133,9 @@ pub struct RunJournal {
      dir: PathBuf,
-     open_files: Mutex<HashMap<String, ChatJournal>>,
+     shared: Arc<Shared>,
+     flusher: Option<std::thread::JoinHandle<()>>,
 +    /// When each chat's run last recorded anything (epoch millis), since
 +    /// this engine started: how long a working chat has been quiet.
 +    last_append: Mutex<HashMap<String, i64>>,
  }
  
- impl RunJournal {
-@@ -57,6 +60,7 @@ impl RunJournal {
-         Ok(Self {
+ /// What the journal shares with its flusher thread.
+@@ -223,6 +226,7 @@ impl RunJournal {
              dir,
-             open_files: Mutex::new(HashMap::new()),
+             shared,
+             flusher: Some(flusher),
 +            last_append: Mutex::new(HashMap::new()),
          })
      }
  
-@@ -214,9 +218,24 @@ impl RunJournal {
-         journal.file.flush()?;
-         journal.needs_newline = false;
-         journal.next_seq = seq + 1;
+@@ -395,6 +399,11 @@ impl RunJournal {
+         if due {
+             journal.write_pending(chat_id)?;
+         }
 +        drop(files);
 +        self.last_append
 +            .lock()
 +            .unwrap_or_else(PoisonError::into_inner)
 +            .insert(chat_id.to_owned(), chrono::Utc::now().timestamp_millis());
          Ok(seq)
+     }
+ 
+@@ -414,6 +423,16 @@ impl RunJournal {
+         }
      }
  
 +    /// When `chat_id`'s run last recorded an event (epoch millis), if it has
@@ -4160,10 +4176,10 @@ index 636da386fd5c5ea43707e10066dcba42df63c55c..43dcd248ad042c5df95d0cda3610b0a0
      pub fn replay(
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..02dd5b9281bc5aa8e5df002e7ba13e1ecd2fb72f
+index 0000000000000000000000000000000000000000..434ff11d7148428375636ea5cd7d0ef36b4c0ff7
 --- /dev/null
 +++ b/crates/engine/src/session_reports.rs
-@@ -0,0 +1,1136 @@
+@@ -0,0 +1,1137 @@
 +//! A child chat reports back to its parent: when a turn its parent's agent
 +//! asked for settles (finished, failed, stopped, or asking the person), the
 +//! child's host writes the reply into the parent as a report
@@ -5131,6 +5147,7 @@ index 0000000000000000000000000000000000000000..02dd5b9281bc5aa8e5df002e7ba13e1e
 +            resolved,
 +            output: None,
 +            diff: None,
++            review: None,
 +            output_ref: None,
 +            output_bytes: None,
 +            preview_paths: Vec::new(),
@@ -5301,7 +5318,7 @@ index 0000000000000000000000000000000000000000..02dd5b9281bc5aa8e5df002e7ba13e1e
 +    }
 +}
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c95368b72 100644
+index ab9bc3cf065c8c2e58947bf81be44eb4d69cc5c4..7e97cce3cb58761c9679fee2c75ee3475ebe26c1 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -29,6 +29,7 @@ use zeron_doc::{
@@ -5322,7 +5339,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
  use crate::{EngineError, new_id, now_ms};
-@@ -280,6 +284,14 @@ struct Inner {
+@@ -285,6 +289,14 @@ struct Inner {
      /// while no run was live (between the failed run and its retry) found
      /// nothing to stop, and still ends the turn.
      user_stops: Mutex<HashMap<String, u64>>,
@@ -5337,17 +5354,17 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      /// Loopback IPC port this engine serves, once known (0 = not serving):
      /// what the injected `zeron mcp` server dials back into.
      ipc_port: std::sync::atomic::AtomicU16,
-@@ -336,6 +348,9 @@ struct Inner {
-     turn_listener: OnceLock<TurnListener>,
-     /// Plugins whose native MCP servers local runs get (absent in bare tests).
-     plugins: OnceLock<crate::plugins::Plugins>,
+@@ -351,6 +363,9 @@ struct Inner {
+     warm: Mutex<HashMap<String, warm_start::WarmStart>>,
+     /// Their leases (open, typed) when a test sets them.
+     warm_leases: Mutex<Option<(std::time::Duration, std::time::Duration)>>,
 +    /// What each child chat hosted here has reported to its parent (see
 +    /// [`reports`]).
 +    reported: Arc<reports::Reported>,
  }
  
- /// Turn-start hook: called with `(chat_id, cwd)`.
-@@ -367,6 +382,8 @@ impl SessionsEngine {
+ /// How long a runtime parked between turns with nothing pending keeps its
+@@ -494,6 +509,8 @@ impl SessionsEngine {
                  revivals_starting: Mutex::new(std::collections::HashSet::new()),
                  cancelled_sends: Mutex::new(HashMap::new()),
                  user_stops: Mutex::new(HashMap::new()),
@@ -5356,15 +5373,15 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
                  ipc_port: std::sync::atomic::AtomicU16::new(0),
                  ipc_ready: tokio::sync::Notify::new(),
                  ipc_none: std::sync::atomic::AtomicBool::new(false),
-@@ -389,6 +406,7 @@ impl SessionsEngine {
-                 scratch_root: OnceLock::new(),
-                 turn_listener: OnceLock::new(),
+@@ -520,6 +537,7 @@ impl SessionsEngine {
                  plugins: OnceLock::new(),
+                 warm: Mutex::new(HashMap::new()),
+                 warm_leases: Mutex::new(None),
 +                reported: Arc::default(),
              }),
          }
      }
-@@ -459,6 +477,31 @@ impl SessionsEngine {
+@@ -627,6 +645,31 @@ impl SessionsEngine {
          let _ = self.inner.plugins.set(plugins);
      }
  
@@ -5396,7 +5413,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      /// Wire the doc host (called once at engine assembly; the two services are mutually
      /// referential by design — sessions stream into docs, docs execute commands here).
      pub fn set_doc_host(&self, host: DocHost) {
-@@ -582,6 +625,11 @@ impl SessionsEngine {
+@@ -758,6 +801,11 @@ impl SessionsEngine {
              .is_some_and(HarnessDescriptor::steers_mid_turn)
      }
  
@@ -5408,7 +5425,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      /// Whether this chat has a turn in flight — streaming, or parked on a
      /// question it is still owed an answer to (see [`is_active`]). A persistent
      /// session parked BETWEEN turns is not: it holds a warm child with nothing
-@@ -1761,8 +1809,10 @@ impl SessionsEngine {
+@@ -2029,8 +2077,10 @@ impl SessionsEngine {
          if !self.turn_in_flight(chat_id) {
              return false;
          }
@@ -5420,7 +5437,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
          redeliver_on_stop.store(true, Release);
          turn.stop_turn();
          let deadline = tokio::time::Instant::now() + STOP_SETTLE;
-@@ -1801,6 +1851,7 @@ impl SessionsEngine {
+@@ -2069,6 +2119,7 @@ impl SessionsEngine {
      /// models never come here: they keep the runtime and its work.)
      pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
          self.note_user_stop(chat_id);
@@ -5428,7 +5445,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
          self.terminate(chat_id).await
      }
  
-@@ -1827,6 +1878,12 @@ impl SessionsEngine {
+@@ -2095,6 +2146,12 @@ impl SessionsEngine {
          }
      }
  
@@ -5441,7 +5458,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      /// End the in-flight turn so another prompt can take its place ("send
      /// now"), keeping the runtime and its background work. Its streaming
      /// entry is stamped `aborted`; this waits (bounded) for that settlement
-@@ -1841,6 +1898,7 @@ impl SessionsEngine {
+@@ -2109,6 +2166,7 @@ impl SessionsEngine {
      pub async fn stop_turn(&self, chat_id: &str) -> Result<bool, EngineError> {
          const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
          self.note_user_stop(chat_id);
@@ -5449,7 +5466,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
          let target = lock(&self.inner.runs)
              .get(chat_id)
              .filter(|h| {
-@@ -2714,6 +2772,7 @@ impl Inner {
+@@ -3019,6 +3077,7 @@ impl Inner {
          outcome: Option<DoneStatus>,
      ) {
          let now = Utc::now();
@@ -5457,7 +5474,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
          let session = {
              let mut statuses = lock(&self.statuses);
              let entry = statuses
-@@ -2801,6 +2860,75 @@ impl Inner {
+@@ -3106,6 +3165,75 @@ impl Inner {
          {
              tracing::warn!(chat = %chat_id, %error, "couldn't wake a sleeping chat");
          }
@@ -5533,7 +5550,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      }
  
      /// Publish what `chat_id`'s agent waits on after its turn ended (`None`:
-@@ -2838,9 +2966,18 @@ impl Inner {
+@@ -3143,9 +3271,18 @@ impl Inner {
      /// A message the user already sent follows the turn that is ending
      /// (see [`crate::doc_host::ChatDocHandle::continues_with_sent_message`]).
      fn continues_with_sent_message(&self, chat_id: &str) -> bool {
@@ -5555,7 +5572,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      }
  
      /// Whether a run of `chat_id` launches without its provider's own
-@@ -4773,6 +4910,10 @@ async fn drive_run(
+@@ -5229,6 +5366,10 @@ async fn drive_run(
      let mut waiting_on = turn.watch_waiting();
      let mut wait: Option<ParkedWait> = None;
      let wake_grace = wake_grace();
@@ -5566,7 +5583,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
      // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
      // steerable harness parks here instead of ending the run — the child and
      // its steering mailbox stay warm, and the next user message (dispatch
-@@ -4917,9 +5058,23 @@ async fn drive_run(
+@@ -5398,9 +5539,23 @@ async fn drive_run(
                      continue;
                  }
                  // What a parked wait waits on changed: shown as it is; once
@@ -5593,7 +5610,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
                      if let Some(parked) = wait.as_mut() {
                          parked.grace = if on.is_empty() {
                              parked.grace.or_else(|| Some(tokio::time::Instant::now() + wake_grace))
-@@ -5942,8 +6097,9 @@ async fn drive_run(
+@@ -6506,8 +6661,9 @@ async fn drive_run(
                  let outcome = (!pending_steer && turn_was_active).then_some(*status);
                  // A finished turn whose agent waits on background work that
                  // will wake it parks into a wait: Waiting, its completion
@@ -5605,7 +5622,7 @@ index 52ec3e0d13028d14e6125a38e2cf74a61a22c9b7..89f50aafcd0b5af01285a876b8f3b07c
                  if completed_turn.is_some() && !on.is_empty() {
                      let since = Utc::now();
                      wait = Some(ParkedWait {
-@@ -7770,4 +7926,1152 @@ mod tests {
+@@ -8334,4 +8490,1152 @@ mod tests {
          sessions.ipc_port_ready(limit).await;
          assert_eq!(start.elapsed(), Duration::ZERO);
      }
@@ -6918,13 +6935,15 @@ index a41b601dc8a3540bc312ed645922362108bdcce4..430abbe4bf29cbadc70df29d34441af9
      assert!(
          archived(&core),
 diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
-index a4be9e109b60bdc7ca4d004f6d434a2177939261..5f37b345b93d6e59a9cdc695b747c6dff3fbd792 100644
+index 8534ee609b78b1e1d749711f05f55fa797bf7819..f7ba2cacdb371a6906b380d54413f5ef15b131d2 100644
 --- a/crates/mcp/src/jsonrpc.rs
 +++ b/crates/mcp/src/jsonrpc.rs
-@@ -43,6 +43,14 @@ For parallel delegation, use `create_chats` with a prompt for each chat or \
- even if your harness executes tool calls sequentially. Alternatively, launch ALL \
- chats/messages with `wait: false` first, then use `wait_for_turn` to collect replies. \
- Do not wait for one worker before launching the next independent worker. \
+@@ -42,7 +42,15 @@ answer them, on any of the person's devices. `run_command` runs shell commands o
+ device as your own shell tool does here. Chats are named by id, unique id prefix, or exact \
+ title; `whoami` gives yours. \
+ For parallel work, start every chat before waiting on any: `create_chats` or `send_messages` \
+-(or `wait: false`, then `wait_for_turn`).\n\
++(or `wait: false`, then `wait_for_turn`). \
 +Chats you delegate to report back automatically when their turn ends, with a note \
 +of which children still work for you, so end your turn rather than polling; use \
 +`wait_for_turn` only when you need the answer inside this turn. If you need the \
@@ -6932,15 +6951,15 @@ index a4be9e109b60bdc7ca4d004f6d434a2177939261..5f37b345b93d6e59a9cdc695b747c6df
 +the next report wakes you. Don't message a child only to acknowledge or thank it. \
 +When you work for a parent chat, your final reply reaches it automatically. Use \
 +`send_message` to your parent mid-task to ask something or share something it \
-+needs now; it reads it when its own turn ends, with its other children's. \
- A chat you create from your chat is your subagent by default (`kind: subagent`): \
- it lists under your chat's Subagents and in its transcript's subagent block. Use \
- `kind: side` only for a side conversation the person should treat as their own, \
++needs now; it reads it when its own turn ends, with its other children's.\n\
+ \n\
+ Where `show_visual` is offered and a chart, table, diagram, dashboard, or 3D view would say \
+ more than prose, show one with it before your final reply, and don't restate it there. To show \
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 04be0be6aec98eba6d97142768a01a470c369061..5f192a1a7f0927bcd33b09dca30b652e38aa3b2f 100644
+index 976378196746d3d144d8d7a49eba067657578fab..52de950e02a1210f1be1c1d88a0747a4f808a112 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1501,6 +1501,12 @@ impl Tools {
+@@ -1514,6 +1514,12 @@ impl Tools {
              .and_then(|id| spaces.iter().find(|s| s.id == id));
          let baseline = session_for(&sessions, &chat);
          let mode = args.mode.as_deref().unwrap_or("auto");
@@ -6953,7 +6972,7 @@ index 04be0be6aec98eba6d97142768a01a470c369061..5f192a1a7f0927bcd33b09dca30b652e
          let body = self.attribute(&chat, text).await;
          let mut result = json!({
              "chatId": chat.id,
-@@ -1510,6 +1516,11 @@ impl Tools {
+@@ -1523,6 +1529,11 @@ impl Tools {
              .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
              .await?;
          result["sent"] = delivered.receipt;
@@ -6965,7 +6984,7 @@ index 04be0be6aec98eba6d97142768a01a470c369061..5f192a1a7f0927bcd33b09dca30b652e
          let pending = Arc::new(PendingTurn {
              baseline,
              start: TurnStart {
-@@ -1658,7 +1669,7 @@ impl Tools {
+@@ -1671,7 +1682,7 @@ impl Tools {
          let chat = self.zeron.resolve_chat(&args.chat).await?;
          let command_id = self
              .zeron
@@ -6974,7 +6993,7 @@ index 04be0be6aec98eba6d97142768a01a470c369061..5f192a1a7f0927bcd33b09dca30b652e
              .await?;
          Ok(json!({ "chatId": chat.id, "commandId": command_id }))
      }
-@@ -1704,6 +1715,17 @@ impl Tools {
+@@ -1717,6 +1728,17 @@ impl Tools {
  
      // ---- shared pieces -------------------------------------------------------
  
@@ -7487,6 +7506,19 @@ index 6682ed0c08c26dc41c04a8def9de9329fbc3369b..94382b19bd5697862e83761c271a2d69
      #[test]
      fn reads_the_messages_a_send_call_sends() {
          let call = |tool: &str, input: serde_json::Value| ToolCall::Mcp {
+diff --git a/crates/sync/src/held_sends.rs b/crates/sync/src/held_sends.rs
+index 7595307b8524703bfc28b1a4430c67f541b950f3..2bd57446be2197d1e3c3e812e74474e1d3c49062 100644
+--- a/crates/sync/src/held_sends.rs
++++ b/crates/sync/src/held_sends.rs
+@@ -267,7 +267,7 @@ mod tests {
+         let (_dir, store) = open();
+         let held = HeldPayload {
+             body: HeldBody::Command {
+-                payload: SessionCommandPayload::Interrupt {},
++                payload: SessionCommandPayload::Interrupt { stopped_by: None },
+             },
+             uploads: Vec::new(),
+             also_peer: true,
 diff --git a/docs/mcp.md b/docs/mcp.md
 index 8c5c5dfeb164ce06045b116cad5ed7951bd69b5d..d293ec54ea6de12ff4bb0c7dcc4d3adaf156fcb4 100644
 --- a/docs/mcp.md
@@ -7507,5 +7539,5 @@ index 8c5c5dfeb164ce06045b116cad5ed7951bd69b5d..d293ec54ea6de12ff4bb0c7dcc4d3ada
  
  `create_chat` and each request in `create_chats` accept `kind`:
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

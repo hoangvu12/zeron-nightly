@@ -1,4 +1,4 @@
-From e8bb5073d812b065df23f4ea5f7d6197e1f50184 Mon Sep 17 00:00:00 2001
+From a670422760af3f03395696c10cb73ec403592804 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 11 Nov 2026 11:02:36 +0700
 Subject: [PATCH] engine: the person's Stop on a child is held, and what they
@@ -26,7 +26,7 @@ theirs: the end of what it does for them no longer reports to the parent.
  2 files changed, 264 insertions(+), 22 deletions(-)
 
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 18758900173613fa428e81c28817cef637a176af..7c3491b7512c20d0252ade9464bd306709bbe180 100644
+index d9a75dbd88b8699b04506d86e0cb662952483c70..fafc4d1d3eed22b87831a8616212b4d8766343de 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -104,6 +104,20 @@ const QUIET_CHARS: usize = 300;
@@ -248,10 +248,10 @@ index 18758900173613fa428e81c28817cef637a176af..7c3491b7512c20d0252ade9464bd3067
  /// spacing, or most of them, one inside the other.
  fn repeats(reply: &str, sent: &str) -> bool {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e..fab0d212fc3fba1f80cd1d0913fcbc135c10700d 100644
+index a0c1bc54c85a7bb27f1378061b9a34a3cc35012e..bf28b5550d7f42b63532179fdcd653eb09f8cfec 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -7971,6 +7971,7 @@ mod tests {
+@@ -8586,6 +8586,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_WAKE_GRACE_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_WINDOW_MS", "1000") };
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
@@ -259,7 +259,7 @@ index dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e..fab0d212fc3fba1f80cd1d0913fcbc13
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -8058,7 +8059,7 @@ mod tests {
+@@ -8673,7 +8674,7 @@ mod tests {
  
          /// Until `check` holds (a few seconds at most).
          async fn until(&self, what: &str, check: impl Fn(&Self) -> bool) {
@@ -268,7 +268,7 @@ index dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e..fab0d212fc3fba1f80cd1d0913fcbc13
                  if check(self) {
                      return;
                  }
-@@ -8602,7 +8603,8 @@ mod tests {
+@@ -9217,7 +9218,8 @@ mod tests {
          rig.quiet().await;
          assert!(rig.reports("lead").is_empty());
          assert!(rig.queued("lead").is_empty());
@@ -278,7 +278,7 @@ index dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e..fab0d212fc3fba1f80cd1d0913fcbc13
          rpc.handle(zeron_rpc::methods::QUEUE_COMMAND, stop("kid-b")).await.unwrap();
          rig.until("the lead hears Docs stopped", |r| !r.reports("lead").is_empty()).await;
          assert_eq!(statuses(&rig.reports("lead")[0]), [("kid-b".to_owned(), ReportStatus::Stopped)]);
-@@ -9024,6 +9026,144 @@ mod tests {
+@@ -9639,6 +9641,144 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -424,5 +424,5 @@ index dcb5f5f042e1f8dc0fd9f2e09ae6384fae88cf0e..fab0d212fc3fba1f80cd1d0913fcbc13
          /// `chat`'s run as it stands now, started if it's a new one since
          /// `was`; a parked run reads the next message from its mailbox.
 -- 
-2.52.0.windows.1
+2.55.0.windows.2
 

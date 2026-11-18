@@ -1,4 +1,4 @@
-From 017f6fa0d1b6a19d04a42a1753c93a5b9300cb4c Mon Sep 17 00:00:00 2001
+From 8650bb0d71b1d3167612be0772fdb39d70847fe7 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hoangvu12@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 12:36:38 +0000
 Subject: [PATCH] Auto access mode reaches engines from before it
@@ -34,10 +34,10 @@ writes "auto".
  create mode 100644 crates/proto/src/access_wire.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index 6ee5465840c5ca29c525e1f81d281047bdf45134..186f7aa0bdc1c90770e411af1230c4d23f4b758d 100644
+index e191f093c23f2ff3779a9ea2b4035d5bdc9cfccc..bb165c4d01e75e584d192a41110262295c8b056b 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
-@@ -1703,7 +1703,11 @@ fn catalog_of(listed: &[Json], by: &HashMap<String, Vec<Json>>, done: bool, devi
+@@ -1982,7 +1982,11 @@ fn catalog_of(listed: &[Json], by: &HashMap<String, Vec<Json>>, done: bool, devi
              // It has an auto mode of its own: the access picker offers Auto.
              (
                  "auto",
@@ -50,18 +50,18 @@ index 6ee5465840c5ca29c525e1f81d281047bdf45134..186f7aa0bdc1c90770e411af1230c4d2
              ),
          ]));
          for m in list {
-@@ -2633,8 +2637,8 @@ impl View {
-             "autoApprove": false,
-             "resume": null,
-         });
--        if let Some(access) = config.get("access") {
--            request["access"] = access.clone();
-+        if config.get("access").is_some() || config.get("autoAccess").is_some() {
-+            zeron_proto::access_wire::write(&mut request, zeron_proto::access_wire::read(&config));
-         }
-         if let Some(plan) = config.get("plan") {
-             request["plan"] = plan.clone();
-@@ -3354,13 +3358,16 @@ fn merged_config(config: &Json, args: &Value) -> Json {
+@@ -3531,8 +3535,8 @@ fn run_request(config: &Json, cwd: &str) -> Json {
+         "autoApprove": false,
+         "resume": null,
+     });
+-    if let Some(access) = config.get("access") {
+-        request["access"] = access.clone();
++    if config.get("access").is_some() || config.get("autoAccess").is_some() {
++        zeron_proto::access_wire::write(&mut request, zeron_proto::access_wire::read(config));
+     }
+     if let Some(plan) = config.get("plan") {
+         request["plan"] = plan.clone();
+@@ -3840,13 +3844,16 @@ fn merged_config(config: &Json, args: &Value) -> Json {
          c["reasoning"] = json!(effort);
      }
      if let Some(access) = field("access") {
@@ -81,7 +81,7 @@ index 6ee5465840c5ca29c525e1f81d281047bdf45134..186f7aa0bdc1c90770e411af1230c4d2
                  }
              }
          }
-@@ -5947,11 +5954,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -6442,11 +6449,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          Some(m) => Value::from(chats.label_of(harness, Some(m)).unwrap_or_else(|| m.to_owned()).as_str()),
          None => chats.label_of(harness, None).map_or(Value::Nil, |l| Value::from(l.as_str())),
      };
@@ -167,10 +167,10 @@ index 674afff2b85d0c5157bddd2595a4fbcff0b598f7..06abba4c9603c04b956b399cddf6c0f4
      fn mid_turn_steering_requires_support_and_a_step_boundary() {
          let mut descriptor = HarnessDescriptor {
 diff --git a/crates/engine/src/rpc/agent_gate.rs b/crates/engine/src/rpc/agent_gate.rs
-index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d06ab5f511 100644
+index d7d7cb56e113e1abb07151269d87d0a9ad222bf1..461369bb10bb219d46b418614ebd92b987eac004 100644
 --- a/crates/engine/src/rpc/agent_gate.rs
 +++ b/crates/engine/src/rpc/agent_gate.rs
-@@ -26,7 +26,7 @@
+@@ -28,7 +28,7 @@
  //! nothing but still can't forge a header.
  
  use serde_json::{Value, json};
@@ -179,7 +179,7 @@ index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d0
  use zeron_rpc::{Caller, RpcError, methods};
  
  use super::EngineRpc;
-@@ -179,14 +179,14 @@ impl EngineRpc {
+@@ -185,14 +185,14 @@ impl EngineRpc {
                      if let Some((max_sandbox, max_access)) = calling.as_ref().and_then(|c| c.ceiling) {
                          let sandbox = serde_json::from_value(config["sandbox"].clone())
                              .unwrap_or(SandboxLevel::DangerFullAccess);
@@ -196,7 +196,7 @@ index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d0
                      }
                      Ok(params)
                  }
-@@ -218,7 +218,7 @@ impl EngineRpc {
+@@ -224,7 +224,7 @@ impl EngineRpc {
                              Some(config) => {
                                  request["harness"] = json!(config.harness);
                                  request["sandbox"] = json!(config.sandbox);
@@ -205,7 +205,7 @@ index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d0
                                  request["plan"] = json!(config.plan);
                              }
                              // A chat set up before configs (or not here yet):
-@@ -230,10 +230,10 @@ impl EngineRpc {
+@@ -236,10 +236,10 @@ impl EngineRpc {
                                      .unwrap_or((SandboxLevel::DangerFullAccess, AccessMode::FullAccess));
                                  let sandbox = serde_json::from_value(request["sandbox"].clone())
                                      .unwrap_or(SandboxLevel::DangerFullAccess);
@@ -218,7 +218,7 @@ index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d0
                              }
                          }
                          if let Some(cwd) = target.and_then(|c| c.cwd.as_deref()) {
-@@ -375,6 +375,76 @@ mod tests {
+@@ -381,6 +381,76 @@ mod tests {
          core.sessions.shutdown().await;
      }
  
@@ -293,8 +293,8 @@ index 7d9a1a7b089f3d6c9b1bb16fcb386d2aab40cd9d..495846f9401a852b7ecaaaea13d976d0
 +    }
 +
      /// A command, here or on another device, only for an agent whose chat
-     /// runs with full access and no sandbox; the person's own calls pass.
-     #[tokio::test]
+     /// runs with full access, whatever sandbox level it records (the app's
+     /// chats record workspace-write); the person's own calls pass.
 diff --git a/crates/mcp/src/zeron.rs b/crates/mcp/src/zeron.rs
 index bed96f680acd9ff15d00db381d164363b2864c66..792b3a0ff8679208f7db25215dbf50759bcb8908 100644
 --- a/crates/mcp/src/zeron.rs
@@ -510,7 +510,7 @@ index 0000000000000000000000000000000000000000..3d08931fb99fd04f3f97c40e62202bb3
 +    }
 +}
 diff --git a/crates/proto/src/agent.rs b/crates/proto/src/agent.rs
-index b8cc5d78a68173771ed2ab7aa9bff182ae3eb79e..0192592ecf92d32b5200e6e256ebdd8d5c2ab868 100644
+index 3f49254537b5e2efa4415c8d1725156d96980745..a6ec426943265182e7a4d661bc53882d65bc5d88 100644
 --- a/crates/proto/src/agent.rs
 +++ b/crates/proto/src/agent.rs
 @@ -602,8 +602,9 @@ pub struct RunRequest {
@@ -554,5 +554,5 @@ index 692ab93601b4d2c0ae466509b40615e31885e22e..0af1bd80f0dafa6e0df42752c2756e44
  pub mod agent_messages;
  pub mod attachment_mentions;
 -- 
-2.47.3
+2.55.0.windows.2
 
