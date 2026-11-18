@@ -1,9 +1,27 @@
 # Zeron nightly
 
-Nightly Windows builds of [Zeron](https://github.com/zeronsh/zeron) v3, the
-zgx interface (`apps/zgx`): upstream's `main` plus a short list of patches
-that aren't (yet) upstream. Installed nightlies update themselves from this
-repo's releases.
+Nightly Windows and Linux builds of [Zeron](https://github.com/zeronsh/zeron)
+v3, the zgx interface (`apps/zgx`): upstream's `main` plus a short list of
+patches that aren't (yet) upstream. Installed nightlies update themselves from
+this repo's releases.
+
+## Linux
+
+Each release has `zeron-<version>-linux-x86_64.tar.gz` and `-aarch64.tar.gz`,
+upstream's layout (`zeron`, `zeron-engine`, `ui/`, `plugins-builtin/`,
+`install.sh`). Docker sandboxes install the x86_64 one's engine (patches/0024).
+On a server, unpack and run `install.sh`, then run `zeron headless`. To
+follow the nightly instead of upstream's releases, set in the engine's
+environment (a systemd unit's `EnvironmentFile`):
+
+```
+ZERON_RELEASES_URL=https://github.com/hoangvu12/zeron-nightly/releases/download/v3-latest
+ZERON_AUTO_UPDATE=1
+```
+
+Without `ZERON_RELEASES_URL`, the updater follows the edge, and upstream's
+next stable release (0.3.9 > 0.3.9-v3.N) replaces the nightly. The builds
+link glibc 2.39 (Ubuntu 24.04's).
 
 Upstream merged its `zeron/zgx` branch into `main` (0.3.0) and has shipped
 the zgx app from `main` since, so the nightly follows `main`; `zeron/zgx` is

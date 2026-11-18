@@ -2,7 +2,8 @@ name: nightly-v3
 
 # Zeron v3 (the zgx interface, apps/zgx): upstream's main +
 # patches-v3.toml, assembled from scratch (scripts/assemble.py), built for
-# Windows (scripts/package-v3-windows.ps1) and published as a prerelease that
+# Windows (scripts/package-v3-windows.ps1) and Linux x86_64 and aarch64
+# (upstream's scripts/package-linux.sh) and published as a prerelease that
 # is never the latest. v2 installs follow releases/latest, so they never see
 # these. v3 installs update from the `v3-latest` release instead: each run
 # replaces its installer and manifest.json, and the app runs that installer
@@ -146,14 +147,27 @@ jobs:
             src/target/package-v3/manifest.json
           if-no-files-found: error
 
-  # The engine Docker sandboxes run (patches/0019's `zeron-engine watchdog`):
-  # the edge's releases are upstream's and lack it, so each release carries
-  # its own, and the Windows build installs that one (patches/0024).
+  # Zeron v3 for Linux, as upstream's zgx-build.yml makes it: the zgx app as
+  # `zeron` (headless servers run `zeron headless`), its scripts, and the
+  # engine from the same tree, in upstream's tarball layout
+  # (scripts/package-linux.sh). Docker sandboxes install its zeron-engine
+  # (patches/0019's `watchdog`; the edge's engines are upstream's and lack
+  # it): every build's engine names this release as where they are
+  # (ZERON_SANDBOX_ENGINE_RELEASES, patches/0024). A Linux install updates
+  # from the v3-latest feed with ZERON_RELEASES_URL set to it.
   linux:
     needs: assemble
     if: needs.assemble.outputs.build == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04 # x86_64: Docker sandboxes
+          - runner: ubuntu-24.04-arm # aarch64: servers
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      VERSION: ${{ needs.assemble.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -175,20 +189,56 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev \
+            rsync
       - name: rust toolchain (rust-toolchain.toml)
         working-directory: src
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
-          key: v3-linux-engine
-          workspaces: src -> target
-      - name: package the engine
-        run: bash tools/scripts/package-v3-linux-engine.sh src
+          key: v3-linux
+          workspaces: |
+            src -> target
+            src/apps/zgx -> target
+      - name: the engine
+        working-directory: src
+        env:
+          ZERON_SANDBOX_ENGINE_RELEASES: https://github.com/${{ github.repository }}/releases/download/v${{ needs.assemble.outputs.version }}
+          # Luau without its asserts, as upstream's: package-linux.sh refuses
+          # an engine that has them.
+          LUAU_CXXFLAGS: -DNDEBUG
+        run: cargo build --release --locked -p zeron --bin zeron-engine
+      - name: package
+        working-directory: src
+        run: ZGX_VERSION="$VERSION" ZGX_ENGINE="$PWD/target/release/zeron-engine" scripts/package-linux.sh
+      - name: inspect and install the tarball
+        working-directory: src
+        run: |
+          arch="$(uname -m)"
+          tarball="target/package/zeron-$VERSION-linux-$arch.tar.gz"
+          mkdir -p "$RUNNER_TEMP/unpacked" "$RUNNER_TEMP/home"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/unpacked"
+          dir="$RUNNER_TEMP/unpacked/zeron-$VERSION-linux-$arch"
+          test "$("$dir/zeron" --version)" = "zeron $VERSION"
+          test "$("$dir/zeron-engine" --version)" = "zeron-engine $VERSION"
+          # What a Docker sandbox runs, and only base libraries (a sandbox
+          # has no desktop ones).
+          "$dir/zeron-engine" watchdog --help >/dev/null
+          readelf -d "$dir/zeron-engine" | grep NEEDED
+          if readelf -d "$dir/zeron-engine" | grep NEEDED | grep -qvE 'lib(c|m|gcc_s|stdc\+\+|z)\.so|ld-linux'; then
+            echo "zeron-engine needs a library a bare sandbox lacks"; exit 1
+          fi
+          grep -aq "releases/download/v$VERSION" "$dir/zeron-engine" ||
+            { echo "zeron-engine doesn't name this release for its sandboxes"; exit 1; }
+          test -f "$dir/ui/app.luau"
+          test -d "$dir/plugins-builtin"
+          HOME="$RUNNER_TEMP/home" "$dir/install.sh"
+          test "$("$RUNNER_TEMP/home/.zeron/app/current/zeron" --version)" = "zeron $VERSION"
+          du -sh "$dir" "$tarball"
       - uses: actions/upload-artifact@v7
         with:
-          name: linux
-          path: src/target/package-v3/*.tar.gz
+          name: linux-${{ runner.arch }}
+          path: src/target/package/*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -204,6 +254,21 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # One manifest for both: the Windows job's names its installer; each
+      # Linux tarball joins it with its checksum (crates/update Manifest),
+      # which a Linux install's updater checks.
+      - name: the Linux tarballs join the manifest
+        run: |
+          for arch in x86_64 aarch64; do
+            test -f "dist/zeron-$VERSION-linux-$arch.tar.gz" || { echo "no Linux $arch tarball"; exit 1; }
+          done
+          for f in dist/zeron-"$VERSION"-linux-*.tar.gz; do
+            jq --arg name "$(basename "$f")" --arg sha "$(sha256sum "$f" | cut -d' ' -f1)" \
+              '.files[$name] = {sha256: $sha}' dist/manifest.json > dist/manifest.next
+            mv dist/manifest.next dist/manifest.json
+          done
+          test "$(jq -r .version dist/manifest.json)" = "$VERSION"
+          jq . dist/manifest.json
       - name: release
         run: |
           target="$GITHUB_SHA"
@@ -212,8 +277,9 @@ jobs:
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$target" \
             --title "Zeron v3 $VERSION" --notes-file dist/report.md --prerelease --latest=false \
             dist/*.exe dist/*.zip dist/*.tar.gz dist/manifest.json dist/nightly.bundle
-      # The feed: the new installer first, then the manifest that names it,
-      # then the installers it no longer names.
+      # The feed: the new packages first (the Windows installer, the Linux
+      # tarballs), then the manifest that names them, then the packages it
+      # no longer names.
       - name: update the v3-latest feed
         run: |
           if ! gh release view "$FEED_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -222,12 +288,15 @@ jobs:
               --notes "What installed Zeron v3 nightlies update from. Download a dated v3 release instead."
           fi
           setup="zeron-$VERSION-windows-x86_64-setup.exe"
-          gh release upload "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --clobber "dist/$setup"
+          linux_x86="zeron-$VERSION-linux-x86_64.tar.gz"
+          linux_arm="zeron-$VERSION-linux-aarch64.tar.gz"
+          gh release upload "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "dist/$setup" "dist/$linux_x86" "dist/$linux_arm"
           gh release upload "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/manifest.json
           gh release view "$FEED_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
           while read -r name; do
             case "$name" in
-              manifest.json|"$setup") ;;
+              manifest.json|"$setup"|"$linux_x86"|"$linux_arm") ;;
               *) gh release delete-asset "$FEED_TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes ;;
             esac
           done
