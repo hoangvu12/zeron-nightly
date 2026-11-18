@@ -147,3 +147,10 @@ note = "Docker Sandbox's \"Sign in with Docker\" waited forever after the code w
 name = "docker-place-shows-sandbox"
 file = "patches/0022-docker-place-shows-sandbox.patch"
 note = "A chat on Docker Sandbox (zeron-dev) sat on \"Sending…\" under \"Unknown device\" with no step line (the Laptop, 2026-11-17), then failed unseen: Docker can't create from zeron-dev (its own operation times out, nothing made; other templates take seconds), so Create failed after 240 s. Until a sandbox's engine signs in its device had no row, so devices called it unknown and the composer never followed its steps. The host device now gives a placed chat's sandbox device a row at once (`sandbox:<provider>`, never online, never a host device): every device shows \"Docker Sandbox\", and the step line shows Creating sandbox, then the failure with Run again. Also: a Blank picked while the template list loads is no longer replaced by the first template. Applies on top of docker-sign-in."
+
+# Boot time.
+
+[[patch]]
+name = "fast-boot-journal-scan"
+file = "patches/0023-fast-boot-journal-scan.patch"
+note = "The engine took 35-49 s to be ready on the PC (2026-11-14 to 11-18), all of it boot's crash scan (RunJournal::stale_sessions) opening every journal ever written (1,133, 1.1 GB) to read its tail: Windows Defender reads a whole file before its first open returns, ~28 ms a journal with a cold scan cache (after a reboot or a signature update). closed-journals.idx, beside the journals, keeps each journal last seen ending in a closed turn with its size and modified time; boot reads only metadata (no scan) and opens only new or changed journals, 8 at a time. Journals are append-only, so a stale line can't hide a crash; losing the index costs one slower boot. On a copy of the PC's profile, cold cache: 34.6 s before, 1.5 s after, ~11 s once to build the index. One file, crates/engine/src/run_journal.rs; upstream's main since fb09b2391 doesn't touch it. Not yet a PR upstream."

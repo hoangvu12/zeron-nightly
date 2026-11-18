@@ -1,0 +1,329 @@
+From 1737c52c9ad4daef3902c484d38d879342daf9c3 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 18 Nov 2026 13:06:06 +0700
+Subject: [PATCH] engine: boot opens only the journals that changed since they
+ were last seen closed
+
+Boot's crash scan (RunJournal::stale_sessions) opened every journal ever
+written to read its tail. On Windows an on-access virus scan reads a whole
+file before the first open returns, so with a cold scan cache (after a
+reboot or a signature update) 1,133 journals (1.1 GB) took 32 s, and the
+engine was not ready until it finished: 35-49 s from launch.
+
+A journal is append-only, so one last seen ending in a closed turn whose
+size and modified time are unchanged has not changed. closed-journals.idx,
+beside the journals, remembers those; boot reads each journal's metadata
+(no data opened, so no scan) and opens only the new or changed ones, 8 at
+a time, since those scans overlap. Losing the index costs one slower boot;
+a wrong line can't hide a crash, since any write changes the length.
+
+Measured on a copy of a real profile with a cold scan cache: 34.6 s before,
+1.5 s after; the first boot after the update builds the index in ~11 s.
+---
+ crates/engine/src/run_journal.rs | 258 ++++++++++++++++++++++++++++++-
+ 1 file changed, 252 insertions(+), 6 deletions(-)
+
+diff --git a/crates/engine/src/run_journal.rs b/crates/engine/src/run_journal.rs
+index 37d2672c07be91fadb415406ba671361af04a3ae..539b808cc60684dd3b982a92c3821a2ceaaaffac 100644
+--- a/crates/engine/src/run_journal.rs
++++ b/crates/engine/src/run_journal.rs
+@@ -10,7 +10,8 @@
+ //! journal flags it for the same pick-up on the next boot.
+ //!
+ //! Bounded-window compaction is deferred (whole file kept for now, per M2 scope); a torn
+-//! trailing line from a crash mid-write is tolerated everywhere.
++//! trailing line from a crash mid-write is tolerated everywhere. Boot's crash scan opens
++//! only journals that changed since it last saw them closed (`closed-journals.idx`).
+ //!
+ //! Lines are written in batches: a streaming agent sends tens of events a second, and
+ //! a `write` each (under the one lock every chat's appends share) was a large part of
+@@ -552,9 +553,19 @@ impl RunJournal {
+ 
+     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
+     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
++    ///
++    /// Boot runs this before the engine is ready, over every journal ever written. A
++    /// journal is append-only, so one that ended in a closed turn and still has the size
++    /// and modified time it had then has not changed: [`CLOSED_INDEX`] remembers those,
++    /// and only journals that are new or changed are opened. Opening is what costs: on
++    /// Windows an on-access virus scan reads the whole file first (~30 ms a journal cold,
++    /// 30 s+ over a thousand), where reading its size and time opens no data at all.
++    /// The ones that must be read are read a few at a time, since those scans overlap.
+     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
+         self.flush_all();
+-        let mut stale = Vec::new();
++        let known = read_closed_index(&self.dir);
++        let mut closed: Vec<(String, FileStamp)> = Vec::new();
++        let mut unknown: Vec<(String, PathBuf, Option<FileStamp>)> = Vec::new();
+         for entry in std::fs::read_dir(&self.dir)? {
+             let entry = entry?;
+             let path = entry.path();
+@@ -564,12 +575,27 @@ impl RunJournal {
+             let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                 continue;
+             };
+-            // Tail read only: journals reach tens of MB and boot scans every one.
+-            match last_valid_line(&path)? {
+-                Some((_, AgentEvent::Done { .. })) | None => {}
+-                Some(_) => stale.push(chat_id.to_string()),
++            // The file's own metadata, not the directory listing's copy (NTFS updates
++            // that lazily while a handle is open).
++            let stamp = std::fs::metadata(&path).ok().and_then(|m| FileStamp::of(&m));
++            match stamp {
++                Some(stamp) if known.get(chat_id) == Some(&stamp) => {
++                    closed.push((chat_id.to_string(), stamp));
++                }
++                _ => unknown.push((chat_id.to_string(), path, stamp)),
++            }
++        }
++        let mut stale = Vec::new();
++        for ((chat_id, _, stamp), is_stale) in unknown.iter().zip(read_tails(&unknown)) {
++            if is_stale? {
++                stale.push(chat_id.clone());
++            } else if let Some(stamp) = stamp {
++                closed.push((chat_id.clone(), *stamp));
+             }
+         }
++        if closed.len() != known.len() || closed.iter().any(|(id, stamp)| known.get(id) != Some(stamp)) {
++            write_closed_index(&self.dir, &mut closed);
++        }
+         stale.sort();
+         Ok(stale)
+     }
+@@ -606,6 +632,125 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+ }
+ 
++/// Beside the journals: one `{chat_id}\t{len}\t{modified_ns}` line per journal last
++/// seen ending in a closed turn ([`RunJournal::stale_sessions`]). Losing it costs one
++/// slow scan; a wrong line can't hide a crash, since any write changes the length.
++const CLOSED_INDEX: &str = "closed-journals.idx";
++/// The most journals [`read_tails`] opens at once (cold opens wait on a virus scan,
++/// and those overlap: 8 at a time took a third of the time one at a time did).
++const TAIL_READERS: usize = 8;
++
++/// A journal's size and modified time, as [`CLOSED_INDEX`] records them.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct FileStamp {
++    len: u64,
++    modified_ns: u128,
++}
++
++impl FileStamp {
++    fn of(meta: &std::fs::Metadata) -> Option<Self> {
++        let modified = meta
++            .modified()
++            .ok()?
++            .duration_since(std::time::UNIX_EPOCH)
++            .ok()?;
++        Some(Self {
++            len: meta.len(),
++            modified_ns: modified.as_nanos(),
++        })
++    }
++}
++
++/// [`CLOSED_INDEX`] as saved; empty when missing or unreadable, and a line that
++/// doesn't parse is left out (its journal is read again).
++fn read_closed_index(dir: &Path) -> HashMap<String, FileStamp> {
++    let Ok(raw) = std::fs::read_to_string(dir.join(CLOSED_INDEX)) else {
++        return HashMap::new();
++    };
++    raw.lines()
++        .filter_map(|line| {
++            let mut fields = line.split('\t');
++            let chat_id = fields.next().filter(|id| !id.is_empty())?;
++            let len = fields.next()?.parse().ok()?;
++            let modified_ns = fields.next()?.parse().ok()?;
++            if fields.next().is_some() {
++                return None;
++            }
++            Some((chat_id.to_string(), FileStamp { len, modified_ns }))
++        })
++        .collect()
++}
++
++/// Replace [`CLOSED_INDEX`] (written aside, then renamed over it). Best-effort.
++fn write_closed_index(dir: &Path, closed: &mut [(String, FileStamp)]) {
++    closed.sort_by(|a, b| a.0.cmp(&b.0));
++    let mut out = String::with_capacity(closed.len() * 72);
++    for (chat_id, stamp) in closed.iter() {
++        if chat_id.contains(['\t', '\n', '\r']) {
++            continue;
++        }
++        out.push_str(&format!("{chat_id}\t{}\t{}\n", stamp.len, stamp.modified_ns));
++    }
++    let tmp = dir.join(format!("{CLOSED_INDEX}.tmp"));
++    let saved = std::fs::write(&tmp, out).and_then(|()| std::fs::rename(&tmp, dir.join(CLOSED_INDEX)));
++    if let Err(err) = saved {
++        let _ = std::fs::remove_file(&tmp);
++        tracing::warn!(error = %err, "journal: closed-journal index not saved; the next boot reads every journal");
++    }
++}
++
++/// For each journal, in order: whether its last valid event is something other than a
++/// `Done` (a run that died mid-stream). Up to [`TAIL_READERS`] are read at once.
++fn read_tails(journals: &[(String, PathBuf, Option<FileStamp>)]) -> Vec<Result<bool, JournalError>> {
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    let is_stale = |path: &Path| -> Result<bool, JournalError> {
++        Ok(matches!(
++            last_valid_line(path)?,
++            Some((_, event)) if !matches!(event, AgentEvent::Done { .. })
++        ))
++    };
++    let next = AtomicUsize::new(0);
++    // A reader takes the next unclaimed journal until none are left, and says
++    // which one each of its results is for.
++    let indexed_work = || {
++        let mut read = Vec::new();
++        loop {
++            let i = next.fetch_add(1, Ordering::Relaxed);
++            let Some((_, path, _)) = journals.get(i) else { break };
++            read.push((i, is_stale(path)));
++        }
++        read
++    };
++    let mut results: Vec<Option<Result<bool, JournalError>>> = (0..journals.len()).map(|_| None).collect();
++    let mut place = |indexed: Vec<(usize, Result<bool, JournalError>)>| {
++        for (i, result) in indexed {
++            results[i] = Some(result);
++        }
++    };
++    std::thread::scope(|scope| {
++        let helpers: Vec<_> = (1..TAIL_READERS.min(journals.len()))
++            .filter_map(|_| {
++                std::thread::Builder::new()
++                    .name("journal-scan".into())
++                    .spawn_scoped(scope, indexed_work)
++                    .ok()
++            })
++            .collect();
++        // This thread reads too, so a reader that couldn't start costs nothing.
++        place(indexed_work());
++        for helper in helpers {
++            match helper.join() {
++                Ok(indexed) => place(indexed),
++                Err(panic) => std::panic::resume_unwind(panic),
++            }
++        }
++    });
++    results
++        .into_iter()
++        .map(|result| result.expect("every journal is claimed by exactly one reader"))
++        .collect()
++}
++
+ /// Parse every valid line; malformed lines (torn tail writes) are skipped.
+ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
+     let file = match File::open(path) {
+@@ -1143,6 +1288,107 @@ mod tests {
+         assert_eq!(journal.stale_sessions().unwrap(), expected);
+         assert!(expected.contains(&"multi-chunk-garbage-tail".to_string()));
+         assert!(!expected.contains(&"multi-chunk-middle-line".to_string()));
++        // Again, from the index the first scan saved: the same answer.
++        assert!(dir.path().join(CLOSED_INDEX).exists());
++        assert_eq!(journal.stale_sessions().unwrap(), expected);
++    }
++
++    /// The index lists only journals that ended in a closed turn, and a journal
++    /// written to after it was listed is read again.
++    #[test]
++    fn closed_index_lists_closed_journals_and_rereads_changed_ones() {
++        let dir = tempfile::tempdir().unwrap();
++        let journal = RunJournal::open(dir.path()).unwrap();
++        journal.append("dead", &text("partial")).unwrap();
++        journal.append("clean", &text("full")).unwrap();
++        journal.append("clean", &done()).unwrap();
++        assert_eq!(journal.stale_sessions().unwrap(), vec!["dead".to_string()]);
++        let index = read_closed_index(dir.path());
++        assert_eq!(index.keys().collect::<Vec<_>>(), vec!["clean"]);
++
++        // A new turn in the listed journal dies mid-stream: found, and unlisted.
++        journal.append("clean", &text("next turn")).unwrap();
++        assert_eq!(
++            journal.stale_sessions().unwrap(),
++            vec!["clean".to_string(), "dead".to_string()]
++        );
++        assert!(read_closed_index(dir.path()).is_empty());
++
++        // Both close: both listed.
++        journal.append("clean", &done()).unwrap();
++        journal.append("dead", &done()).unwrap();
++        assert!(journal.stale_sessions().unwrap().is_empty());
++        let mut listed: Vec<_> = read_closed_index(dir.path()).into_keys().collect();
++        listed.sort();
++        assert_eq!(listed, vec!["clean", "dead"]);
++
++        // A journal that's gone leaves the index.
++        journal.discard("dead").unwrap();
++        assert!(journal.stale_sessions().unwrap().is_empty());
++        assert_eq!(read_closed_index(dir.path()).into_keys().collect::<Vec<_>>(), vec!["clean"]);
++    }
++
++    /// A listed journal whose size and modified time are unchanged is not opened:
++    /// rewritten in place to the same length and time (which an append-only journal
++    /// never is), its new contents go unseen.
++    #[test]
++    fn closed_index_skips_unchanged_journals() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("chat.jsonl");
++        let closed = format!("{}\n", serde_json::to_string(&JournalLineRef { seq: 1, event: &done() }).unwrap());
++        std::fs::write(&path, &closed).unwrap();
++        let journal = RunJournal::open(dir.path()).unwrap();
++        assert!(journal.stale_sessions().unwrap().is_empty());
++
++        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
++        // The same length: JSON padded with trailing spaces.
++        let open = serde_json::to_string(&JournalLineRef { seq: 1, event: &text("x") }).unwrap();
++        let open = format!("{open:<width$}\n", width = closed.len() - 1);
++        assert_eq!(open.len(), closed.len());
++        std::fs::write(&path, &open).unwrap();
++        File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
++        assert!(journal.stale_sessions().unwrap().is_empty(), "read from the index");
++
++        // Any other time and it is read.
++        let later = modified + std::time::Duration::from_secs(5);
++        File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
++        assert_eq!(journal.stale_sessions().unwrap(), vec!["chat".to_string()]);
++    }
++
++    /// A damaged index costs a read of every journal, never a wrong answer.
++    #[test]
++    fn closed_index_damage_reads_journals_again() {
++        let dir = tempfile::tempdir().unwrap();
++        let journal = RunJournal::open(dir.path()).unwrap();
++        journal.append("dead", &text("partial")).unwrap();
++        journal.append("clean", &done()).unwrap();
++        std::fs::write(
++            dir.path().join(CLOSED_INDEX),
++            "dead\tnot-a-number\t1\nclean\t1\nnoise\n\t5\t5\ndead\t1\t2\t3\n",
++        )
++        .unwrap();
++        assert_eq!(journal.stale_sessions().unwrap(), vec!["dead".to_string()]);
++        assert_eq!(read_closed_index(dir.path()).into_keys().collect::<Vec<_>>(), vec!["clean"]);
++    }
++
++    /// More journals than readers: every one is read, each result is its own.
++    #[test]
++    fn many_journals_are_read_in_parallel_with_the_same_answer() {
++        let dir = tempfile::tempdir().unwrap();
++        let journal = RunJournal::open(dir.path()).unwrap();
++        let mut expected = Vec::new();
++        for i in 0..TAIL_READERS * 5 + 3 {
++            let chat = format!("chat-{i:03}");
++            journal.append(&chat, &text("a")).unwrap();
++            if i % 3 == 0 {
++                expected.push(chat);
++            } else {
++                journal.append(&chat, &done()).unwrap();
++            }
++        }
++        assert_eq!(journal.stale_sessions().unwrap(), expected);
++        assert_eq!(read_closed_index(dir.path()).len(), TAIL_READERS * 5 + 3 - expected.len());
++        assert_eq!(journal.stale_sessions().unwrap(), expected);
+     }
+ 
+     #[test]
+-- 
+2.55.0.windows.2
+
