@@ -6,7 +6,8 @@ name: nightly-v3
 # is never the latest. v2 installs follow releases/latest, so they never see
 # these. v3 installs update from the `v3-latest` release instead: each run
 # replaces its installer and manifest.json, and the app runs that installer
-# silently over itself (patches/0005).
+# silently over itself (patches/0005). Each release also carries the Linux
+# engine its Docker sandboxes install (patches/0024).
 
 on:
   schedule:
@@ -132,8 +133,10 @@ jobs:
       - name: updater tests
         working-directory: src
         run: cargo test --locked -p zeron-update
+      # Its sandboxes install the Linux engine of this same release (the
+      # `linux` job's; patches/0024).
       - name: package installer and portable zip
-        run: ./tools/scripts/package-v3-windows.ps1 -Src src -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:FEED_TAG"
+        run: ./tools/scripts/package-v3-windows.ps1 -Src src -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:FEED_TAG" -SandboxEngineReleases "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v${{ needs.assemble.outputs.version }}"
       - uses: actions/upload-artifact@v7
         with:
           name: windows
@@ -143,8 +146,53 @@ jobs:
             src/target/package-v3/manifest.json
           if-no-files-found: error
 
+  # The engine Docker sandboxes run (patches/0019's `zeron-engine watchdog`):
+  # the edge's releases are upstream's and lack it, so each release carries
+  # its own, and the Windows build installs that one (patches/0024).
+  linux:
+    needs: assemble
+    if: needs.assemble.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: tools
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: source
+      - name: check out the assembled nightly
+        run: |
+          git clone --quiet --filter=blob:none "$UPSTREAM" src
+          git -C src fetch --quiet ../source/nightly.bundle nightly:nightly
+          git -C src checkout --quiet nightly
+          test "$(git -C src rev-parse HEAD)" = '${{ needs.assemble.outputs.head }}'
+      - name: system deps (upstream's Linux release job's)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: rust toolchain (rust-toolchain.toml)
+        working-directory: src
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: v3-linux-engine
+          workspaces: src -> target
+      - name: package the engine
+        run: bash tools/scripts/package-v3-linux-engine.sh src
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: src/target/package-v3/*.tar.gz
+          if-no-files-found: error
+
   publish:
-    needs: [assemble, windows]
+    needs: [assemble, windows, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -163,7 +211,7 @@ jobs:
           # Never the latest: v2 installs update from releases/latest.
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$target" \
             --title "Zeron v3 $VERSION" --notes-file dist/report.md --prerelease --latest=false \
-            dist/*.exe dist/*.zip dist/manifest.json dist/nightly.bundle
+            dist/*.exe dist/*.zip dist/*.tar.gz dist/manifest.json dist/nightly.bundle
       # The feed: the new installer first, then the manifest that names it,
       # then the installers it no longer names.
       - name: update the v3-latest feed

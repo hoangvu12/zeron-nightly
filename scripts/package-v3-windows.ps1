@@ -15,18 +15,25 @@
 # would leave ui\ and the engine behind. Without it, the install doesn't
 # update itself.
 #
-#   ./scripts/package-v3-windows.ps1 -Src ../zeron-nightly-src [-ReleasesUrl https://...] [-CargoArgs '-j','4']
+# With -SandboxEngineReleases, the engine is built knowing where this
+# release's Linux engine is published (ZERON_SANDBOX_ENGINE_RELEASES,
+# patches/0024): Docker sandboxes install that one, since the edge's engines
+# lack the nightly's patches. Without it, sandboxes take the edge's.
+#
+#   ./scripts/package-v3-windows.ps1 -Src ../zeron-nightly-src [-ReleasesUrl https://...] [-SandboxEngineReleases https://...] [-CargoArgs '-j','4']
 #
 # Writes <Src>/target/package-v3/zeron-<version>-windows-<arch>(.zip|-setup.exe)
 # and, with the installer and -ReleasesUrl, the feed's manifest.json.
 param(
     [Parameter(Mandatory)][string]$Src,
     [string]$ReleasesUrl,
+    [string]$SandboxEngineReleases,
     [string[]]$CargoArgs = @(),
     [switch]$NoInstaller
 )
 $ErrorActionPreference = 'Stop'
 if ($ReleasesUrl -and -not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
+if ($SandboxEngineReleases -and -not $SandboxEngineReleases.StartsWith('https://')) { throw 'Sandbox engine releases must use HTTPS' }
 $tools = Split-Path $PSScriptRoot -Parent
 $root = (Resolve-Path -LiteralPath $Src).Path
 
@@ -98,8 +105,13 @@ try {
     $version = $found.Groups[1].Value
     $numericVersion = ($version -split '-', 2)[0]
 
-    cargo build --release --locked -p zeron --bin zeron-engine @CargoArgs
-    if ($LASTEXITCODE -ne 0) { throw 'Engine build failed' }
+    if ($SandboxEngineReleases) { $env:ZERON_SANDBOX_ENGINE_RELEASES = $SandboxEngineReleases }
+    try {
+        cargo build --release --locked -p zeron --bin zeron-engine @CargoArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Engine build failed' }
+    } finally {
+        Remove-Item Env:ZERON_SANDBOX_ENGINE_RELEASES -ErrorAction SilentlyContinue
+    }
     $engine = (Resolve-Path -LiteralPath './target/release/zeron-engine.exe').Path
 
     # apps/zgx is a workspace of its own; cargo reads its .cargo/config.toml

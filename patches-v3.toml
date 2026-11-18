@@ -148,6 +148,11 @@ name = "docker-place-shows-sandbox"
 file = "patches/0022-docker-place-shows-sandbox.patch"
 note = "A chat on Docker Sandbox (zeron-dev) sat on \"Sending…\" under \"Unknown device\" with no step line (the Laptop, 2026-11-17), then failed unseen: Docker can't create from zeron-dev (its own operation times out, nothing made; other templates take seconds), so Create failed after 240 s. Until a sandbox's engine signs in its device had no row, so devices called it unknown and the composer never followed its steps. The host device now gives a placed chat's sandbox device a row at once (`sandbox:<provider>`, never online, never a host device): every device shows \"Docker Sandbox\", and the step line shows Creating sandbox, then the failure with Run again. Also: a Blank picked while the template list loads is no longer replaced by the first template. Applies on top of docker-sign-in."
 
+[[patch]]
+name = "docker-sandbox-own-engine"
+file = "patches/0024-docker-sandbox-own-engine.patch"
+note = "A chat on Docker Sandbox (zeron-build, the Laptop, 2026-11-18) failed at Starting Zeron with \"zeron-engine has no window: open the Zeron app\": the nightly isn't a release build, so Install Zeron took the edge's latest (upstream's 0.3.8), which has no `watchdog` (docker-sandbox's) and stopped. A build that sets ZERON_SANDBOX_ENGINE_RELEASES at build time (the nightly: its release's download folder, scripts/package-v3-windows.ps1 -SandboxEngineReleases) installs its own Linux engine from there and nowhere else (the `linux` job builds it, scripts/package-v3-linux-engine.sh, and publish attaches it), fails saying so when it's missing, keeps a template's engine only when it is that build, and checks the one it installed. Upstream's builds don't set it: no change there. One file and its Docker smoke, crates/engine/src/sandboxes.rs. Applies on top of docker-sandbox."
+
 # Boot time.
 
 [[patch]]
