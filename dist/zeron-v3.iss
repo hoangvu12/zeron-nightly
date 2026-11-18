@@ -12,6 +12,8 @@
 ;   /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /DIR=<folder>
 ;   /WAITPID=<the app's pid>   wait for the app to exit first
 ;   /RELAUNCH=1                open the app again when done
+;   /LOG=<data>\logs\installer.log   what it did, the only account of an
+;                              install that stopped partway
 
 #ifndef AppVersion
   #error AppVersion must be defined
@@ -80,12 +82,22 @@ RedirectionGuard=no
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [InstallDelete]
-; The scripts are replaced whole, so a file a newer build dropped is gone.
-Type: filesandordirs; Name: "{app}\ui"
-Type: filesandordirs; Name: "{app}\plugins-builtin"
+; The scripts are replaced whole, so a file a newer build dropped is gone:
+; but never deleted before the new ones are in. They go into ui.new and
+; plugins-builtin.new, and swap in only once every file is copied
+; (SwapIn, below). An install that stops partway (its log in
+; <data>\logs\installer.log) leaves the working ones as they were; on
+; 2026-11-18 deleting ui here first left an install with no interface.
+; What a stopped install left behind goes first.
+Type: filesandordirs; Name: "{app}\ui.new"
+Type: filesandordirs; Name: "{app}\ui.old"
+Type: filesandordirs; Name: "{app}\plugins-builtin.new"
+Type: filesandordirs; Name: "{app}\plugins-builtin.old"
 
 [Files]
-Source: "{#PackageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageDir}\*"; DestDir: "{app}"; Excludes: "\ui,\plugins-builtin"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageDir}\ui\*"; DestDir: "{app}\ui.new"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageDir}\plugins-builtin\*"; DestDir: "{app}\plugins-builtin.new"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\Zeron v3"; Filename: "{app}\zeron.exe"; IconFilename: "{app}\zeron.ico"
@@ -98,6 +110,14 @@ Filename: "{app}\zeron.exe"; Flags: nowait; Check: Relaunch
 [UninstallDelete]
 Type: files; Name: "{app}\zeron-engine*.old"
 Type: filesandordirs; Name: "{app}\.zeron-update-*"
+; Installed as ui.new and plugins-builtin.new, then renamed: the uninstall
+; log names the .new paths, so the folders they became go by name.
+Type: filesandordirs; Name: "{app}\ui"
+Type: filesandordirs; Name: "{app}\ui.new"
+Type: filesandordirs; Name: "{app}\ui.old"
+Type: filesandordirs; Name: "{app}\plugins-builtin"
+Type: filesandordirs; Name: "{app}\plugins-builtin.new"
+Type: filesandordirs; Name: "{app}\plugins-builtin.old"
 
 [Code]
 const
@@ -133,6 +153,34 @@ begin
   Result := WizardSilent and (ExpandConstant('{param:RELAUNCH|0}') = '1');
 end;
 
+// Name.new, every file of it copied, becomes Name; the one it replaces goes
+// aside first and is deleted after. A swap that fails puts the old one back,
+// so there is always one whole folder under Name.
+procedure SwapIn(Name: String);
+var
+  Current, Incoming, Aside: String;
+begin
+  Current := ExpandConstant('{app}\' + Name);
+  Incoming := Current + '.new';
+  Aside := Current + '.old';
+  if not DirExists(Incoming) then
+    Exit;
+  if DirExists(Current) and not RenameFile(Current, Aside) then
+  begin
+    Log('Could not move ' + Current + ' aside; it stays, and ' + Incoming + ' with it');
+    Exit;
+  end;
+  if not RenameFile(Incoming, Current) then
+  begin
+    Log('Could not move ' + Incoming + ' into place; putting the old one back');
+    if DirExists(Aside) and not RenameFile(Aside, Current) then
+      Log('Could not put ' + Aside + ' back: ' + Current + ' is missing');
+    Exit;
+  end;
+  DelTree(Aside, True, True, True);
+  Log('Swapped in ' + Current);
+end;
+
 // A running engine can't be overwritten but can be renamed: move it aside so
 // the new one goes in place. Earlier ones still running keep their names.
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -140,6 +188,12 @@ var
   Engine, Aside: String;
   N: Integer;
 begin
+  if CurStep = ssPostInstall then
+  begin
+    SwapIn('ui');
+    SwapIn('plugins-builtin');
+    Exit;
+  end;
   if CurStep <> ssInstall then
     Exit;
   Engine := ExpandConstant('{app}\zeron-engine.exe');

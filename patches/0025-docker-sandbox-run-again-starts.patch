@@ -1,0 +1,89 @@
+From 964532272266fdfeedaeb313674f4d041b6ff463 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 18 Nov 2026 19:32:51 +0700
+Subject: [PATCH] Docker Sandbox: Run again starts the sandbox before the step
+ that failed
+
+A chat on Docker Sandbox (the Laptop, 2026-11-18) failed at Install Zeron,
+its sandbox stopped at Docker's time limit while the failure waited, and
+Run again failed with "Couldn't install Zeron: The sandbox isn't running
+(it's stopped)": Run again ran only the failed step and what follows, and
+Start, done once, stayed done.
+
+Run again now runs Start again too when it had started the sandbox.
+Starting a running sandbox does nothing (a sandbox Create just made is
+running, and Start runs after it already), so a retry costs no more when
+the sandbox is still up. A provider that skipped Start (it can't start
+sandboxes) keeps it skipped.
+---
+ crates/engine/src/sandboxes/steps.rs | 43 +++++++++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/crates/engine/src/sandboxes/steps.rs b/crates/engine/src/sandboxes/steps.rs
+index 2743f5c41..c8f6b422d 100644
+--- a/crates/engine/src/sandboxes/steps.rs
++++ b/crates/engine/src/sandboxes/steps.rs
+@@ -326,11 +326,24 @@ impl SandboxSteps {
+         }
+     }
+ 
+-    /// Run again: the failed step (and what follows) runs once more.
++    /// Run again: the failed step (and what follows) runs once more, and
++    /// Start before it when it had started the sandbox: a sandbox can stop
++    /// while its failure waits for Run again (Docker stops one at its time
++    /// limit), and no later step runs in a stopped one. Starting a running
++    /// sandbox again does nothing.
+     pub(crate) fn retry(&mut self) {
++        let mut failed = false;
+         for progress in &mut self.steps {
+             if progress.state == StepState::Failed {
+                 progress.state = StepState::Pending;
++                failed = true;
++            }
++        }
++        if failed {
++            for progress in &mut self.steps {
++                if progress.step == Step::Start && progress.state == StepState::Done {
++                    progress.state = StepState::Pending;
++                }
+             }
+         }
+         self.state = SandboxState::Starting;
+@@ -470,6 +483,34 @@ mod tests {
+         assert_eq!(steps.error, None);
+     }
+ 
++    #[test]
++    fn running_again_after_a_later_step_starts_the_sandbox_first() {
++        // The Laptop, 2026-11-18: Install Zeron failed, the sandbox stopped
++        // at its time limit, and Run again failed with "The sandbox isn't
++        // running (it's stopped)".
++        let mut steps = SandboxSteps::new("chat", "fake", None, "device");
++        for step in [Step::Create, Step::Start] {
++            steps.begin(step);
++            steps.finish(step, StepState::Done);
++        }
++        steps.begin(Step::InstallZeron);
++        steps.fail(Step::InstallZeron, "no".into());
++        steps.retry();
++        assert_eq!(steps.state_of(Step::Create), StepState::Done);
++        assert_eq!(steps.state_of(Step::Start), StepState::Pending);
++        assert_eq!(steps.state_of(Step::InstallZeron), StepState::Pending);
++        // A provider that can't start sandboxes skipped Start: it stays so.
++        let mut skipped = SandboxSteps::new("chat", "fake", None, "device");
++        skipped.begin(Step::Create);
++        skipped.finish(Step::Create, StepState::Done);
++        skipped.begin(Step::Start);
++        skipped.finish(Step::Start, StepState::Skipped);
++        skipped.begin(Step::InstallZeron);
++        skipped.fail(Step::InstallZeron, "no".into());
++        skipped.retry();
++        assert_eq!(skipped.state_of(Step::Start), StepState::Skipped);
++    }
++
+     #[test]
+     fn a_step_cut_off_by_a_restart_fails_and_can_run_again() {
+         let mut steps = SandboxSteps::new("chat", "fake", None, "device");
+-- 
+2.55.0.windows.2
+
