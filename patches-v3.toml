@@ -164,3 +164,10 @@ note = "Run again after a failed Install Zeron (the Laptop, 2026-11-18) failed w
 name = "fast-boot-journal-scan"
 file = "patches/0023-fast-boot-journal-scan.patch"
 note = "The engine took 35-49 s to be ready on the PC (2026-11-14 to 11-18), all of it boot's crash scan (RunJournal::stale_sessions) opening every journal ever written (1,133, 1.1 GB) to read its tail: Windows Defender reads a whole file before its first open returns, ~28 ms a journal with a cold scan cache (after a reboot or a signature update). closed-journals.idx, beside the journals, keeps each journal last seen ending in a closed turn with its size and modified time; boot reads only metadata (no scan) and opens only new or changed journals, 8 at a time. Journals are append-only, so a stale line can't hide a crash; losing the index costs one slower boot. On a copy of the PC's profile, cold cache: 34.6 s before, 1.5 s after, ~11 s once to build the index. One file, crates/engine/src/run_journal.rs; upstream's main since fb09b2391 doesn't touch it. Not yet a PR upstream."
+
+# Install safety.
+
+[[patch]]
+name = "ui-without-app-refused"
+file = "patches/0026-ui-without-app-refused.patch"
+note = "The PC's v3 opened on nothing (2026-11-18): an update's installer stopped partway after deleting the install's ui folder (dist/zeron-v3.iss now swaps it in only once copied), and the next launch copied the missing folder into templates\\.zeron as an empty one, taking .live's app.luau with it, with the error on stderr alone. sync_zeron now refuses a ui/ without its app.luau and keeps .zeron as the last copy laid it; a launch with ui/ unusable runs .live as the last launch laid it; the errors reach zeron-headed.log. apps/zgx/src/plugins/live.rs and mod.rs, and tracing in apps/zgx's Cargo.toml. Upstream's bug too (its installs swap whole, so it rarely shows there): not yet a PR upstream."

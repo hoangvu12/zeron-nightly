@@ -1,4 +1,4 @@
-From b7c7abaa0ece4ee760677a2766ee4c6e19f3210e Mon Sep 17 00:00:00 2001
+From 63e2539e36b628cdc40690a3aa876cdcb6eb3065 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 6 Nov 2026 06:29:50 +0700
 Subject: [PATCH] Windows: updates by installer for an install of more than
@@ -17,11 +17,15 @@ rest behind.
 - Such an install is never "incomplete" (zeron/zgx's 0.3.0 completes a
   zeron.exe without its beta\<version> folder from the edge's feed): the
   installer puts its files beside zeron.exe whole.
+
+- The installer writes its log to <data>\logs\installer.log (/LOG). It
+  runs after the app is gone, with no window and no prompts, so the log is
+  the only account of an install that stopped partway.
 ---
- apps/zgx/src/engine/manager.rs | 11 ++++
- apps/zgx/src/engine_update.rs  |  6 ++-
- crates/update/src/windows.rs   | 94 ++++++++++++++++++++++++++++++++++
- 3 files changed, 109 insertions(+), 2 deletions(-)
+ apps/zgx/src/engine/manager.rs |  11 ++++
+ apps/zgx/src/engine_update.rs  |   6 +-
+ crates/update/src/windows.rs   | 108 +++++++++++++++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 2 deletions(-)
 
 diff --git a/apps/zgx/src/engine/manager.rs b/apps/zgx/src/engine/manager.rs
 index 47dc0b4f51c249ff9548cacc9daacdebe7288798..0e63a4c69b42da498cc67f2d1678a0afe5c964ce 100644
@@ -63,7 +67,7 @@ index 929df56d5017fa8f0455f9dfe6696a9862785aaf..63dddc6e872dee752ac732dcd8ddabe5
              }
              let running = info["build"].as_str().map(str::to_owned);
 diff --git a/crates/update/src/windows.rs b/crates/update/src/windows.rs
-index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b08010930 100644
+index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..3410c0dabe1a0a588d4dc6498834b6494f5e5132 100644
 --- a/crates/update/src/windows.rs
 +++ b/crates/update/src/windows.rs
 @@ -66,6 +66,25 @@ pub fn version_files(directory: &Path, version: &str) -> PathBuf {
@@ -115,7 +119,7 @@ index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b
          && !files_complete(&version_files(&directory, version)))
      .then_some(directory)
  }
-@@ -546,6 +571,68 @@ async fn lock_completion(directory: &Path) -> anyhow::Result<std::fs::File> {
+@@ -546,6 +571,82 @@ async fn lock_completion(directory: &Path) -> anyhow::Result<std::fs::File> {
      }
  }
  
@@ -171,6 +175,12 @@ index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b
 +    if relaunch {
 +        command.arg("/RELAUNCH=1");
 +    }
++    // The installer runs after this process is gone, with no window and no
++    // prompts: its log is the only account of an install that stopped
++    // partway, so it goes beside the app's own (`<data>\logs`).
++    if let Some(log) = installer_log() {
++        command.arg(format!("/LOG={}", log.display()));
++    }
 +    command
 +        .stdin(std::process::Stdio::null())
 +        .stdout(std::process::Stdio::null())
@@ -181,10 +191,18 @@ index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b
 +    Ok(())
 +}
 +
++/// `<data>\logs\installer.log`, where an update's installer writes its log
++/// (each update's replaces the last's); none before the app names its data.
++fn installer_log() -> Option<PathBuf> {
++    let logs = super::channel::data_dir()?.join("logs");
++    std::fs::create_dir_all(&logs).ok()?;
++    Some(logs.join("installer.log"))
++}
++
  fn verify(staged: &Path) -> anyhow::Result<()> {
      let expected = std::fs::read_to_string(staged.with_file_name("sha256"))?;
      verify_digest(staged, expected.trim())
-@@ -584,6 +671,9 @@ fn digest(path: &Path) -> anyhow::Result<String> {
+@@ -584,6 +685,9 @@ fn digest(path: &Path) -> anyhow::Result<String> {
  /// and [`Self::recover_from_backup`] cover the leftovers of a hard crash
  /// between the two renames.
  pub fn apply(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {
@@ -194,7 +212,7 @@ index f9c49ce90b791b952eb6fe02fc021e33bfdef2e2..d10a1092af6afa6fadc2018a88d9c05b
      // From the new version's folder going in to the swap, no start's cleanup
      // may take that folder for an old one (nothing runs from it yet).
      let _lock = lock_completion_blocking(directory, std::time::Duration::from_secs(30))?;
-@@ -1121,6 +1211,10 @@ mod tests {
+@@ -1121,6 +1225,10 @@ mod tests {
          assert_eq!(incomplete_install(&exe, "0.2.139"), None);
          // Another version's files don't count.
          assert!(incomplete_install(&exe, "0.2.140").is_some());
