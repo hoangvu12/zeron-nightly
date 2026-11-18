@@ -1,4 +1,4 @@
-From 0c92a01d973c1384074b16aab7dffad73526e383 Mon Sep 17 00:00:00 2001
+From 0812b6e11f3fdab69bd87138745a4d9fecefbf4b Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Wed, 18 Nov 2026 14:30:15 +0700
 Subject: [PATCH] Docker Sandbox: a sandbox runs this build's own engine, never
@@ -22,13 +22,19 @@ sandbox (a template's) is kept only when it is that build, and the step
 checks the one it installed is. Without the variable (upstream's builds),
 nothing changes. The dev override (`ZERON_SANDBOX_ENGINE_TARBALL`) now
 always installs, even over a template's engine.
+
+Whether a release has a file is asked with its first byte (a ranged GET),
+not a HEAD: in a Docker sandbox the proxy signs github.com's requests, and
+a release download's redirect to GitHub's storage answers a HEAD with 401
+while a GET works (0.3.9-v3.202611180811 said it had no Linux engine). The
+tests' fake curl refuses a HEAD the same way.
 ---
- crates/engine/src/sandboxes.rs        | 170 ++++++++++++++++++++++----
+ crates/engine/src/sandboxes.rs        | 181 ++++++++++++++++++++++----
  crates/engine/src/sandboxes/docker.rs |   2 +-
- 2 files changed, 150 insertions(+), 22 deletions(-)
+ 2 files changed, 159 insertions(+), 24 deletions(-)
 
 diff --git a/crates/engine/src/sandboxes.rs b/crates/engine/src/sandboxes.rs
-index a0f25a3e7..7c03386a7 100644
+index a0f25a3e7..2e57a606e 100644
 --- a/crates/engine/src/sandboxes.rs
 +++ b/crates/engine/src/sandboxes.rs
 @@ -863,21 +863,32 @@ impl Sandboxes {
@@ -68,7 +74,7 @@ index a0f25a3e7..7c03386a7 100644
                  Ok(StepState::Done)
              }
              Step::SignIn => {
-@@ -1514,30 +1525,88 @@ pub fn host_release() -> Option<&'static str> {
+@@ -1514,34 +1525,96 @@ pub fn host_release() -> Option<&'static str> {
      option_env!("ZERON_ENGINE_VERSION").filter(|v| !v.trim().is_empty())
  }
  
@@ -150,20 +156,29 @@ index a0f25a3e7..7c03386a7 100644
      const SCRIPT: &str = r#"set -eu
  edge="$ZERON_EDGE_URL"
  case "$(uname -m)" in aarch64|arm64) arch=aarch64 ;; *) arch=x86_64 ;; esac
++# Whether a URL serves a file: its first byte, not a HEAD. In a Docker
++# sandbox the proxy signs github.com's requests, and a release download's
++# redirect to GitHub's storage then answers a HEAD with 401 (a GET works).
++has() { curl -fsL -r 0-0 -o /dev/null "$1" >/dev/null 2>&1; }
  if [ -n "${ZERON_SANDBOX_ENGINE_TARBALL:-}" ]; then
    version=dev
    url="$ZERON_SANDBOX_ENGINE_TARBALL"
 +elif [ -n "${ZERON_ENGINE_RELEASES:-}" ]; then
 +  version="${ZERON_ENGINE_WANTED:-}"
 +  url="${ZERON_ENGINE_RELEASES%/}/zeron-$version-linux-$arch.tar.gz"
-+  if [ -z "$version" ] || ! curl -fsIL "$url" >/dev/null 2>&1; then
++  if [ -z "$version" ] || ! has "$url"; then
 +    echo "Zeron $version has no Linux engine at $url, and a sandbox needs this build's own" >&2
 +    exit 1
 +  fi
  else
    version="${ZERON_ENGINE_WANTED:-}"
    url="$edge/releases/zeron-$version-linux-$arch.tar.gz"
-@@ -1560,6 +1629,9 @@ zeron-engine --version"#;
+-  if [ -z "$version" ] || ! curl -fsIL "$url" >/dev/null 2>&1; then
++  if [ -z "$version" ] || ! has "$url"; then
+     version=$(curl -fsSL "$edge/releases/latest.txt")
+     url="$edge/releases/zeron-$version-linux-$arch.tar.gz"
+   fi
+@@ -1560,6 +1633,9 @@ zeron-engine --version"#;
      if let Some(wanted) = present(wanted) {
          command = command.env(ENGINE_WANTED_ENV, wanted);
      }
@@ -173,7 +188,7 @@ index a0f25a3e7..7c03386a7 100644
      if let Some(tarball) = present(tarball) {
          command = command.env(ENGINE_TARBALL_ENV, tarball);
      }
-@@ -1680,6 +1752,25 @@ mod tests {
+@@ -1680,6 +1756,25 @@ mod tests {
          wanted: Option<&str>,
          tarball: Option<&str>,
      ) -> (String, String) {
@@ -199,7 +214,21 @@ index a0f25a3e7..7c03386a7 100644
          use std::os::unix::fs::PermissionsExt;
          let root = tempfile::tempdir().unwrap();
          let (edge, bin, home) = (
-@@ -1726,7 +1817,7 @@ file="$FAKE_EDGE/${url##*/}"
+@@ -1716,9 +1811,12 @@ mod tests {
+ url=""; head=0
+ for a in "$@"; do case "$a" in -*I*) head=1 ;; -*) ;; *) url="$a" ;; esac; done
+ echo "$url" >> "$FAKE_LOG"
++# A HEAD fails, as GitHub's release storage answers one in a Docker
++# sandbox (401, through the proxy that signs github.com's requests).
++[ "$head" = 1 ] && exit 22
+ file="$FAKE_EDGE/${url##*/}"
+ [ -f "$file" ] || exit 22
+-[ "$head" = 1 ] || cat "$file"
++cat "$file"
+ "#;
+         for (name, script) in [("curl", curl), ("sudo", "#!/bin/sh\nexit 0\n")] {
+             let path = bin.join(name);
+@@ -1726,7 +1824,7 @@ file="$FAKE_EDGE/${url##*/}"
              std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
          }
          let log = root.path().join("urls");
@@ -208,7 +237,7 @@ index a0f25a3e7..7c03386a7 100644
          let path = format!(
              "{}:{}:{}",
              home.join(".zeron/app/current").display(),
-@@ -1742,15 +1833,51 @@ file="$FAKE_EDGE/${url##*/}"
+@@ -1742,15 +1840,51 @@ file="$FAKE_EDGE/${url##*/}"
              .env("FAKE_LOG", &log)
              .output()
              .unwrap();
@@ -268,7 +297,7 @@ index a0f25a3e7..7c03386a7 100644
      }
  
      #[cfg(unix)]
-@@ -1786,10 +1913,11 @@ file="$FAKE_EDGE/${url##*/}"
+@@ -1786,10 +1920,11 @@ file="$FAKE_EDGE/${url##*/}"
  
      #[test]
      fn the_install_source_is_the_hosts_release_and_the_dev_override() {
