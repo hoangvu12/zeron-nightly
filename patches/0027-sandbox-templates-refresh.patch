@@ -1,0 +1,202 @@
+From 929b6ea13a55e60cb7ac515114b386c96b2e0e2e Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 19 Nov 2026 01:35:26 +0700
+Subject: [PATCH] Templates' menu asks for the list again as it opens
+
+The place's Template row listed the account's templates as they were when
+Docker Sandbox was first picked: two saved since (zgx-dev-claude,
+zeron-dev-claude) didn't show and the two removed did, until Zeron
+restarted. Each opening of the row now asks again; the list shown stays
+until the new one comes, and a pick the account no longer has goes to the
+default.
+---
+ apps/zgx/ui/chat_fixture.luau                 |  5 +++
+ apps/zgx/ui/ds/composer.luau                  | 22 ++++++++++-
+ apps/zgx/ui/screens/chat/composer.luau        |  1 +
+ apps/zgx/ui/screens/chat/where.luau           | 37 +++++++++++++++++++
+ .../zgx/ui/tests/chat_where_sandbox.test.luau | 31 ++++++++++++++++
+ 5 files changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
+index 8fe9919c0..1d4e5a3f6 100644
+--- a/apps/zgx/ui/chat_fixture.luau
++++ b/apps/zgx/ui/chat_fixture.luau
+@@ -1556,6 +1556,11 @@ do
+ 	ui.command { id = "sandbox_stub.slow_templates", title = "The next templates list is slow", run = function()
+ 		slow_templates = true
+ 	end }
++	-- `sandbox_stub.templates_change`: the account's templates change while
++	-- Zeron runs (two saved with Claude Code, the two they came from removed).
++	ui.command { id = "sandbox_stub.templates_change", title = "The account's templates change", run = function()
++		listed = { { id = "tmpl-zgx-claude", name = "zgx-dev-claude" }, { id = "tmpl-zeron-claude", name = "zeron-dev-claude" } }
++	end }
+ 	ui.command { id = "sandbox_stub.templates_arrive", title = "The slow templates list arrives", run = function()
+ 		local ok = held_templates
+ 		held_templates = nil
+diff --git a/apps/zgx/ui/ds/composer.luau b/apps/zgx/ui/ds/composer.luau
+index b3b4abc70..5584dc863 100644
+--- a/apps/zgx/ui/ds/composer.luau
++++ b/apps/zgx/ui/ds/composer.luau
+@@ -208,6 +208,9 @@ export type Props = {
+ 	-- as the place is picked.
+ 	template: State<string?>?,
+ 	templates: ({ Dropdown.Item } | State<{ Dropdown.Item }> | () -> { Dropdown.Item })?,
++	-- Told each time the templates' row opens (by hover, click, or the
++	-- place's pick): the host asks for the list again.
++	on_templates_open: (() -> ())?,
+ 	checkout: State<string?>?,
+ 	branch: State<string?>?,
+ 	branches: ({ Dropdown.Item } | State<{ Dropdown.Item }> | () -> { Dropdown.Item })?,
+@@ -786,7 +789,8 @@ local function work_in(
+ 	reach: State<string?>?,
+ 	reach_default: (() -> string?)?,
+ 	template: State<string?>?,
+-	templates: any
++	templates: any,
++	on_templates_open: (() -> ())?
+ ): Node
+ 	local siblings: { State<boolean> } = {}
+ 	-- The templates' row's open state, once it's made: picking a place
+@@ -871,7 +875,20 @@ local function work_in(
+ 				id = "composer-place-templates",
+ 				w_full = true,
+ 				submenu(siblings, locale.t("ds.composer.sandbox_template.label"), template, choices, 1, nil, nil, nil, nil, function(open: State<boolean>)
++					local first = templates_open ~= open
+ 					templates_open = open
++					-- Each opening, however it opens (its row made again
++					-- watches the same state once).
++					if first and on_templates_open then
++						local was = open:peek()
++						ui.effect(function()
++							local now = open:get()
++							if now and not was then
++								(on_templates_open :: () -> ())()
++							end
++							was = now
++						end)
++					end
+ 				end, {
+ 					-- Back to the devices ("‹ Docker Sandbox", its name), then
+ 					-- "Templates" over them, the one picked checked (screen 02).
+@@ -2444,7 +2461,8 @@ return ui.component(function(props: Props): Node
+ 						props.reach,
+ 						props.reach_default,
+ 						props.template,
+-						props.templates
++						props.templates,
++						props.on_templates_open
+ 					)
+ 					else nil
+ 			end
+diff --git a/apps/zgx/ui/screens/chat/composer.luau b/apps/zgx/ui/screens/chat/composer.luau
+index a8861e402..13dd8260a 100644
+--- a/apps/zgx/ui/screens/chat/composer.luau
++++ b/apps/zgx/ui/screens/chat/composer.luau
+@@ -1629,6 +1629,7 @@ local function Composer(): Node
+ 			devices = where.devices,
+ 			template = template,
+ 			templates = where.templates,
++			on_templates_open = where.refresh_templates,
+ 			checkout = checkout,
+ 			branch = branch,
+ 			branches = where.branches,
+diff --git a/apps/zgx/ui/screens/chat/where.luau b/apps/zgx/ui/screens/chat/where.luau
+index 5458250c0..f68b69d2e 100644
+--- a/apps/zgx/ui/screens/chat/where.luau
++++ b/apps/zgx/ui/screens/chat/where.luau
+@@ -723,6 +723,42 @@ function M.bind(c: Choices)
+ 			end
+ 		end)
+ 	end)
++	-- The list again as its menu opens: one saved or removed on the account
++	-- since shows (the PC, 2026-11-18: two templates saved and the two they
++	-- came from removed, and the picker went on listing the removed ones
++	-- until Zeron restarted). The list shown stays until the new one comes;
++	-- one that fails leaves it. A pick the account no longer has goes to the
++	-- default (the one last used if listed, else the first, else Blank).
++	local asking = false
++	local function refresh_templates()
++		local provider = place_of(c.device:peek())
++		local was = templates_of:peek()
++		if asking or not provider or was.provider ~= provider or was.state == "loading" then
++			return
++		end
++		asking = true
++		sandboxes.templates(provider):after(function(list: any)
++			asking = false
++			list = list or {}
++			if templates_of:peek().provider ~= provider then
++				return
++			end
++			templates_of:set { provider = provider, state = "ready", list = list }
++			local pick = c.template
++			local picked = if pick then pick:peek() else nil
++			if not pick or picked == nil or picked == sandboxes.BLANK or place_of(c.device:peek()) ~= provider then
++				return
++			end
++			for _, template in list do
++				if template.id == picked then
++					return
++				end
++			end
++			pick:set(M.default_template(provider, list))
++		end, function()
++			asking = false
++		end)
++	end
+ 	-- The one picked, kept for the next new chat on that provider.
+ 	ui.effect(function()
+ 		local picked = if c.template then c.template:get() else nil
+@@ -761,6 +797,7 @@ function M.bind(c: Choices)
+ 		plan = plan,
+ 		refs = refs,
+ 		templates = templates,
++		refresh_templates = refresh_templates,
+ 	}
+ end
+ 
+diff --git a/apps/zgx/ui/tests/chat_where_sandbox.test.luau b/apps/zgx/ui/tests/chat_where_sandbox.test.luau
+index ea3c15f13..cbe0df412 100644
+--- a/apps/zgx/ui/tests/chat_where_sandbox.test.luau
++++ b/apps/zgx/ui/tests/chat_where_sandbox.test.luau
+@@ -192,6 +192,37 @@ test("picking the provider opens its templates, the account's and Blank", functi
+ 	expect(showing(app, 'role:option ~"zgx-dev"')).to_be(true)
+ end)
+ 
++test("the templates are asked again as their row opens: one saved since shows, one removed goes", function()
++	local app = mount("chat_fixture.luau")
++	home(app)
++	app:command("sandbox_stub.offer")
++	settle(app)
++	open_row(app, "Device")
++	app:click('role:option ~"Docker Sandbox"')
++	rested(app)
++	app:click('role:option ~"zgx-dev"')
++	close(app)
++	expect(chosen(app, "Template")).to_contain("zgx-dev")
++	-- Saved and removed on the account while Zeron runs.
++	app:command("sandbox_stub.templates_change")
++	settle(app)
++	open_row(app, "Template")
++	rested(app)
++	expect(showing(app, 'role:option ~"zgx-dev-claude"')).to_be(true)
++	expect(showing(app, 'role:option ~"zeron-dev-claude"')).to_be(true)
++	expect(app:has('role:option "zgx-dev"')).to_be(false)
++	expect(app:has('role:option "zeron-dev"')).to_be(false)
++	close(app)
++	-- The one picked is gone: the first listed instead, and it's what a
++	-- send makes the chat on.
++	expect(chosen(app, "Template")).to_contain("zgx-dev-claude")
++	app:type('role:textbox "Message"', "hi")
++	app:key("Enter")
++	rested(app)
++	expect(app:state("calls")).to_contain("|place:docker:tmpl-zgx-claude")
++	expect(app:error()).to_be(nil)
++end)
++
+ test("the provider's row has a chevron; its submenu: ‹ the provider, Templates, ✓ on the one picked (screens 01, 02)", function()
+ 	local app = mount("chat_fixture.luau")
+ 	home(app)
+-- 
+2.55.0.windows.2
+

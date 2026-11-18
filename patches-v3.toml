@@ -158,6 +158,16 @@ name = "docker-sandbox-run-again-starts"
 file = "patches/0025-docker-sandbox-run-again-starts.patch"
 note = "Run again after a failed Install Zeron (the Laptop, 2026-11-18) failed with \"The sandbox isn't running (it's stopped)\": the sandbox had stopped at Docker's time limit while the failure waited, and Run again reran only the failed step on. It now reruns Start too when Start had started the sandbox (starting a running one does nothing); a provider that skipped Start keeps it skipped. One file, crates/engine/src/sandboxes/steps.rs. Applies on top of docker-sandbox."
 
+[[patch]]
+name = "sandbox-templates-refresh"
+file = "patches/0027-sandbox-templates-refresh.patch"
+note = "The place's Template row kept listing the templates the account had when Docker Sandbox was first picked (the PC, 2026-11-18): zgx-dev-claude and zeron-dev-claude, saved since, didn't show, and zgx-dev and zeron-dev, removed, did, until Zeron restarted. The list was asked for once per provider and reused. Each opening of the row (hover, click, or the place's pick) now asks again; the list shown stays until the new one comes, one that fails leaves it, and a pick the account no longer has goes to the default. apps/zgx/ui only: screens/chat/where.luau (`refresh_templates`), ds/composer.luau (`on_templates_open`), screens/chat/composer.luau, and ui/tests/chat_where_sandbox.test.luau with its fixture. Applies on top of docker-place-shows-sandbox."
+
+[[patch]]
+name = "mcp-create-chat-on-place"
+file = "patches/0028-mcp-create-chat-on-place.patch"
+note = "An agent couldn't put a chat on Docker Sandbox: MCP's create_chat knew devices, projects and Cloud only. create_chat and create_chats take `place` (a sandbox provider, by id or name) and `template` (by id or exact name, asked of the account each time; none or `blank` is Blank) and send createChat with `place` as the composer does (deviceId only without a project). Harness and model are checked against the template's catalog (`place:<provider>:<template>`): an agent the template hasn't got is refused naming what it has, Blank with no agent is refused, an unknown template lists the account's. The sandbox's device and checkout come back from the engine; the reply's `place` says the sandbox is still being made (a first prompt and its wait include that). Not with device, cloud, cwd or branch. crates/mcp/src/tools.rs and zeron.rs; no engine change. Applies on top of docker-sandbox."
+
 # Boot time.
 
 [[patch]]

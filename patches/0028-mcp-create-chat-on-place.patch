@@ -1,0 +1,531 @@
+From 3d8232cd3f1bdfc291c7aae6c056fe41c3958fe3 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 19 Nov 2026 01:35:26 +0700
+Subject: [PATCH] MCP create_chat on a place: a sandbox of the chat's own
+
+create_chat and create_chats take place (a sandbox provider, by id or
+name) and template (by id or exact name, asked of the account each time;
+none or blank is Blank), as the composer's Docker Sandbox and Template
+rows do. Harness and model are checked against the template's own catalog
+(place:<provider>:<template>); what it hasn't got is refused, naming what
+it has. The sandbox's device and checkout come back from the engine, and
+the reply says the sandbox is still being made. Not with device, cloud,
+cwd or branch.
+---
+ crates/mcp/src/tools.rs | 263 ++++++++++++++++++++++++++++++++++++++--
+ crates/mcp/src/zeron.rs | 102 ++++++++++++++++
+ 2 files changed, 353 insertions(+), 12 deletions(-)
+
+diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
+index f7f354ede..4e7d9eb44 100644
+--- a/crates/mcp/src/tools.rs
++++ b/crates/mcp/src/tools.rs
+@@ -138,7 +138,7 @@ fn catalog() -> Vec<ToolDef> {
+         },
+         ToolDef {
+             name: "create_chat",
+-            description: "Create a child of your chat to delegate work to (kind subagent, the default when you speak from a chat or pass parent: listed under that chat's Subagents and in its transcript's subagent block), a side chat (kind side: only when the person should treat it as a side conversation of their own), or a standalone session (kind chat, no parent). Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
++            description: "Create a child of your chat to delegate work to (kind subagent, the default when you speak from a chat or pass parent: listed under that chat's Subagents and in its transcript's subagent block), a side chat (kind side: only when the person should treat it as a side conversation of their own), or a standalone session (kind chat, no parent). Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. With place, it runs in a sandbox of its own (e.g. a Docker Sandbox) made from a template, with only the agents that template has. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
+             input_schema: json!({
+                 "type": "object",
+                 "properties": {
+@@ -156,6 +156,8 @@ fn catalog() -> Vec<ToolDef> {
+                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
+                     "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
+                     "cloud": { "type": "boolean", "default": false, "description": "Run on a Cloud machine of its own (cloning the project's GitHub repository) instead of the project's device. From a Cloud chat, the child clones the same repository; without cloud it shares this machine, unless device or project names another of the person's devices." },
++                    "place": { "type": "string", "description": "Run in a new sandbox of this provider (its id or name, e.g. docker) instead of on a device: the chat gets a sandbox of its own, made from template, with the project's code when project is given. Not with device or cloud. The sandbox takes a minute or more to make; a first prompt waits for it." },
++                    "template": { "type": "string", "description": "With place: the sandbox's template, its id or exact name as the provider's account lists them, or blank (the default, a bare shell). A sandbox runs only the agents its template has: harness and model are checked against it." },
+                     "prompt": { "type": "string", "description": "First message to send right away." },
+                     "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
+                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
+@@ -721,6 +723,10 @@ struct CreateChatArgs {
+     cwd: Option<String>,
+     #[serde(default)]
+     cloud: bool,
++    /// A sandbox provider to make the chat's sandbox on ([`Zeron::resolve_place`]).
++    place: Option<String>,
++    /// With `place`: its template, by id or name; none or `blank` is Blank.
++    template: Option<String>,
+     prompt: Option<String>,
+     #[serde(default)]
+     wait: bool,
+@@ -1388,11 +1394,51 @@ impl Tools {
+                 parent.title.as_deref().unwrap_or(&parent.id)
+             );
+         }
++        // A place: a sandbox of the chat's own, made where its provider is
++        // kept, from the template asked for (the composer's Docker Sandbox
++        // and Template rows).
++        let blank = |v: &Option<String>| v.as_deref().is_none_or(|v| v.trim().is_empty());
++        let place = match args.place.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
++            Some(provider) => {
++                anyhow::ensure!(
++                    !args.cloud,
++                    "place and cloud each give the chat a machine of its own: pick one"
++                );
++                anyhow::ensure!(
++                    blank(&args.device),
++                    "a chat on a place runs in a sandbox of its own, not on a device: drop device (project names the code it gets)"
++                );
++                anyhow::ensure!(
++                    blank(&args.cwd) && blank(&args.branch),
++                    "a chat on a place works in its sandbox's own checkout: drop cwd and branch"
++                );
++                Some(self.zeron.resolve_place(provider, args.template.as_deref()).await?)
++            }
++            None => {
++                anyhow::ensure!(
++                    blank(&args.template),
++                    "template is a sandbox's: pass place too (e.g. place docker)"
++                );
++                None
++            }
++        };
+         let (space, device_id) = self
+             .zeron
+             .resolve_target(args.project.as_deref(), args.device.as_deref())
+             .await?;
+-        let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
++        // A place's catalog is its template's agents, answered by the device
++        // keeping the provider.
++        let (catalog, on) = match &place {
++            Some(place) => (
++                place.target(),
++                match &place.template {
++                    Some(template) => format!("{} template {}", place.provider.name, template.name),
++                    None => format!("{} (Blank template)", place.provider.name),
++                },
++            ),
++            None => (device_id.clone(), format!("device {device_id}")),
++        };
++        let harnesses = self.zeron.harnesses_on(Some(&catalog)).await?;
+         let harness = match args.harness.as_deref() {
+             // Cloud runs its own agents, with your Cloud accounts.
+             Some(raw) if args.cloud => {
+@@ -1408,18 +1454,31 @@ impl Tools {
+                 let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+                 anyhow::ensure!(
+                     harnesses.iter().any(|h| h.id == id && h.available()),
+-                    "harness {raw} is not available on device {device_id} (see list_harnesses with device)"
++                    "harness {raw} is not available on {on} ({})",
++                    match &place {
++                        Some(_) => format!(
++                            "it has: {}",
++                            available_names(&harnesses)
++                        ),
++                        None => "see list_harnesses with device".to_owned(),
++                    }
+                 );
+                 id
+             }
+-            None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
++            // A sandbox runs only the agents its template has.
++            None if place.is_some() => default_harness(&harnesses).map_err(|_| {
++                anyhow::anyhow!(
++                    "no agent is on {on}: a sandbox runs only the agents its template has. Pick a template with one."
++                )
++            })?,
++            None => default_harness(&harnesses).with_context(|| on.clone())?,
+         };
+         // A Cloud machine's catalog is checked when it runs, not here.
+         if let Some(model) = args.model.as_deref().filter(|_| !args.cloud) {
+-            let models = self.zeron.models_on(harness, Some(&device_id)).await?;
++            let models = self.zeron.models_on(harness, Some(&catalog)).await?;
+             anyhow::ensure!(
+                 models.iter().any(|m| m.id == model),
+-                "model {model:?} is not offered by {harness:?} on device {device_id}; available: {}",
++                "model {model:?} is not offered by {harness:?} on {on}; available: {}",
+                 models
+                     .iter()
+                     .map(|m| m.id.as_str())
+@@ -1459,13 +1518,13 @@ impl Tools {
+             let modes = &info.access_modes;
+             anyhow::ensure!(
+                 access.is_full_access() || modes.contains(&access),
+-                "{harness:?} on device {device_id} cannot run {} (accessModes: {})",
++                "{harness:?} on {on} cannot run {} (accessModes: {})",
+                 access.label(),
+                 modes.iter().map(|m| m.label()).collect::<Vec<_>>().join(", ")
+             );
+             anyhow::ensure!(
+                 !args.plan || info.supports_plan,
+-                "{harness:?} on device {device_id} has no plan mode"
++                "{harness:?} on {on} has no plan mode"
+             );
+         }
+         let config = ChatConfig {
+@@ -1487,6 +1546,19 @@ impl Tools {
+         if let Some(space) = &space {
+             mutate["spaceId"] = json!(space.id);
+         }
++        // As the composer asks for one: the place, and the device asking only
++        // when no project names where it belongs.
++        if let Some(place) = &place {
++            mutate["place"] = json!({ "provider": place.provider.id });
++            if let Some(template) = &place.template {
++                mutate["place"]["template"] = json!(template.id);
++            }
++            if space.is_some()
++                && let Some(fields) = mutate.as_object_mut()
++            {
++                fields.remove("deviceId");
++            }
++        }
+         if let Some(parent) = &parent_chat_id {
+             mutate["parentChatId"] = json!(parent);
+             mutate["childKind"] = json!(match kind {
+@@ -1514,6 +1586,7 @@ impl Tools {
+         if space.is_none()
+             && cwd.is_none()
+             && !args.cloud
++            && place.is_none()
+             && self.zeron.devices().await?.iter().any(|d| {
+                 d.id == device_id
+                     && d.capabilities
+@@ -1533,14 +1606,22 @@ impl Tools {
+             mutate["cloud"] = json!(true);
+         }
+         let created = self.zeron.mutate(mutate).await?;
+-        // A Cloud chat's machine and checkout come back from the engine.
+-        let (device_id, cwd) = if args.cloud {
++        // A Cloud chat's machine, or a place's sandbox, and its checkout
++        // come back from the engine.
++        let (device_id, cwd) = if args.cloud || place.is_some() {
+             (
+                 created["deviceId"]
+                     .as_str()
++                    .filter(|d| !d.is_empty())
+                     .map(str::to_owned)
+-                    .context("the engine didn't name the Cloud machine")?,
+-                created["cwd"].as_str().map(str::to_owned).or(cwd),
++                    .with_context(|| {
++                        if args.cloud {
++                            "the engine didn't name the Cloud machine".to_owned()
++                        } else {
++                            format!("the engine didn't name the sandbox on {on}")
++                        }
++                    })?,
++                created["cwd"].as_str().filter(|c| !c.is_empty()).map(str::to_owned).or(cwd),
+             )
+         } else {
+             (device_id, cwd)
+@@ -1574,6 +1655,16 @@ impl Tools {
+         if let Some(capped) = &capped {
+             result["accessCapped"] = json!(capped);
+         }
++        if let Some(place) = &place {
++            result["place"] = json!({
++                "provider": { "id": place.provider.id, "name": place.provider.name },
++                "template": place.template.as_ref().map(|t| json!({ "id": t.id, "name": t.name })),
++                "cwd": cwd,
++                "sandbox": format!(
++                    "Its sandbox is being made on {on} (a minute or more); a first prompt waits for it, and a wait counts that time too."
++                ),
++            });
++        }
+         if signed_out {
+             result["warning"] = json!(format!(
+                 "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
+@@ -2285,6 +2376,16 @@ impl Tools {
+     }
+ }
+ 
++/// The ids of the harnesses that can run, for an error that says which.
++fn available_names(harnesses: &[HarnessInfo]) -> String {
++    let names: Vec<&str> = harnesses
++        .iter()
++        .filter(|h| h.available() && h.id != HarnessId::Mock)
++        .map(|h| h.id.as_str())
++        .collect();
++    if names.is_empty() { "no agent".to_owned() } else { names.join(", ") }
++}
++
+ /// claude-code when it is ready here, else the first ready harness — a
+ /// provider that is installed but signed out only when nothing else is.
+ fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
+@@ -2448,6 +2549,35 @@ mod tests {
+                     RpcReply::Value(self.accounts.clone().unwrap())
+                 }
+                 methods::WATCH_SESSIONS => stream(json!([])),
++                // A Docker account with one template that has Claude Code
++                // and one that has no agent; Blank has none either.
++                methods::LIST_SANDBOX_PROVIDERS => RpcReply::Value(json!([
++                    { "id": "docker", "name": "Docker Sandbox", "icon": "docker", "ops": [] }
++                ])),
++                methods::LIST_SANDBOX_TEMPLATES if params["provider"] == "docker" => RpcReply::Value(json!([
++                    { "id": "tmpl_claude", "name": "zgx-dev-claude" },
++                    { "id": "tmpl_build", "name": "zeron-build" }
++                ])),
++                methods::LIST_HARNESSES if params["targetDeviceId"] == "place:docker:tmpl_claude" => {
++                    RpcReply::Value(json!([
++                        { "id": "claude-code", "name": "Claude Code", "installed": true, "enabled": true,
++                          "accessModes": ["supervised", "auto-accept-edits", "full-access"], "supportsPlan": true },
++                        { "id": "codex", "name": "Codex", "installed": false, "enabled": true }
++                    ]))
++                }
++                methods::LIST_HARNESSES
++                    if params["targetDeviceId"].as_str().is_some_and(|t| t.starts_with("place:")) =>
++                {
++                    RpcReply::Value(json!([
++                        { "id": "claude-code", "name": "Claude Code", "installed": false, "enabled": true },
++                        { "id": "codex", "name": "Codex", "installed": false, "enabled": true }
++                    ]))
++                }
++                methods::LIST_AGENT_ACCOUNTS
++                    if params["targetDeviceId"].as_str().is_some_and(|t| t.starts_with("place:")) =>
++                {
++                    return Err(RpcError::Failed("a place has no accounts of its own".into()));
++                }
+                 methods::LIST_HARNESSES if remote => RpcReply::Value(json!([
+                     {"id":"codex", "name":"Remote Codex", "installed":true},
+                     {"id":"cursor", "name":"Disabled Cursor", "installed":true, "enabled":false}
+@@ -2503,10 +2633,19 @@ mod tests {
+                     let cloud_create = method == methods::MUTATE
+                         && params["op"] == "createChat"
+                         && params["cloud"] == true;
++                    // A place's gets its sandbox's device and checkout.
++                    let place_create = method == methods::MUTATE
++                        && params["op"] == "createChat"
++                        && params["place"].is_object();
+                     self.writes
+                         .lock()
+                         .unwrap()
+                         .push((method.to_owned(), params));
++                    if place_create {
++                        return Ok(RpcReply::Value(json!({
++                            "ok": true, "deviceId": "sbx-1", "cwd": "/work/comet",
++                        })));
++                    }
+                     if cloud_create {
+                         return Ok(RpcReply::Value(json!({
+                             "ok": true, "deviceId": "cloud-child", "cwd": "/home/user/app",
+@@ -3518,6 +3657,106 @@ mod tests {
+         assert!(refused.contains("Codex and Claude Code"), "{refused}");
+     }
+ 
++    #[tokio::test]
++    async fn a_chat_on_a_place_gets_a_sandbox_of_its_template_with_that_templates_agents() {
++        let world = Arc::new(World::default());
++        let alpha = tools(world.clone(), origin("chat-alpha-1"));
++        let created_chat = |world: &World| {
++            world
++                .writes
++                .lock()
++                .unwrap()
++                .iter()
++                .rev()
++                .find(|(method, w)| method == methods::MUTATE && w["op"] == "createChat")
++                .map(|(_, w)| w.clone())
++                .unwrap()
++        };
++        // By the provider's and the template's names, in a project.
++        let created = alpha
++            .call(
++                "create_chat",
++                json!({
++                    "place": "Docker Sandbox", "template": "zgx-dev-claude",
++                    "project": "space-1", "prompt": "hi"
++                }),
++            )
++            .await
++            .unwrap();
++        // The engine names the sandbox's device and checkout.
++        assert_eq!(created["deviceId"], "sbx-1");
++        assert_eq!(created["harness"], "claude-code", "the template's agent");
++        assert_eq!(created["place"]["template"], json!({ "id": "tmpl_claude", "name": "zgx-dev-claude" }));
++        assert_eq!(created["place"]["cwd"], "/work/comet");
++        let sent = created_chat(&world);
++        assert_eq!(sent["place"], json!({ "provider": "docker", "template": "tmpl_claude" }));
++        assert_eq!(sent["spaceId"], "space-1");
++        assert!(sent.get("deviceId").is_none(), "the project says where it belongs: {sent}");
++        assert!(sent.get("cwd").is_none(), "{sent}");
++        assert_eq!(sent["parentChatId"], "chat-alpha-1");
++        // Its catalog is the template's, asked of the place.
++        assert!(
++            world.reads.lock().unwrap().iter().any(|(method, p)| method == methods::LIST_HARNESSES
++                && p["targetDeviceId"] == "place:docker:tmpl_claude"),
++            "{:?}",
++            world.reads.lock().unwrap()
++        );
++        // The first prompt runs in the sandbox's checkout.
++        let queued = world
++            .writes
++            .lock()
++            .unwrap()
++            .iter()
++            .find(|(method, _)| method == methods::QUEUE_COMMAND)
++            .map(|(_, w)| w.to_string())
++            .unwrap();
++        assert!(queued.contains("/work/comet"), "{queued}");
++
++        // By id, with no project: the device asking is named, as the composer does.
++        alpha
++            .call("create_chat", json!({ "place": "docker", "template": "tmpl_claude" }))
++            .await
++            .unwrap();
++        let sent = created_chat(&world);
++        assert_eq!(sent["deviceId"], "dev-local");
++        assert!(sent.get("spaceId").is_none(), "{sent}");
++
++        // What the template doesn't have is refused, saying what it has.
++        let refused = alpha
++            .call(
++                "create_chat",
++                json!({ "place": "docker", "template": "zgx-dev-claude", "harness": "codex" }),
++            )
++            .await
++            .unwrap_err();
++        assert!(refused.contains("it has: claude-code"), "{refused}");
++        // Blank has no agent.
++        let refused = alpha.call("create_chat", json!({ "place": "docker" })).await.unwrap_err();
++        assert!(refused.contains("no agent is on Docker Sandbox (Blank template)"), "{refused}");
++        // A template the account doesn't have (removed since), with what it has.
++        let refused = alpha
++            .call("create_chat", json!({ "place": "docker", "template": "zgx-dev" }))
++            .await
++            .unwrap_err();
++        assert!(refused.contains("no template \"zgx-dev\""), "{refused}");
++        assert!(refused.contains("zgx-dev-claude (tmpl_claude)"), "{refused}");
++        let refused = alpha.call("create_chat", json!({ "place": "nope" })).await.unwrap_err();
++        assert!(refused.contains("no sandbox provider matches"), "{refused}");
++        // A place is its own machine: not with a device, Cloud, or a cwd.
++        for (args, words) in [
++            (json!({ "place": "docker", "device": "Worker" }), "drop device"),
++            (json!({ "place": "docker", "cloud": true }), "pick one"),
++            (json!({ "place": "docker", "cwd": "/tmp" }), "drop cwd"),
++            (json!({ "template": "zgx-dev-claude" }), "pass place too"),
++        ] {
++            let refused = alpha.call("create_chat", args.clone()).await.unwrap_err();
++            assert!(refused.contains(words), "{args}: {refused}");
++        }
++        // create_chats takes the same.
++        let def = catalog().into_iter().find(|d| d.name == "create_chats").unwrap();
++        assert!(def.input_schema.to_string().contains("\"template\""), "{}", def.input_schema);
++    }
++
+     #[tokio::test]
+     async fn connected_means_installed_enabled_and_not_known_signed_out() {
+         let accounts = |active: bool| {
+diff --git a/crates/mcp/src/zeron.rs b/crates/mcp/src/zeron.rs
+index 792b3a0ff..b8b7ef103 100644
+--- a/crates/mcp/src/zeron.rs
++++ b/crates/mcp/src/zeron.rs
+@@ -72,6 +72,44 @@ impl Origin {
+     }
+ }
+ 
++/// A sandbox provider or template as the engine lists it: `{id, name}`.
++#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
++pub struct NamedRow {
++    pub id: String,
++    #[serde(default)]
++    pub name: String,
++}
++
++/// Where a chat's sandbox is made ([`Zeron::resolve_place`]): its provider
++/// and its template (`None`: Blank).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Place {
++    pub provider: NamedRow,
++    pub template: Option<NamedRow>,
++}
++
++impl Place {
++    /// What `ListHarnesses` / `ListModels` are asked for: the place's own
++    /// catalog, its template's agents.
++    pub fn target(&self) -> String {
++        zeron_proto::places::place_target(
++            &self.provider.id,
++            self.template.as_ref().map(|t| t.id.as_str()),
++        )
++    }
++}
++
++/// `name (id), …` of listed rows, for an error that says what there is.
++fn listed(rows: &[NamedRow]) -> String {
++    if rows.is_empty() {
++        return "none".to_owned();
++    }
++    rows.iter()
++        .map(|r| if r.name.is_empty() || r.name == r.id { r.id.clone() } else { format!("{} ({})", r.name, r.id) })
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
+ /// A dial failure as an RPC error.
+ fn transport(error: anyhow::Error) -> RpcError {
+     RpcError::Transport(format!("{error:#}"))
+@@ -594,6 +632,70 @@ impl Zeron {
+         ))
+     }
+ 
++    /// A place to make a chat's sandbox on: the provider by id or name (as
++    /// `ListSandboxProviders` lists them), the template by id or exact name
++    /// from its account's (`ListSandboxTemplates`, asked each time: one saved
++    /// or removed since shows), or Blank for none, `blank` or "". An image
++    /// reference the account doesn't list (it holds `/`) goes as is.
++    pub async fn resolve_place(&self, provider: &str, template: Option<&str>) -> anyhow::Result<Place> {
++        let provider = provider.trim();
++        let providers = self
++            .call(methods::LIST_SANDBOX_PROVIDERS, json!({}))
++            .await
++            .context("this Zeron lists no sandbox providers")?;
++        let providers: Vec<NamedRow> = serde_json::from_value(providers).unwrap_or_default();
++        let provider = providers
++            .iter()
++            .find(|p| p.id == provider)
++            .or_else(|| {
++                providers
++                    .iter()
++                    .find(|p| p.id.eq_ignore_ascii_case(provider) || p.name.eq_ignore_ascii_case(provider))
++            })
++            .with_context(|| {
++                format!(
++                    "no sandbox provider matches {provider:?}; known: {}",
++                    listed(&providers)
++                )
++            })?
++            .clone();
++        let template = template
++            .map(str::trim)
++            .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("blank"));
++        let Some(template) = template else {
++            return Ok(Place { provider, template: None });
++        };
++        let templates = self
++            .call(methods::LIST_SANDBOX_TEMPLATES, json!({ "provider": provider.id }))
++            .await
++            .with_context(|| format!("{}'s templates", provider.name))?;
++        let templates: Vec<NamedRow> = serde_json::from_value(templates).unwrap_or_default();
++        if let Some(found) = templates.iter().find(|t| t.id == template) {
++            return Ok(Place { template: Some(found.clone()), provider });
++        }
++        let named: Vec<&NamedRow> = templates
++            .iter()
++            .filter(|t| t.name.eq_ignore_ascii_case(template))
++            .collect();
++        match named.as_slice() {
++            [one] => Ok(Place { template: Some((*one).clone()), provider }),
++            [] if template.contains('/') => Ok(Place {
++                template: Some(NamedRow { id: template.to_owned(), name: template.to_owned() }),
++                provider,
++            }),
++            [] => bail!(
++                "{} has no template {template:?}; it has: {}, or blank",
++                provider.name,
++                listed(&templates)
++            ),
++            many => bail!(
++                "{} templates are named {template:?}; use an id: {}",
++                many.len(),
++                many.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", ")
++            ),
++        }
++    }
++
+     /// Device id or exact name; `None` means this engine's own device.
+     pub async fn resolve_device_id(&self, key: Option<&str>) -> anyhow::Result<String> {
+         let Some(key) = key.map(str::trim).filter(|k| !k.is_empty()) else {
+-- 
+2.55.0.windows.2
+
