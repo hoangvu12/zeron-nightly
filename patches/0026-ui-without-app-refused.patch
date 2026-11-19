@@ -1,0 +1,149 @@
+From e92ee7bc0aa6d8b09b68aeaa3f746b6d2091b282 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Wed, 18 Nov 2026 19:35:19 +0700
+Subject: [PATCH] zgx: a ui folder without its app is refused, not copied over
+ the last one
+
+On 2026-11-18 an update's installer stopped partway on Windows after it
+had deleted the install's ui folder. The next launch copied that missing
+folder into templates\.zeron as an empty one, so .live lost its app.luau
+too, and the window opened on nothing: the system backdrop and the
+caption buttons. The only word of it went to stderr, which an app opened
+from the Start menu has nobody reading.
+
+- sync_zeron refuses a ui/ without its app.luau and leaves .zeron as the
+  last copy laid it. The window and the watcher's survey both see the
+  error.
+- prepare_live, when ui/ itself is unusable, runs .live as the last launch
+  laid it, if that is whole, and otherwise falls back to ui/ as before.
+- The launch's interface errors go to the app's log
+  (<data>\logs\zeron-headed.log) as well as stderr.
+
+Test: plugins::live::tests::a_ui_without_its_app_is_refused_and_zeron_s_copy_kept
+---
+ apps/zgx/Cargo.lock          |  1 +
+ apps/zgx/Cargo.toml          |  3 +++
+ apps/zgx/src/plugins/live.rs | 29 +++++++++++++++++++++++++++++
+ apps/zgx/src/plugins/mod.rs  | 20 ++++++++++++++++++--
+ 4 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/apps/zgx/Cargo.lock b/apps/zgx/Cargo.lock
+index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..c518911fa48eddd7537ce7bbade08cd2a919db47 100644
+--- a/apps/zgx/Cargo.lock
++++ b/apps/zgx/Cargo.lock
+@@ -7389,6 +7389,7 @@ dependencies = [
+  "similar",
+  "tempfile",
+  "tokio",
++ "tracing",
+  "ttf-parser",
+  "tungstenite",
+  "ureq 2.12.1",
+diff --git a/apps/zgx/Cargo.toml b/apps/zgx/Cargo.toml
+index b1c16c719039440c2182dceafca694acbc82416c..21df09dfd1568e62ae078c3617617476b5ddbc68 100644
+--- a/apps/zgx/Cargo.toml
++++ b/apps/zgx/Cargo.toml
+@@ -132,6 +132,9 @@ chrono = "0.4"
+ serde = "1"
+ zeron-update = { path = "../../crates/update" }
+ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
++# A launch's interface trouble into the app's log (src/plugins/mod.rs
++# `report`), as zeron-cli's subscriber writes it.
++tracing = "0.1"
+ # Templates' theme files, JSON with comments, read for their previews
+ # (src/plugins/looks.rs), as the theme crate reads them.
+ json5 = "0.4"
+diff --git a/apps/zgx/src/plugins/live.rs b/apps/zgx/src/plugins/live.rs
+index b5d480c3eea48fefeaa8389f868ea4f74519e732..bd7a11b11223689d1042bcdbf37903b2464edecc 100644
+--- a/apps/zgx/src/plugins/live.rs
++++ b/apps/zgx/src/plugins/live.rs
+@@ -219,7 +219,17 @@ fn in_parallel<T: Sync>(jobs: &[T], work: impl Fn(&T) -> std::io::Result<()> + S
+ /// of screens (what each draws, the hooks it declares) and Zeron's manifest;
+ /// and the official templates beside it, as this build ships them
+ /// (`official::install`). How many of `.zeron`'s files changed.
++///
++/// A `ui/` without its `app.luau` (gone, or an install that stopped partway)
++/// is refused, `.zeron` left as it was: copied, it would empty `.zeron`, and
++/// `.live` with it, and the window would open on nothing.
+ pub fn sync_zeron(ui: &Path, templates: &Path) -> std::io::Result<usize> {
++    if !ui.join("app.luau").is_file() {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::NotFound,
++            format!("{} has no app.luau", ui.display()),
++        ));
++    }
+     let dir = templates.join(ZERON);
+     let want = files(ui, |rel| !not_the_app(rel));
+     // Each file's hash from the bytes the copy read (`ui/` read once).
+@@ -835,6 +845,25 @@ mod tests {
+         assert_eq!(done.into_inner(), jobs.len(), "all of them, once");
+     }
+ 
++    /// A `ui/` gone, or without its app (an install that stopped partway),
++    /// is refused and leaves `.zeron` as the last copy laid it: copied, it
++    /// emptied `.zeron` and the window opened on nothing.
++    #[test]
++    fn a_ui_without_its_app_is_refused_and_zeron_s_copy_kept() {
++        let root = dir("no-app");
++        let (ui, t) = (root.join("ui"), root.join("templates"));
++        write(&ui, "app.luau", "-- app");
++        write(&ui, "screens/x.luau", "-- x");
++        sync_zeron(&ui, &t).unwrap();
++        std::fs::remove_dir_all(&ui).unwrap();
++        assert!(sync_zeron(&ui, &t).is_err(), "a ui/ that's gone");
++        write(&ui, "screens/x.luau", "-- x");
++        assert!(sync_zeron(&ui, &t).is_err(), "a ui/ without its app.luau");
++        let kept = t.join(ZERON);
++        assert!(kept.join("app.luau").is_file() && kept.join("screens/x.luau").is_file(), "the last copy stays");
++        assert_eq!(read_json(&kept.join(".hashes.json"))["app.luau"], hash(b"-- app"));
++    }
++
+     /// `.zeron`'s hashes, taken from the bytes its copy read, are each file's.
+     #[test]
+     fn zeron_s_hashes_are_its_files() {
+diff --git a/apps/zgx/src/plugins/mod.rs b/apps/zgx/src/plugins/mod.rs
+index e009314eda327167a0fd1421ab9a538cc8cb967b..853e87f677b1deb5b41d9518b78f5501e0ab52b0 100644
+--- a/apps/zgx/src/plugins/mod.rs
++++ b/apps/zgx/src/plugins/mod.rs
+@@ -824,7 +824,15 @@ pub fn prepare_live() -> PathBuf {
+         return root.join(live::LIVE).join("app.luau");
+     }
+     if let Err(error) = live::sync_zeron(&ui, &root) {
+-        eprintln!("zeron-zgx: Zeron's own interface wasn't copied ({error}); running it from ui/");
++        // `ui/` itself unusable (an install that stopped partway): `.live`
++        // as the last launch laid it, if it's whole, rather than a window
++        // with nothing to run.
++        let last = root.join(live::LIVE).join("app.luau");
++        if !fallback.is_file() && last.is_file() {
++            report(&format!("Zeron's own interface wasn't copied ({error}); running the last one laid down"));
++            return last;
++        }
++        report(&format!("Zeron's own interface wasn't copied ({error}); running it from ui/"));
+         return fallback;
+     }
+     zgx::profile::mark("Zeron's own interface copied");
+@@ -845,12 +853,20 @@ pub fn prepare_live() -> PathBuf {
+             root.join(live::LIVE).join("app.luau")
+         }
+         Err(error) => {
+-            eprintln!("zeron-zgx: the template wasn't laid down ({error}); running Zeron's own from ui/");
++            report(&format!("the template wasn't laid down ({error}); running Zeron's own from ui/"));
+             fallback
+         }
+     }
+ }
+ 
++/// A launch's interface trouble, on stderr and in the app's log
++/// (`<data>\logs\zeron-headed.log`): an app opened from the Start menu has
++/// no stderr anyone reads.
++fn report(message: &str) {
++    eprintln!("zeron-zgx: {message}");
++    tracing::error!("{message}");
++}
++
+ /// The host's own menu item's action ("Use Zeron v3").
+ pub const USE_ZERON_TEMPLATE: &str = "zeron.use-zeron-template";
+ /// The host's own "Keep <template>…": the keep sheet for the one in preview.
+-- 
+2.55.0.windows.2
+
