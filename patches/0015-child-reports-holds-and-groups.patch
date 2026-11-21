@@ -1,4 +1,4 @@
-From 514387738353bb438998837d1e3f88da06791020 Mon Sep 17 00:00:00 2001
+From 9d4b814980eb78d7638df9540b62749dd4a67b78 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:52:16 +0700
 Subject: [PATCH 01/12] engine: a child's progress message can wait for its end
@@ -7,7 +7,7 @@ Subject: [PATCH 01/12] engine: a child's progress message can wait for its end
 ---
  crates/doc/src/queue.rs              | 112 +++++++
  crates/doc/src/schema.rs             |   1 +
- crates/engine/src/doc_host.rs        | 425 ++++++++++++++++++++++++---
+ crates/engine/src/doc_host.rs        | 429 ++++++++++++++++++++++++---
  crates/engine/src/rpc/agent_gate.rs  |   3 +-
  crates/engine/src/session_reports.rs |  62 +++-
  crates/engine/src/sessions.rs        | 111 ++++++-
@@ -15,16 +15,16 @@ Subject: [PATCH 01/12] engine: a child's progress message can wait for its end
  crates/proto/src/agent_messages.rs   | 160 ++++++++--
  crates/proto/src/workspace.rs        |   7 +
  docs/mcp.md                          |  20 ++
- 10 files changed, 920 insertions(+), 71 deletions(-)
+ 10 files changed, 924 insertions(+), 71 deletions(-)
 
 diff --git a/crates/doc/src/queue.rs b/crates/doc/src/queue.rs
-index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf5817935e699ef1 100644
+index 93cf30e083cb88eb135d8bca9a37c116598f579b..65f7aee7c45143bce16ac06df27e028827969676 100644
 --- a/crates/doc/src/queue.rs
 +++ b/crates/doc/src/queue.rs
-@@ -49,6 +49,46 @@ pub struct QueuedMessage {
-     /// `ReviewRequired`; they never silently become sendable again.
+@@ -55,6 +55,46 @@ pub struct QueuedMessage {
+     /// row with these run-target settings and updates the chat's saved config.
      #[serde(default, skip_serializing_if = "Option::is_none")]
-     pub delivery_gate: Option<QueueDeliveryGate>,
+     pub config: Option<ChatConfig>,
 +    /// A row of children's reports or FYIs the host holds for its agent:
 +    /// what each is, in the order they joined it, as the host filed them.
 +    /// Empty on any other row, and on one held before this was kept (the
@@ -68,15 +68,15 @@ index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf581793
  }
  
  /// Why a queued row is not currently eligible for automatic or explicit
-@@ -96,6 +136,7 @@ impl QueuedMessage {
-             issued_at: 0,
+@@ -103,6 +143,7 @@ impl QueuedMessage {
              edited_at: None,
              delivery_gate: None,
+             config: None,
 +            held: Vec::new(),
          }
      }
  }
-@@ -189,6 +230,25 @@ impl SessionDoc {
+@@ -196,6 +237,25 @@ impl SessionDoc {
          Ok(true)
      }
  
@@ -102,8 +102,8 @@ index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf581793
      /// Install, replace or clear a host-authoritative delivery barrier.
      /// Callers serialize this with the host's queue drain lock.
      pub fn set_queued_delivery_gate(
-@@ -373,6 +433,12 @@ fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), Doc
-             crate::schema::loro_value_from_json(&serde_json::to_value(gate)?),
+@@ -386,6 +446,12 @@ fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), Doc
+             crate::schema::loro_value_from_json(&serde_json::to_value(config)?),
          )?;
      }
 +    if !item.held.is_empty() {
@@ -115,10 +115,10 @@ index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf581793
      Ok(())
  }
  
-@@ -416,6 +482,12 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
-                 })
-             }),
-         },
+@@ -433,6 +499,12 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
+             .get("config")
+             .filter(|c| !c.is_null())
+             .and_then(|c| serde_json::from_value(c.clone()).ok()),
 +        // A row from a newer host that can't be read is one held before
 +        // this was kept: the host reads it off the row.
 +        held: v
@@ -128,10 +128,10 @@ index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf581793
      })
  }
  
-@@ -468,9 +540,49 @@ mod tests {
-             issued_at: 1_000,
+@@ -486,9 +558,49 @@ mod tests {
              edited_at: None,
              delivery_gate: None,
+             config: None,
 +            held: Vec::new(),
          }
      }
@@ -179,19 +179,19 @@ index c816d683980ee4da02b316a708c340d90266cfe6..baeb4e88eced95736ef0732ccf581793
          doc.read_queue()
              .unwrap()
 diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
-index 97258dde46b19c5a8aca9356ce2aa568f53ce063..cf91f9fb21edccd1ac6c564c3632ada7a712aa87 100644
+index 6a8c495f4db4361f0caecefe5116ed625a57f3f7..62ad441b2708943bae9449807abc94a715d3861e 100644
 --- a/crates/doc/src/schema.rs
 +++ b/crates/doc/src/schema.rs
-@@ -2489,6 +2489,7 @@ mod tests {
-             issued_at: 1,
+@@ -2553,6 +2553,7 @@ mod tests {
              edited_at: None,
              delivery_gate: None,
+             config: None,
 +            held: Vec::new(),
          };
          a.push_queued(&row("q1")).unwrap();
          a.set_queued_text("q1", "later, edited", 2).unwrap();
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05fe29599fe 100644
+index 7a3b6dace26f301ed62acf78a0057b54d2c6fea3..d905c190e9bad9a427e8ef0c29890d4ad16c10b9 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
 @@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
@@ -203,7 +203,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
      MessagePart, MessageRole, MessageStatus, QueueDeliveryGate, QueuedMessage, SessionCommandEntry,
      SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
      evaluate_command,
-@@ -159,6 +159,19 @@ fn report_message_hold_ms() -> i64 {
+@@ -170,6 +170,19 @@ fn report_message_hold_ms() -> i64 {
          .unwrap_or(REPORT_MESSAGE_HOLD.as_millis() as i64)
  }
  
@@ -223,7 +223,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
  /// The most of children's reports one message to the agent carries; what
  /// comes past it waits in a message of its own, read right after.
  const REPORT_BATCH: usize = 48 * 1024;
-@@ -177,10 +190,70 @@ fn report_retry() -> std::time::Duration {
+@@ -188,10 +201,70 @@ fn report_retry() -> std::time::Duration {
  /// How often an archived chat's waiting reports look for it restored.
  const ARCHIVED_RECHECK_MS: i64 = 30_000;
  
@@ -297,7 +297,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
  }
  
  /// Transfer attempt outcome: transient failures retry (the link may heal),
-@@ -4447,11 +4520,12 @@ impl DocHost {
+@@ -4616,11 +4689,12 @@ impl DocHost {
              turn_id: Some(m.id.clone()),
              frontier: None,
          });
@@ -312,15 +312,15 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
              }
              SessionCommandPayload::Steer { .. } => true,
              _ => false,
-@@ -4549,6 +4623,7 @@ impl DocHost {
-             issued_at: now_ms(),
+@@ -4741,6 +4815,7 @@ impl DocHost {
              edited_at: None,
              delivery_gate: None,
+             config,
 +            held: Vec::new(),
          };
          if self.hold_row_if_needed(chat_id, &item, &transfers)? {
              self.unarchive_on_send(chat_id);
-@@ -5126,7 +5201,12 @@ impl DocHost {
+@@ -5321,7 +5396,12 @@ impl DocHost {
              return;
          }
          loop {
@@ -334,7 +334,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
                  return;
              };
              if paused && !held_report_row(&head) {
-@@ -5206,30 +5286,57 @@ impl DocHost {
+@@ -5401,30 +5481,57 @@ impl DocHost {
              // now from what is so now: who still works for the agent, and a
              // question still waiting on it.
              let mut sent = item.clone();
@@ -405,7 +405,15 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
                  handle.publish_queue();
                  return;
              }
-@@ -6670,8 +6777,11 @@ impl DocHost {
+@@ -6782,6 +6889,7 @@ impl DocHost {
+                 edited_at: None,
+                 delivery_gate: None,
+                 config: None,
++                held: Vec::new(),
+             };
+             let queued = handle.doc.read_queue().is_ok_and(|q| q.iter().any(|r| r.id == row.id));
+             if !queued && let Err(err) = handle.doc.insert_queued(0, &row) {
+@@ -6889,8 +6997,11 @@ impl DocHost {
                  // and joins any report already waiting there. At rest, it
                  // waits out a short window from the first one waiting, so
                  // children finishing together wake the agent once: the drain
@@ -419,10 +427,10 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
                  let in_flight = sessions.turn_in_flight(chat_id);
                  if report {
                      // Its wait call returned the reply: kept in the ledger,
-@@ -6967,7 +7077,20 @@ impl DocHost {
-             issued_at: issued_at.min(now_ms()),
+@@ -7187,7 +7298,20 @@ impl DocHost {
              edited_at: None,
              delivery_gate: None,
+             config: None,
 +            held: Vec::new(),
          };
 +        self.hold_row(handle, item, steer, request)
@@ -440,7 +448,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
          if handle.doc.read_queue()?.iter().any(|row| row.id == item.id) {
              return Ok(()); // a redelivered command: already held
          }
-@@ -6996,42 +7119,77 @@ impl DocHost {
+@@ -7216,42 +7340,77 @@ impl DocHost {
      /// rows are the whole state: they're in the doc, so an engine restart
      /// finds them waiting still. Unlike a send, it doesn't thaw a queue the
      /// person froze with Stop.
@@ -527,7 +535,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
              if let Some(held) = lock(&handle.held_sends).get_mut(&row.id) {
                  held.prompt = merged;
              }
-@@ -7040,8 +7198,19 @@ impl DocHost {
+@@ -7260,8 +7419,20 @@ impl DocHost {
          }
          let mut request = request.clone();
          request.prompt = text.to_owned();
@@ -540,6 +548,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
 +            issued_at: held.held_at.min(now_ms()),
 +            edited_at: None,
 +            delivery_gate: None,
++            config: None,
 +            held: vec![held.clone()],
 +        };
          let paused = handle.queue_paused.load(Ordering::Acquire);
@@ -548,7 +557,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
          handle.queue_paused.store(paused, Ordering::Release);
          Ok(())
      }
-@@ -7072,7 +7241,9 @@ impl DocHost {
+@@ -7292,7 +7463,9 @@ impl DocHost {
              .iter()
              .flat_map(|e| &e.parts)
              .all(|p| matches!(p, MessagePart::Error { .. } | MessagePart::Reasoning { .. }));
@@ -559,7 +568,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
              return;
          }
          let id = entries[at].id.clone();
-@@ -7152,6 +7323,11 @@ impl DocHost {
+@@ -7372,6 +7545,11 @@ impl DocHost {
      /// has written to the chat (their words wait behind the reports, which
      /// go first so the agent reads both before answering). A report held
      /// through a turn longer than the window goes the moment the turn ends.
@@ -571,7 +580,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
      pub(crate) fn held_report_waits(&self, handle: &Arc<ChatDocHandle>) -> bool {
          let Ok(queue) = handle.doc.read_queue() else {
              return false;
-@@ -7170,16 +7346,19 @@ impl DocHost {
+@@ -7390,16 +7568,19 @@ impl DocHost {
              .is_some_and(|chat| chat.archived);
          let deadline = if archived {
              now_ms() + ARCHIVED_RECHECK_MS
@@ -595,7 +604,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
          };
          if now_ms() >= deadline {
              return false;
-@@ -8182,6 +8361,178 @@ mod queued_message_prompt_tests {
+@@ -8403,6 +8584,180 @@ mod queued_message_prompt_tests {
      }
  }
  
@@ -632,6 +641,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
 +            auto_approve: false,
 +            access: Default::default(),
 +            plan: false,
++            code_mode: false,
 +            attachments: Vec::new(),
 +            resume: None,
 +            worktree: None,
@@ -654,6 +664,7 @@ index 4140689442a95520d1a12284aeb3c6e7889db619..7a3f58cbc508e95a704cad828a8be05f
 +            issued_at,
 +            edited_at: None,
 +            delivery_gate: None,
++            config: None,
 +            held: Vec::new(),
 +        }
 +    }
@@ -883,7 +894,7 @@ index dfa782aef35f9e7fea0196eca1eff76ace204591..8f76be3dc53a868cb6ce515cfca47eae
      fn says_a_span_as_a_person_would() {
          assert_eq!(ago(42_000), "42 s");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 834681e637eee69a05054afffdb9c90b04b8b25c..921f0751202568470a26119874fbad1cbca7969e 100644
+index 4b4a0f1cc215ca2092d91e91bfec806f2e17e02d..1546b229dbd2a2dda108963f66119a9044abe543 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -896,7 +907,7 @@ index 834681e637eee69a05054afffdb9c90b04b8b25c..921f0751202568470a26119874fbad1c
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
  use crate::run_journal::RunJournal;
-@@ -8632,6 +8633,7 @@ mod tests {
+@@ -8772,6 +8773,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_WINDOW_MS", "1000") };
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_MESSAGE_HOLD_MS", "4000") };
@@ -904,7 +915,7 @@ index 834681e637eee69a05054afffdb9c90b04b8b25c..921f0751202568470a26119874fbad1c
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9335,6 +9337,113 @@ mod tests {
+@@ -9475,6 +9477,113 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -1019,10 +1030,10 @@ index 834681e637eee69a05054afffdb9c90b04b8b25c..921f0751202568470a26119874fbad1c
  
      /// A command the subagent runs, open until the test ends it.
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee66df753a 100644
+index 2e473288505fc7d0aaefc268a1cc151c799766c5..650d68f9d15696fc3bc10cad9ed77e229eb13b95 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -174,12 +174,13 @@ fn catalog() -> Vec<ToolDef> {
+@@ -187,12 +187,13 @@ fn catalog() -> Vec<ToolDef> {
          },
          ToolDef {
              name: "send_message",
@@ -1038,7 +1049,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
              })),
          },
          ToolDef {
-@@ -709,6 +710,8 @@ struct SendArgs {
+@@ -722,6 +723,8 @@ struct SendArgs {
      #[serde(default)]
      wait: bool,
      timeout_secs: Option<u64>,
@@ -1047,7 +1058,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
  }
  
  #[derive(Deserialize)]
-@@ -1532,8 +1535,15 @@ impl Tools {
+@@ -1545,8 +1548,15 @@ impl Tools {
          // sibling's waiting there, so five children wake it once. Only an
          // explicit steer goes in at once.
          let to_parent = self.writes_to_own_parent(&chat).await;
@@ -1064,7 +1075,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
          let mut result = json!({
              "chatId": chat.id,
              "title": chat.title,
-@@ -1542,7 +1552,11 @@ impl Tools {
+@@ -1555,7 +1565,11 @@ impl Tools {
              .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
              .await?;
          result["sent"] = delivered.receipt;
@@ -1077,7 +1088,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
              result["note"] = json!(
                  "Your parent reads this when its current turn ends, with any other child's waiting. Your final reply reaches it on its own: don't send it again."
              );
-@@ -1752,11 +1766,22 @@ impl Tools {
+@@ -1765,11 +1779,22 @@ impl Tools {
          }
      }
  
@@ -1101,7 +1112,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
          let Some(origin_id) = self.zeron.origin().chat_id.as_deref() else {
              return text.to_owned();
          };
-@@ -1773,6 +1798,9 @@ impl Tools {
+@@ -1786,6 +1811,9 @@ impl Tools {
              }
              _ => short(origin_id).to_owned(),
          };
@@ -1111,7 +1122,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
          zeron_proto::agent_messages::agent_message(&label, origin_id, text)
      }
  
-@@ -2076,6 +2104,8 @@ mod tests {
+@@ -2090,6 +2118,8 @@ mod tests {
          reads: Mutex<Vec<(String, Value)>>,
          /// `DeviceStats` reply; absent = an engine without the method.
          stats: Option<Value>,
@@ -1120,7 +1131,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
      }
  
      fn stream(item: Value) -> RpcReply {
-@@ -2114,7 +2144,8 @@ mod tests {
+@@ -2128,7 +2158,8 @@ mod tests {
                  })),
                  methods::WATCH_DEVICES => stream(json!([{
                      "id": "dev-local", "name": "Laptop", "platform": "linux",
@@ -1130,7 +1141,7 @@ index dee6b19d4f86057d8acb3982dcd117a8e785f3af..d1be20d16950036fa7e986ef34c29dee
                  }, {"id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null, "version": "1"}])),
                  methods::WATCH_SPACES => stream(json!([{
                      "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
-@@ -2500,6 +2531,53 @@ mod tests {
+@@ -2514,6 +2545,53 @@ mod tests {
          assert_eq!(params["command"]["request"]["model"], "opus");
      }
  
@@ -1532,7 +1543,7 @@ index 0f829bddce8b35426b8334cb12dca7cce46a3a41..a22878afb902f134bbc3b7201eb23781
 2.55.0.windows.2
 
 
-From a3884e1ecf4ffd1d9aa8914d72339c4d83b45da2 Mon Sep 17 00:00:00 2001
+From e917938eb62326b0270115be8e6381de0b9b2dbd Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:35:55 +0700
 Subject: [PATCH 02/12] engine: a report the parent's agent already read with
@@ -1546,10 +1557,10 @@ Subject: [PATCH 02/12] engine: a report the parent's agent already read with
  4 files changed, 376 insertions(+), 14 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 7a3f58cbc508e95a704cad828a8be05fe29599fe..91527d0f9c2bf3da0ea993dc8bb2857d104c84ab 100644
+index d905c190e9bad9a427e8ef0c29890d4ad16c10b9..e799a0a95d8954e4d8289a87aaaa47d3c28a5033 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -5296,7 +5296,12 @@ impl DocHost {
+@@ -5491,7 +5491,12 @@ impl DocHost {
                      match crate::sessions::without_waited(self, &handle.chat_id, reports, item.issued_at) {
                          // Nor a question answered meanwhile (by the person, say).
                          Some(text) => match crate::sessions::without_stale(self, &text) {
@@ -1891,7 +1902,7 @@ index 8f76be3dc53a868cb6ce515cfca47eaeb05b52d1..5b849df3824a26af2bdce9fb219667f5
 +    }
  }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 921f0751202568470a26119874fbad1cbca7969e..c53ed4c9375ecba95ab105986471199388cb3773 100644
+index 1546b229dbd2a2dda108963f66119a9044abe543..0b7427a0153dbcde7ee87a0fb8ed9ff6ae86b48b 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,7 @@ mod activity;
@@ -1903,7 +1914,7 @@ index 921f0751202568470a26119874fbad1cbca7969e..c53ed4c9375ecba95ab1059864711993
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -9234,6 +9234,105 @@ mod tests {
+@@ -9374,6 +9374,105 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -2034,7 +2045,7 @@ index a22878afb902f134bbc3b7201eb237817d88a9bb..dbc74eb5c8ed8fda72b6600c8eb3204f
 2.55.0.windows.2
 
 
-From e7a7c36f6fa424f1f4614f08826062f394d18ab6 Mon Sep 17 00:00:00 2001
+From bf3693fc7e9728dfe0be9656069125724d240aa0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 06:39:25 +0700
 Subject: [PATCH 03/12] engine: a child that keeps coming back is paused after
@@ -2043,16 +2054,16 @@ Subject: [PATCH 03/12] engine: a child that keeps coming back is paused after
 ---
  crates/engine/src/doc_host.rs        |   8 +-
  crates/engine/src/lib.rs             |   8 +
- crates/engine/src/session_reports.rs | 336 ++++++++++++++++++++++++++-
- crates/engine/src/sessions.rs        | 198 +++++++++++++++-
+ crates/engine/src/session_reports.rs | 337 ++++++++++++++++++++++++++-
+ crates/engine/src/sessions.rs        | 199 +++++++++++++++-
  docs/mcp.md                          |  10 +
- 5 files changed, 551 insertions(+), 9 deletions(-)
+ 5 files changed, 553 insertions(+), 9 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 91527d0f9c2bf3da0ea993dc8bb2857d104c84ab..6390aad4967dc55fecb09c7fc7682deae59d56c4 100644
+index e799a0a95d8954e4d8289a87aaaa47d3c28a5033..616dc507c569e4d9c0d3f08f24503156d47153b5 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -6794,10 +6794,12 @@ impl DocHost {
+@@ -7014,10 +7014,12 @@ impl DocHost {
                      if message_id.ends_with(crate::sessions::REPORT_WAITED) {
                          return Ok((SessionCommandStatus::Applied, Some("its wait returned it".into())));
                      }
@@ -2069,10 +2080,10 @@ index 91527d0f9c2bf3da0ea993dc8bb2857d104c84ab..6390aad4967dc55fecb09c7fc7682dea
                      // Sent again (a restart, a retry): it's here already.
                      let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
 diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
-index 5d2ae23321f5bbcab2756902b088c06a03e88365..3313c83bca0b8aff8acd4b48ab6197a463ac11b2 100644
+index 3807f4352e8aa62c6d5c5f8391c6c09d27d62713..838ed9ef01578f77e699d87498d66a93f9a96221 100644
 --- a/crates/engine/src/lib.rs
 +++ b/crates/engine/src/lib.rs
-@@ -354,6 +354,14 @@ impl EngineCore {
+@@ -356,6 +356,14 @@ impl EngineCore {
                  desktop_notify::post_for(&data_dir, &focus, source, &title, body, session).to_owned()
              });
          }
@@ -2088,7 +2099,7 @@ index 5d2ae23321f5bbcab2756902b088c06a03e88365..3313c83bca0b8aff8acd4b48ab6197a4
          // it would ask, get a 403, and ask again every 30 s for as long as it's up.
          if let Some(edge) = edge.as_ref().filter(|_| !runner::is_cloud_platform()) {
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 5b849df3824a26af2bdce9fb219667f547ba16af..1fddc3e06d2f9db401d0698e56dccb2d5ddaedb4 100644
+index 5b849df3824a26af2bdce9fb219667f547ba16af..6a98adea86c930d8cb7a751fe881591ff0635ccc 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -50,11 +50,13 @@ const REPORT_CAP: usize = 16 * 1024;
@@ -2359,7 +2370,7 @@ index 5b849df3824a26af2bdce9fb219667f547ba16af..1fddc3e06d2f9db401d0698e56dccb2d
  /// One line naming each child still working on something `parent` asked:
  /// how long since it was asked, and how long since its run last did
  /// anything (when it runs here) or since its device was last heard from.
-@@ -2243,4 +2439,134 @@ mod tests {
+@@ -2243,4 +2439,135 @@ mod tests {
          let cut = capped(long.clone(), "kid");
          assert!(cut.len() < long.len() && long.starts_with(reported_reply(&cut)), "{}", &cut[cut.len() - 100..]);
      }
@@ -2380,6 +2391,7 @@ index 5b849df3824a26af2bdce9fb219667f547ba16af..1fddc3e06d2f9db401d0698e56dccb2d
 +                    auto_approve: true,
 +                    access: Default::default(),
 +                    plan: false,
++                    code_mode: false,
 +                    resume: None,
 +                    attachments: Vec::new(),
 +                    worktree: None,
@@ -2495,7 +2507,7 @@ index 5b849df3824a26af2bdce9fb219667f547ba16af..1fddc3e06d2f9db401d0698e56dccb2d
 +    }
  }
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b246688fc 100644
+index 0b7427a0153dbcde7ee87a0fb8ed9ff6ae86b48b..f4db7dee76f4a98fe53886a49fb5320c81acaa83 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -2508,7 +2520,7 @@ index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -375,6 +376,9 @@ struct Inner {
+@@ -379,6 +380,9 @@ struct Inner {
      /// What each child chat hosted here has reported to its parent (see
      /// [`reports`]).
      reported: Arc<reports::Reported>,
@@ -2518,7 +2530,7 @@ index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b
  }
  
  /// How long a runtime parked between turns with nothing pending keeps its
-@@ -489,6 +493,8 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+@@ -493,6 +497,8 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
  #[path = "warm_start.rs"]
  mod warm_start;
  pub use warm_start::WarmOutcome;
@@ -2527,7 +2539,7 @@ index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b
  
  fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
      mutex.lock().unwrap_or_else(PoisonError::into_inner)
-@@ -548,6 +554,7 @@ impl SessionsEngine {
+@@ -552,6 +558,7 @@ impl SessionsEngine {
                  warm: Mutex::new(HashMap::new()),
                  warm_leases: Mutex::new(None),
                  reported: Arc::default(),
@@ -2535,7 +2547,7 @@ index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b
              }),
          }
      }
-@@ -655,6 +662,12 @@ impl SessionsEngine {
+@@ -659,6 +666,12 @@ impl SessionsEngine {
          let _ = self.inner.plugins.set(plugins);
      }
  
@@ -2548,7 +2560,7 @@ index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b
      /// On start, once revived turns are under way: each report a child chat
      /// here owed its parent when the engine went down goes now
      /// ([`reports::owed_on_boot`]). After [`Self::recover_stale`], on every
-@@ -10437,4 +10450,187 @@ mod tests {
+@@ -10577,4 +10590,188 @@ mod tests {
          assert!(body.contains("rejected the request"), "{body}");
          rig.core.sessions.shutdown().await;
      }
@@ -2707,6 +2719,7 @@ index c53ed4c9375ecba95ab105986471199388cb3773..a1bad62c8f7c72458c59e8901e52996b
 +            multi_select: false,
 +            prefill: None,
 +            multiline: false,
++            note: None,
 +        }]);
 +        rig.until("the lead hears the question", |r| !r.reports("lead").is_empty()).await;
 +        assert_eq!(statuses(&rig.reports("lead")[0]), [("kid-a".to_owned(), ReportStatus::NeedsInput)]);
@@ -2761,7 +2774,7 @@ index dbc74eb5c8ed8fda72b6600c8eb3204f7fc2c902..bc6c25959faf1f455034c99dccd8bc8a
 2.55.0.windows.2
 
 
-From f0cd3d6f1e93f5e24cd24a13c2c579ef8e7fafd5 Mon Sep 17 00:00:00 2001
+From 10647bc802008abbb3dc0672c56138bc056ab51e Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:34:37 +0700
 Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
@@ -2772,10 +2785,10 @@ Subject: [PATCH 04/12] mcp: the reports-back warning covers side chats and
  1 file changed, 35 insertions(+), 14 deletions(-)
 
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455fec911363 100644
+index 650d68f9d15696fc3bc10cad9ed77e229eb13b95..cbe210f122c1e626b1185f0d672c6efddf611eea 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1403,17 +1403,10 @@ impl Tools {
+@@ -1416,17 +1416,10 @@ impl Tools {
                  "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
              ));
          }
@@ -2796,7 +2809,7 @@ index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455f
          }
          if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
              // The row may not have folded into WatchChats yet; build the
-@@ -1552,6 +1545,13 @@ impl Tools {
+@@ -1565,6 +1558,13 @@ impl Tools {
              .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
              .await?;
          result["sent"] = delivered.receipt;
@@ -2810,7 +2823,7 @@ index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455f
          if fyi {
              result["note"] = json!(
                  "An FYI: your parent reads it with whatever wakes it next (your end, another child's report), or in 30 min. Your final reply reaches it on its own: don't send it by message."
-@@ -1766,6 +1766,22 @@ impl Tools {
+@@ -1779,6 +1779,22 @@ impl Tools {
          }
      }
  
@@ -2833,7 +2846,7 @@ index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455f
      /// Whether `chat`'s host holds a child's FYI for its next wake
      /// ([`zeron_proto::capabilities::CHILD_REPORTS_FYI`]). Unknown: no.
      async fn hosts_fyis(&self, chat: &Chat) -> bool {
-@@ -2775,9 +2791,9 @@ mod tests {
+@@ -2789,9 +2805,9 @@ mod tests {
          assert!(err.contains("no chat matches"), "{err}");
      }
  
@@ -2846,7 +2859,7 @@ index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455f
      #[tokio::test]
      async fn a_subagent_on_a_host_that_doesnt_report_back_is_warned_of() {
          let world = Arc::new(World::default());
-@@ -2798,7 +2814,12 @@ mod tests {
+@@ -2812,7 +2828,12 @@ mod tests {
              .call("create_chat", json!({ "kind": "side", "device": "Worker" }))
              .await
              .unwrap();
@@ -2864,7 +2877,7 @@ index d1be20d16950036fa7e986ef34c29dee66df753a..a1b00653fb71dce98227bb969fff455f
 2.55.0.windows.2
 
 
-From 323c7f27e4641049c32d24616d0c816220368703 Mon Sep 17 00:00:00 2001
+From 12e65ab5dda5bfa655cc3c9d011a5c96aca468f0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:44:58 +0700
 Subject: [PATCH 05/12] engine: a child's FYIs never wake the parent alone, and
@@ -2873,17 +2886,17 @@ Subject: [PATCH 05/12] engine: a child's FYIs never wake the parent alone, and
 ---
  crates/engine/src/doc_host.rs        | 105 ++++++++++++++++++++--
  crates/engine/src/session_reports.rs | 128 +++++++++++++++++++++++----
- crates/engine/src/sessions.rs        |  77 +++++++++++++++-
+ crates/engine/src/sessions.rs        |  78 +++++++++++++++-
  crates/mcp/src/tools.rs              |  35 ++++++--
  crates/proto/src/agent_messages.rs   |  10 +++
  docs/mcp.md                          |  14 +--
- 6 files changed, 331 insertions(+), 38 deletions(-)
+ 6 files changed, 332 insertions(+), 38 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 6390aad4967dc55fecb09c7fc7682deae59d56c4..2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4 100644
+index 616dc507c569e4d9c0d3f08f24503156d47153b5..635d1aeb588e47ecf392c5a27dc4dcfc3e5d75fc 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -256,6 +256,30 @@ fn queue_lead(queue: &[QueuedMessage]) -> Option<QueuedMessage> {
+@@ -267,6 +267,30 @@ fn queue_lead(queue: &[QueuedMessage]) -> Option<QueuedMessage> {
          .cloned()
  }
  
@@ -2914,7 +2927,7 @@ index 6390aad4967dc55fecb09c7fc7682deae59d56c4..2d0736a9d145a929a7aa7ff038d1a48c
  /// Transfer attempt outcome: transient failures retry (the link may heal),
  /// permanent ones stop (the host actively refused, or the bytes are gone).
  enum TransferError {
-@@ -5309,18 +5333,43 @@ impl DocHost {
+@@ -5504,18 +5528,43 @@ impl DocHost {
                  }
                  // The FYIs held go with what wakes the agent, after it: its
                  // children's reports, or their own time come.
@@ -2964,7 +2977,7 @@ index 6390aad4967dc55fecb09c7fc7682deae59d56c4..2d0736a9d145a929a7aa7ff038d1a48c
                          riders.push(rider);
                      }
                  }
-@@ -8370,7 +8419,9 @@ mod queued_message_prompt_tests {
+@@ -8593,7 +8642,9 @@ mod queued_message_prompt_tests {
  
  #[cfg(test)]
  mod held_report_tests {
@@ -2975,7 +2988,7 @@ index 6390aad4967dc55fecb09c7fc7682deae59d56c4..2d0736a9d145a929a7aa7ff038d1a48c
      use std::sync::Arc;
      use zeron_proto::agent_messages::{ReportStatus, child_fyi, child_report, merge_reports};
  
-@@ -8538,6 +8589,46 @@ mod held_report_tests {
+@@ -8763,6 +8814,46 @@ mod held_report_tests {
          assert_eq!(lead(&[theirs, fyi]).as_deref(), Some("p1"));
          assert_eq!(lead(&[]), None);
      }
@@ -3023,7 +3036,7 @@ index 6390aad4967dc55fecb09c7fc7682deae59d56c4..2d0736a9d145a929a7aa7ff038d1a48c
  
  /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 1fddc3e06d2f9db401d0698e56dccb2d5ddaedb4..87a0b31df2beed6c45be504e14a2f492629ba217 100644
+index 6a98adea86c930d8cb7a751fe881591ff0635ccc..d1e7fb5051a1a107ddf5a809bfd98468282113a4 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -1266,27 +1266,39 @@ fn report_id(child: &str, asked: &str, stage: &str) -> String {
@@ -3179,7 +3192,7 @@ index 1fddc3e06d2f9db401d0698e56dccb2d5ddaedb4..87a0b31df2beed6c45be504e14a2f492
      fn says_a_span_as_a_person_would() {
          assert_eq!(ago(42_000), "42 s");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index a1bad62c8f7c72458c59e8901e52996b246688fc..18388ec33665260832d04737e630306f6384679e 100644
+index f4db7dee76f4a98fe53886a49fb5320c81acaa83..89a9ac909af9d6565ef6668d454c3073d5f86fb0 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,7 +42,8 @@ mod activity;
@@ -3192,7 +3205,7 @@ index a1bad62c8f7c72458c59e8901e52996b246688fc..18388ec33665260832d04737e630306f
      QUIET as REPORT_QUIET,
      WAITED as REPORT_WAITED,
  };
-@@ -9556,6 +9557,80 @@ mod tests {
+@@ -9696,6 +9697,81 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -3222,6 +3235,7 @@ index a1bad62c8f7c72458c59e8901e52996b246688fc..18388ec33665260832d04737e630306f
 +            issued_at: now_ms(),
 +            edited_at: None,
 +            delivery_gate: None,
++            config: None,
 +            held: Vec::new(),
 +        };
 +        rig.core.doc_host.open("lead").unwrap().doc().push_queued(&both).unwrap();
@@ -3274,10 +3288,10 @@ index a1bad62c8f7c72458c59e8901e52996b246688fc..18388ec33665260832d04737e630306f
  
      /// A command the subagent runs, open until the test ends it.
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index a1b00653fb71dce98227bb969fff455fec911363..380c814b1aa62d6aaed95511266352dbfb88d85d 100644
+index cbe210f122c1e626b1185f0d672c6efddf611eea..c8f115fb171868918dfb2773755a81d60d319555 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -1531,7 +1531,8 @@ impl Tools {
+@@ -1544,7 +1544,8 @@ impl Tools {
          // `wake: false` to its own parent: an FYI, which waits for whatever
          // wakes the parent next. Only a parent's host that holds FYIs gets
          // one; another would start a turn on it, so it gets a message.
@@ -3287,7 +3301,7 @@ index a1b00653fb71dce98227bb969fff455fec911363..380c814b1aa62d6aaed95511266352db
          if fyi && matches!(mode, "steer" | "queue") {
              anyhow::bail!("wake=false waits for your parent's next wake: use it with mode auto or run");
          }
-@@ -1556,10 +1557,23 @@ impl Tools {
+@@ -1569,10 +1570,23 @@ impl Tools {
              result["note"] = json!(
                  "An FYI: your parent reads it with whatever wakes it next (your end, another child's report), or in 30 min. Your final reply reaches it on its own: don't send it by message."
              );
@@ -3315,7 +3329,7 @@ index a1b00653fb71dce98227bb969fff455fec911363..380c814b1aa62d6aaed95511266352db
          }
          let pending = Arc::new(PendingTurn {
              baseline,
-@@ -2578,14 +2592,21 @@ mod tests {
+@@ -2592,14 +2606,21 @@ mod tests {
          let error = send(true, "chat-beta-2", "alpha", steer).await.unwrap_err();
          assert!(error.contains("wake=false"), "{error}");
  
@@ -3396,7 +3410,7 @@ index bc6c25959faf1f455034c99dccd8bc8a7ecd5679..ee4d4ddcb66bf65be0cb03cfe7e4bf26
 2.55.0.windows.2
 
 
-From 132c7d17e4b7ed03fcf78b6690cb6bd803416e58 Mon Sep 17 00:00:00 2001
+From ba7696e845db4035c7bdad3110ae52dbdc94e1b4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:53:13 +0700
 Subject: [PATCH 06/12] engine: while the person talks to the parent, its
@@ -3410,10 +3424,10 @@ Subject: [PATCH 06/12] engine: while the person talks to the parent, its
  4 files changed, 522 insertions(+), 65 deletions(-)
 
 diff --git a/crates/doc/src/queue.rs b/crates/doc/src/queue.rs
-index baeb4e88eced95736ef0732ccf5817935e699ef1..3849e473b72a5551d9eb839f1aeab1cdd000c93e 100644
+index 65f7aee7c45143bce16ac06df27e028827969676..462eeca8fc0b5fa2ec801a188602399e7618cbce 100644
 --- a/crates/doc/src/queue.rs
 +++ b/crates/doc/src/queue.rs
-@@ -394,6 +394,27 @@ impl SessionDoc {
+@@ -401,6 +401,27 @@ impl SessionDoc {
          };
          self.take_queued(&head.id)
      }
@@ -3441,7 +3455,7 @@ index baeb4e88eced95736ef0732ccf5817935e699ef1..3849e473b72a5551d9eb839f1aeab1cd
  }
  
  fn index_of(queue: &loro::LoroMovableList, id: &str) -> Option<usize> {
-@@ -583,6 +604,21 @@ mod tests {
+@@ -601,6 +622,21 @@ mod tests {
          assert!(!doc.set_queued_held("gone", &[]).unwrap());
      }
  
@@ -3464,10 +3478,10 @@ index baeb4e88eced95736ef0732ccf5817935e699ef1..3849e473b72a5551d9eb839f1aeab1cd
          doc.read_queue()
              .unwrap()
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b5b726c92 100644
+index 635d1aeb588e47ecf392c5a27dc4dcfc3e5d75fc..cf4b0378ec2527876a866cad176252e331affe47 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -172,6 +172,20 @@ fn report_fyi_hold_ms() -> i64 {
+@@ -183,6 +183,20 @@ fn report_fyi_hold_ms() -> i64 {
          .unwrap_or(REPORT_FYI_HOLD.as_millis() as i64)
  }
  
@@ -3488,7 +3502,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
  /// The most of children's reports one message to the agent carries; what
  /// comes past it waits in a message of its own, read right after.
  const REPORT_BATCH: usize = 48 * 1024;
-@@ -242,12 +256,34 @@ fn held_since(row: &QueuedMessage) -> i64 {
+@@ -253,12 +267,34 @@ fn held_since(row: &QueuedMessage) -> i64 {
      held_of(row).iter().map(|held| held.held_at).min().unwrap_or(row.issued_at)
  }
  
@@ -3525,7 +3539,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
      queue[..held]
          .iter()
          .find(|row| wakes(row))
-@@ -713,6 +749,13 @@ enum QueueSend {
+@@ -724,6 +760,13 @@ enum QueueSend {
      Interrupt,
  }
  
@@ -3539,7 +3553,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
  const ATTACHMENT_ONLY_PROMPT: &str = "See the attached image(s).";
  const ATTACHMENT_PROMPT_HEADER: &str = "Attached images (local files — open them to view):";
  
-@@ -5106,7 +5149,7 @@ impl DocHost {
+@@ -5298,7 +5341,7 @@ impl DocHost {
          let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
          handle.publish_queue();
          if let Err(err) = self
@@ -3548,7 +3562,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
              .await
          {
              if was_paused {
-@@ -5181,7 +5224,7 @@ impl DocHost {
+@@ -5376,7 +5419,7 @@ impl DocHost {
          // Always attempt the non-interrupting path first. If no turn exists,
          // `dispatch_queued` falls through to NextTurn; if a new turn appeared
          // after our capability check, the prompt steers that turn instead.
@@ -3557,7 +3571,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
              if was_paused {
                  handle.queue_paused.store(true, Ordering::Release);
              }
-@@ -5228,9 +5271,10 @@ impl DocHost {
+@@ -5423,9 +5466,10 @@ impl DocHost {
              let Ok(queue) = handle.doc.read_queue() else {
                  return;
              };
@@ -3570,7 +3584,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
                  return;
              };
              if paused && !held_report_row(&head) {
-@@ -5383,8 +5427,15 @@ impl DocHost {
+@@ -5578,8 +5622,15 @@ impl DocHost {
                  sent.text = zeron_proto::agent_messages::with_notes(&text, &notes);
                  tracing::info!(chat = %handle.chat_id, notes = notes.len(), fyis = riders.len(), "held reports go to the agent");
              }
@@ -3587,7 +3601,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
                  tracing::warn!(chat = %handle.chat_id, error = %err, "queued send failed");
                  handle.queue_paused.store(true, Ordering::Release);
                  let _ = handle.doc.insert_queued(0, &item);
-@@ -5397,6 +5448,50 @@ impl DocHost {
+@@ -5592,6 +5643,50 @@ impl DocHost {
          }
      }
  
@@ -3638,8 +3652,8 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
      /// A Stop acts on everything sent before it, in the order the user sent
      /// it. Controls bypass the prompt drain (so a stalled provider stays
      /// stoppable), which let a Stop execute before a send queued ahead of it
-@@ -5530,12 +5625,14 @@ impl DocHost {
-         }
+@@ -5710,12 +5805,14 @@ impl DocHost {
+         handle.publish_queue();
      }
  
 -    /// Send one taken queue row.
@@ -3654,7 +3668,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
      ) -> Result<(), EngineError> {
          let Some(sessions) = self.sessions() else {
              return Err(EngineError::Other("sessions engine not wired".into()));
-@@ -5551,6 +5648,11 @@ impl DocHost {
+@@ -5731,6 +5828,11 @@ impl DocHost {
                  "this message's images are still uploading".into(),
              ));
          }
@@ -3666,10 +3680,10 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
          let mut attachments = item.attachments.clone();
          // A send held for the turn end goes out exactly as it was sent: its
          // text never carried the queue's image note.
-@@ -5608,6 +5710,15 @@ impl DocHost {
-                 "no live run and no prior run config".into(),
-             ));
-         };
+@@ -5799,6 +5901,15 @@ impl DocHost {
+             request.reasoning = cfg.reasoning;
+             request.model_options = cfg.model_options.clone();
+         }
 +        // What's held goes with the person's words: their message as they
 +        // wrote it, under its own id, and Zeron's after it. The agent reads
 +        // both in this run (the transcript's copies make the dispatch's own
@@ -3682,7 +3696,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
          request.prompt = prompt;
          request.resume = None; // dispatch re-derives the harness session
          request.attachments = attachments;
-@@ -6882,9 +6993,15 @@ impl DocHost {
+@@ -7102,9 +7213,15 @@ impl DocHost {
                          Some("held until the turn ends".into()),
                      ));
                  }
@@ -3701,7 +3715,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
                  if !report && !in_flight && self.holds_report(handle) {
                      self.hold_until_turn_end(
                          handle,
-@@ -6897,7 +7014,7 @@ impl DocHost {
+@@ -7117,7 +7234,7 @@ impl DocHost {
                      self.kick_queue(handle);
                      return Ok((
                          SessionCommandStatus::Applied,
@@ -3710,7 +3724,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
                      ));
                  }
                  let other_provider = sessions.live_harness(chat_id).is_some_and(|live| live != harness);
-@@ -6964,6 +7081,9 @@ impl DocHost {
+@@ -7184,6 +7301,9 @@ impl DocHost {
                  message_id,
                  at_once,
              } => {
@@ -3720,7 +3734,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
                  self.deliver_prompt(
                      sessions,
                      handle,
-@@ -7275,7 +7395,10 @@ impl DocHost {
+@@ -7497,7 +7617,10 @@ impl DocHost {
      /// (a rate limit, a provider down): the same message goes again, under
      /// its own id, so the transcript keeps one copy and the agent reads it
      /// after all. Twice at most; a turn the person starts meanwhile carries
@@ -3732,7 +3746,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
      pub(crate) fn retry_unread_reports(&self, chat_id: &str) {
          let Ok(handle) = self.open(chat_id) else {
              return;
-@@ -7284,15 +7407,18 @@ impl DocHost {
+@@ -7506,15 +7629,18 @@ impl DocHost {
          let Some(at) = entries.iter().rposition(|e| e.role == MessageRole::User) else {
              return;
          };
@@ -3760,7 +3774,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
          let untouched = entries[at + 1..]
              .iter()
              .flat_map(|e| &e.parts)
-@@ -7314,6 +7440,18 @@ impl DocHost {
+@@ -7536,6 +7662,18 @@ impl DocHost {
          let Ok(runtime) = tokio::runtime::Handle::try_current() else {
              return;
          };
@@ -3779,7 +3793,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
          tracing::info!(chat = %chat_id, message = %id, "reports the agent never read go again");
          let host = self.clone();
          self.spawn_worker_on(&runtime, async move {
-@@ -7358,6 +7496,16 @@ impl DocHost {
+@@ -7580,6 +7718,16 @@ impl DocHost {
              .is_ok_and(|queue| queue.iter().any(held_report_row))
      }
  
@@ -3796,7 +3810,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
      /// When this host first saw `child`, hosted elsewhere, at rest with a
      /// message of its waiting for its end: now, if just now. This host's
      /// clock, its row's being the child's.
-@@ -7376,14 +7524,19 @@ impl DocHost {
+@@ -7598,14 +7746,19 @@ impl DocHost {
      /// child still works, up to [`REPORT_MESSAGE_HOLD`] after it arrived,
      /// so its end, coming soon, wakes the agent with it. Never past that,
      /// whatever other children are doing; and not at all once the person
@@ -3819,7 +3833,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
      pub(crate) fn held_report_waits(&self, handle: &Arc<ChatDocHandle>) -> bool {
          let Ok(queue) = handle.doc.read_queue() else {
              return false;
-@@ -7391,7 +7544,10 @@ impl DocHost {
+@@ -7613,7 +7766,10 @@ impl DocHost {
          let Some(head) = queue.first() else {
              return false;
          };
@@ -3831,7 +3845,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
              return false;
          }
          // Archived: its reports wait for it to be restored, looked for now
-@@ -7402,19 +7558,28 @@ impl DocHost {
+@@ -7624,19 +7780,28 @@ impl DocHost {
              .is_some_and(|chat| chat.archived);
          let deadline = if archived {
              now_ms() + ARCHIVED_RECHECK_MS
@@ -3872,7 +3886,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
          };
          if now_ms() >= deadline {
              return false;
-@@ -8420,10 +8585,11 @@ mod queued_message_prompt_tests {
+@@ -8643,10 +8808,11 @@ mod queued_message_prompt_tests {
  #[cfg(test)]
  mod held_report_tests {
      use super::{
@@ -3886,7 +3900,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
  
      fn host() -> (tempfile::TempDir, DocHost) {
          let dir = tempfile::tempdir().expect("tempdir");
-@@ -8581,7 +8747,7 @@ mod held_report_tests {
+@@ -8806,7 +8972,7 @@ mod held_report_tests {
          let ended = row("report-kid-a-lead-m1-end", report("kid-a", ReportStatus::Finished, "Green."), 2_000);
          let theirs = row("p1", "How's it going?".into(), 3_000);
          fn lead(queue: &[QueuedMessage]) -> Option<String> {
@@ -3895,7 +3909,7 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
          }
          assert_eq!(lead(&[fyi.clone(), ended.clone(), theirs.clone()]).as_deref(), Some("report-kid-a-lead-m1-end"));
          assert_eq!(lead(&[fyi.clone(), theirs.clone()]).as_deref(), Some("p1"));
-@@ -8629,6 +8795,60 @@ mod held_report_tests {
+@@ -8854,6 +9020,60 @@ mod held_report_tests {
          assert!(fyis_of(&ended).is_none());
          assert_eq!(fyis_since(&ended, &[]), None);
      }
@@ -3957,10 +3971,10 @@ index 2d0736a9d145a929a7aa7ff038d1a48c0d1cbfe4..19934f8afbaefdcd1dc10d68cf13918b
  
  /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 18388ec33665260832d04737e630306f6384679e..14e758d80f380872fc90d2ebb6b424b85171fb30 100644
+index 89a9ac909af9d6565ef6668d454c3073d5f86fb0..facb4acf169b38aaa46a056512d3acff94181176 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -8567,6 +8567,8 @@ mod tests {
+@@ -8707,6 +8707,8 @@ mod tests {
          _steers: Arc<Mutex<mpsc::Receiver<SteerMessage>>>,
          /// Where the engine stops the run's turn in place.
          turn: zeron_harness::TurnControl,
@@ -3969,7 +3983,7 @@ index 18388ec33665260832d04737e630306f6384679e..14e758d80f380872fc90d2ebb6b424b8
      }
  
      /// A harness running several chats at once, told apart by the origin
-@@ -8626,6 +8628,7 @@ mod tests {
+@@ -8766,6 +8768,7 @@ mod tests {
                      ask: Arc::from(controls.request_input),
                      _steers: Arc::new(Mutex::new(controls.steering)),
                      turn: controls.turn,
@@ -3977,7 +3991,7 @@ index 18388ec33665260832d04737e630306f6384679e..14e758d80f380872fc90d2ebb6b424b8
                  },
              );
              Ok(futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|e| e.map(Ok))).boxed())
-@@ -8648,6 +8651,7 @@ mod tests {
+@@ -8788,6 +8791,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_RETRY_MS", "300") };
          unsafe { std::env::set_var("ZERON_REPORT_MESSAGE_HOLD_MS", "4000") };
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
@@ -3985,7 +3999,7 @@ index 18388ec33665260832d04737e630306f6384679e..14e758d80f380872fc90d2ebb6b424b8
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -9415,37 +9419,25 @@ mod tests {
+@@ -9555,37 +9559,25 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -4034,7 +4048,7 @@ index 18388ec33665260832d04737e630306f6384679e..14e758d80f380872fc90d2ebb6b424b8
          drop(b);
          rig.core.sessions.shutdown().await;
      }
-@@ -10708,4 +10700,199 @@ mod tests {
+@@ -10850,4 +10842,199 @@ mod tests {
          assert_eq!(rig.kept(), 0);
          rig.core.sessions.shutdown().await;
      }
@@ -4272,7 +4286,7 @@ index ee4d4ddcb66bf65be0cb03cfe7e4bf261fe5f2be..ed689748e3528cf3e95c73cc6ed6bb33
 2.55.0.windows.2
 
 
-From 34ebe37a7412f71123164134bce2f36f7ee08a13 Mon Sep 17 00:00:00 2001
+From eaa75872c6338f0c7976dd240364ecc39ef92eb3 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 07:57:27 +0700
 Subject: [PATCH 07/12] engine: the parent's host decides a child's pause, by
@@ -4280,16 +4294,16 @@ Subject: [PATCH 07/12] engine: the parent's host decides a child's pause, by
 
 ---
  crates/engine/src/doc_host.rs        |  15 +-
- crates/engine/src/session_reports.rs | 769 ++++++++++++++++++++-------
+ crates/engine/src/session_reports.rs | 771 ++++++++++++++++++++-------
  crates/engine/src/sessions.rs        |  84 ++-
  docs/mcp.md                          |  46 +-
- 4 files changed, 692 insertions(+), 222 deletions(-)
+ 4 files changed, 694 insertions(+), 222 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 19934f8afbaefdcd1dc10d68cf13918b5b726c92..61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7 100644
+index cf4b0378ec2527876a866cad176252e331affe47..2255df0693323281ceea460c72ff4907811a5383 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -6954,12 +6954,10 @@ impl DocHost {
+@@ -7174,12 +7174,10 @@ impl DocHost {
                      if message_id.ends_with(crate::sessions::REPORT_WAITED) {
                          return Ok((SessionCommandStatus::Applied, Some("its wait returned it".into())));
                      }
@@ -4305,7 +4319,7 @@ index 19934f8afbaefdcd1dc10d68cf13918b5b726c92..61ea9e024ffd6221a25a098b6ab9eb0e
                      }
                      // Sent again (a restart, a retry): it's here already.
                      let again = handle.doc.read_commands().unwrap_or_default().iter().any(|c| {
-@@ -6970,6 +6968,13 @@ impl DocHost {
+@@ -7190,6 +7188,13 @@ impl DocHost {
                      if again {
                          return Ok((SessionCommandStatus::Applied, Some("delivered already".into())));
                      }
@@ -4320,7 +4334,7 @@ index 19934f8afbaefdcd1dc10d68cf13918b5b726c92..61ea9e024ffd6221a25a098b6ab9eb0e
                      tracing::info!(chat = %chat_id, in_flight, joins, "a child's report arrived");
                  }
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 87a0b31df2beed6c45be504e14a2f492629ba217..ad1b312a97261ca8550d0695580691cbde5dbbd9 100644
+index d1e7fb5051a1a107ddf5a809bfd98468282113a4..964cd1452b25361c809ed963e1c2c6716f5fc07f 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
@@ -5079,7 +5093,7 @@ index 87a0b31df2beed6c45be504e14a2f492629ba217..ad1b312a97261ca8550d0695580691cb
              "report-other-m1-end",
          ] {
              assert_eq!(plain_end(key, "kid"), None, "{key}");
-@@ -2579,52 +2835,176 @@ mod tests {
+@@ -2580,52 +2836,178 @@ mod tests {
              // The person's Stop, filed: no coming back.
              run("c6", "report-kid-m3-stopped-quiet", &report("kid"), 50),
              run("c7", "report-other-m1-end", &report("other"), 55),
@@ -5206,6 +5220,7 @@ index 87a0b31df2beed6c45be504e14a2f492629ba217..ad1b312a97261ca8550d0695580691cb
 +            issued_at: 0,
 +            edited_at: None,
 +            delivery_gate: None,
++            config: None,
 +            held: Vec::new(),
 +        };
 +        assert!(back_before(&[], &ledger, &[row], "kid", 6).is_empty(), "the person's word waits in its queue");
@@ -5266,6 +5281,7 @@ index 87a0b31df2beed6c45be504e14a2f492629ba217..ad1b312a97261ca8550d0695580691cb
 +            issued_at: 0,
 +            edited_at: None,
 +            delivery_gate: None,
++            config: None,
 +            held: Vec::new(),
 +        };
 +        assert!(wrote_since(&entries, &[], &[row], Some(35)));
@@ -5294,7 +5310,7 @@ index 87a0b31df2beed6c45be504e14a2f492629ba217..ad1b312a97261ca8550d0695580691cb
      }
  
      #[test]
-@@ -2641,13 +3021,22 @@ mod tests {
+@@ -2642,13 +3024,22 @@ mod tests {
          assert!(answers_question(&[filed("ask-r1", None, 10), filed("stopped", Some(QUIET), 20)]));
      }
  
@@ -5322,7 +5338,7 @@ index 87a0b31df2beed6c45be504e14a2f492629ba217..ad1b312a97261ca8550d0695580691cb
  
      #[test]
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 14e758d80f380872fc90d2ebb6b424b85171fb30..78cd5e5ba3f6e65d481401319fd55e7fbf8f87f4 100644
+index facb4acf169b38aaa46a056512d3acff94181176..469bfcce9a9dc1eb9f74539fcb6a76293f9a9f2e 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,9 +42,8 @@ mod activity;
@@ -5337,7 +5353,7 @@ index 14e758d80f380872fc90d2ebb6b424b85171fb30..78cd5e5ba3f6e65d481401319fd55e7f
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -378,7 +377,7 @@ struct Inner {
+@@ -382,7 +381,7 @@ struct Inner {
      /// [`reports`]).
      reported: Arc<reports::Reported>,
      /// Posts a desktop banner, as the engine's own are (absent in bare
@@ -5346,7 +5362,7 @@ index 14e758d80f380872fc90d2ebb6b424b85171fb30..78cd5e5ba3f6e65d481401319fd55e7f
      notifier: Mutex<Option<Notifier>>,
  }
  
-@@ -10531,13 +10530,20 @@ mod tests {
+@@ -10672,13 +10671,20 @@ mod tests {
              banners
          }
  
@@ -5372,7 +5388,7 @@ index 14e758d80f380872fc90d2ebb6b424b85171fb30..78cd5e5ba3f6e65d481401319fd55e7f
              for i in 0..20 {
                  let mut request = request();
                  request.prompt = zeron_proto::agent_messages::child_report("Tests (kid-a)", "kid-a", ReportStatus::Finished, "ok");
-@@ -10549,11 +10555,23 @@ mod tests {
+@@ -10690,11 +10696,23 @@ mod tests {
                      )
                      .unwrap();
              }
@@ -5398,7 +5414,7 @@ index 14e758d80f380872fc90d2ebb6b424b85171fb30..78cd5e5ba3f6e65d481401319fd55e7f
          }
  
          /// Zeron's note under the lead's next report saying Tests' reports
-@@ -10579,10 +10597,11 @@ mod tests {
+@@ -10720,10 +10738,11 @@ mod tests {
          let kid = rig.start("kid-a", &from_lead("Run the tests: do they pass?")).await;
          kid.feed.send(text("All 40 pass.")).unwrap();
          kid.feed.send(done(DoneStatus::Completed)).unwrap();
@@ -5412,7 +5428,7 @@ index 14e758d80f380872fc90d2ebb6b424b85171fb30..78cd5e5ba3f6e65d481401319fd55e7f
          // A row still saying it works (one from another device can lag):
          // its end is in, so the lead's wait lets it go.
          let mut row = rig.status("kid-a");
-@@ -10632,6 +10651,45 @@ mod tests {
+@@ -10773,6 +10792,45 @@ mod tests {
          assert_eq!((heard[0].0.as_str(), heard[0].1), ("kid-a", ReportStatus::Finished));
          assert_eq!(rig.kept(), 2);
          assert_eq!(lock(&banners).len(), 1);
@@ -5526,7 +5542,7 @@ index ed689748e3528cf3e95c73cc6ed6bb33a8fb62c2..a9fcd29560ce5a3fd44257723904ab37
 2.55.0.windows.2
 
 
-From c3b70b4d3ac30d2ee895a26fc013fafb1dc42741 Mon Sep 17 00:00:00 2001
+From 7f8b4ecbbf924bf3cea7354a94aaf501d621c4fb Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:05:23 +0700
 Subject: [PATCH 08/12] engine: a parent can ask to hear from a group of
@@ -5539,19 +5555,19 @@ Subject: [PATCH 08/12] engine: a parent can ask to hear from a group of
  crates/engine/src/rpc.rs             |  41 +++
  crates/engine/src/rpc/agent_gate.rs  |  29 ++
  crates/engine/src/session_reports.rs | 229 +++++++++++++++-
- crates/engine/src/sessions.rs        | 234 +++++++++++++++-
+ crates/engine/src/sessions.rs        | 235 +++++++++++++++-
  crates/mcp/src/jsonrpc.rs            |   4 +-
  crates/mcp/src/tools.rs              | 383 ++++++++++++++++++++++++---
  crates/proto/src/workspace.rs        |   7 +
  crates/rpc/src/lib.rs                |  10 +
  docs/mcp.md                          |  26 ++
- 12 files changed, 1353 insertions(+), 55 deletions(-)
+ 12 files changed, 1354 insertions(+), 55 deletions(-)
 
 diff --git a/crates/doc/src/queue.rs b/crates/doc/src/queue.rs
-index 3849e473b72a5551d9eb839f1aeab1cdd000c93e..58ea4174fd0f74880717d30b5e80d78aa42b1887 100644
+index 462eeca8fc0b5fa2ec801a188602399e7618cbce..c4902b300e1596e47623e8133679a3a94f3cd90b 100644
 --- a/crates/doc/src/queue.rs
 +++ b/crates/doc/src/queue.rs
-@@ -80,6 +80,40 @@ pub struct HeldReport {
+@@ -86,6 +86,40 @@ pub struct HeldReport {
      pub held_at: i64,
      /// Whether it wakes the agent: an FYI waits for something that does.
      pub wake: bool,
@@ -5592,7 +5608,7 @@ index 3849e473b72a5551d9eb839f1aeab1cdd000c93e..58ea4174fd0f74880717d30b5e80d78a
  }
  
  /// What a held row's entry is: a report wakes the agent, an FYI goes with
-@@ -578,6 +612,7 @@ mod tests {
+@@ -596,6 +630,7 @@ mod tests {
              request_id: Some("req-1".into()),
              held_at: 5_000,
              wake: true,
@@ -5600,7 +5616,7 @@ index 3849e473b72a5551d9eb839f1aeab1cdd000c93e..58ea4174fd0f74880717d30b5e80d78a
          };
          let mut row = item("report-kid-a-m-1-ask-req-1", "[Report …]");
          row.held = vec![end.clone()];
-@@ -587,6 +622,7 @@ mod tests {
+@@ -605,6 +640,7 @@ mod tests {
          let json = serde_json::to_value(doc.read_queue().unwrap()).unwrap();
          assert_eq!(json[0]["held"][0]["heldAt"], 5_000);
          assert_eq!(json[0]["held"][0]["kind"], "report");
@@ -5608,7 +5624,7 @@ index 3849e473b72a5551d9eb839f1aeab1cdd000c93e..58ea4174fd0f74880717d30b5e80d78a
          assert!(json[1].get("held").is_none());
  
          let fyi = HeldReport {
-@@ -597,6 +633,7 @@ mod tests {
+@@ -615,6 +651,7 @@ mod tests {
              request_id: None,
              held_at: 6_000,
              wake: false,
@@ -5617,7 +5633,7 @@ index 3849e473b72a5551d9eb839f1aeab1cdd000c93e..58ea4174fd0f74880717d30b5e80d78a
          assert!(doc.set_queued_held(&row.id, &[end.clone(), fyi.clone()]).unwrap());
          assert!(doc.move_queued(&row.id, 1).unwrap());
 diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
-index cf91f9fb21edccd1ac6c564c3632ada7a712aa87..38793dfa2bf1e0214334dbd6b6f4956a0d7f0633 100644
+index 62ad441b2708943bae9449807abc94a715d3861e..943f21e57b7b3509cc1cdaf4d4dd4650f155e5e3 100644
 --- a/crates/doc/src/schema.rs
 +++ b/crates/doc/src/schema.rs
 @@ -791,6 +791,30 @@ impl SessionDoc {
@@ -5651,7 +5667,7 @@ index cf91f9fb21edccd1ac6c564c3632ada7a712aa87..38793dfa2bf1e0214334dbd6b6f4956a
      pub fn mark_provider_switched(&self) -> Result<(), DocError> {
          if !self.provider_switched() {
              self.doc.get_map("meta").insert("providerSwitched", true)?;
-@@ -2704,6 +2728,26 @@ mod tests {
+@@ -2768,6 +2792,26 @@ mod tests {
          assert!(!all.contains_key("m1") && all.contains_key(&format!("n{}", SENT_BY_KEPT + 4)));
      }
  
@@ -5679,7 +5695,7 @@ index cf91f9fb21edccd1ac6c564c3632ada7a712aa87..38793dfa2bf1e0214334dbd6b6f4956a
      fn provider_switch_seam_round_trips_and_flags_the_doc() {
          let doc = SessionDoc::init("switch").unwrap();
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a990023c9 100644
+index 2255df0693323281ceea460c72ff4907811a5383..ab753f454dea8b421ed0fad1cf65908d4a3da118 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
 @@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
@@ -5693,7 +5709,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
      evaluate_command,
  };
-@@ -186,6 +186,19 @@ fn report_person_hold_ms() -> i64 {
+@@ -197,6 +197,19 @@ fn report_person_hold_ms() -> i64 {
          .unwrap_or(REPORT_PERSON_HOLD.as_millis() as i64)
  }
  
@@ -5713,7 +5729,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
  /// The most of children's reports one message to the agent carries; what
  /// comes past it waits in a message of its own, read right after.
  const REPORT_BATCH: usize = 48 * 1024;
-@@ -243,9 +256,61 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
+@@ -254,9 +267,61 @@ fn held_report(kind: HeldKind, child: &str, key: &str, held_at: i64) -> HeldRepo
          stage,
          held_at,
          wake: kind == HeldKind::Report,
@@ -5775,7 +5791,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
  /// The held row wakes the agent: it holds a report, not FYIs alone.
  fn wakes(row: &QueuedMessage) -> bool {
      held_of(row).iter().any(|held| held.wake)
-@@ -522,7 +587,7 @@ struct DocHostInner {
+@@ -533,7 +598,7 @@ struct DocHostInner {
      drain_waiting: Mutex<HashSet<String>>,
      /// Each chat's waiting report whose window's end is armed to come back
      /// for it (its queue row, and when), so a drain arms one timer, not one
@@ -5784,7 +5800,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      report_settles: Mutex<HashMap<String, String>>,
      /// By parent chat, when each child's latest message on the way got here
      /// (this host's clock), while it waits ([`REPORT_MESSAGE_HOLD`]).
-@@ -533,6 +598,9 @@ struct DocHostInner {
+@@ -544,6 +609,9 @@ struct DocHostInner {
      /// How often each report message went again, its turn having failed
      /// before the agent read it ([`DocHost::retry_unread_reports`]).
      report_retries: Mutex<HashMap<String, u32>>,
@@ -5794,7 +5810,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      /// Uploads store (engine assembly) — resolves `pending://` attachment
      /// refs and jails transfer reads to the uploads dir.
      uploads: OnceLock<crate::uploads::Uploads>,
-@@ -1531,6 +1599,7 @@ impl DocHost {
+@@ -1602,6 +1670,7 @@ impl DocHost {
                  report_messages: Mutex::new(HashMap::new()),
                  report_rests: Mutex::new(HashMap::new()),
                  report_retries: Mutex::new(HashMap::new()),
@@ -5802,7 +5818,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
                  uploads: OnceLock::new(),
                  connectivity: OnceLock::new(),
                  connectivity_started: AtomicBool::new(false),
-@@ -5271,6 +5340,11 @@ impl DocHost {
+@@ -5466,6 +5535,11 @@ impl DocHost {
              let Ok(queue) = handle.doc.read_queue() else {
                  return;
              };
@@ -5814,7 +5830,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
              // The person's words go first, what's held with them. Else,
              // held at the head, a report goes first, its FYIs with it; FYIs
              // alone let the row behind them go, and wait on.
-@@ -5422,7 +5496,11 @@ impl DocHost {
+@@ -5617,7 +5691,11 @@ impl DocHost {
                      continue;
                  }
                  let text = zeron_proto::agent_messages::merge_reports(&parts);
@@ -5827,7 +5843,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
                  let notes = crate::sessions::report_notes(self, &handle.chat_id, &text, &sessions.local_sessions(), more);
                  sent.text = zeron_proto::agent_messages::with_notes(&text, &notes);
                  tracing::info!(chat = %handle.chat_id, notes = notes.len(), fyis = riders.len(), "held reports go to the agent");
-@@ -5453,14 +5531,17 @@ impl DocHost {
+@@ -5648,14 +5726,17 @@ impl DocHost {
      /// question answered meanwhile and an end it read left out first, then
      /// the reports, the FYIs after them, and Zeron's notes under all. Each
      /// row taken goes in `riders`, to put back if the send fails. `None`:
@@ -5847,7 +5863,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
          let (mut parts, mut fyis): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
          for row in queue.iter().filter(|row| held_report_row(row)) {
              let Ok(Some(rider)) = handle.doc.take_queued(&row.id) else {
-@@ -5486,7 +5567,11 @@ impl DocHost {
+@@ -5681,7 +5762,11 @@ impl DocHost {
              return None;
          }
          let text = zeron_proto::agent_messages::merge_reports(&parts);
@@ -5860,7 +5876,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
          let notes = crate::sessions::report_notes(self, &handle.chat_id, &text, &sessions.local_sessions(), more);
          tracing::info!(chat = %handle.chat_id, rows = riders.len(), "held reports go with the person's words");
          Some(Riding { id, text: zeron_proto::agent_messages::with_notes(&text, &notes) })
-@@ -7304,7 +7389,9 @@ impl DocHost {
+@@ -7525,7 +7610,9 @@ impl DocHost {
      /// Each row files what it holds ([`QueuedMessage::held`]): whose report,
      /// on which message, at what stage (its key says), and `held_at`, when it
      /// got here by this host's clock, which every wait counts from. A child's
@@ -5871,7 +5887,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      fn hold_report(
          &self,
          handle: &Arc<ChatDocHandle>,
-@@ -7313,15 +7400,19 @@ impl DocHost {
+@@ -7534,15 +7621,19 @@ impl DocHost {
          held_at: i64,
      ) -> Result<(), EngineError> {
          let text = &request.prompt;
@@ -5895,7 +5911,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
          // The same report held already, under another command (two pushers
          // sent it): the one held stands for both.
          let queue = handle.doc.read_queue()?;
-@@ -7344,7 +7435,8 @@ impl DocHost {
+@@ -7565,7 +7656,8 @@ impl DocHost {
  
      /// One report (or part of one) into the waiting ones: the last message
      /// of them, while it has room. Reports join reports and FYIs FYIs: the
@@ -5905,7 +5921,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      fn hold_report_part(
          &self,
          handle: &Arc<ChatDocHandle>,
-@@ -7360,6 +7452,8 @@ impl DocHost {
+@@ -7581,6 +7673,8 @@ impl DocHost {
          let waiting = queue.into_iter().rev().find(|row| {
              held_report_row(row)
                  && row.text.len() + text.len() + 2 <= REPORT_BATCH
@@ -5914,7 +5930,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
                  && match held.kind {
                      HeldKind::Report => zeron_proto::agent_messages::split_fyis(&row.text).1.is_none(),
                      HeldKind::Fyi => zeron_proto::agent_messages::child_reports(&row.text).is_none(),
-@@ -7493,12 +7587,14 @@ impl DocHost {
+@@ -7715,12 +7809,14 @@ impl DocHost {
          stopped.is_none_or(|at| head.issued_at > at)
      }
  
@@ -5931,7 +5947,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      }
  
      /// The person typed to the chat: when it got here, by this host's
-@@ -7546,6 +7642,7 @@ impl DocHost {
+@@ -7768,6 +7864,7 @@ impl DocHost {
          let Ok(queue) = handle.doc.read_queue() else {
              return false;
          };
@@ -5939,7 +5955,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
          let Some(head) = queue.first() else {
              return false;
          };
-@@ -7611,6 +7708,178 @@ impl DocHost {
+@@ -7833,6 +7930,178 @@ impl DocHost {
          true
      }
  
@@ -6118,7 +6134,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      /// Hand the chat's queue to the agent off this thread (the drain decides
      /// whether anything goes).
      fn kick_queue(&self, handle: &Arc<ChatDocHandle>) {
-@@ -8590,8 +8859,9 @@ mod queued_message_prompt_tests {
+@@ -8813,8 +9082,9 @@ mod queued_message_prompt_tests {
  #[cfg(test)]
  mod held_report_tests {
      use super::{
@@ -6130,7 +6146,7 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
      };
      use std::sync::Arc;
      use zeron_proto::agent_messages::{ReportStatus, agent_message, child_fyi, child_report, merge_reports};
-@@ -8854,6 +9124,66 @@ mod held_report_tests {
+@@ -9079,6 +9349,66 @@ mod held_report_tests {
          assert_eq!(handle.doc().read_queue().unwrap().len(), 1, "one row");
          assert!(!host.held_report_waits(&handle), "a failure doesn't wait for them");
      }
@@ -6198,10 +6214,10 @@ index 61ea9e024ffd6221a25a098b6ab9eb0e98bb86c7..a97ffc90c3c2ad33a5e6df20655ca19a
  
  /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 22035672a7b53b327148b37c9a4656d63c289e61..9154d0f6b25a9cf473f09efacaaa47b665aaca4e 100644
+index 4d835ac1cdcd1dfd63823051aa20d36e5ee1f800..a000ca2c84aac8ff3f8268675ba140ba97607ae3 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
-@@ -340,6 +340,21 @@ struct AwaitBackgroundParams {
+@@ -344,6 +344,21 @@ struct AwaitBackgroundParams {
      waiting: Option<bool>,
  }
  
@@ -6223,7 +6239,7 @@ index 22035672a7b53b327148b37c9a4656d63c289e61..9154d0f6b25a9cf473f09efacaaa47b6
  #[derive(Debug, Deserialize)]
  #[serde(rename_all = "camelCase")]
  struct StopWaitingParams {
-@@ -4144,6 +4159,32 @@ impl RpcService for EngineRpc {
+@@ -4266,6 +4281,32 @@ impl RpcService for EngineRpc {
                      )),
                  }
              }
@@ -6302,7 +6318,7 @@ index 63f4a9f5a99e30eddb2ae582aa2ddc10a00a00d6..d7d7cb56e113e1abb07151269d87d0a9
 +    }
  }
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index ad1b312a97261ca8550d0695580691cbde5dbbd9..deb038508780f6188d5898cd677fc383ab5a5400 100644
+index 964cd1452b25361c809ed963e1c2c6716f5fc07f..8cb63f6992c2c4be9eef2c6691da865132742b59 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
@@ -6528,7 +6544,7 @@ index ad1b312a97261ca8550d0695580691cbde5dbbd9..deb038508780f6188d5898cd677fc383
  /// One line naming each child still working on something `parent` asked:
  /// how long since it was asked, and how long since its run last did
  /// anything (when it runs here) or since its device was last heard from.
-@@ -2861,6 +3048,40 @@ mod tests {
+@@ -2862,6 +3049,40 @@ mod tests {
          assert_eq!(back_before(&[], &later, &[], "kid", later.len()).len(), 3);
      }
  
@@ -6570,7 +6586,7 @@ index ad1b312a97261ca8550d0695580691cbde5dbbd9..deb038508780f6188d5898cd677fc383
      fn back_once(i: usize, at: i64) -> SessionCommandEntry {
          let report = agent_messages::child_report("Tests (kid)", "kid", ReportStatus::Finished, "ok");
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 78cd5e5ba3f6e65d481401319fd55e7fbf8f87f4..2e3aa9ee4889be0deb44972a47b67fdb4bd72fbc 100644
+index 469bfcce9a9dc1eb9f74539fcb6a76293f9a9f2e..6cca7d50bfe4f7a476d75b01f2537511b1a98270 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -42,8 +42,8 @@ mod activity;
@@ -6584,7 +6600,7 @@ index 78cd5e5ba3f6e65d481401319fd55e7fbf8f87f4..2e3aa9ee4889be0deb44972a47b67fdb
      WAITED as REPORT_WAITED,
  };
  use crate::registry::{HarnessDescriptor, HarnessRegistry};
-@@ -8651,6 +8651,7 @@ mod tests {
+@@ -8791,6 +8791,7 @@ mod tests {
          unsafe { std::env::set_var("ZERON_REPORT_MESSAGE_HOLD_MS", "4000") };
          unsafe { std::env::set_var("ZERON_REPORT_FYI_HOLD_MS", "2500") };
          unsafe { std::env::set_var("ZERON_REPORT_PERSON_HOLD_MS", "5000") };
@@ -6592,7 +6608,7 @@ index 78cd5e5ba3f6e65d481401319fd55e7fbf8f87f4..2e3aa9ee4889be0deb44972a47b67fdb
          let harness = Arc::new(ChatsHarness::default());
          let registry = HarnessRegistry::new();
          registry.register(harness.clone());
-@@ -10953,4 +10954,233 @@ mod tests {
+@@ -11095,4 +11096,234 @@ mod tests {
          assert!(handle.doc().person_typed_at().is_some());
          rig.core.sessions.shutdown().await;
      }
@@ -6696,6 +6712,7 @@ index 78cd5e5ba3f6e65d481401319fd55e7fbf8f87f4..2e3aa9ee4889be0deb44972a47b67fdb
 +            multi_select: false,
 +            prefill: None,
 +            multiline: false,
++            note: None,
 +        }]);
 +        rig.until("the lead hears the question", |r| !r.reports("lead").is_empty()).await;
 +        let reports = rig.reports("lead");
@@ -6827,7 +6844,7 @@ index 78cd5e5ba3f6e65d481401319fd55e7fbf8f87f4..2e3aa9ee4889be0deb44972a47b67fdb
 +    }
  }
 diff --git a/crates/mcp/src/jsonrpc.rs b/crates/mcp/src/jsonrpc.rs
-index f646b032bcb2e1bbe1f2f15778c1adcbeb643ac8..d46cafcf702ed0475395da89bd60c53cf37b517b 100644
+index c75bbb517e91251a75b7ed30cb3309e1f2de11b1..201e1b729ff69e85f10dd56fb4319e8ded415c28 100644
 --- a/crates/mcp/src/jsonrpc.rs
 +++ b/crates/mcp/src/jsonrpc.rs
 @@ -47,7 +47,9 @@ Chats you delegate to report back automatically when their turn ends, with a not
@@ -6842,10 +6859,10 @@ index f646b032bcb2e1bbe1f2f15778c1adcbeb643ac8..d46cafcf702ed0475395da89bd60c53c
  `send_message` to your parent mid-task to ask something or share something it \
  needs now; it reads it when its own turn ends, with its other children's.\n\
 diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
-index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba78652b868 100644
+index c8f115fb171868918dfb2773755a81d60d319555..edafe3ccc2ada752244976c5f52219bf8428c613 100644
 --- a/crates/mcp/src/tools.rs
 +++ b/crates/mcp/src/tools.rs
-@@ -225,7 +225,7 @@ fn catalog() -> Vec<ToolDef> {
+@@ -238,7 +238,7 @@ fn catalog() -> Vec<ToolDef> {
          (
              "create_chats",
              "create_chat",
@@ -6854,7 +6871,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
          ),
          (
              "send_messages",
-@@ -239,14 +239,19 @@ fn catalog() -> Vec<ToolDef> {
+@@ -252,14 +252,19 @@ fn catalog() -> Vec<ToolDef> {
              .unwrap()
              .input_schema
              .clone();
@@ -6881,7 +6898,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
      }
      tools.push(ToolDef {
          name: SHOW_VISUAL,
-@@ -594,6 +599,37 @@ struct ShowVisualArgs {
+@@ -607,6 +612,37 @@ struct ShowVisualArgs {
  #[derive(Deserialize)]
  struct BatchArgs {
      requests: Vec<Value>,
@@ -6919,7 +6936,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
  }
  
  #[derive(Deserialize)]
-@@ -923,29 +959,163 @@ impl Tools {
+@@ -936,29 +972,163 @@ impl Tools {
              (1..=MAX_BATCH).contains(&args.requests.len()),
              "requests must contain between 1 and {MAX_BATCH} items"
          );
@@ -7096,7 +7113,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
      }
  
      async fn whoami(&self) -> anyhow::Result<Value> {
-@@ -1149,6 +1319,13 @@ impl Tools {
+@@ -1162,6 +1332,13 @@ impl Tools {
      }
  
      async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
@@ -7110,7 +7127,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
          // Parent: the explicit `parent` argument, else the chat this server
          // speaks for. Resolved so a prefix/title works and a typo fails loud.
          let explicit_parent = args
-@@ -1301,7 +1478,6 @@ impl Tools {
+@@ -1314,7 +1491,6 @@ impl Tools {
              plan: args.plan,
          };
  
@@ -7118,7 +7135,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
          let mut mutate = json!({
              "op": "createChat",
              "chatId": chat_id,
-@@ -1403,11 +1579,17 @@ impl Tools {
+@@ -1416,11 +1592,17 @@ impl Tools {
                  "{harness:?} does not look signed in on this device, so its first turn may fail. Pick a connected harness (list_harnesses) if it does."
              ));
          }
@@ -7139,7 +7156,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
          if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
              // The row may not have folded into WatchChats yet; build the
              // chat locally from what we just wrote rather than re-reading.
-@@ -1442,6 +1624,7 @@ impl Tools {
+@@ -1455,6 +1637,7 @@ impl Tools {
                  .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
                  .await?;
              result["sent"] = delivered.receipt;
@@ -7147,7 +7164,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
              let pending = Arc::new(PendingTurn {
                  baseline: None,
                  start: TurnStart {
-@@ -1458,7 +1641,7 @@ impl Tools {
+@@ -1471,7 +1654,7 @@ impl Tools {
                      .await?;
              }
          }
@@ -7156,7 +7173,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
      }
  
      async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
-@@ -2136,6 +2319,8 @@ mod tests {
+@@ -2150,6 +2333,8 @@ mod tests {
          stats: Option<Value>,
          /// `dev-local` holds a child's FYIs (`child-reports-fyi`).
          fyi: bool,
@@ -7165,7 +7182,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
      }
  
      fn stream(item: Value) -> RpcReply {
-@@ -2172,11 +2357,21 @@ mod tests {
+@@ -2186,11 +2371,21 @@ mod tests {
                  methods::ENGINE_INFO => RpcReply::Value(json!({
                      "deviceId": "dev-local", "workspaceScope": "local"
                  })),
@@ -7192,7 +7209,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
                  methods::WATCH_SPACES => stream(json!([{
                      "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                      "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
-@@ -2265,6 +2460,18 @@ mod tests {
+@@ -2279,6 +2474,18 @@ mod tests {
                          .push((method.to_owned(), params.clone()));
                      RpcReply::Value(json!({ "id": "img:1", "name": params["name"] }))
                  }
@@ -7211,7 +7228,7 @@ index 380c814b1aa62d6aaed95511266352dbfb88d85d..ca12a8a194e63410ca2522a25fbb1ba7
                  methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                      // A Cloud chat gets a machine of its own from the engine.
                      let cloud_create = method == methods::MUTATE
-@@ -2948,6 +3155,120 @@ mod tests {
+@@ -2962,6 +3169,120 @@ mod tests {
          assert!(world.writes.lock().unwrap().is_empty());
      }
  
@@ -7365,10 +7382,10 @@ index 3f0dad93c4a509333bb794a9b6e9f478740e595d..f467e84fa68ab180c3654b7a42940e31
                  ],
              })
 diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
-index ac3a8c5c0aa64e9fdaeaee6dde6544ab8171faec..a0030ecb26ad63d871a883358e0c87ecae9de9f5 100644
+index 81846568e19f67f020e5f363277ca865adfa2cbc..756ae294618717f64a9d37220ca9b9d1fcfc5ee5 100644
 --- a/crates/rpc/src/lib.rs
 +++ b/crates/rpc/src/lib.rs
-@@ -298,6 +298,14 @@ pub mod methods {
+@@ -302,6 +302,14 @@ pub mod methods {
      /// where the runtime doesn't wake its agent when the work ends. Local:
      /// an agent's MCP server dials its chat's host.
      pub const AWAIT_BACKGROUND: &str = "AwaitBackground";
@@ -7383,7 +7400,7 @@ index ac3a8c5c0aa64e9fdaeaee6dde6544ab8171faec..a0030ecb26ad63d871a883358e0c87ec
      /// `{chatId}` → `{stopped}`: the person's Stop waiting: the processes the
      /// agent said it waits on no longer hold the chat (its background agents
      /// still do). Relay-forwardable, to the chat's host.
-@@ -864,6 +872,8 @@ pub fn agent_allowed(method: &str) -> bool {
+@@ -868,6 +876,8 @@ pub fn agent_allowed(method: &str) -> bool {
              | methods::READ_COMMAND_OUTPUT
              | methods::STOP_COMMAND
              | methods::LIST_BACKGROUND_COMMANDS
@@ -7440,7 +7457,7 @@ index a9fcd29560ce5a3fd44257723904ab376f9f9312..375bea5f0983b2753803b350a21f0782
 2.55.0.windows.2
 
 
-From 70a0f6d8212263b8ee04152e1beea88a87b4a462 Mon Sep 17 00:00:00 2001
+From 269adbd6c854d3f5ceb4e6c0aad2fed28f8e37db Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 08:15:30 +0700
 Subject: [PATCH 09/12] engine: report groups work with the person-active hold
@@ -7451,10 +7468,10 @@ Subject: [PATCH 09/12] engine: report groups work with the person-active hold
  1 file changed, 39 insertions(+)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index a97ffc90c3c2ad33a5e6df20655ca19a990023c9..3e6d71717ecc6ca81fbb85b63856b91334ffda1a 100644
+index ab753f454dea8b421ed0fad1cf65908d4a3da118..e756613855a2355b05daa26bf935239e77f04d36 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -7057,7 +7057,18 @@ impl DocHost {
+@@ -7277,7 +7277,18 @@ impl DocHost {
                      // host decides, by its own ledger's order, and keeps it
                      // from the agent here, still the child's end in the
                      // ledger. A pause beginning, the person hears.
@@ -7473,7 +7490,7 @@ index a97ffc90c3c2ad33a5e6df20655ca19a990023c9..3e6d71717ecc6ca81fbb85b63856b913
                          return Ok((SessionCommandStatus::Applied, Some(crate::sessions::REPORT_PAUSED.into())));
                      }
                      let joins = self.holds_report(handle);
-@@ -9184,6 +9195,34 @@ mod held_report_tests {
+@@ -9409,6 +9420,34 @@ mod held_report_tests {
          left[0].released = Some(vec!["kid-b".into()]);
          assert!(!waits_in_group(&left, &docs));
      }
@@ -7512,7 +7529,7 @@ index a97ffc90c3c2ad33a5e6df20655ca19a990023c9..3e6d71717ecc6ca81fbb85b63856b913
 2.55.0.windows.2
 
 
-From 1c7dbaa7d00bafe4dc8ee0cfdbc9509f8c229920 Mon Sep 17 00:00:00 2001
+From 5a3f4482fc866f4df55434b9e0dadf38a39a59e0 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:15:22 +0700
 Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
@@ -7523,10 +7540,10 @@ Subject: [PATCH 10/12] engine: report tests read the lead's mailbox, and Tests
  1 file changed, 3 insertions(+), 4 deletions(-)
 
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 2e3aa9ee4889be0deb44972a47b67fdb4bd72fbc..989f41d4b731421c2b6bc5628faf6508cce494b0 100644
+index 6cca7d50bfe4f7a476d75b01f2537511b1a98270..7a45d271b4e49f3836e708785f4812a5a7fe96f7 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -10767,7 +10767,6 @@ mod tests {
+@@ -10909,7 +10909,6 @@ mod tests {
              let lead = self.start("lead", "Get the tests run.").await;
              lead.feed.send(text("Asked Tests.")).unwrap();
              let kid = self.start("kid-a", &from_lead("Run the tests.")).await;
@@ -7534,7 +7551,7 @@ index 2e3aa9ee4889be0deb44972a47b67fdb4bd72fbc..989f41d4b731421c2b6bc5628faf6508
              lead.feed.send(done(DoneStatus::Completed)).unwrap();
              self.until("the lead rests", |r| r.status("lead").status != SessionStatus::Working).await;
              self.person_writes("lead", "What's the plan?", "p1");
-@@ -11027,7 +11026,7 @@ mod tests {
+@@ -11169,7 +11168,7 @@ mod tests {
              notes.iter().any(|n| n == "You asked to hear from Tests, Docs at once, when all are done. Done: Tests. Still out: Docs."),
              "{notes:?}"
          );
@@ -7543,7 +7560,7 @@ index 2e3aa9ee4889be0deb44972a47b67fdb4bd72fbc..989f41d4b731421c2b6bc5628faf6508
          woke.feed.send(done(DoneStatus::Completed)).unwrap();
          b.feed.send(text("Written.")).unwrap();
          b.feed.send(done(DoneStatus::Completed)).unwrap();
-@@ -11135,14 +11134,14 @@ mod tests {
+@@ -11278,14 +11277,14 @@ mod tests {
          a.feed.send(done(DoneStatus::Completed)).unwrap();
          rig.until("Tests' end is held", |r| r.queued("lead").len() == 1).await;
          rig.person_writes("lead", "Lint it too.", "l2");
@@ -7564,7 +7581,7 @@ index 2e3aa9ee4889be0deb44972a47b67fdb4bd72fbc..989f41d4b731421c2b6bc5628faf6508
 2.55.0.windows.2
 
 
-From 6f7cab8e24d2a047942ce7c432a6e09f6499c583 Mon Sep 17 00:00:00 2001
+From acad989cc83c1d45086ba29f974dead3e508314b Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:20:48 +0700
 Subject: [PATCH 11/12] engine: held reports survive a restart between the
@@ -7578,10 +7595,10 @@ Subject: [PATCH 11/12] engine: held reports survive a restart between the
  4 files changed, 135 insertions(+), 12 deletions(-)
 
 diff --git a/crates/doc/src/queue.rs b/crates/doc/src/queue.rs
-index 58ea4174fd0f74880717d30b5e80d78aa42b1887..360ef1a8b87517ae42b29b8097a01f7f5ffaa57b 100644
+index c4902b300e1596e47623e8133679a3a94f3cd90b..7cb8c13a8fa7800024595534bdec3c6e7a8d2d47 100644
 --- a/crates/doc/src/queue.rs
 +++ b/crates/doc/src/queue.rs
-@@ -283,6 +283,38 @@ impl SessionDoc {
+@@ -290,6 +290,38 @@ impl SessionDoc {
          Ok(true)
      }
  
@@ -7620,7 +7637,7 @@ index 58ea4174fd0f74880717d30b5e80d78aa42b1887..360ef1a8b87517ae42b29b8097a01f7f
      /// Install, replace or clear a host-authoritative delivery barrier.
      /// Callers serialize this with the host's queue drain lock.
      pub fn set_queued_delivery_gate(
-@@ -641,6 +673,41 @@ mod tests {
+@@ -659,6 +691,41 @@ mod tests {
          assert!(!doc.set_queued_held("gone", &[]).unwrap());
      }
  
@@ -7663,10 +7680,10 @@ index 58ea4174fd0f74880717d30b5e80d78aa42b1887..360ef1a8b87517ae42b29b8097a01f7f
      /// doc read back from its snapshot) still knows it.
      #[test]
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 3e6d71717ecc6ca81fbb85b63856b91334ffda1a..041ab4ccbe3ad45a1496e89331019bb2ee45ff59 100644
+index e756613855a2355b05daa26bf935239e77f04d36..e87a0e673a87a750e4ad6a3b1ba6ebc24067ef64 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -5561,7 +5561,10 @@ impl DocHost {
+@@ -5756,7 +5756,10 @@ impl DocHost {
          }
          // Under the first row's id, as a row of them goes on its own.
          let id = riders.first()?.id.clone();
@@ -7678,7 +7695,7 @@ index 3e6d71717ecc6ca81fbb85b63856b91334ffda1a..041ab4ccbe3ad45a1496e89331019bb2
          if parts.is_empty() {
              tracing::info!(chat = %handle.chat_id, "held reports all said already: nothing goes with the person's words");
              return None;
-@@ -7855,14 +7858,18 @@ impl DocHost {
+@@ -8077,14 +8080,18 @@ impl DocHost {
              return Ok(());
          };
          let merged = zeron_proto::agent_messages::merge_reports(&[into.text.as_str(), row.text.as_str()]);
@@ -7702,7 +7719,7 @@ index 3e6d71717ecc6ca81fbb85b63856b91334ffda1a..041ab4ccbe3ad45a1496e89331019bb2
          handle.publish_queue();
          Ok(())
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index deb038508780f6188d5898cd677fc383ab5a5400..25d628f356b5db61b3256b3945ed32a12f80873e 100644
+index 8cb63f6992c2c4be9eef2c6691da865132742b59..6af235601e2d181f96f2c22547ad0cc9a003d344 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -653,6 +653,28 @@ pub(super) fn owed_on_boot(
@@ -7735,10 +7752,10 @@ index deb038508780f6188d5898cd677fc383ab5a5400..25d628f356b5db61b3256b3945ed32a1
  /// sent after it started another turn: the one that ended its last turn.
  fn stop_after(commands: &[SessionCommandEntry], asked: &str) -> Option<String> {
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 989f41d4b731421c2b6bc5628faf6508cce494b0..6a3bb9910fb85d451e5f01d419b7d5835456755c 100644
+index 7a45d271b4e49f3836e708785f4812a5a7fe96f7..b0e0a75a3a97a6f4e359e54384e9646f1cbc03e7 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -689,17 +689,18 @@ impl SessionsEngine {
+@@ -693,17 +693,18 @@ impl SessionsEngine {
              };
              let floor = engine.inner.journal.child_reports_since(now_ms()) - reports::OWED_FLOOR_MARGIN_MS;
              let stopped = std::mem::take(&mut *lock(&engine.inner.boot_stops));
@@ -7764,7 +7781,7 @@ index 989f41d4b731421c2b6bc5628faf6508cce494b0..6a3bb9910fb85d451e5f01d419b7d583
          });
      }
  
-@@ -10849,6 +10850,32 @@ mod tests {
+@@ -10991,6 +10992,32 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -7801,7 +7818,7 @@ index 989f41d4b731421c2b6bc5628faf6508cce494b0..6a3bb9910fb85d451e5f01d419b7d583
 2.55.0.windows.2
 
 
-From 4c5320573f02dd0f859321473b23083fe20d7edc Mon Sep 17 00:00:00 2001
+From 965fbf8d95dcd407d4d184b38475c85c1a500606 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Mon, 16 Nov 2026 10:23:32 +0700
 Subject: [PATCH 12/12] engine: a group member's follow-up brings its held end
@@ -7815,10 +7832,10 @@ Subject: [PATCH 12/12] engine: a group member's follow-up brings its held end
  4 files changed, 47 insertions(+), 14 deletions(-)
 
 diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
-index 041ab4ccbe3ad45a1496e89331019bb2ee45ff59..52603d109de924ad06ba54f0b1594cc7410d0b77 100644
+index e87a0e673a87a750e4ad6a3b1ba6ebc24067ef64..1f79d48d824ef2ee402e8cb61d29c2ae963ddac2 100644
 --- a/crates/engine/src/doc_host.rs
 +++ b/crates/engine/src/doc_host.rs
-@@ -7427,6 +7427,9 @@ impl DocHost {
+@@ -7648,6 +7648,9 @@ impl DocHost {
          if status == Some(zeron_proto::agent_messages::ReportStatus::Finished) {
              held.group = group_of_end(&handle.doc.report_groups(), &held);
          }
@@ -7828,7 +7845,7 @@ index 041ab4ccbe3ad45a1496e89331019bb2ee45ff59..52603d109de924ad06ba54f0b1594cc7
          // The same report held already, under another command (two pushers
          // sent it): the one held stands for both.
          let queue = handle.doc.read_queue()?;
-@@ -7447,6 +7450,27 @@ impl DocHost {
+@@ -7668,6 +7671,27 @@ impl DocHost {
          Ok(())
      }
  
@@ -7857,7 +7874,7 @@ index 041ab4ccbe3ad45a1496e89331019bb2ee45ff59..52603d109de924ad06ba54f0b1594cc7
      /// of them, while it has room. Reports join reports and FYIs FYIs: the
      /// FYIs go after the reports when they go. A group's end joins nothing,
 diff --git a/crates/engine/src/session_reports.rs b/crates/engine/src/session_reports.rs
-index 25d628f356b5db61b3256b3945ed32a12f80873e..a87b90d9f565d6ea1f7ef8481ffecfa8de680579 100644
+index 6af235601e2d181f96f2c22547ad0cc9a003d344..7812d4128d9662db8ec5a7adac55001d01df96b2 100644
 --- a/crates/engine/src/session_reports.rs
 +++ b/crates/engine/src/session_reports.rs
 @@ -1085,7 +1085,11 @@ pub(crate) fn settle_groups(
@@ -7874,10 +7891,10 @@ index 25d628f356b5db61b3256b3945ed32a12f80873e..a87b90d9f565d6ea1f7ef8481ffecfa8
      let ledger = host
          .open(parent)
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 6a3bb9910fb85d451e5f01d419b7d5835456755c..69d71b7f05ff410d8023e6cd378219b25ffdcafe 100644
+index b0e0a75a3a97a6f4e359e54384e9646f1cbc03e7..280651c5ac8db66f331e773949d50b824805774b 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
-@@ -11179,10 +11179,11 @@ mod tests {
+@@ -11322,10 +11322,11 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -7892,7 +7909,7 @@ index 6a3bb9910fb85d451e5f01d419b7d5835456755c..69d71b7f05ff410d8023e6cd378219b2
          let rig = family_rig().await;
          let (_lead, kid, b) = rig.group_at_work().await;
          kid.turn.set_background_processes(vec![background_task()]);
-@@ -11198,14 +11199,17 @@ mod tests {
+@@ -11341,14 +11342,17 @@ mod tests {
          rig.until("Tests works again", |r| r.status("kid-a").status == SessionStatus::Working).await;
          kid.feed.send(text("Pushed abc123.")).unwrap();
          kid.feed.send(done(DoneStatus::Completed)).unwrap();

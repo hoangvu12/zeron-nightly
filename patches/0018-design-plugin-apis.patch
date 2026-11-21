@@ -1,4 +1,4 @@
-From 825c638ed221d9260876ac2cc0e94543eaaa3410 Mon Sep 17 00:00:00 2001
+From aa040e7477c4f21c5f323554a27b7e827ea5004e Mon Sep 17 00:00:00 2001
 From: zeron-nightly <zeron-nightly@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 00:54:54 +0700
 Subject: [PATCH] Plugins: the APIs a design plugin needs (#1392 at 6094319cb,
@@ -9,20 +9,23 @@ onto upstream main as one commit. #1392's base is the frozen zeron/zgx;
 main moved the same lines, so it conflicts there:
 
 - apps/zgx/Cargo.toml and crates/engine/Cargo.toml: main's side, with
-  every zgx rev moved from main's zeronsh/zgx b80a8af1c to hoangvu12/zgx
-  2d6d52fbc (kept on the branch nightly-design-2d6d52fb): #1392's
-  ebebffb01 (nightly-design-ebebffb0: #2110 at 4914d045a, on zgx main
-  126357bb5, with zgx#2299's four tile fixes cherry-picked onto it and
-  #2285 (middle-mouse press), #2297 (full screen) and #2298 (display
-  scale) merged on) with main's pin b80a8af1c merged in (9a65480ee),
-  then zgx's fabb111f reverted: rows a list builds in spare time are
-  observed there again, or main's transcript (#1495) shows nothing for
-  two steps when a synced chat scrolled up is republished short, then
-  whole.
+  every zgx rev moved from main's zeronsh/zgx b8f298b6b to hoangvu12/zgx
+  39fa8866a (kept on the branch nightly-design-39fa8866): 9a65480ee
+  (#1392's ebebffb01, nightly-design-ebebffb0: #2110 at 4914d045a, on zgx
+  main 126357bb5, with zgx#2299's four tile fixes cherry-picked onto it
+  and #2285 (middle-mouse press), #2297 (full screen) and #2298 (display
+  scale) merged on, with main's earlier pin b80a8af1c merged in) with
+  main's pin b8f298b6b merged in. zgx main has #2110 since e35626b88, so
+  what the fork adds is #2299, #2285, #2297 and #2298. The fabb111f
+  revert the previous rev (2d6d52fbc) carried is gone: b8f298b6b has
+  zgx#2386, which fixes fabb111f's frame-late row reports.
 - apps/zgx/src/plugins/mod.rs: a plugin's window gets its memory, then
   main's reload, held until the window's first load.
 - apps/zgx/ui/consent_fixture.luau: both main's "draft" and #1392's
   "fonts" permissions.
+- crates/engine/src/plugins/manifest.rs, apps/zgx/src/plugins/grants.rs,
+  apps/zgx/ui/screens/plugins/words.luau and ui/locales: main's
+  "scene3d" permission (#1539) and #1392's "fonts", both.
 - apps/zgx/Cargo.lock: main's, updated by cargo for the new zgx source and
   zeron-plugin-db; Cargo.lock: the same, with smallvec at 1.16.5 (the zgx
   merge asks for ^1.16). Since #1499 retired crates/ui, the font and text
@@ -33,8 +36,8 @@ main moved the same lines, so it conflicts there:
 ---
  Cargo.lock                                    | 340 +++++++++++++++-
  Cargo.toml                                    |   2 +
- apps/zgx/Cargo.lock                           |  77 ++--
- apps/zgx/Cargo.toml                           |  36 +-
+ apps/zgx/Cargo.lock                           |  60 +--
+ apps/zgx/Cargo.toml                           |  37 +-
  apps/zgx/docs/plugins.md                      |  46 ++-
  apps/zgx/src/plugins/consent.rs               |   5 +
  apps/zgx/src/plugins/db.rs                    | 207 +---------
@@ -61,14 +64,14 @@ main moved the same lines, so it conflicts there:
  crates/mcp/src/jsonrpc.rs                     | 264 +++++++++++-
  crates/plugin-db/Cargo.toml                   |  13 +
  crates/plugin-db/src/lib.rs                   | 378 ++++++++++++++++++
- 30 files changed, 2405 insertions(+), 281 deletions(-)
+ 30 files changed, 2390 insertions(+), 280 deletions(-)
  create mode 100644 crates/engine/src/plugins/service/files.rs
  create mode 100644 crates/engine/src/plugins/service/vm/text.rs
  create mode 100644 crates/plugin-db/Cargo.toml
  create mode 100644 crates/plugin-db/src/lib.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b450108ca3 100644
+index f8e6db5ad1ec4584877d30e5f7b4f3ae0f5965b6..15b7700e8e3a764c95a9aa853b3cabfcb7efcc65 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -196,6 +196,15 @@ version = "0.1.12"
@@ -477,11 +480,11 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
  
 @@ -9120,6 +9358,14 @@ dependencies = [
  name = "zeron-orb"
- version = "0.3.8"
+ version = "0.3.14"
  
 +[[package]]
 +name = "zeron-plugin-db"
-+version = "0.3.8"
++version = "0.3.14"
 +dependencies = [
 + "rusqlite",
 + "serde_json",
@@ -489,7 +492,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +
  [[package]]
  name = "zeron-plugin-guard"
- version = "0.3.8"
+ version = "0.3.14"
 @@ -9440,6 +9686,96 @@ dependencies = [
   "syn 3.0.3",
  ]
@@ -497,7 +500,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +[[package]]
 +name = "zgx"
 +version = "0.1.10"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
 +dependencies = [
 + "foldhash 0.2.0",
 + "libc",
@@ -517,7 +520,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +[[package]]
 +name = "zgx-cosmic-text"
 +version = "0.19.14"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
 +dependencies = [
 + "bitflags 2.13.1",
 + "fontdb",
@@ -541,7 +544,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +[[package]]
 +name = "zgx-harfrust"
 +version = "0.5.4"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
 +dependencies = [
 + "bitflags 2.13.1",
 + "bytemuck",
@@ -553,7 +556,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +[[package]]
 +name = "zgx-swash"
 +version = "0.2.11"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
 +dependencies = [
 + "skrifa 0.44.0",
 + "yazi",
@@ -563,7 +566,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +[[package]]
 +name = "zgx-taffy"
 +version = "0.9.2"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
 +dependencies = [
 + "arrayvec",
 + "grid",
@@ -574,7 +577,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
 +[[package]]
 +name = "zgx-text"
 +version = "0.1.10"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
 +dependencies = [
 + "fontconfig-parser",
 + "rustc-hash 2.1.3",
@@ -588,7 +591,7 @@ index 611152ef45e31fd4e8eda7d4d6ca1a159d914093..929567d194118e3e2b8785a4163fd5b4
  name = "zip"
  version = "7.2.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index 810d395ccbbbacce0885329595454c630bf4df9c..c899c9f10886d70475590e905184d7af40aae48a 100644
+index edb7669a0fe0d2c08f6b6798b90257e9cb5170f6..0599c6cfbf3357bbec7f1405a5b848cad92eef38 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -33,6 +33,7 @@ members = [
@@ -608,15 +611,15 @@ index 810d395ccbbbacce0885329595454c630bf4df9c..c899c9f10886d70475590e905184d7af
  # CRDT
  loro = "1.17"
 diff --git a/apps/zgx/Cargo.lock b/apps/zgx/Cargo.lock
-index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2be9f82fb9 100644
+index 69d3e4cb22f70e9eb776cb52a449a10d940c165b..2d65854e671702f680fce539156eb51c11bf7509 100644
 --- a/apps/zgx/Cargo.lock
 +++ b/apps/zgx/Cargo.lock
 @@ -30,7 +30,7 @@ dependencies = [
  [[package]]
  name = "accesskit_atspi_common"
  version = "0.19.1"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
@@ -624,8 +627,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "accesskit_consumer"
  version = "0.38.0"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "accesskit",
   "hashbrown 0.16.1",
@@ -633,8 +636,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "accesskit_macos"
  version = "0.26.3"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
@@ -642,8 +645,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "accesskit_unix"
  version = "0.22.1"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "accesskit",
   "accesskit_atspi_common",
@@ -651,8 +654,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "accesskit_windows"
  version = "0.34.0"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
@@ -660,8 +663,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "wgpu-hal"
  version = "29.0.4"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "android_system_properties",
   "arrayvec",
@@ -669,8 +672,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "winit"
  version = "0.30.13"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "ahash",
   "android-activity",
@@ -680,7 +683,7 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  
 +[[package]]
 +name = "zeron-plugin-db"
-+version = "0.3.8"
++version = "0.3.14"
 +dependencies = [
 + "rusqlite",
 + "serde_json",
@@ -688,7 +691,7 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
 +
  [[package]]
  name = "zeron-plugin-guard"
- version = "0.3.8"
+ version = "0.3.14"
 @@ -7381,7 +7389,6 @@ dependencies = [
   "open",
   "png 0.18.1",
@@ -709,8 +712,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "zgx"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "fixed_decimal",
   "foldhash 0.2.0",
@@ -718,8 +721,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "zgx-3d"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "bytemuck",
   "zgx",
@@ -727,8 +730,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "zgx-alacritty-terminal"
  version = "0.26.8"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "base64 0.22.1",
   "bitflags 2.13.2",
@@ -736,8 +739,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "zgx-components"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "zgx",
  ]
@@ -745,8 +748,8 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "zgx-cosmic-text"
  version = "0.19.14"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "bitflags 2.13.2",
   "fontdb",
@@ -754,190 +757,154 @@ index b7b2e8e790ebdd050dafbbf3851eeeb341d06dce..fafaae6117886567aa80c1799d938d2b
  [[package]]
  name = "zgx-desktop"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
-@@ -7603,18 +7611,17 @@ dependencies = [
+@@ -7603,12 +7611,12 @@ dependencies = [
  [[package]]
  name = "zgx-ghostty-sys"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  
  [[package]]
  name = "zgx-gpu"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "ash",
   "block2 0.6.2",
-  "bytemuck",
-  "dispatch2",
-- "fontconfig-parser",
-  "gif",
-  "image",
-  "libc",
-@@ -7629,7 +7636,6 @@ dependencies = [
-  "pollster",
-  "resvg",
-  "rustc-hash 2.1.3",
-- "smallvec",
-  "tiny-skia",
-  "unicode-segmentation",
-  "wayland-backend",
-@@ -7642,13 +7648,14 @@ dependencies = [
-  "x11rb",
-  "zgx",
-  "zgx-cosmic-text",
-+ "zgx-text",
-  "zgx-zune-jpeg",
- ]
- 
+@@ -7647,7 +7655,7 @@ dependencies = [
  [[package]]
  name = "zgx-harfrust"
  version = "0.5.4"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "bitflags 2.13.2",
   "bytemuck",
-@@ -7660,7 +7667,7 @@ dependencies = [
+@@ -7659,7 +7667,7 @@ dependencies = [
  [[package]]
  name = "zgx-mlua"
- version = "0.12.9"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+ version = "0.12.10"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "bstr",
   "either",
-@@ -7675,7 +7682,7 @@ dependencies = [
+@@ -7674,7 +7682,7 @@ dependencies = [
  [[package]]
  name = "zgx-run"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "serde_json",
   "ureq 3.5.0",
-@@ -7687,8 +7694,10 @@ dependencies = [
+@@ -7686,7 +7694,7 @@ dependencies = [
  [[package]]
  name = "zgx-script"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
-+ "base64 0.22.1",
-+ "crc32fast",
-  "icu_locale_core",
-  "icu_plurals",
-  "libc",
-@@ -7712,7 +7721,7 @@ dependencies = [
+  "base64 0.22.1",
+  "crc32fast",
+@@ -7713,7 +7721,7 @@ dependencies = [
  [[package]]
  name = "zgx-swash"
  version = "0.2.11"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "skrifa",
   "yazi",
-@@ -7722,7 +7731,7 @@ dependencies = [
+@@ -7723,7 +7731,7 @@ dependencies = [
  [[package]]
  name = "zgx-taffy"
  version = "0.9.2"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "arrayvec",
   "grid",
-@@ -7733,7 +7742,7 @@ dependencies = [
+@@ -7734,7 +7742,7 @@ dependencies = [
  [[package]]
  name = "zgx-terminal"
  version = "0.1.10"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "base64 0.22.1",
   "flate2",
-@@ -7741,15 +7750,29 @@ dependencies = [
-  "memchr",
-  "png 0.18.1",
-  "polling",
-+ "unicode-width",
-  "windows-sys 0.59.0",
-  "zgx",
-  "zgx-alacritty-terminal",
- ]
- 
-+[[package]]
-+name = "zgx-text"
-+version = "0.1.10"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
-+dependencies = [
-+ "fontconfig-parser",
-+ "rustc-hash 2.1.3",
-+ "smallvec",
-+ "unicode-segmentation",
-+ "zgx",
-+ "zgx-cosmic-text",
-+]
-+
+@@ -7751,7 +7759,7 @@ dependencies = [
+ [[package]]
+ name = "zgx-text"
+ version = "0.1.10"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
+ dependencies = [
+  "fontconfig-parser",
+  "rustc-hash 2.1.3",
+@@ -7764,7 +7772,7 @@ dependencies = [
  [[package]]
  name = "zgx-vte"
  version = "0.15.4"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "arrayvec",
   "bitflags 2.13.2",
-@@ -7761,7 +7784,7 @@ dependencies = [
+@@ -7776,7 +7784,7 @@ dependencies = [
  [[package]]
  name = "zgx-zune-jpeg"
  version = "0.5.15"
--source = "git+https://github.com/zeronsh/zgx?rev=b80a8af1c1f2079e373ec34a9194d26f2c998cbb#b80a8af1c1f2079e373ec34a9194d26f2c998cbb"
-+source = "git+https://github.com/hoangvu12/zgx?rev=2d6d52fbce56a942e2c805b515266af42eaa998f#2d6d52fbce56a942e2c805b515266af42eaa998f"
+-source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
++source = "git+https://github.com/hoangvu12/zgx?rev=39fa8866ad5dc50ddc84789cbc319e63e39de052#39fa8866ad5dc50ddc84789cbc319e63e39de052"
  dependencies = [
   "zune-core",
  ]
 diff --git a/apps/zgx/Cargo.toml b/apps/zgx/Cargo.toml
-index b1c16c719039440c2182dceafca694acbc82416c..cac4b7df6a8c4ff109882663e945dbe15791d13d 100644
+index 11ed63d8bdec095bc0757818d3a61ab2452d04d2..2d063cd2ffd6311d8aed999a2e04824994319fc0 100644
 --- a/apps/zgx/Cargo.toml
 +++ b/apps/zgx/Cargo.toml
-@@ -32,7 +32,11 @@ layout_probe = []
+@@ -32,7 +32,12 @@ layout_probe = []
  
  [dependencies]
  lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
--zgx = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
-+# Every zgx crate below, and the engine's, at the combined zgx pull request
-+# the plugin APIs need (zeronsh/zgx#2110: `Capability::Fonts`, zgx-text, ...,
-+# with #2299, #2285, #2297 and #2298 merged on, and zeron main's zgx pin b80a8af1c, fabb111f reverted: branch nightly-design-2d6d52fb),
-+# on the author's fork until it merges; then back to zeronsh/zgx.
-+zgx = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
+-zgx = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
++# Every zgx crate below, and the engine's, at the zgx the plugin APIs need
++# (zeronsh/zgx#2110: `Capability::Fonts`, zgx-text, ..., on zgx main since
++# e35626b88), with #2299, #2285, #2297 and #2298 merged on, and zeron main's
++# zgx pin b8f298b6b: branch nightly-design-39fa8866, on the author's fork
++# until those merge; then back to zeronsh/zgx.
++zgx = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
  # `mimalloc`: the program's allocator, in place of the system's. It hands
  # freed memory back to the system (the system's keeps the most it ever
  # held), and zgx measures 1-10% less CPU for script, text and layout work.
-@@ -43,7 +47,7 @@ zgx = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9
+@@ -43,7 +48,7 @@ zgx = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e2165
  # none of it, and without it pages are placeholders ("Web view · <url>").
  # zgx-run turns it on by default, but this app takes zgx-run without its
  # defaults (below). Nothing on macOS or Windows.
--zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb", features = ["mimalloc", "terminal", "webkitgtk"] }
-+zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", features = ["mimalloc", "terminal", "webkitgtk"] }
+-zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", features = ["mimalloc", "terminal", "webkitgtk"] }
++zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", features = ["mimalloc", "terminal", "webkitgtk"] }
  # `inspect`: devtools for `zgx inspect` (and its MCP server), asked for
  # with `--inspect`. `i18n`: `ui.t`'s plurals and numbers by each locale's
  # own rules (ICU4X's data, about 90 KB), for ui/locales' translations.
-@@ -51,18 +55,18 @@ zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e3
+@@ -51,18 +56,18 @@ zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363a
  # wgpu this app already links), for plugins that show 3D: the CAD plugin
  # hands it its own triangles (`geometry = { positions, indices, … }`). It
  # asks no grant; a scene draws a frame only when something in it changes.
--zgx-script = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb", features = ["inspect", "i18n", "scene3d"] }
-+zgx-script = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", features = ["inspect", "i18n", "scene3d"] }
+-zgx-script = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", features = ["inspect", "i18n", "scene3d"] }
++zgx-script = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", features = ["inspect", "i18n", "scene3d"] }
  # A picture's pixels for the clipboard (src/images.rs): zgx's own decoder,
  # the formats `ui.image` shows (no features of its own: the ones zgx-desktop
  # turns on).
--zgx-gpu = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb", default-features = false }
-+zgx-gpu = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", default-features = false }
+-zgx-gpu = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", default-features = false }
++zgx-gpu = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", default-features = false }
  # Each plugin's own database (`zeron.db`, src/plugins/db.rs): SQLite,
 -# built in; `limits` to keep one from attaching any other file.
 -rusqlite = { version = "0.32", features = ["bundled", "limits", "hooks"] }
@@ -946,47 +913,47 @@ index b1c16c719039440c2182dceafca694acbc82416c..cac4b7df6a8c4ff109882663e945dbe1
  # `fetch`: zgx's own transport for `ui.fetch` and remote images (HTTP and
  # HTTPS, rustls), given to every window (src/main.rs): the app's scripts,
  # and plugins granted "network". Nothing else of the runner.
--zgx-run = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb", default-features = false, features = ["fetch"] }
-+zgx-run = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", default-features = false, features = ["fetch"] }
+-zgx-run = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", default-features = false, features = ["fetch"] }
++zgx-run = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", default-features = false, features = ["fetch"] }
  # `webp`: `ui.image` decodes through this crate, by what its features
  # allow, so turning WebP on here is all it takes (the member cards' art).
  # `ico`: sites' favicons (the browser tab's: src/favicons.rs), most of
-@@ -162,7 +166,7 @@ foreign-types = "0.5"
+@@ -162,7 +167,7 @@ foreign-types = "0.5"
  # elements, box drawing and Powerline glyphs to the cell; zgx's own renderer
  # draws them from the font at its text line height, gapped. Builds Ghostty
  # with Zig 0.16 (cached in ~/Library/Caches/zgx-ghostty).
--zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb", features = ["ghostty"] }
-+zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", features = ["ghostty"] }
+-zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", features = ["ghostty"] }
++zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", features = ["ghostty"] }
  
  # Windows' Transparency effects (src/transparency.rs), read and watched in
  # the registry, until zgx reports them (zgx-asks/windows-transparency); a
-@@ -173,7 +177,7 @@ zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e3
+@@ -173,7 +178,7 @@ zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363a
  # 11 (and with Edge on Windows 10); without it, pages are placeholders.
  [target.'cfg(windows)'.dependencies]
  windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_WindowsAndMessaging"] }
--zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb", features = ["webview2"] }
-+zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", features = ["webview2"] }
+-zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", features = ["webview2"] }
++zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", features = ["webview2"] }
  
  # zgx's D-Bus (menus, portals) linked in rather than loaded: `zeron` is also
  # what a headless Linux server and every Cloud machine runs (`zeron
-@@ -185,13 +189,13 @@ libdbus-sys = { version = "0.2.7", features = ["vendored"] }
+@@ -185,13 +190,13 @@ libdbus-sys = { version = "0.2.7", features = ["vendored"] }
  # zgx's own patches (its root Cargo.toml): a git dependency does not bring
  # them, so every consumer repeats them.
  [patch.crates-io]
--wgpu-hal = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
--winit = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
--accesskit_macos = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
--accesskit_consumer = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
--accesskit_atspi_common = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
--accesskit_unix = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
--accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "b80a8af1c1f2079e373ec34a9194d26f2c998cbb" }
-+wgpu-hal = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
-+winit = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
-+accesskit_macos = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
-+accesskit_consumer = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
-+accesskit_atspi_common = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
-+accesskit_unix = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
-+accesskit_windows = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
+-wgpu-hal = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+-winit = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+-accesskit_macos = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+-accesskit_consumer = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+-accesskit_atspi_common = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+-accesskit_unix = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+-accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
++wgpu-hal = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
++winit = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
++accesskit_macos = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
++accesskit_consumer = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
++accesskit_atspi_common = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
++accesskit_unix = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
++accesskit_windows = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
  
  # zgx is slow unoptimized (its own setting): optimize dependencies, keep
  # this crate quick to build.
@@ -1338,18 +1305,18 @@ index d4c3e67df90980a3fb233550d0bb84f90b500635..9942219c884cdea72dbc554d8308446b
 -    }
 -}
 diff --git a/apps/zgx/src/plugins/grants.rs b/apps/zgx/src/plugins/grants.rs
-index 2e731d6e2f1e188b999b76a51deed859f2efe8e5..7e55b10bed565df063bacf493b99a984067f84f0 100644
+index f2d2f3cbf98ce26eb2238bf83d28bfbc973064a8..89c912dc0e8c332f9ae90be96c21f4d2477259de 100644
 --- a/apps/zgx/src/plugins/grants.rs
 +++ b/apps/zgx/src/plugins/grants.rs
-@@ -264,6 +264,7 @@ pub fn capabilities(id: &str, permissions: &[String], change: &[String], replace
-             "files" => out.push(Capability::Files),
+@@ -265,6 +265,7 @@ pub fn capabilities(id: &str, permissions: &[String], change: &[String], replace
              "web" => out.push(Capability::Web),
              "windows" => out.push(Capability::Windows),
+             "scene3d" => out.push(Capability::Scene3d),
 +            "fonts" => out.push(Capability::Fonts),
              // The engine's: tools reach agents through Zeron's MCP server,
              // a native server runs beside agents.
              "tools" | "native" => {}
-@@ -286,6 +287,12 @@ mod tests {
+@@ -287,6 +288,12 @@ mod tests {
          assert_eq!(capabilities("focus", &[], &[], &[]), vec![own("focus")]);
      }
  
@@ -1483,10 +1450,10 @@ index 0c70daf878ebcf45a38ed9320a8ed18a560e26b0..5a480b033db305e854f5b62fd7c15712
  		commands = { "git" },
  		tools = { { name = "a", description = "First." } },
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 3f2e039606f49dab2a6faa70100584a8aa6f4dc9..33856cf787b236db4ad4445c6f1f5b4efb1ee04c 100644
+index d22b64ed4a5b08ae1f254031743ebfc910ff3300..ccf792bdf81974cbe567a99745792da628d18ac1 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
-@@ -3515,6 +3515,9 @@
+@@ -3512,6 +3512,9 @@
          "files_read": {
            "title": "See file names and paths in your projects"
          },
@@ -1497,8 +1464,8 @@ index 3f2e039606f49dab2a6faa70100584a8aa6f4dc9..33856cf787b236db4ad4445c6f1f5b4e
            "title": "Open tabs in your chats' panels"
          },
 @@ -3593,6 +3596,10 @@
-         "windows": {
-           "title": "Open windows of its own"
+         "scene3d": {
+           "title": "Draw 3D scenes"
          },
 +        "fonts": {
 +          "title": "Add fonts of its own",
@@ -1530,10 +1497,10 @@ index 3f2e039606f49dab2a6faa70100584a8aa6f4dc9..33856cf787b236db4ad4445c6f1f5b4e
          "ui_replace": "Replace {places} with its own"
        },
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index 50f7fd7763006ac167a0fcc52bda722abcddb581..1f9f0220f9e5db2145f0faaf63787ef41dc39ec1 100644
+index dbd30378eea3a080613313c3cffc0c501dd8934c..bf1eb868b08bc28c449b5b743645e90e0ae355af 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
-@@ -3518,6 +3518,9 @@
+@@ -3515,6 +3515,9 @@
          "files_read": {
            "title": "查看项目中的文件名和路径"
          },
@@ -1544,8 +1511,8 @@ index 50f7fd7763006ac167a0fcc52bda722abcddb581..1f9f0220f9e5db2145f0faaf63787ef4
            "title": "在对话的面板中打开标签页"
          },
 @@ -3596,6 +3599,10 @@
-         "windows": {
-           "title": "打开自己的窗口"
+         "scene3d": {
+           "title": "绘制 3D 场景"
          },
 +        "fonts": {
 +          "title": "添加自己的字体",
@@ -1577,7 +1544,7 @@ index 50f7fd7763006ac167a0fcc52bda722abcddb581..1f9f0220f9e5db2145f0faaf63787ef4
          "ui_replace": "用自己的界面替换{places}"
        },
 diff --git a/apps/zgx/ui/screens/plugins/words.luau b/apps/zgx/ui/screens/plugins/words.luau
-index 3e18ba196c2efe566eb3131926dfcaf126688b66..74053bf2a23e91bf1311881cd0c489ae1b5d37cb 100644
+index 1d3d842aa4cb58b585d4647e8e496db71485e5f9..e25b2a92476063cde3ecb9a803a03579fd0d0202 100644
 --- a/apps/zgx/ui/screens/plugins/words.luau
 +++ b/apps/zgx/ui/screens/plugins/words.luau
 @@ -265,6 +265,8 @@ function M.permission(item: any, permission: string): Line
@@ -1589,10 +1556,10 @@ index 3e18ba196c2efe566eb3131926dfcaf126688b66..74053bf2a23e91bf1311881cd0c489ae
  	elseif permission == "panel.tabs" then
  		return line(false, "split-columns", "plugins.words.permission.panel_tabs.title")
  	elseif permission == "pages.add" then
-@@ -321,6 +323,10 @@ function M.permission(item: any, permission: string): Line
- 		return line(false, "global", "plugins.words.permission.web.title")
- 	elseif permission == "windows" then
+@@ -323,6 +325,10 @@ function M.permission(item: any, permission: string): Line
  		return line(false, "monitor", "plugins.words.permission.windows.title")
+ 	elseif permission == "scene3d" then
+ 		return line(false, "widget", "plugins.words.permission.scene3d.title")
 +	elseif permission == "fonts" then
 +		-- (A family Zeron draws in, given a face of the plugin's, changes
 +		-- how Zeron's own text looks: said so.)
@@ -1600,7 +1567,7 @@ index 3e18ba196c2efe566eb3131926dfcaf126688b66..74053bf2a23e91bf1311881cd0c489ae
  	elseif permission == "tools" then
  		-- Each tool by name, with what it tells your agents (their words
  		-- reach every agent's list of tools).
-@@ -332,17 +338,22 @@ function M.permission(item: any, permission: string): Line
+@@ -334,17 +340,22 @@ function M.permission(item: any, permission: string): Line
  		return line(false, "smartphone", "plugins.words.permission.devices.title")
  	elseif permission == "service" then
  		-- Its headless half, run by the engine on the device that allowed it
@@ -1626,7 +1593,7 @@ index 3e18ba196c2efe566eb3131926dfcaf126688b66..74053bf2a23e91bf1311881cd0c489ae
  	elseif permission == "commands" then
  		-- The programs its manifest names, as you: what they can do, it can.
  		-- Each by name; a shell or an interpreter says it's full control, one
-@@ -452,6 +463,12 @@ function M.diff(item: any): { Line }
+@@ -454,6 +465,12 @@ function M.diff(item: any): { Line }
  		local maybe_near = type(d.network_named) == "table" and #d.network_named > 0
  		table.insert(out, line(listed.near, "global", "plugins.words.diff.network", if maybe_near then "plugins.words.permission.network.detail_named" else nil, nil, { literal = listed.list }))
  	end
@@ -1640,7 +1607,7 @@ index 3e18ba196c2efe566eb3131926dfcaf126688b66..74053bf2a23e91bf1311881cd0c489ae
  		table.insert(out, line(false, "settings", "plugins.words.diff.settings"))
  	end
 diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
-index b7469e281e36aae647aa2762e0f66ebb5a2775ce..9484264bfa1ee3db94b2ea088dc73223474c14d9 100644
+index b7469e281e36aae647aa2762e0f66ebb5a2775ce..0b3bdc21b81aa670bc07e9d166cb25163bf85944 100644
 --- a/crates/engine/Cargo.toml
 +++ b/crates/engine/Cargo.toml
 @@ -23,6 +23,14 @@ zeron-visual.workspace = true
@@ -1650,11 +1617,11 @@ index b7469e281e36aae647aa2762e0f66ebb5a2775ce..9484264bfa1ee3db94b2ea088dc73223
 +# `zeron.measure_text` in services (plugins/service/vm/text.rs): zgx's own
 +# shaper and font lookup, as a plugin window's canvas measures, with no
 +# window. zgx-text is that alone, without zgx-gpu's renderer (no wgpu or
-+# winit). Pinned, as apps/zgx is, to the combined zgx pull request that
-+# makes it a crate (zeronsh/zgx#2110, on the author's fork until it merges),
-+# so the service and its windows measure alike.
-+zgx = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f", default-features = false }
-+zgx-text = { git = "https://github.com/hoangvu12/zgx", rev = "2d6d52fbce56a942e2c805b515266af42eaa998f" }
++# winit; a crate since zeronsh/zgx#2110). Pinned to apps/zgx's zgx (the
++# author's fork, until what it adds merges), so the service and its windows
++# measure alike.
++zgx = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052", default-features = false }
++zgx-text = { git = "https://github.com/hoangvu12/zgx", rev = "39fa8866ad5dc50ddc84789cbc319e63e39de052" }
  loro.workspace = true
  tokio.workspace = true
  futures.workspace = true
@@ -1767,7 +1734,7 @@ index 36cdf4444871ee7e8b43312663e0b32b619a9e1c..a2881fc89685ae130a330ecbb3cec76c
      fn plugins_capability_a_service_where_there_was_none_grows() {
          let before = record(&manifest(json!({})));
 diff --git a/crates/engine/src/plugins/manifest.rs b/crates/engine/src/plugins/manifest.rs
-index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a256c8f0a 100644
+index 243e8ced4f585080bf293345785487c9a046b736..b46deb4dc9b2855d0ab1144ad93c9c48f92ef1a6 100644
 --- a/crates/engine/src/plugins/manifest.rs
 +++ b/crates/engine/src/plugins/manifest.rs
 @@ -20,6 +20,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
@@ -1780,17 +1747,17 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
      "panel.tabs",
      "pages.add",
      "github",
-@@ -36,6 +39,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
-     "files",
-     "web",
+@@ -38,6 +41,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
      "windows",
+     // Drawing 3D scenes (`ui.scene3d`), the zgx grant `scene3d`.
+     "scene3d",
 +    // Font files of its own for its windows' text (`ui.load_font`), which
 +    // reach every window's text, Zeron's too.
 +    "fonts",
      "tools",
      "devices",
      "native",
-@@ -45,6 +51,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
+@@ -47,6 +53,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
      // each device that allowed it, called by its windows and agents from
      // this device or another (plugins/service).
      "service",
@@ -1800,7 +1767,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
      // The agents' accounts, usage and models (plugins/agents): reading
      // them, and the two controls (switching an account, setting a model).
      "usage.read",
-@@ -58,6 +67,11 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
+@@ -60,6 +69,11 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
      "messages.send",
  ];
  
@@ -1812,7 +1779,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
  /// Ids the app keeps for itself.
  pub const RESERVED_IDS: &[&str] = &["templates", "zeron", "app"];
  
-@@ -217,6 +231,10 @@ pub struct Manifest {
+@@ -219,6 +233,10 @@ pub struct Manifest {
      /// with the permission): none named, any public host; named, those
      /// alone, a private one (`localhost:8080`) only so (plugin-guard's `net`).
      pub network_hosts: Vec<String>,
@@ -1823,7 +1790,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
      /// `None` when absent; `Some(Err)` when present but malformed.
      pub signature: Option<Result<SignatureSpec, ()>>,
      /// The first thing wrong with it, in plain words.
-@@ -410,6 +428,27 @@ impl Manifest {
+@@ -412,6 +430,27 @@ impl Manifest {
                  Vec::new()
              }
          };
@@ -1851,7 +1818,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
          let signature = object.get("signature").map(parse_signature);
          let mut manifest = Manifest {
              raw: raw.clone(),
-@@ -426,6 +465,7 @@ impl Manifest {
+@@ -428,6 +467,7 @@ impl Manifest {
              commands,
              service,
              network_hosts,
@@ -1859,7 +1826,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
              signature,
              problem: None,
          };
-@@ -482,6 +522,14 @@ impl Manifest {
+@@ -484,6 +524,14 @@ impl Manifest {
              }
              _ => {}
          }
@@ -1874,7 +1841,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
          if !self.ui.change.is_empty() && !asks("ui.change") {
              return Some("It changes parts of Zeron but doesn't ask for \"ui.change\"".into());
          }
-@@ -567,6 +615,11 @@ mod tests {
+@@ -569,6 +617,11 @@ mod tests {
          }
      }
  
@@ -1886,7 +1853,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
      fn with(key: &str, value: serde_json::Value) -> serde_json::Value {
          let mut manifest = base();
          manifest[key] = value;
-@@ -611,6 +664,31 @@ mod tests {
+@@ -613,6 +666,31 @@ mod tests {
          }
      }
  
@@ -1918,7 +1885,7 @@ index 5bfd31f574c958375a7a29a1498eeb110309796c..8dda74938c14ef01beb53437a659438a
      #[test]
      fn plugins_manifest_minimal_is_fine() {
          assert_eq!(problem(base()), None);
-@@ -633,6 +711,12 @@ mod tests {
+@@ -635,6 +713,12 @@ mod tests {
          assert!(problem(ui.clone()).is_some());
          ui["permissions"] = serde_json::json!(["ui.change"]);
          assert_eq!(problem(ui), None);
