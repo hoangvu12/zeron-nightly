@@ -221,15 +221,17 @@ jobs:
           dir="$RUNNER_TEMP/unpacked/zeron-$VERSION-linux-$arch"
           test "$("$dir/zeron" --version)" = "zeron $VERSION"
           test "$("$dir/zeron-engine" --version)" = "zeron-engine $VERSION"
-          # What a Docker sandbox runs, and only base libraries (a sandbox
-          # has no desktop ones).
-          "$dir/zeron-engine" watchdog --help >/dev/null
+          # Only base libraries (a sandbox or a bare server has no desktop
+          # ones).
           readelf -d "$dir/zeron-engine" | grep NEEDED
           if readelf -d "$dir/zeron-engine" | grep NEEDED | grep -qvE 'lib(c|m|gcc_s|stdc\+\+|z)\.so|ld-linux'; then
             echo "zeron-engine needs a library a bare sandbox lacks"; exit 1
           fi
-          grep -aq "releases/download/v$VERSION" "$dir/zeron-engine" ||
-            { echo "zeron-engine doesn't name this release for its sandboxes"; exit 1; }
+          # Off with the Docker Sandbox patches (patches-v3.toml, since
+          # 2026-11-21); restore both when they're back on:
+          #   "$dir/zeron-engine" watchdog --help >/dev/null
+          #   grep -aq "releases/download/v$VERSION" "$dir/zeron-engine" ||
+          #     { echo "zeron-engine doesn't name this release for its sandboxes"; exit 1; }
           test -f "$dir/ui/app.luau"
           test -d "$dir/plugins-builtin"
           HOME="$RUNNER_TEMP/home" "$dir/install.sh"
