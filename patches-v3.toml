@@ -194,3 +194,10 @@ note = "The engine took 35-49 s to be ready on the PC (2026-11-14 to 11-18), all
 name = "ui-without-app-refused"
 file = "patches/0026-ui-without-app-refused.patch"
 note = "The PC's v3 opened on nothing (2026-11-18): an update's installer stopped partway after deleting the install's ui folder (dist/zeron-v3.iss now swaps it in only once copied), and the next launch copied the missing folder into templates\\.zeron as an empty one, taking .live's app.luau with it, with the error on stderr alone. sync_zeron now refuses a ui/ without its app.luau and keeps .zeron as the last copy laid it; a launch with ui/ unusable runs .live as the last launch laid it; the errors reach zeron-headed.log. apps/zgx/src/plugins/live.rs and mod.rs, and tracing in apps/zgx's Cargo.toml. Upstream's bug too (its installs swap whole, so it rarely shows there): not yet a PR upstream."
+
+# The composer.
+
+[[patch]]
+name = "slash-list-stuck-loading"
+file = "patches/0029-slash-list-stuck-loading.patch"
+note = "The `/` list stayed on its loading rows after Zeron was closed and opened again, until Reload Zeron (Discord, 2026-11-23): the engine starts cold with the app, a read of the agent's commands that never answered left its list loading, and a list loading was never asked for again. The host's call (chat.invocations) has no deadline, and the engine can wait without one (execution_lease while an agent's update is pending). A read now has 30 s: then it's asked once more, then the list fails and the next `/` or `$` reads again; a late answer to a read given up on changes nothing. apps/zgx/ui only: screens/chat/invocations.luau, with chat_fixture.luau's `invocations_hang` and two tests in tests/chat_invocations.test.luau. What makes the first read hang on a cold engine isn't known yet. Upstream's bug too: not yet a PR upstream."

@@ -1,0 +1,210 @@
+From c19e481af5df3c107bfc578385d041232fb5b7c7 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Mon, 23 Nov 2026 17:51:00 +0700
+Subject: [PATCH] zgx: the `/` list no longer stays loading until Zeron reloads
+
+The composer's `/` and `$` lists sat on their loading rows for good after
+a cold start (the engine started with the app): a read of the agent's
+commands that never answered left its list loading, and a list loading was
+never asked for again, so only Reload Zeron, which drops kept state's
+read, brought it back. The host's call has no deadline, and the engine can
+wait without one (an agent whose update is pending).
+
+A read now has `M.deadline_ms` (30 s) to answer: past it, it's asked once
+more, then the list fails, so the next `/` or `$` reads again. Each read
+has a number, so one given up on and answering late changes nothing; a
+list left loading with no read behind it (a reload kept the state, not the
+read) is read again.
+
+Tests: chat_fixture's `invocations_hang` makes the next read never answer
+(with a 1 s deadline there); one such read is asked again and its list
+shows, two are given up and the next `/` reads again.
+---
+ apps/zgx/ui/chat_fixture.luau                | 17 ++++++
+ apps/zgx/ui/screens/chat/invocations.luau    | 61 ++++++++++++++++++--
+ apps/zgx/ui/tests/chat_invocations.test.luau | 35 +++++++++++
+ 3 files changed, 108 insertions(+), 5 deletions(-)
+
+diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
+index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..3c641d1c759458c1b0de7d8e581703d24fef7f04 100644
+--- a/apps/zgx/ui/chat_fixture.luau
++++ b/apps/zgx/ui/chat_fixture.luau
+@@ -667,8 +667,25 @@ end
+ -- (screens/chat/invocations), each read noted.
+ local Invocations = require("@app/screens/chat/invocations")
+ local invocations_stub = Invocations :: any
++-- (A read the host never answers is given up on in a moment, not 30 s.)
++invocations_stub.deadline_ms = 1000
++-- `invocations_hang`: one more of the next reads never answers (an engine
++-- that took the call and went quiet). Run twice, the next two.
++local INVOCATIONS_HANG = ui.state("fixture_invocations_hang", 0)
++ui.command {
++	id = "invocations_hang",
++	title = "The next read of the agent's commands never answers",
++	run = function()
++		INVOCATIONS_HANG:set(INVOCATIONS_HANG:peek() + 1)
++	end,
++}
+ invocations_stub.read = function(harness: string, target: any): any
+ 	note(`invocations:{harness}:{target.chat or target.space or "?"}`)
++	local hang = INVOCATIONS_HANG:peek()
++	if hang > 0 then
++		INVOCATIONS_HANG:set(hang - 1)
++		return { after = function() end }
++	end
+ 	return settled({
+ 		rows = {
+ 			{ kind = "command", name = "review", label = "/review", detail = "Review the diff · <branch>", link = "[/review](zeron-invoke:7b226b696e64223a22636f6d6d616e64222c226e616d65223a22726576696577227d)" },
+diff --git a/apps/zgx/ui/screens/chat/invocations.luau b/apps/zgx/ui/screens/chat/invocations.luau
+index 574343200ea57c8d66939212d72e5343c0848b0e..e71972174463f0fc3077d8742da9101eb5c4aa43 100644
+--- a/apps/zgx/ui/screens/chat/invocations.luau
++++ b/apps/zgx/ui/screens/chat/invocations.luau
+@@ -7,7 +7,8 @@
+ --
+ -- Each list is kept by agent and place (kept state: a reload reads none
+ -- again) and read again each time a `/` or `$` opens afresh, the last list
+--- showing meanwhile, as Zeron's does.
++-- showing meanwhile, as Zeron's does. A read that doesn't answer in time is
++-- asked once more, then given up (`M.deadline_ms`).
+ --
+ -- A command or skill picked lands in the draft as its token (`/review`,
+ -- `$code-review`); what it stands for is remembered, and the send writes
+@@ -49,28 +50,77 @@ local function put(key: string, catalog: Catalog)
+ 	CATALOGS:set(now)
+ end
+ 
++-- How long a read may take before it's given up on (ms). The engine's own
++-- probe of an agent's commands stops at 25 s, but its answer may never come:
++-- the host's call has no deadline, and the engine waits without one for an
++-- agent whose update is pending. A read given up on is asked once more, then
++-- the list is failed, so the next `/` or `$` reads again; before, it stayed
++-- loading for good (its rows' skeleton) until Zeron was reloaded.
++-- (A test makes it short.)
++M.deadline_ms = 30000
++
++-- Each read's number, so one given up on and answering late changes nothing.
++local serial = 0
++-- When each list's read in flight began (ui.now()), and its number.
++local reading: { [string]: { serial: number, since: number } } = {}
++
+ -- Reads the list for `harness` at `target` (again, if it has been), the
+ -- last one showing until it lands.
+-function M.load(harness: string, target: Target)
++function M.load(harness: string, target: Target, retried: boolean?)
+ 	local key = M.key(harness, target)
+ 	if not key then
+ 		return
+ 	end
+ 	local was = CATALOGS:peek()[key]
+ 	if was and was.state == "loading" then
+-		return
++		-- One on its way already, unless it's past its time or no longer
++		-- tracked (a reload kept the state, not the read).
++		local inflight = reading[key]
++		if inflight and ui.now() - inflight.since < M.deadline_ms then
++			return
++		end
++	end
++	serial += 1
++	local mine = serial
++	reading[key] = { serial = mine, since = ui.now() }
++	local function current(): boolean
++		local r = reading[key]
++		return r ~= nil and r.serial == mine
++	end
++	local function fail(why: string)
++		reading[key] = nil
++		local now = CATALOGS:peek()[key]
++		put(key, { state = "failed", rows = if now then now.rows else {}, warning = if now then now.warning else nil, error = why })
+ 	end
+ 	put(key, { state = "loading", rows = if was then was.rows else {}, warning = if was then was.warning else nil })
+ 	local ok, promise = pcall(M.read, harness, target)
+ 	if not ok or not promise then
+-		put(key, { state = "failed", rows = if was then was.rows else {}, error = ui.t("chat.invocations.couldnt_list"):get() })
++		fail(ui.t("chat.invocations.couldnt_list"):get())
+ 		return
+ 	end
+ 	promise:after(function(got: any)
++		if not current() then
++			return
++		end
++		reading[key] = nil
+ 		local rows = if type(got) == "table" and type(got.rows) == "table" then got.rows else {}
+ 		put(key, { state = "ready", rows = rows, warning = if type(got) == "table" then got.warning else nil })
+ 	end, function(err: any)
+-		put(key, { state = "failed", rows = if was then was.rows else {}, error = tostring(err) })
++		if current() then
++			fail(tostring(err))
++		end
++	end)
++	-- No answer in time: asked once more, then given up.
++	ui.after(M.deadline_ms, function()
++		if not current() then
++			return
++		end
++		if retried then
++			fail(ui.t("chat.invocations.couldnt_list"):get())
++		else
++			reading[key] = nil
++			M.load(harness, target, true)
++		end
+ 	end)
+ end
+ 
+@@ -198,6 +248,7 @@ end
+ 
+ -- Forgets every list and pick (a test's fresh start).
+ function M.forget()
++	reading = {}
+ 	CATALOGS:set({})
+ 	PICKS:set({})
+ end
+diff --git a/apps/zgx/ui/tests/chat_invocations.test.luau b/apps/zgx/ui/tests/chat_invocations.test.luau
+index de13445f22687534cb1c89b7b7005bc0a820f12a..683f72fa16fa5b151203c0c14b932abd67b1557e 100644
+--- a/apps/zgx/ui/tests/chat_invocations.test.luau
++++ b/apps/zgx/ui/tests/chat_invocations.test.luau
+@@ -45,6 +45,41 @@ test("`/` lists the agent's commands, read as it opens, narrowing as the name is
+ 	expect(reads(app)).to_be(1)
+ end)
+ 
++test("a read the engine never answers is asked again in time, not left loading until Zeron reloads", function()
++	local app = chat()
++	app:command("invocations_hang")
++	settle(app)
++	app:type("role:textbox", "/")
++	settle(app)
++	expect(reads(app)).to_be(1)
++	-- (Its rows' skeleton meanwhile: none of the agent's.)
++	expect(app:has('role:option "/review"')).to_be(false)
++	-- Past the fixture's deadline (1 s): asked once more, which answers.
++	expect(app:wait('role:option "/review"', { timeout_ms = 5000 })).to_be(true)
++	expect(reads(app)).to_be(2)
++end)
++
++test("a read that never answers twice is given up, and the next `/` reads again", function()
++	local app = chat()
++	app:command("invocations_hang")
++	app:command("invocations_hang")
++	settle(app)
++	app:type("role:textbox", "/")
++	settle(app)
++	-- (Both reads, 1 s each, then given up: no third read while it's open.)
++	app:wait('"never shown, only waited past"', { timeout_ms = 3000 })
++	settle(app)
++	expect(reads(app)).to_be(2)
++	expect(app:has('role:option "/review"')).to_be(false)
++	app:key("Escape")
++	app:key("Backspace")
++	settle(app)
++	app:type("role:textbox", "/")
++	settle(app)
++	expect(reads(app)).to_be(3)
++	expect(app:has('role:option "/review"')).to_be(true)
++end)
++
+ test("`$` lists the skills; with the agent's `$` off it's plain text, and with `/` not separate, `/` lists them too", function()
+ 	local app = chat()
+ 	app:type("role:textbox", "$")
+-- 
+2.55.0.windows.2
+
