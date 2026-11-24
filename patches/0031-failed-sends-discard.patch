@@ -1,0 +1,674 @@
+From 67442954e555c2c5e62d2c2bd2c554d32736e75d Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Tue, 24 Nov 2026 14:06:44 +0000
+Subject: [PATCH] zgx: a send not delivered can be discarded, and sent again
+ whole
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A prompt that failed before its run was made (a file's upload failed, the
+link to the chat's device was down, a new chat not yet known here) had no
+run to send again, so "Not delivered — send again" dropped its row: the
+composer was said to have the words, but a new chat's had already let them
+go, so the message was gone (Discord, 2026-11-24: a new chat on another
+device, sent while the link to it dropped for 5 s). And a failed row could
+only be sent again: one that kept failing (a file over the 24 MB a message
+may carry) sat under every later turn until Zeron restarted.
+
+A pending prompt now keeps the send as it was asked for, and one with no run
+is sent again whole from it under its own id, its row staying meanwhile.
+Its row says why when that's known ("A file is over 24 MB"), and offers
+Discard (`chat.discard`): the row goes and it's never sent; one still in
+the engine's outbox is taken out of it first (RemoveHeldSend, by the id
+follow_held now keeps). Only a failed row can be discarded. Preview mode
+refuses it, as it does chat.retry. Zeron v2's lane_tab copy passes it too.
+
+Tests: chat_pending_tests' a_send_that_failed_before_its_run_is_sent_again_
+whole_not_dropped and discard_lets_a_failed_prompt_go_but_never_one_on_its_
+way; chat_in_place's Discard and too-large lines (chat_fixture's
+`undelivered_too_large`, and `discard` stubbed).
+---
+ apps/zgx/src/chat.rs                          | 97 ++++++++++++++++---
+ apps/zgx/src/chat_pending_tests.rs            | 56 ++++++++++-
+ apps/zgx/src/plugins/preview.rs               |  1 +
+ apps/zgx/ui/chat_fixture.luau                 | 18 ++++
+ apps/zgx/ui/ds/locale_en.luau                 |  2 +
+ apps/zgx/ui/ds/transcript.luau                | 70 ++++++++-----
+ apps/zgx/ui/locales/en.json                   |  2 +
+ apps/zgx/ui/locales/zh-Hans.json              |  2 +
+ apps/zgx/ui/screens/chat/lane_tab.luau        |  3 +
+ apps/zgx/ui/screens/chat/session.luau         |  6 ++
+ apps/zgx/ui/screens/chat/store.luau           |  6 ++
+ apps/zgx/ui/templates/zeron-v2/.base.json     |  2 +-
+ .../zeron-v2/screens/chat/lane_tab.luau       |  3 +
+ apps/zgx/ui/tests/chat_in_place.test.luau     | 26 +++++
+ 14 files changed, 258 insertions(+), 36 deletions(-)
+
+diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
+index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff81bdc24d 100644
+--- a/apps/zgx/src/chat.rs
++++ b/apps/zgx/src/chat.rs
+@@ -882,6 +882,14 @@ struct Pending {
+     row: bool,
+     /// The files the engine delivers for it, for a run sent again.
+     transfers: Vec<Json>,
++    /// The send as it was asked for (`chat.send`'s request): one that failed
++    /// before its run was made (a file's upload, a link down) is sent again
++    /// whole from it, rather than dropped.
++    request: Option<Value>,
++    /// Why it wasn't delivered, when that's known (an outcome: "too_large").
++    failure: Option<Outcome>,
++    /// Its id in the engine's outbox while it's held there, to take it out.
++    item: Option<String>,
+ }
+ 
+ impl Pending {
+@@ -897,6 +905,8 @@ impl Pending {
+             ("text", Value::from(words.as_str())),
+             ("attachments", carried_value(&self.paths, &quotes, &picks, &comments, &chats)),
+             ("waiting", Value::from(self.waiting)),
++            // (Why it wasn't delivered, when that's known.)
++            ("failure", self.failure.map_or(Value::Nil, Value::from)),
+             // Still in the engine's outbox, its files uploading: nothing has
+             // gone to its chat yet (a Cloud machine isn't woken for it).
+             ("held", Value::Bool(self.held)),
+@@ -1307,6 +1317,10 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+             held: false,
+             row: false,
+             transfers: Vec::new(),
++            // (Its send, once the chat is made, puts its own row in its place.)
++            request: None,
++            failure: None,
++            item: None,
+         });
+     });
+     let c = chats.clone();
+@@ -1412,6 +1426,12 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+         let v = pick(&args);
+         async move { crate::plugins::preview::refuse("chat.retry")?; v.retry(args).await.map(|_| Value::Nil).map_err(String::from) }
+     });
++    // A prompt that wasn't delivered, let go unsent: `{ id, message }`.
++    let pick = which.clone();
++    host.async_action("chat.discard", move |args| {
++        let v = pick(&args);
++        async move { crate::plugins::preview::refuse("chat.discard")?; v.discard(args).await.map(|_| Value::Nil).map_err(String::from) }
++    });
+     // A send in this device's outbox (still uploading, or stopped) taken out
+     // for good: `{ id, item, message? }` → whether it was there to take
+     // ("unsupported": an engine from before it can).
+@@ -3053,6 +3073,10 @@ impl View {
+             held: false,
+             row: false,
+             transfers: Vec::new(),
++            // (Under the id it shows as, so sent again it's this row again.)
++            request: Some(with_fields(req.clone(), [("message_id", Value::from(message_id.as_str()))])),
++            failure: None,
++            item: None,
+         });
+         drop(pending);
+         if !fresh && !chats.running(&id) {
+@@ -3144,8 +3168,8 @@ impl View {
+                     paths.push(at)
+                 }
+                 Err(why) => {
+-                    // Failed before it could go: the prompt says so.
+-                    self.mark_failed(&id, &message_id, None);
++                    // Failed before it could go: the prompt says so, and why.
++                    self.mark_failed(&id, &message_id, None, Some(why));
+                     return Err(why);
+                 }
+             }
+@@ -3207,7 +3231,8 @@ impl View {
+         // parent's.)
+         if fresh && config["harness"].is_null() {
+             eprintln!("zeron-zgx: chat: {id}: no agent to send with (the chat isn't known here yet)");
+-            self.mark_failed(&id, &message_id, None);
++            // (Sent again once it is: its request is kept.)
++            self.mark_failed(&id, &message_id, None, None);
+             return Err("missing");
+         }
+         // A chat just made: its config goes out now, and its first message
+@@ -3252,7 +3277,7 @@ impl View {
+                         // (It runs what its row says, then.)
+                         chats.starting.borrow_mut().remove(&id);
+                         chats.publish_views();
+-                        self.mark_failed(&id, &message_id, None);
++                        self.mark_failed(&id, &message_id, None, Some(engine::outcome(&e)));
+                         return Err(engine::outcome(&e));
+                     }
+                 }
+@@ -3266,7 +3291,7 @@ impl View {
+             {
+                 p.transfers = transfers;
+             }
+-            self.mark_failed(&id, &message_id, Some(run));
++            self.mark_failed(&id, &message_id, Some(run), sent.err());
+         } else if !fresh && runs_otherwise(&chat["config"], &config) {
+             // Sent with another agent, model or effort than the chat had (the
+             // composer's pick, kept as a draft until now): the chat takes
+@@ -3318,6 +3343,7 @@ impl View {
+                 };
+                 let waiting = if send["failure"].is_string() { "failed" } else { "sending" };
+                 let row = send["queueRow"].as_bool() == Some(true);
++                let item = send["id"].as_str().map(str::to_owned);
+                 let prompts = pending.entry(chat.to_owned()).or_default();
+                 match prompts.iter_mut().find(|p| p.id == message) {
+                     Some(p) => {
+@@ -3326,6 +3352,7 @@ impl View {
+                         p.row = row;
+                         p.waiting = waiting;
+                         p.retry = None;
++                        p.item = item;
+                     }
+                     None => {
+                         let (words, paths) =
+@@ -3340,6 +3367,10 @@ impl View {
+                             held: true,
+                             row,
+                             transfers: Vec::new(),
++                            // (The engine has it, and sends it again.)
++                            request: None,
++                            failure: None,
++                            item,
+                         });
+                         changed = true;
+                     }
+@@ -3352,13 +3383,15 @@ impl View {
+     }
+ 
+     /// A pending prompt that didn't go: failed, with the command that sends
+-    /// it again (none: it never got that far, and is sent again whole).
+-    fn mark_failed(&self, id: &str, message_id: &str, retry: Option<Json>) {
++    /// it again (none: it never got that far, and is sent again whole), and
++    /// why, when that's known.
++    fn mark_failed(&self, id: &str, message_id: &str, retry: Option<Json>, failure: Option<Outcome>) {
+         if let Some(pending) = self.pending.borrow_mut().get_mut(id)
+             && let Some(p) = pending.iter_mut().find(|p| p.id == message_id)
+         {
+             p.waiting = "failed";
+             p.retry = retry;
++            p.failure = failure;
+         }
+         self.publish_messages();
+     }
+@@ -3399,12 +3432,13 @@ impl View {
+         if self.open_id().as_deref() != Some(&id) {
+             return Err("missing");
+         }
+-        let (run, transfers, held) = {
++        let (run, transfers, held, request) = {
+             let mut pending = self.pending.borrow_mut();
+             let prompts = pending.get_mut(&id).ok_or("missing")?;
+             let p = prompts.iter_mut().find(|p| p.id == message_id).ok_or("missing")?;
+             p.waiting = "sending";
+-            (p.retry.clone(), p.transfers.clone(), p.held)
++            p.failure = None;
++            (p.retry.clone(), p.transfers.clone(), p.held, p.request.clone())
+         };
+         self.publish_messages();
+         // In the engine's outbox: the engine has what it takes to send it.
+@@ -3416,20 +3450,56 @@ impl View {
+                 .map_err(|e| engine::outcome(&e));
+         }
+         let Some(run) = run else {
+-            // It never got as far as a run (an upload failed): the composer
+-            // has the words; the row goes.
++            // It never got as far as a run (an upload failed, the link to its
++            // device was down, the chat wasn't known here yet): sent again
++            // whole, as it was asked for, its row staying meanwhile. (Before,
++            // the row went and the words with it: a new chat's composer had
++            // already let them go.)
++            if let Some(request) = request {
++                return self.send(request).await;
++            }
++            // (Nothing kept to send it from: the composer has the words.)
+             self.forget_pending(&id, &message_id);
+             self.publish_messages();
+             return Err("failed");
+         };
+         let sent = command_with(&id, run.clone(), &transfers).await;
+         if sent.is_err() {
+-            self.mark_failed(&id, &message_id, Some(run));
++            self.mark_failed(&id, &message_id, Some(run), sent.err());
+         }
+         self.publish_messages();
+         sent
+     }
+ 
++    /// A prompt that wasn't delivered, let go: its row goes and it's never
++    /// sent. One still in the engine's outbox is taken out of it first
++    /// (`RemoveHeldSend`); one the engine can't take out stays.
++    async fn discard(self: &Rc<Self>, args: Value) -> Result<(), Outcome> {
++        let id = args.field("id").map(text).unwrap_or_default();
++        let message_id = args.field("message").map(text).unwrap_or_default();
++        let item = {
++            let pending = self.pending.borrow();
++            let p = pending
++                .get(&id)
++                .and_then(|prompts| prompts.iter().find(|p| p.id == message_id))
++                .ok_or("missing")?;
++            // (Only one that failed: one on its way may still land.)
++            if p.waiting != "failed" {
++                return Err("missing");
++            }
++            if p.held { p.item.clone() } else { None }
++        };
++        if let Some(item) = item {
++            engine::get()
++                .call("RemoveHeldSend", json!({ "chatId": id, "id": item }))
++                .await
++                .map_err(|e| held_removal_failure(&e))?;
++        }
++        self.forget_pending(&id, &message_id);
++        self.publish_messages();
++        Ok(())
++    }
++
+     async fn respond(self: &Rc<Self>, args: Value) -> Result<(), Outcome> {
+         let id = args.field("id").map(text).unwrap_or_default();
+         let request = args.field("request").map(text).unwrap_or_default();
+@@ -9371,6 +9441,9 @@ mod tests {
+                 held: false,
+                 row: false,
+                 transfers: Vec::new(),
++                request: None,
++                failure: None,
++                item: None,
+             }],
+         );
+         let ids = || -> Vec<String> {
+diff --git a/apps/zgx/src/chat_pending_tests.rs b/apps/zgx/src/chat_pending_tests.rs
+index 0a4def0ee29e8737b979d4cde62a8b0540ccc1ac..a10fc4314a0c346b9caf9859681b323bb30a94dc 100644
+--- a/apps/zgx/src/chat_pending_tests.rs
++++ b/apps/zgx/src/chat_pending_tests.rs
+@@ -130,7 +130,7 @@ fn a_send_that_fails_while_away_keeps_its_prompt_and_retry() {
+     let (_app, view, _sending) = pending_chat();
+     view.open_chat(Some("other-chat".into()));
+     let run = json!({ "kind": "run", "messageId": "first-message", "request": { "prompt": "Find the startup bug" } });
+-    view.mark_failed("new-chat", "first-message", Some(run.clone()));
++    view.mark_failed("new-chat", "first-message", Some(run.clone()), None);
+     assert_eq!(messages(&view), json!([]));
+ 
+     view.open_chat(Some("new-chat".into()));
+@@ -151,6 +151,59 @@ fn a_send_that_fails_while_away_keeps_its_prompt_and_retry() {
+     assert_eq!(messages(&view)[0]["waiting"], "sending");
+ }
+ 
++#[test]
++fn a_send_that_failed_before_its_run_is_sent_again_whole_not_dropped() {
++    // A new chat's first message that never got as far as a run (its file's
++    // upload failed, the link to its device was down): "send again" used to
++    // drop its row, and a new chat's composer had already let the words go.
++    let (_app, view, _sending) = pending_chat();
++    view.mark_failed("new-chat", "first-message", None, Some("too_large"));
++    let failed = messages(&view);
++    assert_eq!(failed[0]["waiting"], "failed");
++    assert_eq!(failed[0]["failure"], "too_large", "the row can say why");
++
++    let mut retry = Box::pin(view.retry(Value::record([
++        ("id", Value::from("new-chat")),
++        ("message", Value::from("first-message")),
++    ])));
++    // (Sent again from its request: it waits on the engine, as the first did.)
++    assert!(
++        retry
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop()))
++            .is_pending()
++    );
++    let again = messages(&view);
++    assert_eq!(again.as_array().unwrap().len(), 1, "still its one row, under its own id");
++    assert_eq!(again[0]["id"], "first-message");
++    assert_eq!(again[0]["text"], "Find the startup bug");
++    assert_eq!(again[0]["waiting"], "sending");
++    assert!(again[0]["failure"].is_null());
++}
++
++#[test]
++fn discard_lets_a_failed_prompt_go_but_never_one_on_its_way() {
++    let (_app, view, _sending) = pending_chat();
++    let discard = || {
++        let mut d = Box::pin(view.discard(Value::record([
++            ("id", Value::from("new-chat")),
++            ("message", Value::from("first-message")),
++        ])));
++        match d.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++            std::task::Poll::Ready(out) => out,
++            std::task::Poll::Pending => panic!("a prompt not in the outbox goes at once"),
++        }
++    };
++    // Still sending: it may yet land, so it stays.
++    assert_eq!(discard(), Err("missing"));
++    assert_eq!(messages(&view)[0]["waiting"], "sending");
++
++    view.mark_failed("new-chat", "first-message", None, None);
++    assert_eq!(discard(), Ok(()));
++    assert_eq!(messages(&view), json!([]));
++    assert!(!view.pending.borrow().contains_key("new-chat"));
++}
++
+ #[test]
+ fn a_saved_first_prompt_stays_visible_after_the_sending_indicator_expires() {
+     let (_app, view, _sending) = pending_chat();
+@@ -207,6 +260,7 @@ fn a_failed_send_in_the_outbox_reads_failed_and_comes_back() {
+         let prompt = &pending["other-chat"][0];
+         assert!(prompt.held, "the engine retries it, not a command from here");
+         assert!(prompt.retry.is_none());
++        assert_eq!(prompt.item.as_deref(), Some("send-m1"), "Discard takes it out of the outbox by this");
+     }
+     view.follow_held(&[held_send("m1", None)]);
+     assert_eq!(messages(&view)[0]["waiting"], "sending");
+diff --git a/apps/zgx/src/plugins/preview.rs b/apps/zgx/src/plugins/preview.rs
+index be5a0e4ed5b88611d8a6e781a64c7993124d43d9..850aee12a5134c6141c601956f72c3ca16cfcdb1 100644
+--- a/apps/zgx/src/plugins/preview.rs
++++ b/apps/zgx/src/plugins/preview.rs
+@@ -74,6 +74,7 @@ pub const BLOCKED: &[&str] = &[
+     "chat.queue_edit",
+     "chat.queue_finish",
+     "chat.retry",
++    "chat.discard",
+     "chat.remove_held",
+     // (Only one that says what an agent may do unasked: `chat.configure`.)
+     "chat.configure",
+diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
+index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..0544e471c0af959e07a47fda19645ac9af0cc12e 100644
+--- a/apps/zgx/ui/chat_fixture.luau
++++ b/apps/zgx/ui/chat_fixture.luau
+@@ -417,6 +417,17 @@ end
+ stub.retry = function(id: string, message: string)
+ 	note(`retry:{id}:{message}`)
+ end
++-- A prompt not delivered, let go (noted): gone from the list, as the host's.
++stub.discard = function(id: string, message: string)
++	note(`discard:{id}:{message}`)
++	local kept = {}
++	for _, m in store.messages:peek() do
++		if m.id ~= message then
++			table.insert(kept, m)
++		end
++	end
++	store.messages:set(kept)
++end
+ -- This device's outbox, as the engine takes a send out of it (#1256's
+ -- RemoveHeldSend): gone from the chat's waiting list, or not there. An
+ -- engine from before it refuses.
+@@ -501,6 +512,13 @@ ui.command {
+ 		store.messages:push { id = "lost1", role = "user", text = "Lost on the way", waiting = "failed" }
+ 	end,
+ }
++ui.command {
++	id = "undelivered_too_large",
++	title = "A send wasn't delivered: its file is over 24 MB",
++	run = function()
++		store.messages:push { id = "big1", role = "user", text = "Transcribe this recording", waiting = "failed", failure = "too_large" }
++	end,
++}
+ stub.interrupt = function(id: string)
+ 	note(`interrupt:{id}`)
+ end
+diff --git a/apps/zgx/ui/ds/locale_en.luau b/apps/zgx/ui/ds/locale_en.luau
+index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..ad48609d2da64d9502f470be5d873afc7e0ea242 100644
+--- a/apps/zgx/ui/ds/locale_en.luau
++++ b/apps/zgx/ui/ds/locale_en.luau
+@@ -573,6 +573,8 @@ return {
+ 	["ds.transcript.switched"] = "Switched from {from} to {to}",
+ 	["ds.transcript.message_from"] = "Message from",
+ 	["ds.transcript.not_delivered"] = "Not delivered — send again",
++	["ds.transcript.too_large"] = "A file is over 24 MB",
++	["ds.transcript.discard"] = "Discard",
+ 	["ds.transcript.reply"] = "Reply",
+ 	["ds.transcript.you"] = "You",
+ 	["ds.transcript.agent"] = "Agent",
+diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
+index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..a9007a29105012d3abb19c5218e97ecfdcbffaee 100644
+--- a/apps/zgx/ui/ds/transcript.luau
++++ b/apps/zgx/ui/ds/transcript.luau
+@@ -100,6 +100,9 @@ export type Message = {
+ 	-- reply's place.
+ 	waiting: ("sending" | "working" | "failed")?,
+ 	since: number?,
++	-- Not delivered, why, when that's known ("too_large": a file over the
++	-- 24 MB a message may carry).
++	failure: string?,
+ 	-- Its blocks laid out compact (Settings' compact transcript): its work
+ 	-- folded into one group, the reply it ends on shown.
+ 	compact: { Block }?,
+@@ -131,6 +134,9 @@ export type Props = {
+ 	on_attach: ((q: Quote.Quote) -> ())?,
+ 	-- A prompt that wasn't delivered, sent again (by its id).
+ 	on_retry: ((id: string) -> ())?,
++	-- A prompt that wasn't delivered, let go unsent (by its id). With none,
++	-- its line offers only to send it again.
++	on_discard: ((id: string) -> ())?,
+ 	-- What an unfinished turn's foot says in its working word's place, when
+ 	-- there's no turn to speak of (its host gone, its machine asleep): the
+ 	-- caller's, for a message (nil: the working word). `sending`: a prompt
+@@ -533,9 +539,9 @@ end
+ -- Under a person's newest prompt while its reply hasn't begun, in that
+ -- reply's place: "Sending…" while it is on its way, then the turn's working
+ -- word and clock, as Zeron's working trailer (transcript.rs); not
+--- delivered, a line to send it again. The reply's own row takes over once
+--- it comes.
+-local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?, turn_state: ((m: Message, sending: boolean) -> TurnLine?)?): Node
++-- delivered, a line to send it again or let it go, and why when that's
++-- known. The reply's own row takes over once it comes.
++local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?, on_discard: ((id: string) -> ())?, turn_state: ((m: Message, sending: boolean) -> TurnLine?)?): Node
+ 	local function said(): TurnLine?
+ 		local m = row:get()
+ 		return if turn_state and m.waiting and m.waiting ~= "failed" then turn_state(m, m.waiting == "sending") else nil
+@@ -582,26 +588,46 @@ local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?
+ 			}
+ 		end
+ 		if kind == "failed" then
+-			return ui.button {
+-				label = locale.t("ds.transcript.not_delivered"),
++			-- A word that acts, in the line's ink: underlined under the pointer.
++			local function link(key: string, color: string, act: ((id: string) -> ())?): Node
++				return ui.button {
++					label = locale.t(key),
++					p = 0,
++					bg = "#00000000",
++					active = { bg = "#00000000" },
++					hover = { bg = "#00000000", underline = true },
++					cursor = "pointer",
++					selectable = false,
++					text_size = "$font.size.sm",
++					color = color,
++					on_click = function()
++						if act then
++							act(row:peek().id)
++						end
++					end,
++					on_press = function() end,
++					on_release = function() end,
++					locale.t(key),
++				}
++			end
++			return ui.row {
+ 				self = "start",
+ 				mt = "$space.4",
+-				p = 0,
+-				bg = "#00000000",
+-				active = { bg = "#00000000" },
+-				hover = { bg = "#00000000", underline = true },
+-				cursor = "pointer",
+-				selectable = false,
+-				text_size = "$font.size.sm",
+-				color = "$danger",
+-				on_click = function()
+-					if on_retry then
+-						on_retry(row:peek().id)
+-					end
+-				end,
+-				on_press = function() end,
+-				on_release = function() end,
+-				locale.t("ds.transcript.not_delivered"),
++				gap = "$space.3",
++				items = "center",
++				link("ds.transcript.not_delivered", "$danger", on_retry),
++				-- Why, when that's known: sent again as it is, it fails again.
++				ui.show(function(): boolean
++					return row:get().failure == "too_large"
++				end, ui.text {
++					locale.t("ds.transcript.too_large"),
++					text_size = "$font.size.sm",
++					line_height = "$font.line.sm",
++					color = "$text.tertiary",
++				}),
++				ui.show(function(): boolean
++					return on_discard ~= nil
++				end, link("ds.transcript.discard", "$text.tertiary", on_discard)),
+ 			}
+ 		end
+ 		return ui.row {
+@@ -2628,7 +2654,7 @@ local function Transcript(props: Props): Node
+ 							find = if find_for then find_for(`{m.id}:u`) else nil,
+ 						},
+ 						strip(m, state, hovered),
+-						waiting_line(state, props.on_retry, props.turn_state),
++						waiting_line(state, props.on_retry, props.on_discard, props.turn_state),
+ 					}
+ 					else reply(m, state, props.draft, hovered, props.compact, { turn_state = props.turn_state, view = list, offset = offset, at_end = at_end, row = outer, pictures = props.pictures, shown_pictures = props.sent_pictures, open = props.open_link, link_menu = props.link_menu, link_chip = props.link_chip, open_subagent = props.on_open_subagent, find = find_for }),
+ 			},
+diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
+index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..8d60b806537574145fa24a21f35f09eb552bcdb1 100644
+--- a/apps/zgx/ui/locales/en.json
++++ b/apps/zgx/ui/locales/en.json
+@@ -748,6 +748,8 @@
+       "switched": "Switched from {from} to {to}",
+       "message_from": "Message from",
+       "not_delivered": "Not delivered — send again",
++      "too_large": "A file is over 24 MB",
++      "discard": "Discard",
+       "reply": "Reply",
+       "you": "You",
+       "agent": "Agent",
+diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
+index 727207c87a2a9787abab967f602d11371bcc4f3b..633166964d46c0d7167b7bc014dea57a2c700048 100644
+--- a/apps/zgx/ui/locales/zh-Hans.json
++++ b/apps/zgx/ui/locales/zh-Hans.json
+@@ -748,6 +748,8 @@
+       "switched": "已从 {from} 切换到 {to}",
+       "message_from": "消息来自",
+       "not_delivered": "未送达——重新发送",
++      "too_large": "有文件超过 24 MB",
++      "discard": "丢弃",
+       "reply": "回复",
+       "you": "你",
+       "agent": "智能体",
+diff --git a/apps/zgx/ui/screens/chat/lane_tab.luau b/apps/zgx/ui/screens/chat/lane_tab.luau
+index ec4636de49a2e8b5c9321e23dde82ef56ddd5bb4..3e667cb9686da59adad8afeb62b9f89fc0f30a78 100644
+--- a/apps/zgx/ui/screens/chat/lane_tab.luau
++++ b/apps/zgx/ui/screens/chat/lane_tab.luau
+@@ -1253,6 +1253,9 @@ M.Tab = ui.component(function(props: { tab: any }): Node
+ 		on_retry = function(message: string)
+ 			store.retry(chat, message)
+ 		end,
++		on_discard = function(message: string)
++			store.discard(chat, message)
++		end,
+ 		-- (A split's pane: the keys stay with this chat, in the window's composer.)
+ 		on_jump = if split
+ 			then function()
+diff --git a/apps/zgx/ui/screens/chat/session.luau b/apps/zgx/ui/screens/chat/session.luau
+index 7d2b1092421df86362ced6e126d02aacb1792ee3..e01d9294f04981f53b37c43f811751042d0d359a 100644
+--- a/apps/zgx/ui/screens/chat/session.luau
++++ b/apps/zgx/ui/screens/chat/session.luau
+@@ -326,6 +326,12 @@ local function Session(id: Id?): Node
+ 								store.retry(s, message)
+ 							end
+ 						end,
++						on_discard = function(message: string)
++							local s = which()
++							if s then
++								store.discard(s, message)
++							end
++						end,
+ 						on_attach = shared.attach_quote,
+ 						pictures = pictures,
+ 						sent_pictures = sent_pictures,
+diff --git a/apps/zgx/ui/screens/chat/store.luau b/apps/zgx/ui/screens/chat/store.luau
+index f60b45989f4d3fc4419b3cf815ec00c778e56dce..268ba9de0a0e869fc0bb33b410676c5c6355f161 100644
+--- a/apps/zgx/ui/screens/chat/store.luau
++++ b/apps/zgx/ui/screens/chat/store.luau
+@@ -247,6 +247,12 @@ function M.retry(id: string, message: string)
+ 	quietly(ui.call("chat.retry", { id = id, message = message }))
+ end
+ 
++-- A prompt that wasn't delivered, let go unsent (taken out of this device's
++-- outbox too, if it's held there).
++function M.discard(id: string, message: string)
++	quietly(ui.call("chat.discard", { id = id, message = message }))
++end
++
+ function M.interrupt(id: string)
+ 	quietly(ui.call("chat.interrupt", id))
+ end
+diff --git a/apps/zgx/ui/templates/zeron-v2/.base.json b/apps/zgx/ui/templates/zeron-v2/.base.json
+index eefe38d9b228d5603bc0c172ba9f31b965eb9227..573b21cd9433718f480c83c47b99e8ac2be4ef06 100644
+--- a/apps/zgx/ui/templates/zeron-v2/.base.json
++++ b/apps/zgx/ui/templates/zeron-v2/.base.json
+@@ -2,7 +2,7 @@
+   "ds/sidebar.luau": "6d5d8113d5768620",
+   "ds/tokens.luau": "0575770327f5e5f2",
+   "screens/chat/composer.luau": "a451ec6aaa53a23a",
+-  "screens/chat/lane_tab.luau": "d9bfbad1abf57f73",
++  "screens/chat/lane_tab.luau": "a9de653312018e30",
+   "screens/panel/init.luau": "a0df0db6e977845f",
+   "screens/shell/init.luau": "302aa5fc3350cd0a",
+   "screens/shell/page.luau": "c60a2e8010d8068e",
+diff --git a/apps/zgx/ui/templates/zeron-v2/screens/chat/lane_tab.luau b/apps/zgx/ui/templates/zeron-v2/screens/chat/lane_tab.luau
+index 242e24a50cfe269474a3db00e8ce9ecc92331516..f979f8486fe05e1cb7a9d9e3254e22864becca4b 100644
+--- a/apps/zgx/ui/templates/zeron-v2/screens/chat/lane_tab.luau
++++ b/apps/zgx/ui/templates/zeron-v2/screens/chat/lane_tab.luau
+@@ -958,6 +958,9 @@ M.Tab = ui.component(function(props: { tab: any }): Node
+ 		on_retry = function(message: string)
+ 			store.retry(chat, message)
+ 		end,
++		on_discard = function(message: string)
++			store.discard(chat, message)
++		end,
+ 		pictures = pictures,
+ 		sent_pictures = sent_pictures,
+ 		on_open_subagent = function(sub: any)
+diff --git a/apps/zgx/ui/tests/chat_in_place.test.luau b/apps/zgx/ui/tests/chat_in_place.test.luau
+index 35f0ea3babc9544dce4a6c43a29c9a1c05efe650..78431567c566b1213af7bab70ecab661181736cb 100644
+--- a/apps/zgx/ui/tests/chat_in_place.test.luau
++++ b/apps/zgx/ui/tests/chat_in_place.test.luau
+@@ -665,6 +665,32 @@ test("a send that wasn't delivered says so, and sends again", function()
+ 	expect(app:state("calls")).to_contain("retry:s1:lost1")
+ end)
+ 
++test("a send that wasn't delivered can be discarded, and its line goes with it", function()
++	local app = mount("chat_fixture.luau")
++	app:resize(900, 700)
++	open(app, "s1")
++	app:command("undelivered")
++	settle(app)
++	-- (Why isn't known: no reason said.)
++	expect(app:has('~"over 24 MB"')).to_be(false)
++	app:click('role:button "Discard"')
++	settle(app)
++	expect(app:state("calls")).to_contain("discard:s1:lost1")
++	expect(app:has('"Lost on the way"')).to_be(false)
++	expect(app:has('~"Not delivered"')).to_be(false)
++end)
++
++test("a send whose file is over 24 MB says so beside its send again", function()
++	local app = mount("chat_fixture.luau")
++	app:resize(900, 700)
++	open(app, "s1")
++	app:command("undelivered_too_large")
++	settle(app)
++	expect(app:has('role:button "Not delivered — send again"')).to_be(true)
++	expect(app:has('"A file is over 24 MB"')).to_be(true)
++	expect(app:has('role:button "Discard"')).to_be(true)
++end)
++
+ test("no byline over a reply; its time and Copy show under it on hover, as Zeron's", function()
+ 	local app = mount("chat_fixture.luau")
+ 	app:resize(900, 700)
+-- 
+2.50.1
+
