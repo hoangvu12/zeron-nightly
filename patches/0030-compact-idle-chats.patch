@@ -1,0 +1,3770 @@
+From 13f8a627ee82419561c087becc7f9f6badbdd9f8 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Tue, 24 Nov 2026 20:30:42 +0700
+Subject: [PATCH] Compact idle chats before their prompt cache expires
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Claude chat left idle past its prompt cache's lifetime pays to send its
+whole context again with the next message. Now, when a Claude turn ends,
+the engine arms a timer 2 min before the cache expires (the last
+request's start plus its TTL, an hour; a read carries the TTL before it
+forward), in memory only. When it fires, a chat still idle and eligible
+gets `/compact` as a run of the engine's own resuming its session: the
+setting on and the chat's own choice not off, Claude Code, at least 200k
+tokens, not a subagent or side chat, not archived, no question pending, no
+background work, nothing queued, no turn running. A compaction arms
+nothing (once an idle spell); a message sent while one runs waits in the
+queue for it rather than steering it.
+
+The transcript shows one divider for a compaction, the engine's or a
+typed `/compact` alike: "Compacting 240k tokens…", then "Compacted 240k →
+18k tokens", opening the summary (from Claude's `compact_boundary` and the
+summary message after it). A bare `/compact` prompt shows as its divider;
+the engine's own writes no user message. The composer's alerts say "Next
+message resends 240k tokens" on a top-level Claude chat of 200k+ tokens
+whose cache expired, with Compact chat (sends `/compact`) and ×, which puts
+it away until the cache expires again; hidden while a command is typed.
+Settings → General has "Compact idle chats" (default on, the engine's
+harness-prefs.json); a Claude chat's menu has "Compact when idle", its own
+choice over the setting (the chat row's `compactIdle`).
+
+Claude Code's `conversation_reset` (`/clear`) now empties the context the
+chat shows, so the alert's count starts again.
+
+ZERON_IDLE_COMPACT_AFTER_MS (fire that long after the last request) and
+ZERON_IDLE_COMPACT_MIN_TOKENS shorten it for a live check
+(crates/engine/tests/idle_compact_live.rs, ignored: one real turn, then
+the engine's own compaction, warm or after the agent's idle stop).
+---
+ apps/zgx/src/chat.rs                          | 125 ++++-
+ apps/zgx/src/sessions.rs                      |  20 +
+ apps/zgx/src/settings.rs                      |   3 +
+ apps/zgx/ui/account/sessions.luau             |   6 +
+ apps/zgx/ui/chat_fixture.luau                 |  63 +++
+ apps/zgx/ui/ds/compaction.luau                | 146 +++++
+ apps/zgx/ui/ds/locale_en.luau                 |  20 +
+ apps/zgx/ui/ds/transcript.luau                |  37 +-
+ apps/zgx/ui/locales/en.json                   |  22 +-
+ apps/zgx/ui/locales/zh-Hans.json              |  22 +-
+ apps/zgx/ui/screens/chat/composer.luau        |  19 +-
+ apps/zgx/ui/screens/chat/idle_compact.luau    | 192 +++++++
+ apps/zgx/ui/screens/settings/general.luau     |  34 ++
+ apps/zgx/ui/screens/shell/sidebar.luau        |  24 +
+ apps/zgx/ui/settings_stub.luau                |   3 +-
+ apps/zgx/ui/shell_fixture.luau                |  13 +-
+ apps/zgx/ui/templates/zeron-v2/.base.json     |   2 +-
+ .../zeron-v2/screens/chat/composer.luau       |  19 +-
+ apps/zgx/ui/tests/idle_compact.test.luau      | 187 +++++++
+ crates/doc/src/parts.rs                       | 106 +++-
+ crates/doc/src/registry.rs                    |  27 +
+ crates/doc/src/schema.rs                      |  68 ++-
+ crates/doc/src/transcript_delta.rs            |   1 +
+ crates/engine/src/idle_compact.rs             | 509 ++++++++++++++++++
+ crates/engine/src/registry.rs                 |  22 +
+ crates/engine/src/rpc.rs                      |  32 ++
+ crates/engine/src/sessions.rs                 | 367 ++++++++++++-
+ crates/engine/src/workspace_host.rs           |  14 +
+ crates/engine/tests/e2e.rs                    |   3 +-
+ crates/engine/tests/idle_compact_live.rs      | 167 ++++++
+ crates/harness/src/claude/normalize.rs        | 306 ++++++++++-
+ crates/harness/src/claude/wire.rs             |   7 +
+ crates/mcp/src/transcript.rs                  |  14 +
+ crates/proto/src/agent.rs                     |  32 ++
+ crates/rpc/src/lib.rs                         |   4 +
+ 35 files changed, 2582 insertions(+), 54 deletions(-)
+ create mode 100644 apps/zgx/ui/ds/compaction.luau
+ create mode 100644 apps/zgx/ui/screens/chat/idle_compact.luau
+ create mode 100644 apps/zgx/ui/tests/idle_compact.test.luau
+ create mode 100644 crates/engine/src/idle_compact.rs
+ create mode 100644 crates/engine/tests/idle_compact_live.rs
+
+diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
+index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c4bda4fa4 100644
+--- a/apps/zgx/src/chat.rs
++++ b/apps/zgx/src/chat.rs
+@@ -710,7 +710,7 @@ struct LetGo {
+     built: HashMap<Rc<str>, Built>,
+     built_model: Option<Option<String>>,
+     context: Option<f64>,
+-    context_usage: (Option<f64>, Option<f64>),
++    context_usage: (Option<f64>, Option<f64>, Option<f64>),
+ }
+ 
+ /// How long a chat let go of is kept for a view to open again, and how many
+@@ -1141,8 +1141,9 @@ struct Open {
+     heard: bool,
+     context: Option<f64>,
+     /// What the context holds as the agent last reported it: tokens in it
+-    /// and the window's size (either may be missing), for the ring's card.
+-    context_usage: (Option<f64>, Option<f64>),
++    /// and the window's size (either may be missing), for the ring's card,
++    /// and when the provider's prompt cache over it expires (Unix ms).
++    context_usage: (Option<f64>, Option<f64>, Option<f64>),
+     queue: Vec<Json>,
+     /// Its messages on their way and not yet taken by its agent, as the engine's
+     /// `WatchWaitingMessages` lists them (none from an engine without it).
+@@ -2596,7 +2597,7 @@ impl View {
+             if let Some(usage) = frame.get("contextUsage").filter(|u| !u.is_null()) {
+                 let (tokens, window) = (usage["tokens"].as_f64(), usage["window"].as_f64());
+                 open.context = tokens.zip(window).filter(|(_, w)| *w > 0.).map(|(t, w)| (t / w).min(1.));
+-                open.context_usage = (tokens, window);
++                open.context_usage = (tokens, window, usage["cacheExpiresAt"].as_f64());
+             }
+             // Opened with all its rows (another view's, or its own with the
+             // model's name moved): not down to the newest few, until the
+@@ -5480,6 +5481,11 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+             if image_note_only(entry) {
+                 return None;
+             }
++            // A bare `/compact`: its compaction's divider says it, as for
++            // one Zeron sent for an idle chat (which has no prompt).
++            if is_compact_command(&text) {
++                return None;
++            }
+             // A message from another chat: its routing header is the agent's to
+             // read; the transcript shows who sent it, over its words.
+             let sender = zeron_proto::agent_messages::agent_message_sender(&text);
+@@ -5518,6 +5524,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+         }
+         "assistant" => {
+             let streaming = entry["status"].as_str() == Some("streaming");
++            if let Some(row) = compaction_row(entry, id, streaming) {
++                return Some(row);
++            }
+             let created = entry["createdAt"].as_f64().unwrap_or(0.) / 1000.;
+             let tools: Vec<Value> = entry["parts"]
+                 .as_array()
+@@ -5647,6 +5656,48 @@ fn blocks(entry: &Json) -> Value {
+ }
+ 
+ /// The blocks of these parts of a reply (`streaming`: still being written).
++/// A bare `/compact` (as the agent gets it: a command picked from the list
++/// arrives as its name), no instructions after it.
++fn is_compact_command(text: &str) -> bool {
++    zeron_proto::invocation::invocation_prompt(text).trim() == "/compact"
++}
++
++/// A compaction part as the transcript's divider reads it: its context
++/// before and after (`post` absent while it runs), its summary, and whether
++/// it runs (`live`) or was cut off (`stopped`: the turn ended without it).
++/// `tag` is the field naming it (`role` for a row, `kind` for a block).
++fn compaction_value(part: &Json, id: &str, tag: &str, streaming: bool) -> Value {
++    let num = |key: &str| part[key].as_f64().map_or(Value::Nil, Value::Num);
++    let done = part["postTokens"].as_f64().is_some();
++    Value::record([
++        ("id", Value::from(id)),
++        (tag, Value::from("compaction")),
++        ("text", Value::from("")),
++        ("pre", num("preTokens")),
++        ("post", num("postTokens")),
++        ("summary", part["summary"].as_str().map_or(Value::Nil, Value::from)),
++        ("live", Value::Bool(!done && streaming)),
++        ("stopped", Value::Bool(!done && !streaming)),
++    ])
++}
++
++/// A reply that is one compaction and nothing else (`/compact`, or Zeron's
++/// own for an idle chat): one divider across the transcript, not a reply.
++/// Empty thoughts and heartbeats don't count; anything said does.
++fn compaction_row(entry: &Json, id: &str, streaming: bool) -> Option<Value> {
++    let parts = entry["parts"].as_array()?;
++    let mut compaction = None;
++    for part in parts {
++        match part["kind"].as_str() {
++            Some("compaction") if compaction.is_none() => compaction = Some(part),
++            Some("reasoning") if part["text"].as_str().unwrap_or_default().trim().is_empty() => {}
++            _ => return None,
++        }
++    }
++    // (The row is the entry's: its id, not the part's.)
++    Some(compaction_value(compaction?, id, "role", streaming))
++}
++
+ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+     let last_ix = parts.len().saturating_sub(1);
+     let mut out: Vec<Value> = Vec::new();
+@@ -5726,6 +5777,10 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+                     out.push(visual_block(part));
+                     continue;
+                 }
++                if kind == Some("compaction") {
++                    out.push(compaction_value(part, part["id"].as_str().unwrap_or_default(), "kind", streaming));
++                    continue;
++                }
+                 let words = match kind {
+                     Some("text") => part["text"].as_str().unwrap_or_default().to_owned(),
+                     Some("error") => format!("> {}", part["message"].as_str().unwrap_or_default()),
+@@ -6728,6 +6783,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+         ("context", open.context.map(Value::Num).unwrap_or(Value::Nil)),
+         ("context_tokens", open.context_usage.0.map(Value::Num).unwrap_or(Value::Nil)),
+         ("context_window", open.context_usage.1.map(Value::Num).unwrap_or(Value::Nil)),
++        // When its prompt cache expires (Unix ms; nil: not known), and
++        // whether it is another chat's (a subagent's, a side chat): the
++        // composer's "Next message resends …" notice.
++        ("cache_expires", open.context_usage.2.map(Value::Num).unwrap_or(Value::Nil)),
++        ("child", Value::Bool(chat["parentChatId"].is_string())),
+         ("ask", ask),
+         ("queue", Value::List(queue.into())),
+         ("waiting", waiting_value(&open.waiting)),
+@@ -8857,6 +8917,63 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn a_compaction_is_one_divider_and_a_bare_compact_shows_no_prompt() {
++        let s = |v: Option<&Value>| match v {
++            Some(Value::Str(t)) => Some(t.to_string()),
++            _ => None,
++        };
++        let n = |v: Option<&Value>| match v {
++            Some(Value::Num(x)) => Some(*x),
++            _ => None,
++        };
++        let b = |v: Option<&Value>| matches!(v, Some(Value::Bool(true)));
++        let part = |post: Option<u64>, summary: Option<&str>| {
++            let mut p = json!({ "kind": "compaction", "id": "c0", "preTokens": 240000 });
++            if let Some(post) = post {
++                p["postTokens"] = json!(post);
++            }
++            if let Some(summary) = summary {
++                p["summary"] = json!(summary);
++            }
++            p
++        };
++        let empty_thought = json!({ "kind": "reasoning", "id": "r", "text": "" });
++        let reply = |parts: Vec<Json>, status: &str| json!({ "id": "a", "role": "assistant", "status": status, "parts": parts });
++
++        // Running: the reply is the divider, its words to come.
++        let running = super::message(&reply(vec![empty_thought.clone(), part(None, None)], "streaming"), None).unwrap();
++        assert_eq!(s(running.field("role")).as_deref(), Some("compaction"));
++        assert_eq!(s(running.field("id")).as_deref(), Some("a"));
++        assert_eq!(n(running.field("pre")), Some(240000.));
++        assert!(running.field("post").is_none() || matches!(running.field("post"), Some(Value::Nil)));
++        assert!(b(running.field("live")) && !b(running.field("stopped")));
++
++        // Done: before and after, and the summary to open.
++        let done = super::message(&reply(vec![part(Some(18000), Some("S"))], "done"), None).unwrap();
++        assert_eq!(s(done.field("role")).as_deref(), Some("compaction"));
++        assert_eq!(n(done.field("post")), Some(18000.));
++        assert_eq!(s(done.field("summary")).as_deref(), Some("S"));
++        assert!(!b(done.field("live")) && !b(done.field("stopped")));
++
++        // Its turn ended without it: stopped.
++        let cut = super::message(&reply(vec![part(None, None)], "done"), None).unwrap();
++        assert!(b(cut.field("stopped")));
++
++        // Said alongside: a reply, the compaction one of its blocks.
++        let said = json!({ "kind": "text", "id": "t", "text": "Done." });
++        let mixed = super::message(&reply(vec![part(Some(18000), None), said], "done"), None).unwrap();
++        assert_eq!(s(mixed.field("role")).as_deref(), Some("assistant"));
++
++        // A bare `/compact` is said by its divider; with instructions, it's a prompt.
++        let prompt = |text: &str| json!({ "id": "u", "role": "user", "parts": [{ "kind": "text", "id": "t", "text": text }] });
++        assert!(super::message(&prompt("/compact"), None).is_none());
++        assert!(super::message(&prompt("  /compact 
++"), None).is_none());
++        assert!(super::message(&prompt("/compact keep the API notes"), None).is_some());
++        assert!(super::message(&prompt("/compactor"), None).is_some());
++    }
++
+     #[test]
+     fn a_subagent_is_named_in_its_part_or_is_in_no_row() {
+         let part = |extra: Json| {
+diff --git a/apps/zgx/src/sessions.rs b/apps/zgx/src/sessions.rs
+index 7e7c779cb326454d9763bb783e542db05f1f23dd..d0f3610e8437730f11fd32def3f4ffaca3e4effb 100644
+--- a/apps/zgx/src/sessions.rs
++++ b/apps/zgx/src/sessions.rs
+@@ -746,6 +746,9 @@ fn top_row(
+         // only unseen activity, which your own send makes too).
+         ("turn", with.turn.as_deref().map_or(Value::Nil, Value::from)),
+         ("turn_fresh", Value::from(finished_turn(session, at).1)),
++        // Its own "Compact when idle" (its menu's tick): true or false when
++        // chosen, none when it follows Settings.
++        ("compact_idle", c["compactIdle"].as_bool().map_or(Value::Nil, Value::Bool)),
+     ]);
+     rows.insert(id.to_owned(), Row { moved: moved(c), updated: updated as f64, marks, with, value: value.clone() });
+     value
+@@ -953,6 +956,23 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+             }
+         }
+     });
++    // A chat's own "Compact when idle": `compact` true or false, or none to
++    // follow Settings again. Synced with the chat.
++    host.async_action("sessions.compact_idle", move |args| {
++        let id = args.field("id").map(text).unwrap_or_default();
++        let compact = args.field("compact").filter(|v| !matches!(v, Value::Nil)).map(Value::truthy);
++        let params = json!({ "op": "setChatCompactIdle", "chatId": id, "compact": compact });
++        async move {
++            if id.is_empty() {
++                return Err("missing".to_string());
++            }
++            match engine::get().call("Mutate", params).await {
++                Ok(_) => Ok(Value::Nil),
++                Err(error) if error.contains("unknown variant") => Err("outdated".to_string()),
++                Err(error) => Err(fail(&error).to_string()),
++            }
++        }
++    });
+     let a = s.clone();
+     host.action("sessions.seen", move |id| {
+         let a = a.clone();
+diff --git a/apps/zgx/src/settings.rs b/apps/zgx/src/settings.rs
+index 4884ba294f6cfc1d8b6837d95f945e97be480f93..8e0f09cd7a73a943d87433647dc8f89d1abb20e5 100644
+--- a/apps/zgx/src/settings.rs
++++ b/apps/zgx/src/settings.rs
+@@ -99,6 +99,9 @@ const ENGINE_METHODS: &[&str] = &[
+     // "Keep Zeron running after you quit" (src/quit_prompt.rs).
+     "GetBackgroundSettings",
+     "SetBackgroundSettings",
++    // "Compact idle chats".
++    "GetIdleCompactSettings",
++    "SetIdleCompactSettings",
+     // Whether this window has the keys: banners set to "only when in the
+     // background" hold while it does.
+     "SetViewportFocus",
+diff --git a/apps/zgx/ui/account/sessions.luau b/apps/zgx/ui/account/sessions.luau
+index 7940c4c685c92d1f45994e0568745647491c363c..9edbc26e1f254d8cc9c99782d95c89de70e61b72 100644
+--- a/apps/zgx/ui/account/sessions.luau
++++ b/apps/zgx/ui/account/sessions.luau
+@@ -252,6 +252,12 @@ function M.stop(id: string): any
+ 	return ui.call("chat.interrupt", id)
+ end
+ 
++-- A chat's own "Compact when idle": true or false, or nil to follow
++-- Settings again. A promise; "outdated" from an engine without it.
++function M.compact_idle(id: string, compact: boolean?): any
++	return ui.call("sessions.compact_idle", { id = id, compact = compact })
++end
++
+ function M.stop_waiting(id: string): any
+ 	return ui.call("chat.stop_waiting", id)
+ end
+diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
+index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..9dd839a3e180b9fe020436e8a4897c90f60918a9 100644
+--- a/apps/zgx/ui/chat_fixture.luau
++++ b/apps/zgx/ui/chat_fixture.luau
+@@ -2192,6 +2192,69 @@ for _, id in { "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9" } do
+ 		end,
+ 	}
+ end
++-- The open chat a large Claude one, idle: its prompt cache expired a
++-- minute ago (`idle_expired`), or good for an hour yet (`idle_cached`);
++-- its context emptied (`idle_cleared`, a `/clear`).
++local function idle(patch: { [string]: any })
++	local s = store.session:peek()
++	if s and s.id then
++		local all: { [string]: any } = { harness = "claude-code", context_tokens = 240000, context_window = 1000000 }
++		for k, v in patch do
++			all[k] = v
++		end
++		publish(s.id, all)
++	end
++end
++-- (Each time a cache of its own: expired a moment earlier than the last.)
++local expiries = 0
++ui.command {
++	id = "idle_expired",
++	title = "The open chat is large and its prompt cache expired",
++	run = function()
++		expiries += 1
++		idle({ cache_expires = (os.time() - 60 - expiries) * 1000 })
++	end,
++}
++ui.command {
++	id = "idle_cached",
++	title = "The open chat is large and its prompt cache is warm",
++	run = function()
++		idle({ cache_expires = (os.time() + 3600) * 1000 })
++	end,
++}
++ui.command {
++	id = "idle_cleared",
++	title = "The open chat's context was cleared",
++	run = function()
++		idle({ context_tokens = 0, cache_expires = (os.time() - 60) * 1000 })
++	end,
++}
++-- Compactions in the transcript: one done, its summary to open, and one
++-- running (`compaction_rows`), which then finishes (`compaction_done`).
++ui.command {
++	id = "compaction_rows",
++	title = "Two compactions: one done, one running",
++	run = function()
++		local list = table.clone(store.messages:peek())
++		table.insert(list, { id = "c1", role = "compaction", text = "", pre = 240000, post = 18000, summary = "We were porting **the deck**.\n\nNext: its tests." })
++		table.insert(list, { id = "u-after", role = "user", text = "Carry on" })
++		table.insert(list, { id = "c2", role = "compaction", text = "", pre = 180000, live = true })
++		store.messages:set(list)
++	end,
++}
++ui.command {
++	id = "compaction_done",
++	title = "The running compaction finishes",
++	run = function()
++		local list = table.clone(store.messages:peek())
++		for i, m in list do
++			if m.id == "c2" then
++				list[i] = { id = "c2", role = "compaction", text = "", pre = 180000, post = 12000, summary = "Carried on." }
++			end
++		end
++		store.messages:set(list)
++	end,
++}
+ -- A new chat with no project asked of it (⌘N, the sidebar's New chat).
+ ui.command {
+ 	id = "go_new",
+diff --git a/apps/zgx/ui/ds/compaction.luau b/apps/zgx/ui/ds/compaction.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ef3b2a680db7823514b8b8fc7fd08a1f38badbd
+--- /dev/null
++++ b/apps/zgx/ui/ds/compaction.luau
+@@ -0,0 +1,146 @@
++-- Where a chat's context was compacted (`/compact`, or Zeron's own before an
++-- idle chat's prompt cache expires): one divider across the transcript,
++-- its line in the middle. While it runs, "Compacting 240k tokens…" with
++-- the working ring; done, "Compacted 240k → 18k tokens", which opens the
++-- summary the agent goes on from under it.
++--
++--   Compaction { id = m.id, now = function() return row:get() end }
++--
++-- `now()` gives what the host says of it (src/chat.rs `compaction_value`):
++-- `pre` and `post` (tokens; `post` none while it runs), `summary`, `live`
++-- (running now) and `stopped` (its turn ended before it did).
++
++local Icon = require("@self/icon")
++local Markdown = require("@self/markdown")
++local status = require("@self/status")
++local locale = require("@self/locale")
++
++export type Data = { pre: number?, post: number?, summary: string?, live: boolean?, stopped: boolean? }
++
++local M = {}
++
++-- A count of tokens as the divider and the composer's notice say it:
++-- "240k", "1.5k", "980".
++function M.short(n: number): string
++	if n >= 10000 then
++		return `{math.floor(n / 1000 + 0.5)}k`
++	elseif n >= 1000 then
++		return string.format("%.1fk", n / 1000)
++	end
++	return tostring(math.floor(n))
++end
++
++-- Its line, as it stands.
++function M.line(d: Data): string
++	if d.post then
++		return if d.pre
++			then locale.s("ds.transcript.compaction.done", { pre = M.short(d.pre), post = M.short(d.post) })
++			else locale.s("ds.transcript.compaction.done_to", { post = M.short(d.post) })
++	elseif d.stopped then
++		return locale.s("ds.transcript.compaction.stopped")
++	end
++	return if d.pre
++		then locale.s("ds.transcript.compaction.running", { n = M.short(d.pre) })
++		else locale.s("ds.transcript.compaction.running_unknown")
++end
++
++-- Which summaries are open, by the divider's id: one map, so a divider
++-- scrolled away and back keeps it.
++local OPEN = ui.state("transcript_compaction_open", {} :: { [string]: boolean })
++
++local function rule(): Node
++	return ui.div { h = 1, grow = 1, min_w = 16, bg = "$border.subtle", aria_hidden = true }
++end
++
++function M.Compaction(props: { id: string, now: () -> Data }): Node
++	local function open(): boolean
++		return OPEN:get()[props.id] == true
++	end
++	local function has_summary(): boolean
++		local s = props.now().summary
++		return s ~= nil and s ~= ""
++	end
++	local function toggle()
++		local all = table.clone(OPEN:peek())
++		all[props.id] = if all[props.id] then nil else true
++		OPEN:set(all)
++	end
++	local function label(): string
++		return M.line(props.now())
++	end
++	return ui.column {
++		class = "compaction",
++		w_full = true,
++		gap = "$space.2",
++		ui.row {
++			w_full = true,
++			items = "center",
++			gap = "$space.3",
++			selectable = false,
++			rule(),
++			-- (With a summary to open, a button; while it runs, or with none,
++			-- only its words.)
++			ui.presence(function(): string
++				return if has_summary() then "button" else "line"
++			end, function(kind: string): Node
++				local line: { [any]: any } = {
++					class = "compaction-line",
++					h = 24,
++					px = "$space.2",
++					gap = "$space.2",
++					items = "center",
++					min_w = 0,
++					rounded = "$radius.md",
++					color = "$text.secondary",
++					ui.show(function(): boolean
++						return props.now().live == true
++					end, status.Spinner { size = 12, ink = "$text.secondary" }),
++					ui.text { label, text_size = "$font.size.sm", weight = "$font.weight.medium", truncate = true },
++				}
++				if kind == "line" then
++					line.role = "status"
++					line.label = label
++					return ui.row(line)
++				end
++				line.label = label
++				line.expanded = open
++				line.bg = "#00000000"
++				line.hover = { color = "$text.primary", bg = "$zeron.secondary.bg" }
++				line.active = { bg = "$zeron.secondary.hover" }
++				line.cursor = "pointer"
++				line.on_click = toggle
++				table.insert(line, ui.div {
++					aria_hidden = true,
++					Icon {
++						name = function(): string
++							return if open() then "alt-arrow-up" else "alt-arrow-down"
++						end,
++						size = 12,
++					},
++				})
++				return ui.button(line)
++			end, { min_w = 0 }),
++			rule(),
++		},
++		ui.presence(function(): string?
++			return if open() and has_summary() then "open" else nil
++		end, function(): Node
++			return ui.column {
++				class = "compaction-summary",
++				w_full = true,
++				p = "$space.4",
++				rounded = "$radius.lg",
++				bg = "$zeron.secondary.bg",
++				color = "$text.secondary",
++				text_size = "$font.size.sm",
++				Markdown {
++					text = function(): string
++						return props.now().summary or ""
++					end,
++				},
++			}
++		end, { enter = { opacity = { 0, 1 }, duration = 150 } }),
++	}
++end
++
++return M
+diff --git a/apps/zgx/ui/ds/locale_en.luau b/apps/zgx/ui/ds/locale_en.luau
+index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..a1219fcd027f97963f8a53de88aa3a78d951489c 100644
+--- a/apps/zgx/ui/ds/locale_en.luau
++++ b/apps/zgx/ui/ds/locale_en.luau
+@@ -464,6 +464,10 @@ return {
+ 	["ds.composer.access.supervised_hint"] = "Ask before commands and file changes.",
+ 	["ds.composer.access.edits"] = "Auto-accept edits",
+ 	["ds.composer.access.edits_hint"] = "Apply edits, ask before other actions.",
++	["ds.composer.access.auto"] = "Auto",
++	["ds.composer.access.auto_hint"] = "The agent's reviewer approves safe actions; risky ones ask.",
++	["ds.composer.access.auto_unavailable"] = "Auto unavailable",
++	["ds.composer.access.auto_unavailable_hint"] = "This agent doesn't support Auto. Choose another access mode or agent.",
+ 	["ds.composer.access.full"] = "Full access",
+ 	["ds.composer.access.full_hint"] = "Run commands and edits without asking.",
+ 	["ds.composer.plan.mode"] = "Plan mode",
+@@ -496,6 +500,7 @@ return {
+ 	["ds.composer.dictate"] = "Dictate",
+ 	["ds.composer.queue_message"] = "Queue message",
+ 	["ds.composer.send_message"] = "Send message",
++	["ds.composer.send_auto_unavailable"] = "Auto isn't available for this agent. Choose another access mode to send.",
+ 	["ds.composer.stop"] = "Stop",
+ 	["ds.composer.back"] = "Back",
+ 	["ds.composer.next"] = "Next",
+@@ -569,6 +574,15 @@ return {
+ 	["ds.activity.open_subagent"] = "Open subagent {title}",
+ 	["ds.activity.subagent"] = "Subagent",
+ 	["ds.activity.worked_for"] = "Worked for {secs}s · {summary}",
++	["ds.activity.review.reviewing"] = "Reviewing…",
++	["ds.activity.review.approved"] = "Auto-approved",
++	["ds.activity.review.denied"] = "Blocked by auto-review",
++	["ds.activity.review.timed-out"] = "Review timed out",
++	["ds.activity.review.reviewing_hint"] = "The agent's reviewer is checking this before it runs.",
++	["ds.activity.review.approved_hint"] = "The agent's reviewer judged this safe and let it run.",
++	["ds.activity.review.denied_hint"] = "The agent's reviewer stopped this. It didn't run.",
++	["ds.activity.review.timed-out_hint"] = "The agent's reviewer didn't decide in time, so this didn't run.",
++	["ds.activity.review.risk"] = "Risk: {risk}",
+ 	["ds.transcript.copy_message"] = "Copy message",
+ 	["ds.transcript.switched"] = "Switched from {from} to {to}",
+ 	["ds.transcript.message_from"] = "Message from",
+@@ -589,6 +603,11 @@ return {
+ 	["ds.transcript.display_failed"] = "This couldn't be shown",
+ 	["ds.transcript.image_failed"] = "Couldn't show this image",
+ 	["ds.transcript.visual_failed"] = "Couldn't show this visual",
++	["ds.transcript.compaction.running"] = "Compacting {n} tokens…",
++	["ds.transcript.compaction.running_unknown"] = "Compacting…",
++	["ds.transcript.compaction.done"] = "Compacted {pre} → {post} tokens",
++	["ds.transcript.compaction.done_to"] = "Compacted to {post} tokens",
++	["ds.transcript.compaction.stopped"] = "Compaction stopped",
+ 	["ds.user_message.open_named"] = "Open {name}",
+ 	["ds.user_message.appshot_label"] = "{app} Appshot: {title}",
+ 	["ds.user_message.appshot"] = "{app} · Appshot",
+@@ -733,6 +752,7 @@ return {
+ 	["ds.provider_card.use_reset"] = "Use a reset",
+ 	["ds.provider_card.connect"] = "Connect a {name} account",
+ 	["ds.provider_card.add_account"] = "Add account",
++	["ds.provider_card.how_it_signs_in"] = "How it signs in on Cloud",
+ 	["ds.provider_card.signing_in_to"] = "Signing in to {name}",
+ 	["ds.provider_card.signing_in_hint"] = "Waiting for you to finish in the browser. Nothing changes until you switch.",
+ 	["ds.provider_card.signing_in"] = "Signing in",
+diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
+index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eecc58626b8 100644
+--- a/apps/zgx/ui/ds/transcript.luau
++++ b/apps/zgx/ui/ds/transcript.luau
+@@ -57,15 +57,18 @@ local control = require("@self/control")
+ local Quote = require("@self/quote")
+ local SelectionMenu = require("@self/selection_menu")
+ local Rail = require("@self/rail")
++local Compaction = require("@self/compaction")
+ local motion = require("@self/motion")
+ local locale = require("@self/locale")
+ 
+ export type Tool = Activity.Tool
+ export type Message = {
+ 	id: string,
+-	-- A person's, a reply, or the seam where the chat moved to another
+-	-- agent (`[mark] From → [mark] To` over the prompt that moved it).
+-	role: "user" | "assistant" | "switch",
++	-- A person's, a reply, the seam where the chat moved to another
++	-- agent (`[mark] From → [mark] To` over the prompt that moved it), or
++	-- where its context was compacted (ds/compaction: `pre`, `post`,
++	-- `summary`, `live`, `stopped`).
++	role: "user" | "assistant" | "switch" | "compaction",
+ 	text: string,
+ 	-- A person's: what came with it.
+ 	attachments: { UserMessage.Attachment }?,
+@@ -110,6 +113,12 @@ export type Message = {
+ 	to_mark: Mark.Name?,
+ 	-- A person's that another chat sent: which, and its title when it was sent.
+ 	sender: { chat: string, title: string }?,
++	-- A compaction's (role "compaction", or a block of kind "compaction").
++	pre: number?,
++	post: number?,
++	summary: string?,
++	live: boolean?,
++	stopped: boolean?,
+ }
+ 
+ export type Props = {
+@@ -227,7 +236,7 @@ export type Draft = { id: string, text: string, part: string?, part_text: string
+ -- its own blocks, opened.
+ export type Block = {
+ 	id: string,
+-	kind: "text" | "tools" | "work" | "visual" | "display_failed" | "images",
++	kind: "text" | "tools" | "work" | "visual" | "display_failed" | "images" | "compaction",
+ 	text: string?,
+ 	-- Pictures an agent showed (`show_image`, a generated image), one after
+ 	-- another: each a path on the chat's host and its name (ds/reply_picture).
+@@ -265,6 +274,7 @@ local ROW_ESTIMATE: any = {
+ 	by = "role",
+ 	cases = {
+ 		user = { height = 64, text = { field = "text", size = 15, line = 24, most = 520 } },
++		compaction = { height = 40 },
+ 		assistant = {
+ 			height = 40,
+ 			has = {
+@@ -277,6 +287,7 @@ local ROW_ESTIMATE: any = {
+ 							tools = { height = 38 },
+ 							work = { height = 38 },
+ 							display_failed = { height = 36 },
++							compaction = { height = 32 },
+ 						},
+ 						default = { height = 320 },
+ 					},
+@@ -857,6 +868,16 @@ local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message,
+ 					else nil,
+ 			}
+ 		end
++		-- Its context compacted partway through (the agent's own): the
++		-- divider, as between turns.
++		if b.kind == "compaction" then
++			return Compaction.Compaction {
++				id = `{m.id}:{b.id}`,
++				now = function(): any
++					return brow:get()
++				end,
++			}
++		end
+ 		-- An agent's visual: built once, followed by the host (src/visuals.rs).
+ 		if b.kind == "visual" then
+ 			return Visual { id = b.id, path = b.path, source = b.source, title = b.title, device = b.device }
+@@ -2595,7 +2616,7 @@ local function Transcript(props: Props): Node
+ 				max_w = measure,
+ 				min_w = 0,
+ 				-- Anywhere on a message shows its lane (Zeron's entry hover).
+-				on_hover = if m.role == "switch"
++				on_hover = if m.role == "switch" or m.role == "compaction"
+ 					then nil
+ 					else function(inside: boolean)
+ 						if inside then
+@@ -2605,6 +2626,12 @@ local function Transcript(props: Props): Node
+ 						end
+ 					end,
+ 				if m.role == "switch" then seam(m)
++					elseif m.role == "compaction" then Compaction.Compaction {
++						id = m.id,
++						now = function(): any
++							return state:get()
++						end,
++					}
+ 					elseif mine then ui.column {
+ 						hook = "chat.message.prompt",
+ 						-- What it is, for a plugin's selector (and the
+diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
+index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..85789dad91ab201398bf0b6a335e56bbe986eb1b 100644
+--- a/apps/zgx/ui/locales/en.json
++++ b/apps/zgx/ui/locales/en.json
+@@ -763,7 +763,14 @@
+       "new_reply": "New reply",
+       "display_failed": "This couldn't be shown",
+       "image_failed": "Couldn't show this image",
+-      "visual_failed": "Couldn't show this visual"
++      "visual_failed": "Couldn't show this visual",
++      "compaction": {
++        "running": "Compacting {n} tokens…",
++        "running_unknown": "Compacting…",
++        "done": "Compacted {pre} → {post} tokens",
++        "done_to": "Compacted to {post} tokens",
++        "stopped": "Compaction stopped"
++      }
+     },
+     "user_message": {
+       "open_named": "Open {name}",
+@@ -1217,6 +1224,11 @@
+         "on": "Chats keep working, and other devices can reach them.",
+         "off": "When you quit, Zeron stops once its chats are done.",
+         "terms": "background quit close engine agents running stop memory battery"
++      },
++      "compact_idle": {
++        "label": "Compact idle chats",
++        "description": "Before the prompt cache expires, on chats over 200k tokens.",
++        "terms": "compact compaction context cache prompt cache tokens idle claude summary"
+       }
+     },
+     "engine": {
+@@ -2455,7 +2467,9 @@
+         "delete": "Delete…",
+         "rename": "Rename…",
+         "remove": "Remove…",
+-        "edit_project": "Edit project…"
++        "edit_project": "Edit project…",
++        "compact_idle": "Compact when idle",
++        "compact_idle_failed": "Couldn't change Compact when idle"
+       },
+       "project": {
+         "rename_title": "Rename project",
+@@ -3021,6 +3035,10 @@
+         "appshot": "Appshot",
+         "image": "Image",
+         "file": "File"
++      },
++      "idle_compact": {
++        "title": "Next message resends {n} tokens",
++        "action": "Compact chat"
+       }
+     },
+     "dictation": {
+diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
+index 727207c87a2a9787abab967f602d11371bcc4f3b..f7f4ef32a22fe7b09b7e6cb2f9f57b8e904ec351 100644
+--- a/apps/zgx/ui/locales/zh-Hans.json
++++ b/apps/zgx/ui/locales/zh-Hans.json
+@@ -763,7 +763,14 @@
+       "new_reply": "新回复",
+       "display_failed": "无法显示此内容",
+       "image_failed": "无法显示这张图片",
+-      "visual_failed": "无法显示这个可视化"
++      "visual_failed": "无法显示这个可视化",
++      "compaction": {
++        "running": "正在压缩 {n} 个 token…",
++        "running_unknown": "正在压缩…",
++        "done": "已压缩 {pre} → {post} 个 token",
++        "done_to": "已压缩至 {post} 个 token",
++        "stopped": "压缩已停止"
++      }
+     },
+     "user_message": {
+       "open_named": "打开 {name}",
+@@ -1217,6 +1224,11 @@
+         "on": "对话会继续进行，其他设备也能访问它们。",
+         "off": "退出时，Zeron 会在对话完成后停止。",
+         "terms": "后台 退出 关闭 引擎 智能体 运行 停止 内存 电池 background quit close engine agents"
++      },
++      "compact_idle": {
++        "label": "压缩闲置对话",
++        "description": "在提示缓存过期前，压缩超过 20 万 token 的对话。",
++        "terms": "压缩 上下文 缓存 提示缓存 token 闲置 摘要 compact cache"
+       }
+     },
+     "engine": {
+@@ -2455,7 +2467,9 @@
+         "delete": "删除…",
+         "rename": "重命名…",
+         "remove": "移除…",
+-        "edit_project": "编辑项目…"
++        "edit_project": "编辑项目…",
++        "compact_idle": "闲置时压缩",
++        "compact_idle_failed": "无法更改“闲置时压缩”"
+       },
+       "project": {
+         "rename_title": "重命名项目",
+@@ -3021,6 +3035,10 @@
+         "appshot": "应用截图",
+         "image": "图片",
+         "file": "文件"
++      },
++      "idle_compact": {
++        "title": "下一条消息将重新发送 {n} 个 token",
++        "action": "压缩对话"
+       }
+     },
+     "dictation": {
+diff --git a/apps/zgx/ui/screens/chat/composer.luau b/apps/zgx/ui/screens/chat/composer.luau
+index de4f291d564a3b1aedbca8866123235a95559ea8..5d8f2d5211c80f8558930c6b8358d54c02dd1768 100644
+--- a/apps/zgx/ui/screens/chat/composer.luau
++++ b/apps/zgx/ui/screens/chat/composer.luau
+@@ -32,6 +32,7 @@ local sessions = require("@account/sessions")
+ local cloud = require("@account/cloud")
+ local LinkNotice = require("@app/screens/chat/link_notice")
+ local CloudTray = require("@app/screens/chat/cloud_tray")
++local IdleCompact = require("@app/screens/chat/idle_compact")
+ local Held = require("@app/screens/chat/held")
+ local CloudMachine = require("@app/screens/chat/cloud_machine")
+ local Where = require("@app/screens/chat/where")
+@@ -672,6 +673,18 @@ local function Composer(): Node
+ 			return CloudMachine.sending_last(store.messages)
+ 		end,
+ 	}
++	-- "Next message resends 240k tokens": a large Claude chat whose prompt
++	-- cache expired, and its Compact chat (`/compact`, as if typed).
++	local idle = IdleCompact.bind {
++		session = open,
++		text = shared.text,
++		send = function(id: string)
++			store.send({ session = id, text = "/compact" } :: any):after(function() end, function()
++				own_notice:set { tone = "danger", key = "chat.composer.didnt_send", dismissable = true }
++			end)
++		end,
++	}
++	local alerts = idle.merged(machine.alerts)
+ 	-- This device's outbox for the chat (#1256): sends uploading or stopped,
+ 	-- each removable where the engine can take one back. Whether it can is
+ 	-- asked once a chat has one, by taking out a send that isn't there (an
+@@ -1586,9 +1599,9 @@ local function Composer(): Node
+ 			end,
+ 			-- (The only notice with an action: a sleeping machine's Wake.)
+ 			on_notice_action = machine.wake,
+-			alerts = machine.alerts,
+-			on_alert_action = machine.on_alert,
+-			on_dismiss_alert = machine.dismiss,
++			alerts = alerts,
++			on_alert_action = idle.on_alert(machine.on_alert),
++			on_dismiss_alert = idle.on_dismiss(machine.dismiss),
+ 			disabled = function(): boolean
+ 				local s = store.session:get()
+ 				local id = session_id:get()
+diff --git a/apps/zgx/ui/screens/chat/idle_compact.luau b/apps/zgx/ui/screens/chat/idle_compact.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3d6dae7559988e12ce58bd05eec94fbdc972e7f
+--- /dev/null
++++ b/apps/zgx/ui/screens/chat/idle_compact.luau
+@@ -0,0 +1,192 @@
++-- "Next message resends 240k tokens": a Claude chat's alert on its
++-- composer's deck once its prompt cache has expired with a large context,
++-- so the next message sends all of it again at full price. Its action is
++-- Compact chat (`/compact`, as typed); Send still just sends. × puts it
++-- away for the chat until its cache expires again.
++--
++--   local idle = IdleCompact.bind { session = fn, text = shared.text, send = fn }
++--   alerts = idle.merged(machine.alerts), on_alert_action = idle.on_alert(machine.on_alert),
++--   on_dismiss_alert = idle.on_dismiss(machine.dismiss)
++--
++-- It reads the session's `context_tokens`, `cache_expires` (Unix ms, nil
++-- when not known: taken as expired), `harness`, `child` and `running`.
++
++local Draft = require("@ds/draft_text")
++local compaction = require("@ds/compaction")
++local sessions = require("@account/sessions")
++
++local M = {}
++
++-- As large as a context must be (the engine's idle compaction's floor).
++M.MIN_TOKENS = 200000
++-- The alert's id in the deck.
++M.ID = "idle-compact"
++
++-- Put away, by chat: the cache expiry it was put away for. Kept across
++-- launches; a new expiry (a turn since) shows it again.
++local DISMISSED = ui.persist("idle_compact_dismissed", {} :: { [string]: string })
++-- Moved as a cache expires, so the alert is judged again then; nothing
++-- ticks otherwise.
++local TICK = ui.state("idle_compact_tick", 0)
++local due: { [number]: boolean } = {}
++
++local function now_ms(): number
++	return os.time() * 1000
++end
++
++local function judge_again_at(ms: number)
++	local key = math.ceil(ms / 1000)
++	if due[key] then
++		return
++	end
++	due[key] = true
++	ui.after(math.max(0, ms - now_ms()) + 250, function()
++		due[key] = nil
++		TICK:set(TICK:peek() + 1)
++	end)
++end
++
++-- What a put-away is keyed by: the expiry it saw.
++function M.expiry_key(s: any): string
++	return tostring(s.cache_expires or "unknown")
++end
++
++-- Whether a session's alert shows (`draft`: the composer's words; `put_away`:
++-- what it was put away for in this chat, if it was). The rules, apart from
++-- where they're read.
++function M.shows(s: any, now: number, draft: string, put_away: string?): boolean
++	if not s or s.state ~= "ready" then
++		return false
++	end
++	-- (Another chat's: a subagent's or a side chat's.)
++	if s.harness ~= "claude-code" or s.child == true or s.running == true then
++		return false
++	end
++	if (s.context_tokens or 0) < M.MIN_TOKENS then
++		return false
++	end
++	if s.cache_expires ~= nil and s.cache_expires > now then
++		return false
++	end
++	-- (A command being typed: `/compact` itself, among others.)
++	if string.sub(draft, 1, 1) == "/" then
++		return false
++	end
++	return put_away ~= M.expiry_key(s)
++end
++
++-- This device's "Compact idle chats" (Settings → General), as last heard:
++-- nil until asked. What a chat's own "Compact when idle" falls back on.
++M.setting = ui.state("idle_compact_setting", nil :: boolean?)
++
++-- Asks the engine for it (once heard, it's kept; Settings sets it as it
++-- changes it).
++function M.load_setting()
++	local ok, p = pcall(ui.call, "settings.engine", { method = "GetIdleCompactSettings", params = {} })
++	if not ok or not p then
++		return
++	end
++	p:after(function(v: any)
++		if type(v) == "table" and v.compactIdleChats ~= nil then
++			M.setting:set(v.compactIdleChats == true)
++		end
++	end, function() end)
++end
++
++-- Whether a chat compacts when idle: its own choice (`compact_idle` on its
++-- row), else the setting (on unless heard otherwise).
++function M.compacts(row: any): boolean
++	if row.compact_idle ~= nil then
++		return row.compact_idle == true
++	end
++	return M.setting:peek() ~= false
++end
++
++-- Its choice flipped: what it now says, kept as the chat's own only where
++-- it differs from the setting (else it follows the setting again).
++function M.toggle(row: any): any
++	local next = not M.compacts(row)
++	local follows = next == (M.setting:peek() ~= false)
++	return sessions.compact_idle(row.id, if follows then nil else next)
++end
++
++export type Bind = {
++	session: () -> any,
++	-- The composer's words (a draft state: ds/draft_text).
++	text: any,
++	-- Compact chat: `/compact` to the chat, as sent from the composer.
++	send: (id: string) -> (),
++}
++
++function M.bind(c: Bind): any
++	local b = {}
++	b.alert = ui.computed(function(): any
++		TICK:get()
++		local s = c.session()
++		if not s then
++			return nil
++		end
++		local now = now_ms()
++		if s.cache_expires ~= nil and s.cache_expires > now then
++			judge_again_at(s.cache_expires)
++		end
++		if not M.shows(s, now, Draft.sub(c.text, 1, 1), DISMISSED:get()[s.id]) then
++			return nil
++		end
++		return {
++			id = M.ID,
++			tone = "info",
++			title = ui.t("chat.composer.idle_compact.title", { n = compaction.short(s.context_tokens) }):get(),
++			action = ui.t("chat.composer.idle_compact.action"):get(),
++			dismissable = true,
++		}
++	end)
++	-- The deck's alerts: this one first, then `others`'.
++	function b.merged(others: State<{ any }>?): State<{ any }>
++		return ui.computed(function(): { any }
++			local mine = b.alert:get()
++			local rest = if others then others:get() else {}
++			if not mine then
++				return rest
++			end
++			local out = { mine }
++			for _, x in rest do
++				table.insert(out, x)
++			end
++			return out
++		end)
++	end
++	-- Its action (Compact chat), else `other`'s.
++	function b.on_alert(other: ((id: string) -> ())?): (id: string) -> ()
++		return function(id: string)
++			if id ~= M.ID then
++				if other then
++					other(id)
++				end
++				return
++			end
++			local s = c.session()
++			if s then
++				c.send(s.id)
++			end
++		end
++	end
++	-- Its ×, else `other`'s.
++	function b.on_dismiss(other: ((id: string) -> ())?): (id: string) -> ()
++		return function(id: string)
++			if id ~= M.ID then
++				if other then
++					other(id)
++				end
++				return
++			end
++			local s = c.session()
++			if s then
++				DISMISSED:set_key(s.id, M.expiry_key(s))
++			end
++		end
++	end
++	return b
++end
++
++return M
+diff --git a/apps/zgx/ui/screens/settings/general.luau b/apps/zgx/ui/screens/settings/general.luau
+index caa9a02858b062c2b8edfb5ae5df5dbb79afb42e..f469dd11dd5dcaf2606dfefec75faea38a220363 100644
+--- a/apps/zgx/ui/screens/settings/general.luau
++++ b/apps/zgx/ui/screens/settings/general.luau
+@@ -16,6 +16,7 @@ local search = require("@app/screens/settings/search")
+ local visits = require("@app/screens/settings/visits")
+ local chat = require("@app/screens/chat/store")
+ local language = require("@app/screens/language")
++local IdleCompact = require("@app/screens/chat/idle_compact")
+ 
+ local M = {}
+ 
+@@ -29,6 +30,7 @@ search.index(M.ID, ui.t("settings.general.title"), ui.t("settings.general.terms"
+ 	{ key = "escape_stops", title = ui.t("settings.general.escape_stops.label"), terms = ui.t("settings.general.escape_stops.terms") },
+ 	{ key = "close_panel", title = ui.t("settings.general.close_panel.label"), terms = ui.t("settings.general.close_panel.terms") },
+ 	{ key = "keep_running", title = ui.t("settings.general.keep_running.label"), terms = ui.t("settings.general.keep_running.terms") },
++	{ key = "compact_idle", title = ui.t("settings.general.compact_idle.label"), terms = ui.t("settings.general.compact_idle.terms") },
+ 	{ key = "hide_emails", title = ui.t("settings.general.hide_emails.label"), section = ui.t("settings.general.privacy"), terms = ui.t("settings.general.hide_emails.terms") },
+ 	{ key = "keep_chats_local", title = ui.t("settings.general.keep_chats_local.label"), section = ui.t("settings.general.privacy"), terms = ui.t("settings.general.keep_chats_local.terms") },
+ 	{ key = "thread_naming", title = ui.t("settings.general.thread_naming.label"), terms = ui.t("settings.general.thread_naming.terms") },
+@@ -51,6 +53,17 @@ local titles = ui.state("settings_titles", nil :: Titles?)
+ -- Whether the engine outlives the app (src/quit_prompt.rs).
+ type Background = { keepRunningAfterQuit: boolean }
+ local background = ui.state("settings_background", nil :: Background?)
++-- Whether this Mac compacts its idle Claude chats before their prompt
++-- cache expires (each chat's menu can say otherwise).
++type IdleCompactSettings = { compactIdleChats: boolean }
++local idle_compact = ui.state("settings_idle_compact", nil :: IdleCompactSettings?)
++-- (What a chat's menu falls back on, as this says it.)
++ui.effect(function()
++	local c = idle_compact:get()
++	if c then
++		IdleCompact.setting:set(c.compactIdleChats == true)
++	end
++end)
+ -- Why one couldn't be had (an outcome word), by name.
+ local failed = ui.state("settings_engine_failed", {} :: { [string]: string })
+ 
+@@ -98,6 +111,7 @@ local function load_all()
+ 	load("worktrees", "GetWorktreeSettings", worktrees)
+ 	load("titles", "GetTitleSettings", titles)
+ 	load("background", "GetBackgroundSettings", background)
++	load("idle_compact", "GetIdleCompactSettings", idle_compact)
+ end
+ 
+ -- A change to the engine's: shown now, back as it was if refused.
+@@ -297,6 +311,26 @@ function M.view(): Node
+ 						return background:get() == nil
+ 					end),
+ 				}),
++				row("compact_idle", {
++					label = ui.t("settings.general.compact_idle.label"),
++					description = function()
++						if failed:get().idle_compact then
++							return says(failed:get().idle_compact):get()
++						end
++						return ui.t("settings.general.compact_idle.description"):get()
++					end,
++					control = ui.div {
++						id = "settings-compact-idle",
++						engine_switch(ui.t("settings.general.compact_idle.label"), function()
++							local c = idle_compact:get()
++							return if c then c.compactIdleChats else nil
++						end, function(on: boolean)
++							change("idle_compact", idle_compact, { compactIdleChats = on }, "SetIdleCompactSettings", { compactIdleChats = on })
++						end, function()
++							return idle_compact:get() == nil
++						end),
++					},
++				}),
+ 			},
+ 		},
+ 		ds.Settings.Section {
+diff --git a/apps/zgx/ui/screens/shell/sidebar.luau b/apps/zgx/ui/screens/shell/sidebar.luau
+index 8e78daf1d110a6811c212e21912ca5dd089baaa7..cc68b6c41d55e0792653de6c86ce1fc904c51e14 100644
+--- a/apps/zgx/ui/screens/shell/sidebar.luau
++++ b/apps/zgx/ui/screens/shell/sidebar.luau
+@@ -32,6 +32,7 @@ local control = require("@ds/control")
+ local locale = require("@ds/locale")
+ local ds_session_row = require("@ds/session_row")
+ local activity = require("@app/screens/shell/activity")
++local IdleCompact = require("@app/screens/chat/idle_compact")
+ 
+ export type Props = {
+ 	collapsed: State<boolean>,
+@@ -1184,6 +1185,28 @@ local function menu(id: string): { any }?
+ 			end
+ 		end
+ 	end
++	-- A Claude chat's own "Compact when idle" (Settings has the default).
++	local compact_idle: any = false
++	if c.harness == "claude-code" and not side then
++		IdleCompact.load_setting()
++		compact_idle = {
++			label = locale.s("shell.sidebar.menu.compact_idle"),
++			icon = "clock-circle",
++			checked = function(): boolean
++				return IdleCompact.compacts(c)
++			end,
++			on_select = function()
++				IdleCompact.toggle(c):after(function() end, function(err: any)
++					local outdated = type(err) == "table" and err.message == "outdated"
++					ds.toast.show {
++						title = locale.s("shell.sidebar.menu.compact_idle_failed"),
++						body = if outdated then locale.s("settings.engine.outdated") else nil,
++						tone = "danger",
++					}
++				end)
++			end,
++		}
++	end
+ 	local entries = {
+ 		{
+ 			label = locale.s("common.rename"),
+@@ -1211,6 +1234,7 @@ local function menu(id: string): { any }?
+ 		if side or activity.on:peek() then false else { label = locale.s("shell.sidebar.menu.move_to"), icon = "folder-with-files", submenu = into },
+ 		sleep,
+ 		stop_waiting,
++		compact_idle,
+ 		{ separator = true },
+ 		{
+ 			-- (No key: ⌘⌫ is a text field's, deleting to the line's start.)
+diff --git a/apps/zgx/ui/settings_stub.luau b/apps/zgx/ui/settings_stub.luau
+index 3cc25e608be0f008f5aabf49ae741f479eb45392..aeb0a0c003a3bb6ca5d3d1ad66e4e282543fa076 100644
+--- a/apps/zgx/ui/settings_stub.luau
++++ b/apps/zgx/ui/settings_stub.luau
+@@ -126,6 +126,7 @@ local engine: { [string]: any } = {
+ 	GetNativeSubagents = { switchable = { "claude-code" }, off = {} },
+ 	GetCodeMode = { supported = { "codex", "muse" }, enabled = {} },
+ 	GetBackgroundSettings = { keepRunningAfterQuit = true },
++	GetIdleCompactSettings = { compactIdleChats = true },
+ }
+ local banners = { desktop = true, background_only = true, agent_updates = true }
+ 
+@@ -297,7 +298,7 @@ local answers: { [string]: (arg: any) -> any } = {
+ 				local w = table.clone(engine[get])
+ 				w.settings = arg.params
+ 				engine[get] = w
+-			elseif m == "SetTitleSettings" or m == "SetBackgroundSettings" then
++			elseif m == "SetTitleSettings" or m == "SetBackgroundSettings" or m == "SetIdleCompactSettings" then
+ 				engine[get] = arg.params
+ 			elseif m == "SetCodeMode" then
+ 				local cur = engine[get]
+diff --git a/apps/zgx/ui/shell_fixture.luau b/apps/zgx/ui/shell_fixture.luau
+index 23268be4fa0b6d396bcde468850ed47277ab2b50..668df5b68f6cebab8135d61ee3be2fd55d435bbe 100644
+--- a/apps/zgx/ui/shell_fixture.luau
++++ b/apps/zgx/ui/shell_fixture.luau
+@@ -263,7 +263,7 @@ local model = {
+ 	chats = {
+ 		{ id = "a1", title = "Fix the build", project = "atlas", device = "mac", branch = "fix/build", status = "working", updated = NOW - 60, created = NOW - 2 * HOUR, agent = "claude" },
+ 		{ id = "a2", title = "Write the docs", project = "atlas", device = "mac", branch = "docs", updated = NOW - HOUR, created = NOW - 3 * HOUR, agent = "openai", harness = "codex", harness_session = "th 7/a" },
+-		{ id = "a3", title = "Tidy the tests", project = "atlas", device = "mac", updated = NOW - 2 * HOUR, created = NOW - 5 * HOUR, agent = "claude" },
++		{ id = "a3", title = "Tidy the tests", project = "atlas", device = "mac", updated = NOW - 2 * HOUR, created = NOW - 5 * HOUR, agent = "claude", harness = "claude-code" },
+ 		{ id = "b1", title = "Ship the release", project = "borealis", device = "box", status = "input", updated = NOW - 3 * HOUR, created = NOW - 6 * HOUR, agent = "claude" },
+ 		{ id = "b2", title = "Answer the review", project = "borealis", device = "box", updated = NOW - 24 * HOUR, created = NOW - 30 * HOUR, agent = "cursor" },
+ 	} :: { any },
+@@ -360,6 +360,17 @@ stub.place = function(p: any)
+ 	model.places = p
+ 	publish()
+ end
++-- A chat's own "Compact when idle", kept on its row as the host's is.
++stub.compact_idle = function(id: string, compact: boolean?): any
++	note(`compact_idle:{id}:{if compact == nil then "setting" else tostring(compact)}`)
++	for _, c in model.chats do
++		if c.id == id then
++			c.compact_idle = compact
++		end
++	end
++	publish()
++	return { after = function(_: any, done: (any) -> ()) done(nil) end }
++end
+ stub.archive = function(id: string)
+ 	note(`archive:{id}`)
+ 	for i, c in model.chats do
+diff --git a/apps/zgx/ui/templates/zeron-v2/.base.json b/apps/zgx/ui/templates/zeron-v2/.base.json
+index eefe38d9b228d5603bc0c172ba9f31b965eb9227..61ff6c5dbe8128ed8b17c069e14b2749e0d70b9f 100644
+--- a/apps/zgx/ui/templates/zeron-v2/.base.json
++++ b/apps/zgx/ui/templates/zeron-v2/.base.json
+@@ -1,7 +1,7 @@
+ {
+   "ds/sidebar.luau": "6d5d8113d5768620",
+   "ds/tokens.luau": "0575770327f5e5f2",
+-  "screens/chat/composer.luau": "a451ec6aaa53a23a",
++  "screens/chat/composer.luau": "2152ee3bbada9d37",
+   "screens/chat/lane_tab.luau": "d9bfbad1abf57f73",
+   "screens/panel/init.luau": "a0df0db6e977845f",
+   "screens/shell/init.luau": "302aa5fc3350cd0a",
+diff --git a/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau b/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
+index 3b291412de829e7896a924845c5887397db60a00..583465ec1a734cbf869f6329f7bd335cce857471 100644
+--- a/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
++++ b/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
+@@ -32,6 +32,7 @@ local sessions = require("@account/sessions")
+ local cloud = require("@account/cloud")
+ local LinkNotice = require("@app/screens/chat/link_notice")
+ local CloudTray = require("@app/screens/chat/cloud_tray")
++local IdleCompact = require("@app/screens/chat/idle_compact")
+ local Held = require("@app/screens/chat/held")
+ local CloudMachine = require("@app/screens/chat/cloud_machine")
+ local Where = require("@app/screens/chat/where")
+@@ -659,6 +660,18 @@ local function Composer(): Node
+ 			return CloudMachine.sending_last(store.messages)
+ 		end,
+ 	}
++	-- "Next message resends 240k tokens": a large Claude chat whose prompt
++	-- cache expired, and its Compact chat (`/compact`, as if typed).
++	local idle = IdleCompact.bind {
++		session = open,
++		text = shared.text,
++		send = function(id: string)
++			store.send({ session = id, text = "/compact" } :: any):after(function() end, function()
++				own_notice:set { tone = "danger", key = "chat.composer.didnt_send", dismissable = true }
++			end)
++		end,
++	}
++	local alerts = idle.merged(machine.alerts)
+ 	-- This device's outbox for the chat (#1256): sends uploading or stopped,
+ 	-- each removable where the engine can take one back. Whether it can is
+ 	-- asked once a chat has one, by taking out a send that isn't there (an
+@@ -1566,9 +1579,9 @@ local function Composer(): Node
+ 			end,
+ 			-- (The only notice with an action: a sleeping machine's Wake.)
+ 			on_notice_action = machine.wake,
+-			alerts = machine.alerts,
+-			on_alert_action = machine.on_alert,
+-			on_dismiss_alert = machine.dismiss,
++			alerts = alerts,
++			on_alert_action = idle.on_alert(machine.on_alert),
++			on_dismiss_alert = idle.on_dismiss(machine.dismiss),
+ 			disabled = function(): boolean
+ 				local s = store.session:get()
+ 				local id = session_id:get()
+diff --git a/apps/zgx/ui/tests/idle_compact.test.luau b/apps/zgx/ui/tests/idle_compact.test.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..c58fe79b604939e9ef9cf567b61fb96ca3ab373f
+--- /dev/null
++++ b/apps/zgx/ui/tests/idle_compact.test.luau
+@@ -0,0 +1,187 @@
++-- Compact idle chats, as the window shows it: a compaction's divider in the
++-- transcript (running, then done, its summary opening under it); the
++-- composer's "Next message resends …" alert on a large Claude chat whose
++-- prompt cache expired (Compact chat sends `/compact`; a command being
++-- typed, a clear and × each put it away); Settings' "Compact idle chats";
++-- and a chat's own "Compact when idle" in its menu. On ui/chat_fixture.luau,
++-- ui/shell_fixture.luau and ui/settings_fixture.luau.
++
++local NOTICE = "Next message resends 240k tokens"
++local ITEM = 'role:menu "Session actions" >> role:menuitemcheckbox "Compact when idle"'
++
++local function chat(): any
++	local app = mount("chat_fixture.luau")
++	app:resize(1000, 800)
++	app:frames(30)
++	app:command("go_s2")
++	app:frames(30)
++	return app
++end
++
++-- Whether the alert is there: the deck's pill, opened to read it.
++local function notice(app: any): boolean
++	if not app:has('role:button "Open Alerts"') then
++		return app:has(`"{NOTICE}"`)
++	end
++	app:click('role:button "Open Alerts"')
++	app:frames(30)
++	return app:has(`"{NOTICE}"`)
++end
++
++test("idle compact: a compaction is one divider: running, then done, its summary opening under it", function()
++	local app = chat()
++	app:command("compaction_rows")
++	app:frames(40)
++	local tree = app:tree("#transcript")
++	expect(tree).to_contain("Compacted 240k → 18k tokens")
++	expect(tree).to_contain("Compacting 180k tokens…")
++	-- (No user turn of its own, no reply's lane.)
++	expect(string.find(tree, "/compact", 1, true)).to_be(nil)
++	-- Running, it's only words; done, it opens its summary.
++	expect(app:has('role:button "Compacting 180k tokens…"')).to_be(false)
++	expect(app:has('"We were porting "')).to_be(false)
++	app:click('role:button "Compacted 240k → 18k tokens"')
++	app:frames(30)
++	expect(app:tree("#transcript")).to_contain("the deck")
++	app:click('role:button "Compacted 240k → 18k tokens"')
++	app:frames(30)
++	expect(string.find(app:tree("#transcript"), "the deck", 1, true)).to_be(nil)
++	-- The running one finishes in place.
++	app:command("compaction_done")
++	app:frames(40)
++	tree = app:tree("#transcript")
++	expect(tree).to_contain("Compacted 180k → 12k tokens")
++	expect(string.find(tree, "Compacting", 1, true)).to_be(nil)
++	expect(app:error()).to_be(nil)
++end)
++
++test("idle compact: a large chat whose cache expired says what the next message resends; Compact chat sends /compact", function()
++	local app = chat()
++	expect(notice(app)).to_be(false)
++	app:command("idle_expired")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	app:click('role:button "Compact chat"')
++	app:frames(30)
++	expect(app:state("calls")).to_contain("send:s2:/compact")
++	expect(app:error()).to_be(nil)
++end)
++
++test("idle compact: no alert while the cache is warm", function()
++	local app = chat()
++	app:command("idle_cached")
++	app:frames(30)
++	expect(notice(app)).to_be(false)
++	expect(app:error()).to_be(nil)
++end)
++
++test("idle compact: a command being typed puts it away; the words gone, it's back", function()
++	local app = chat()
++	app:command("idle_expired")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	app:type("role:textbox", "/")
++	app:frames(30)
++	expect(app:has(`"{NOTICE}"`)).to_be(false)
++	app:fill("role:textbox", "")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	-- Ordinary words keep it: Send still just sends.
++	app:type("role:textbox", "carry on")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	expect(app:error()).to_be(nil)
++end)
++
++test("idle compact: a clear empties the context: the alert goes", function()
++	local app = chat()
++	app:command("idle_expired")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	app:command("idle_cleared")
++	app:frames(30)
++	expect(app:has(`"{NOTICE}"`)).to_be(false)
++	expect(app:error()).to_be(nil)
++end)
++
++test("idle compact: × puts it away until the cache expires again", function()
++	local app = chat()
++	app:command("idle_expired")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	app:click(`role:button "Dismiss {NOTICE}"`)
++	app:frames(30)
++	expect(app:has(`"{NOTICE}"`)).to_be(false)
++	-- A turn since (its cache warm), then expired again: back.
++	app:command("idle_cached")
++	app:frames(30)
++	app:command("idle_expired")
++	app:frames(30)
++	expect(notice(app)).to_be(true)
++	expect(app:error()).to_be(nil)
++end)
++
++test("idle compact: a Claude chat's menu has Compact when idle: ticked by the setting, flipped as its own", function()
++	local app = mount("shell_fixture.luau")
++	app:resize(1200, 900)
++	app:frames(30)
++	local row = '#shell-sidebar >> role:button "Tidy the tests"'
++	app:right_click(row)
++	app:frames(20)
++	expect(app:tree(ITEM)).to_contain("checked")
++	expect(app:tree(ITEM)).never.to_contain("unchecked")
++	app:click(ITEM)
++	app:frames(30)
++	expect(app:state("calls")).to_contain("compact_idle:a3:false")
++	-- Turned back on, it follows the setting again.
++	app:right_click(row)
++	app:frames(20)
++	expect(app:tree(ITEM)).to_contain("unchecked")
++	app:click(ITEM)
++	app:frames(30)
++	expect(app:state("calls")).to_contain("compact_idle:a3:setting")
++	-- Another agent's chat has none.
++	app:key("escape")
++	app:frames(60)
++	app:right_click('#shell-sidebar >> role:button "Write the docs"')
++	app:frames(30)
++	-- (The menu shown: an earlier one stays in the tree, hidden.)
++	local shown = app:tree('role:menu "Session actions"')
++	expect(shown).to_contain("Codex conversation link")
++	expect(shown).never.to_contain("Compact when idle")
++	expect(app:error()).to_be(nil)
++end)
++
++local function asked(app: any, entry: string): boolean
++	for _, c in (app:state("settings_stub_calls") :: any) or {} do
++		if c == entry then
++			return true
++		end
++	end
++	return false
++end
++
++test("idle compact: Settings has Compact idle chats, on until turned off; a chat's menu follows it", function()
++	local app = mount("shell_fixture.luau")
++	app:resize(1200, 900)
++	app:frames(30)
++	app:command("settings_stub.sign_in")
++	app:command("shell.settings")
++	app:frames(20)
++	local switch = '#settings-page >> role:switch "Compact idle chats"'
++	expect(asked(app, "settings.engine:GetIdleCompactSettings")).to_be(true)
++	expect(app:tree(switch)).never.to_contain("unchecked")
++	expect(app:tree("#settings-page")).to_contain("Before the prompt cache expires, on chats over 200k tokens.")
++	app:click(switch)
++	app:frames(10)
++	expect(asked(app, "settings.engine:SetIdleCompactSettings")).to_be(true)
++	expect(app:tree(switch)).to_contain("unchecked")
++	-- Refused: it goes back as it was.
++	app:command("settings_stub.refuse_next")
++	app:click(switch)
++	app:frames(10)
++	expect(app:tree(switch)).to_contain("unchecked")
++	-- Off for the device: what a chat with no choice of its own follows.
++	expect(app:state("idle_compact_setting")).to_be(false)
++	expect(app:error()).to_be(nil)
++end)
+diff --git a/crates/doc/src/parts.rs b/crates/doc/src/parts.rs
+index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c55969e0b7 100644
+--- a/crates/doc/src/parts.rs
++++ b/crates/doc/src/parts.rs
+@@ -377,6 +377,22 @@ pub enum MessagePart {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         to_harness: Option<String>,
+     },
++    /// The agent compacted its context here: one divider across the
++    /// transcript, the same whether the person sent `/compact`, Zeron did
++    /// (an idle chat, before its prompt cache expired) or the agent did on
++    /// its own. Running while `post_tokens` is absent. `summary` is what the
++    /// agent carries on from (shown when the divider is opened). Old builds'
++    /// unknown-kind fallback yields an invisible empty text part.
++    #[serde(rename_all = "camelCase")]
++    Compaction {
++        id: String,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        pre_tokens: Option<u64>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        post_tokens: Option<u64>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        summary: Option<String>,
++    },
+ }
+ 
+ impl MessagePart {
+@@ -390,7 +406,8 @@ impl MessagePart {
+             | MessagePart::Input { id, .. }
+             | MessagePart::Error { id, .. }
+             | MessagePart::Fork { id, .. }
+-            | MessagePart::Switch { id, .. } => id,
++            | MessagePart::Switch { id, .. }
++            | MessagePart::Compaction { id, .. } => id,
+         }
+     }
+ 
+@@ -437,6 +454,7 @@ impl MessagePart {
+                 ..
+             } => source_chat_id.len() + source_title.len(),
+             MessagePart::Switch { from, to, .. } => from.len() + to.len(),
++            MessagePart::Compaction { summary, .. } => 16 + summary.as_ref().map_or(0, String::len),
+         }
+     }
+ }
+@@ -683,6 +701,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
+                 }
+             }
+         }
++        AgentEvent::Compaction {
++            pre_tokens,
++            post_tokens,
++            summary,
++        } => fold_compaction(out, *pre_tokens, *post_tokens, summary.as_deref()),
+         AgentEvent::Error { message } => {
+             let id = format!("e{}", out.len());
+             out.push(MessagePart::Error {
+@@ -759,11 +782,64 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
+         | AgentEvent::Usage { .. }
+         | AgentEvent::PlanUsage { .. }
+         | AgentEvent::ContextUsage { .. }
++        | AgentEvent::PromptCache { .. }
+         | AgentEvent::AvailableCommands { .. }
+         | AgentEvent::UserMessage { .. } => {}
+     }
+ }
+ 
++/// One compaction is one part. Its start (nothing but `pre`), its end
++/// (`post`) and its summary arrive as separate events: each goes into the
++/// turn's latest compaction part while that one still takes it (running,
++/// for a start or an end; any, for a summary not yet known), else starts a
++/// new part (a second compaction in the same turn).
++fn fold_compaction(
++    out: &mut Vec<MessagePart>,
++    pre: Option<u64>,
++    post: Option<u64>,
++    summary: Option<&str>,
++) {
++    let summary = summary.map(str::trim).filter(|s| !s.is_empty());
++    let latest = out.iter_mut().rev().find_map(|p| match p {
++        MessagePart::Compaction {
++            pre_tokens,
++            post_tokens,
++            summary,
++            ..
++        } => Some((pre_tokens, post_tokens, summary)),
++        _ => None,
++    });
++    let only_summary = summary.is_some() && pre.is_none() && post.is_none();
++    if let Some((pre_slot, post_slot, summary_slot)) = latest {
++        let takes = if only_summary {
++            summary_slot.is_none()
++        } else {
++            post_slot.is_none()
++        };
++        if takes {
++            // (The boundary's count is the agent's own: it replaces the
++            // estimate the start was given.)
++            if pre.is_some() && (pre_slot.is_none() || post.is_some()) {
++                *pre_slot = pre;
++            }
++            if post.is_some() {
++                *post_slot = post;
++            }
++            if let Some(summary) = summary {
++                *summary_slot = Some(summary.to_owned());
++            }
++            return;
++        }
++    }
++    let id = format!("c{}", out.len());
++    out.push(MessagePart::Compaction {
++        id,
++        pre_tokens: pre,
++        post_tokens: post,
++        summary: summary.map(str::to_owned),
++    });
++}
++
+ /// Stamp sidecar keys onto resolved tool parts that have sidecar content.
+ ///
+ /// Separate from the fold because the fold is chat-agnostic and pure; the
+@@ -963,6 +1039,34 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
+ mod tests {
+     use super::*;
+ 
++    /// A compaction's start, its boundary and its summary are one part (the
++    /// divider), filled in as they come; a second compaction is a part of
++    /// its own.
++    #[test]
++    fn a_compaction_folds_into_one_part_as_it_goes() {
++        let compaction = |pre: Option<u64>, post: Option<u64>, summary: Option<&str>| AgentEvent::Compaction {
++            pre_tokens: pre,
++            post_tokens: post,
++            summary: summary.map(str::to_owned),
++        };
++        let mut parts = Vec::new();
++        fold_event_into_parts(&mut parts, &compaction(Some(240_000), None, None));
++        fold_event_into_parts(&mut parts, &compaction(Some(240_500), Some(18_000), None));
++        fold_event_into_parts(&mut parts, &compaction(None, None, Some("S")));
++        fold_event_into_parts(&mut parts, &AgentEvent::PromptCache { ttl_secs: Some(3600) });
++        assert_eq!(parts.len(), 1, "{parts:?}");
++        match &parts[0] {
++            MessagePart::Compaction { pre_tokens, post_tokens, summary, .. } => {
++                assert_eq!(*pre_tokens, Some(240_500));
++                assert_eq!(*post_tokens, Some(18_000));
++                assert_eq!(summary.as_deref(), Some("S"));
++            }
++            other => panic!("not a compaction: {other:?}"),
++        }
++        fold_event_into_parts(&mut parts, &compaction(Some(30_000), None, None));
++        assert_eq!(parts.len(), 2, "a done compaction takes no new start");
++    }
++
+     #[test]
+     fn a_review_folds_onto_its_call_and_a_later_one_replaces_it() {
+         use zeron_proto::ToolReviewStatus;
+diff --git a/crates/doc/src/registry.rs b/crates/doc/src/registry.rs
+index ed711e5fc690f666e3bfa7a5cdb0908f4d613896..2f95d939b2d573a0a9f767572e8906a2a44ee455 100644
+--- a/crates/doc/src/registry.rs
++++ b/crates/doc/src/registry.rs
+@@ -1677,6 +1677,33 @@ impl RegistryDoc {
+         Ok(true)
+     }
+ 
++    /// The chat's own choice on compacting it when idle (before its prompt
++    /// cache expires): `None` follows the device's setting. A row field of
++    /// its own (`compactIdle`), last write wins; readers that don't know it
++    /// ignore it. `false` when no such row.
++    pub fn set_chat_compact_idle(
++        &mut self,
++        chat_id: &str,
++        compact: Option<bool>,
++    ) -> Result<bool, DocError> {
++        if !self.row_exists(KIND_CHATS, chat_id) {
++            return Ok(false);
++        }
++        self.write(
++            KIND_CHATS,
++            chat_id,
++            OpKind::Update,
++            fields([("compactIdle", json!(compact))]),
++        );
++        Ok(true)
++    }
++
++    /// [`Self::set_chat_compact_idle`]'s choice, `None` for none (or no row).
++    pub fn chat_compact_idle(&self, chat_id: &str) -> Option<bool> {
++        self.overlay_row(KIND_CHATS, chat_id)
++            .and_then(|row| row.fields.get("compactIdle").and_then(Value::as_bool))
++    }
++
+     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, DocError> {
+         Ok(self
+             .overlay_row(KIND_CHATS, chat_id)
+diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
+index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c700994d907 100644
+--- a/crates/doc/src/schema.rs
++++ b/crates/doc/src/schema.rs
+@@ -117,6 +117,15 @@ struct DocPartJson {
+     from_harness: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     to_harness: Option<String>,
++    /// Compaction divider (`kind: "compaction"`, additive): the context
++    /// before and after, and the agent's summary. The summary is not `text`:
++    /// old readers' unknown-kind fallback would show it as prose.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pre_tokens: Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    post_tokens: Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    summary: Option<String>,
+     /// Tool output summary (additive — absent on old rows and old writers;
+     /// pre-strip writers stored up to 4KB of capped output here).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -295,6 +304,19 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
+             to_harness: to_harness.clone(),
+             ..Default::default()
+         },
++        MessagePart::Compaction {
++            id,
++            pre_tokens,
++            post_tokens,
++            summary,
++        } => DocPartJson {
++            id: id.clone(),
++            kind: "compaction".into(),
++            pre_tokens: *pre_tokens,
++            post_tokens: *post_tokens,
++            summary: summary.clone(),
++            ..Default::default()
++        },
+     })
+ }
+ 
+@@ -376,6 +398,12 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
+             from_harness: p.from_harness,
+             to_harness: p.to_harness,
+         },
++        "compaction" => MessagePart::Compaction {
++            id: p.id,
++            pre_tokens: p.pre_tokens,
++            post_tokens: p.post_tokens,
++            summary: p.summary,
++        },
+         _ => MessagePart::Text {
+             id: p.id,
+             text: p.text.unwrap_or_default(),
+@@ -712,7 +740,27 @@ impl SessionDoc {
+         let next = zeron_proto::ContextUsage {
+             tokens: tokens.or(previous.tokens),
+             window: window.filter(|n| *n > 0).or(previous.window),
++            ..previous
+         };
++        self.write_context_usage(previous, next)
++    }
++
++    /// Record when the provider's prompt cache over this context expires
++    /// (Unix ms), or that it isn't known (`None`).
++    pub fn set_cache_expiry(&self, expires_at: Option<i64>) -> Result<(), DocError> {
++        let previous = self.context_usage().unwrap_or_default();
++        let next = zeron_proto::ContextUsage {
++            cache_expires_at: expires_at,
++            ..previous
++        };
++        self.write_context_usage(previous, next)
++    }
++
++    fn write_context_usage(
++        &self,
++        previous: zeron_proto::ContextUsage,
++        next: zeron_proto::ContextUsage,
++    ) -> Result<(), DocError> {
+         if next != previous {
+             self.doc
+                 .get_map("meta")
+@@ -1700,6 +1748,22 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
+     if let Some(review) = &doc_part.review {
+         map.insert("review", loro_value_from_json(review))?;
+     }
++    write_compaction_fields(&map, &doc_part)?;
++    Ok(())
++}
++
++/// A compaction divider's fields: written as they become known (its start
++/// has only `preTokens`).
++fn write_compaction_fields(map: &LoroMap, doc_part: &DocPartJson) -> Result<(), DocError> {
++    if let Some(tokens) = doc_part.pre_tokens {
++        map.insert("preTokens", tokens as i64)?;
++    }
++    if let Some(tokens) = doc_part.post_tokens {
++        map.insert("postTokens", tokens as i64)?;
++    }
++    if let Some(summary) = &doc_part.summary {
++        map.insert("summary", summary.as_str())?;
++    }
+     Ok(())
+ }
+ 
+@@ -2243,6 +2307,7 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
+     if let Some(review) = &doc_part.review {
+         map.insert("review", loro_value_from_json(review))?;
+     }
++    write_compaction_fields(map, &doc_part)?;
+     if let Some(text) = &doc_part.text {
+         // Defensive path only — the fold never rewrites earlier text.
+         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
+@@ -3887,7 +3952,8 @@ mod context_usage_tests {
+             replica.context_usage(),
+             Some(zeron_proto::ContextUsage {
+                 tokens: Some(0),
+-                window: Some(200_000)
++                window: Some(200_000),
++                ..Default::default()
+             })
+         );
+         host.update_context_usage(None, Some(1_000_000)).unwrap();
+diff --git a/crates/doc/src/transcript_delta.rs b/crates/doc/src/transcript_delta.rs
+index 18cf1407f57eb9fbc42c1362499be1d9e579be0d..4918104dec0516dd75b277e5390778f0b2f2bc00 100644
+--- a/crates/doc/src/transcript_delta.rs
++++ b/crates/doc/src/transcript_delta.rs
+@@ -1073,6 +1073,7 @@ mod context_update_tests {
+             context_usage: Some(zeron_proto::ContextUsage {
+                 tokens: Some(0),
+                 window: Some(200000),
++                ..Default::default()
+             }),
+         })
+         .unwrap();
+diff --git a/crates/engine/src/idle_compact.rs b/crates/engine/src/idle_compact.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ddcaf1eda486e7a52c233d1963acf4a0d4fae42
+--- /dev/null
++++ b/crates/engine/src/idle_compact.rs
+@@ -0,0 +1,509 @@
++//! Compact idle chats: a large idle Claude chat is compacted shortly before
++//! its prompt cache expires, while its history is still cached.
++//!
++//! A Claude subscription's prompt cache lives an hour from the start of the
++//! request that last wrote or read it. A chat left past that resends its
++//! whole context uncached with the next message (measured on the PC: after
++//! an hour away, 96 of 98 requests missed the cache and rewrote ~190k
++//! tokens each, at twice the input price). Compacting while the cache is
++//! warm costs a cached read of the history and leaves a small context for
++//! that next message.
++//!
++//! Claude Code has this itself (`idleCompaction`), but its timer never runs
++//! under Zeron: it arms only for interactive sessions or a list of
++//! entrypoints, and the engine stops an idle agent after two minutes
++//! ([`super::AGENT_IDLE_STOP`]). So the engine does it:
++//!
++//! - Each request's start and its usage's cache lifetime are noted per chat
++//!   ([`CacheClock`]). A request that only read the cache carries the
++//!   lifetime before it on.
++//! - When a turn ends, the expiry is written to the chat's context usage
++//!   (`cacheExpiresAt`, the app's "Next message resends …" notice) and, for
++//!   an hour's cache, a timer is armed [`LEAD`] before it ([`fire_at`]).
++//! - When it fires, the chat must still be idle and eligible
++//!   ([`eligible`]); then `/compact` goes to the agent as a run of its own
++//!   that resumes the session, with no user message in the transcript (its
++//!   divider is the agent's own compaction, as for a `/compact` sent by
++//!   hand). Messages sent meanwhile wait in the queue for its end.
++//! - A compaction's own end never arms another: a chat compacts at most once
++//!   per idle spell. Timers live in memory: a restart drops them, and the
++//!   app's notice covers what they missed.
++
++use std::collections::HashMap;
++use std::time::Duration;
++
++/// The context a chat must hold for it to be worth compacting.
++pub const MIN_TOKENS: u64 = 200_000;
++
++/// How long before the cache expires the compaction starts: its own request
++/// must read the history while it is still cached.
++pub const LEAD: Duration = Duration::from_secs(2 * 60);
++
++/// The cache lifetime worth compacting for. A 5-minute cache expires before
++/// anyone is away long enough for it to matter.
++pub const HOUR_TTL_SECS: u64 = 60 * 60;
++
++/// The prompt that compacts (Claude Code's own command).
++pub const COMPACT_PROMPT: &str = "/compact";
++
++/// Test and measurement knobs, read once per use:
++/// `ZERON_IDLE_COMPACT_AFTER_MS` fires that long after the last request's
++/// start, whatever the cache's lifetime (a live run needn't wait an hour);
++/// `ZERON_IDLE_COMPACT_MIN_TOKENS` lowers [`MIN_TOKENS`].
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Overrides {
++    pub after: Option<Duration>,
++    pub min_tokens: Option<u64>,
++}
++
++impl Overrides {
++    pub fn from_env() -> Self {
++        let num = |name: &str| {
++            std::env::var(name)
++                .ok()
++                .and_then(|v| v.trim().parse::<u64>().ok())
++        };
++        Self {
++            after: num("ZERON_IDLE_COMPACT_AFTER_MS").map(Duration::from_millis),
++            min_tokens: num("ZERON_IDLE_COMPACT_MIN_TOKENS"),
++        }
++    }
++
++    pub fn min_tokens(self) -> u64 {
++        self.min_tokens.unwrap_or(MIN_TOKENS)
++    }
++}
++
++/// One chat's prompt cache as its requests left it.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct CacheClock {
++    /// When the request under way (or the last one) started, Unix ms.
++    request_started: Option<i64>,
++    /// The lifetime of the last cache write, carried over reads.
++    ttl_secs: Option<u64>,
++    /// When the cache the last measured request left expires, Unix ms.
++    expires_at: Option<i64>,
++}
++
++impl CacheClock {
++    /// A request leaves (a turn's prompt, a tool's result going back, a
++    /// compaction): its cache lifetime counts from here.
++    pub fn request_started(&mut self, at_ms: i64) {
++        self.request_started = Some(at_ms);
++    }
++
++    /// Its usage came: `ttl` is the lifetime it wrote, `None` for a pure
++    /// read (the cache lives on as long as it did, from this request).
++    pub fn usage(&mut self, ttl_secs: Option<u64>) {
++        if ttl_secs.is_some() {
++            self.ttl_secs = ttl_secs;
++        }
++        if let (Some(start), Some(ttl)) = (self.request_started, self.ttl_secs) {
++            self.expires_at = Some(start + (ttl as i64) * 1000);
++        }
++    }
++
++    pub fn expires_at(&self) -> Option<i64> {
++        self.expires_at
++    }
++
++    pub fn ttl_secs(&self) -> Option<u64> {
++        self.ttl_secs
++    }
++
++    pub fn request_started_at(&self) -> Option<i64> {
++        self.request_started
++    }
++}
++
++/// When to compact, Unix ms: [`LEAD`] before an hour's cache expires (or
++/// `after` the request's start, when overridden). `None`: not worth it (a
++/// shorter cache, or none known).
++pub fn fire_at(clock: &CacheClock, overrides: Overrides) -> Option<i64> {
++    if let Some(after) = overrides.after {
++        return Some(clock.request_started_at()? + after.as_millis() as i64);
++    }
++    if clock.ttl_secs()? < HOUR_TTL_SECS {
++        return None;
++    }
++    Some(clock.expires_at()? - LEAD.as_millis() as i64)
++}
++
++/// What decides whether a chat compacts now, read when its timer fires.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Facts {
++    /// This device's "Compact idle chats".
++    pub setting_on: bool,
++    /// The chat's own "Compact when idle", when set.
++    pub chat_choice: Option<bool>,
++    pub claude: bool,
++    pub tokens: Option<u64>,
++    pub min_tokens: u64,
++    /// A subagent's or another chat's child (it has a parent).
++    pub child: bool,
++    pub archived: bool,
++    /// A question waits on the person.
++    pub awaiting_input: bool,
++    /// The agent runs background work.
++    pub background: bool,
++    /// A message waits in the queue (or on its way through the commands).
++    pub queued: bool,
++    pub turn_running: bool,
++    /// Its cache expired already (the machine slept through the timer):
++    /// compacting would pay the whole context uncached all the same.
++    pub cache_expired: bool,
++}
++
++/// Why a chat doesn't compact now.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Skip {
++    Off,
++    NotClaude,
++    Small,
++    Child,
++    Archived,
++    Question,
++    Background,
++    Queued,
++    Running,
++    Expired,
++}
++
++pub fn eligible(facts: &Facts) -> Result<(), Skip> {
++    if !facts.chat_choice.unwrap_or(facts.setting_on) {
++        return Err(Skip::Off);
++    }
++    if !facts.claude {
++        return Err(Skip::NotClaude);
++    }
++    if facts.child {
++        return Err(Skip::Child);
++    }
++    if facts.archived {
++        return Err(Skip::Archived);
++    }
++    if facts.tokens.is_none_or(|t| t < facts.min_tokens) {
++        return Err(Skip::Small);
++    }
++    if facts.turn_running {
++        return Err(Skip::Running);
++    }
++    if facts.awaiting_input {
++        return Err(Skip::Question);
++    }
++    if facts.background {
++        return Err(Skip::Background);
++    }
++    if facts.queued {
++        return Err(Skip::Queued);
++    }
++    if facts.cache_expired {
++        return Err(Skip::Expired);
++    }
++    Ok(())
++}
++
++/// The chats' cache clocks and armed timers.
++#[derive(Default)]
++pub struct IdleCompactions {
++    clocks: HashMap<String, CacheClock>,
++    /// Armed timers: chat → (generation, when it fires (Unix ms), task).
++    armed: HashMap<String, Armed>,
++    generation: u64,
++}
++
++struct Armed {
++    generation: u64,
++    at_ms: i64,
++    task: tokio::task::AbortHandle,
++}
++
++impl IdleCompactions {
++    pub fn clock(&mut self, chat_id: &str) -> &mut CacheClock {
++        self.clocks.entry(chat_id.to_owned()).or_default()
++    }
++
++    pub fn peek(&self, chat_id: &str) -> Option<CacheClock> {
++        self.clocks.get(chat_id).copied()
++    }
++
++    /// The next generation for a timer about to be armed.
++    pub fn next_generation(&mut self) -> u64 {
++        self.generation += 1;
++        self.generation
++    }
++
++    /// Arm (replacing any timer the chat had).
++    pub fn arm(
++        &mut self,
++        chat_id: &str,
++        generation: u64,
++        at_ms: i64,
++        task: tokio::task::AbortHandle,
++    ) {
++        if let Some(old) = self.armed.insert(
++            chat_id.to_owned(),
++            Armed {
++                generation,
++                at_ms,
++                task,
++            },
++        ) {
++            old.task.abort();
++        }
++    }
++
++    /// When the chat's armed timer fires, if one is.
++    pub fn armed_at(&self, chat_id: &str) -> Option<i64> {
++        self.armed.get(chat_id).map(|a| a.at_ms)
++    }
++
++    /// The timer of `generation` fired: it is spent. `false` when another
++    /// replaced it meanwhile.
++    pub fn take_fired(&mut self, chat_id: &str, generation: u64) -> bool {
++        match self.armed.get(chat_id) {
++            Some(armed) if armed.generation == generation => {
++                self.armed.remove(chat_id);
++                true
++            }
++            _ => false,
++        }
++    }
++
++    pub fn disarm(&mut self, chat_id: &str) {
++        if let Some(armed) = self.armed.remove(chat_id) {
++            armed.task.abort();
++        }
++    }
++
++    pub fn disarm_all(&mut self) {
++        for (_, armed) in self.armed.drain() {
++            armed.task.abort();
++        }
++    }
++
++    /// A chat that's gone (deleted): its clock goes too.
++    pub fn forget(&mut self, chat_id: &str) {
++        self.disarm(chat_id);
++        self.clocks.remove(chat_id);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const MIN: i64 = 60 * 1000;
++
++    fn eligible_facts() -> Facts {
++        Facts {
++            setting_on: true,
++            chat_choice: None,
++            claude: true,
++            tokens: Some(240_000),
++            min_tokens: MIN_TOKENS,
++            ..Facts::default()
++        }
++    }
++
++    #[test]
++    fn the_cache_expires_an_hour_after_the_request_started_not_after_its_reply() {
++        let mut clock = CacheClock::default();
++        clock.request_started(1_000_000);
++        // The reply streamed for five minutes; its usage came at the end.
++        clock.usage(Some(HOUR_TTL_SECS));
++        assert_eq!(clock.expires_at(), Some(1_000_000 + 60 * MIN));
++        // Fired two minutes before.
++        assert_eq!(
++            fire_at(&clock, Overrides::default()),
++            Some(1_000_000 + 58 * MIN)
++        );
++    }
++
++    #[test]
++    fn a_cache_read_carries_the_lifetime_before_it_and_refreshes_it() {
++        let mut clock = CacheClock::default();
++        clock.request_started(0);
++        clock.usage(Some(HOUR_TTL_SECS));
++        // A later request only read the cache: an hour from ITS start.
++        clock.request_started(30 * MIN);
++        clock.usage(None);
++        assert_eq!(clock.ttl_secs(), Some(HOUR_TTL_SECS));
++        assert_eq!(clock.expires_at(), Some(90 * MIN));
++        assert_eq!(fire_at(&clock, Overrides::default()), Some(88 * MIN));
++    }
++
++    #[test]
++    fn a_five_minute_cache_or_none_known_arms_nothing() {
++        let mut clock = CacheClock::default();
++        clock.request_started(0);
++        clock.usage(Some(5 * 60));
++        assert_eq!(clock.expires_at(), Some(5 * MIN));
++        assert_eq!(fire_at(&clock, Overrides::default()), None);
++        // A read with no lifetime ever written: unknown.
++        let mut unknown = CacheClock::default();
++        unknown.request_started(0);
++        unknown.usage(None);
++        assert_eq!(unknown.expires_at(), None);
++        assert_eq!(fire_at(&unknown, Overrides::default()), None);
++        // A 5-minute write after an hour's: the 5-minute one stands now.
++        let mut clock = CacheClock::default();
++        clock.request_started(0);
++        clock.usage(Some(HOUR_TTL_SECS));
++        clock.request_started(MIN);
++        clock.usage(Some(5 * 60));
++        assert_eq!(fire_at(&clock, Overrides::default()), None);
++    }
++
++    #[test]
++    fn the_override_fires_after_the_request_whatever_the_cache() {
++        let mut clock = CacheClock::default();
++        clock.request_started(10_000);
++        clock.usage(Some(5 * 60));
++        let overrides = Overrides {
++            after: Some(Duration::from_secs(20)),
++            min_tokens: Some(1_000),
++        };
++        assert_eq!(fire_at(&clock, overrides), Some(30_000));
++        assert_eq!(overrides.min_tokens(), 1_000);
++        assert_eq!(Overrides::default().min_tokens(), MIN_TOKENS);
++    }
++
++    #[test]
++    fn eligibility_needs_every_rule() {
++        assert_eq!(eligible(&eligible_facts()), Ok(()));
++        let cases: Vec<(Facts, Skip)> = vec![
++            (
++                Facts {
++                    setting_on: false,
++                    ..eligible_facts()
++                },
++                Skip::Off,
++            ),
++            (
++                Facts {
++                    chat_choice: Some(false),
++                    ..eligible_facts()
++                },
++                Skip::Off,
++            ),
++            (
++                Facts {
++                    claude: false,
++                    ..eligible_facts()
++                },
++                Skip::NotClaude,
++            ),
++            (
++                Facts {
++                    tokens: Some(199_999),
++                    ..eligible_facts()
++                },
++                Skip::Small,
++            ),
++            (
++                Facts {
++                    tokens: None,
++                    ..eligible_facts()
++                },
++                Skip::Small,
++            ),
++            (
++                Facts {
++                    child: true,
++                    ..eligible_facts()
++                },
++                Skip::Child,
++            ),
++            (
++                Facts {
++                    archived: true,
++                    ..eligible_facts()
++                },
++                Skip::Archived,
++            ),
++            (
++                Facts {
++                    awaiting_input: true,
++                    ..eligible_facts()
++                },
++                Skip::Question,
++            ),
++            (
++                Facts {
++                    background: true,
++                    ..eligible_facts()
++                },
++                Skip::Background,
++            ),
++            (
++                Facts {
++                    queued: true,
++                    ..eligible_facts()
++                },
++                Skip::Queued,
++            ),
++            (
++                Facts {
++                    turn_running: true,
++                    ..eligible_facts()
++                },
++                Skip::Running,
++            ),
++            (
++                Facts {
++                    cache_expired: true,
++                    ..eligible_facts()
++                },
++                Skip::Expired,
++            ),
++        ];
++        for (facts, skip) in cases {
++            assert_eq!(eligible(&facts), Err(skip), "{facts:?}");
++        }
++        // Exactly the threshold counts.
++        assert_eq!(
++            eligible(&Facts {
++                tokens: Some(MIN_TOKENS),
++                ..eligible_facts()
++            }),
++            Ok(())
++        );
++    }
++
++    #[test]
++    fn the_chats_own_choice_overrides_the_setting() {
++        let on_here = Facts {
++            setting_on: false,
++            chat_choice: Some(true),
++            ..eligible_facts()
++        };
++        assert_eq!(eligible(&on_here), Ok(()));
++        let off_here = Facts {
++            setting_on: true,
++            chat_choice: Some(false),
++            ..eligible_facts()
++        };
++        assert_eq!(eligible(&off_here), Err(Skip::Off));
++    }
++
++    #[tokio::test]
++    async fn a_timer_fires_once_and_a_newer_one_replaces_it() {
++        let mut timers = IdleCompactions::default();
++        let task = || tokio::spawn(std::future::pending::<()>()).abort_handle();
++        let first = timers.next_generation();
++        let first_task = task();
++        timers.arm("c", first, 100, first_task.clone());
++        assert_eq!(timers.armed_at("c"), Some(100));
++        let second = timers.next_generation();
++        timers.arm("c", second, 200, task());
++        // The replaced one was stopped, and its firing counts for nothing.
++        tokio::task::yield_now().await;
++        assert!(first_task.is_finished());
++        assert!(!timers.take_fired("c", first));
++        // The armed one fires once.
++        assert!(timers.take_fired("c", second));
++        assert!(!timers.take_fired("c", second));
++        assert_eq!(timers.armed_at("c"), None);
++    }
++}
+diff --git a/crates/engine/src/registry.rs b/crates/engine/src/registry.rs
+index 68c8b65d70be7d3969931e9e8178170174499e77..f8b421ec4a6170f1523b6a8287d0d76a59741b32 100644
+--- a/crates/engine/src/registry.rs
++++ b/crates/engine/src/registry.rs
+@@ -113,6 +113,8 @@ struct HarnessPrefsFile {
+     native_subagents_off: Vec<HarnessId>,
+     /// Harnesses the user turned Code Mode on for.
+     code_mode_on: Vec<HarnessId>,
++    /// "Compact idle chats" turned off (Settings → General): on unless set.
++    compact_idle_chats_off: bool,
+     /// The allow-list written back when enablement was a fixed default set.
+     /// Read once, folded into `disabled`, and never written again.
+     #[serde(skip_serializing)]
+@@ -129,6 +131,15 @@ pub struct TitleSettings {
+     pub model: Option<String>,
+ }
+ 
++/// "Compact idle chats" (Settings → General), this device's: its idle
++/// Claude chats over 200k tokens compact before their prompt cache expires
++/// ([`crate::idle_compact`]). A chat's own choice overrides it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct IdleCompactSettings {
++    pub compact_idle_chats: bool,
++}
++
+ /// Per-device native subagent preferences (Settings → Providers).
+ #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+ #[serde(default, rename_all = "camelCase")]
+@@ -711,6 +722,17 @@ impl HarnessRegistry {
+         Ok(())
+     }
+ 
++    pub fn idle_compact_settings(&self) -> IdleCompactSettings {
++        IdleCompactSettings {
++            compact_idle_chats: !self.prefs().compact_idle_chats_off,
++        }
++    }
++
++    pub fn set_idle_compact_settings(&self, settings: IdleCompactSettings) {
++        self.prefs().compact_idle_chats_off = !settings.compact_idle_chats;
++        self.persist_prefs();
++    }
++
+     /// Whether runs of `id` keep the provider's own subagent tools. Off only
+     /// by the user's choice, for a driver that can launch without them.
+     pub fn native_subagents(&self, id: HarnessId) -> bool {
+diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
+index 0db6239742b097574cb34d83485815c62fe36428..43156a0d2a5f311cb8bdc6a5c088d9d228c4eef0 100644
+--- a/crates/engine/src/rpc.rs
++++ b/crates/engine/src/rpc.rs
+@@ -911,6 +911,14 @@ enum MutateParams {
+         #[serde(default)]
+         until: Option<i64>,
+     },
++    /// The chat's own "Compact when idle": on, off, or (absent) as the
++    /// host's setting says. Synced.
++    #[serde(rename_all = "camelCase")]
++    SetChatCompactIdle {
++        chat_id: String,
++        #[serde(default)]
++        compact: Option<bool>,
++    },
+ }
+ 
+ #[derive(Clone)]
+@@ -2458,6 +2466,17 @@ impl EngineRpc {
+                     .map_err(failed)
+                     .map(drop)
+             }
++            MutateParams::SetChatCompactIdle { chat_id, compact } => {
++                let changed = self
++                    .workspace
++                    .set_chat_compact_idle(&chat_id, compact)
++                    .map_err(failed)?;
++                // Turned off: a compaction armed for it doesn't run.
++                if changed && compact == Some(false) {
++                    self.sessions.disarm_idle_compaction(&chat_id);
++                }
++                Ok(())
++            }
+             MutateParams::MarkChatSeen { chat_id, at } => {
+                 let at = at
+                     .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+@@ -2712,6 +2731,8 @@ fn forwardable(method: &str) -> bool {
+             | methods::CANCEL_INSTALL
+             | methods::GET_TITLE_SETTINGS
+             | methods::SET_TITLE_SETTINGS
++            | methods::GET_IDLE_COMPACT_SETTINGS
++            | methods::SET_IDLE_COMPACT_SETTINGS
+             | methods::GET_COMMIT_CREDIT
+             | methods::SET_COMMIT_CREDIT
+             | methods::GET_NATIVE_SUBAGENTS
+@@ -3648,6 +3669,17 @@ impl RpcService for EngineRpc {
+                 RpcReply::value(&serde_json::json!({}))
+             }
+             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
++            methods::GET_IDLE_COMPACT_SETTINGS => {
++                RpcReply::value(&self.registry.idle_compact_settings())
++            }
++            methods::SET_IDLE_COMPACT_SETTINGS => {
++                let p: crate::registry::IdleCompactSettings = parse_params(params)?;
++                self.registry.set_idle_compact_settings(p);
++                if !p.compact_idle_chats {
++                    self.sessions.disarm_all_idle_compactions();
++                }
++                RpcReply::value(&self.registry.idle_compact_settings())
++            }
+             methods::GET_COMMIT_CREDIT => match self.registry.commit_credit() {
+                 Some(credit) => RpcReply::value(&credit.status()),
+                 None => Err(RpcError::Failed(
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac715e9f18 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -174,6 +174,12 @@ struct RunHandle {
+     /// The harness stream is open. Before that there is no runtime to keep:
+     /// a stop tears the pending start down instead.
+     started: Arc<std::sync::atomic::AtomicBool>,
++    /// The turn under way compacts the agent's context (`/compact`, by the
++    /// person or for an idle chat, or the agent's own): messages sent now
++    /// wait for its end ([`SessionsEngine::defers_to_turn_end`]), never
++    /// steered into it. [`COMPACTING_OWN`]: the engine's own, for an idle
++    /// chat (its end is no completion to tell anyone of).
++    compacting: Arc<std::sync::atomic::AtomicU8>,
+     /// Engine-level cancel: arms the run task's grace deadline so a harness that
+     /// ignores its token can never strand the run.
+     cancel: watch::Sender<bool>,
+@@ -352,6 +358,12 @@ struct Inner {
+     warm: Mutex<HashMap<String, warm_start::WarmStart>>,
+     /// Their leases (open, typed) when a test sets them.
+     warm_leases: Mutex<Option<(std::time::Duration, std::time::Duration)>>,
++    /// Each chat's prompt cache, and the compactions armed before it
++    /// expires ([`idle_compact`]).
++    idle_compactions: Mutex<idle_compact::IdleCompactions>,
++    /// Message ids of runs the engine starts itself to compact an idle
++    /// chat: no user message, title or preview of their own.
++    quiet_runs: Mutex<std::collections::HashSet<String>>,
+ }
+ 
+ /// How long a runtime parked between turns with nothing pending keeps its
+@@ -375,6 +387,12 @@ struct Inner {
+ /// it ([`zeron_harness::process::unexpected_descendants`]).
+ pub const AGENT_IDLE_STOP: std::time::Duration = std::time::Duration::from_secs(120);
+ 
++/// [`RunHandle::compacting`]: no compaction, the agent's (or the person's
++/// `/compact`), or the engine's own for an idle chat.
++const NOT_COMPACTING: u8 = 0;
++const COMPACTING: u8 = 1;
++const COMPACTING_OWN: u8 = 2;
++
+ /// The idle window of drivers not stopped after [`AGENT_IDLE_STOP`].
+ const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+ 
+@@ -465,6 +483,9 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+ 
+ #[path = "warm_start.rs"]
+ mod warm_start;
++
++#[path = "idle_compact.rs"]
++pub(crate) mod idle_compact;
+ pub use warm_start::WarmOutcome;
+ 
+ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+@@ -521,6 +542,8 @@ impl SessionsEngine {
+                 plugins: OnceLock::new(),
+                 warm: Mutex::new(HashMap::new()),
+                 warm_leases: Mutex::new(None),
++                idle_compactions: Mutex::new(idle_compact::IdleCompactions::default()),
++                quiet_runs: Mutex::new(std::collections::HashSet::new()),
+             }),
+         }
+     }
+@@ -1008,6 +1031,13 @@ impl SessionsEngine {
+         if !self.turn_in_flight(chat_id) {
+             return false;
+         }
++        // A compaction under way takes no steer: the message waits for it.
++        if lock(&self.inner.runs)
++            .get(chat_id)
++            .is_some_and(|h| h.compacting.load(std::sync::atomic::Ordering::Acquire) != NOT_COMPACTING)
++        {
++            return true;
++        }
+         let live = lock(&self.inner.runs).get(chat_id).map(|h| {
+             (
+                 h.runtime_config.harness_id,
+@@ -1266,6 +1296,16 @@ impl SessionsEngine {
+         // `drive_run`; normalize here so parked-session routing and mid-turn
+         // guards go through `code_mode_changed`.
+         request.code_mode = false;
++        // The engine's own `/compact` for an idle chat ([`idle_compact`]):
++        // no user message, preview, title or turn snapshot. Any other turn
++        // takes the chat out of its idle spell: a compaction armed for it
++        // waits for that turn's end instead.
++        let quiet = message_id
++            .as_deref()
++            .is_some_and(|id| lock(&self.inner.quiet_runs).contains(id));
++        if !quiet && !idle {
++            lock(&self.inner.idle_compactions).disarm(chat_id);
++        }
+         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
+             (
+                 h.run_id.clone(),
+@@ -1387,19 +1427,28 @@ impl SessionsEngine {
+                     lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+                 }
+                 let handle = self.doc_handle(chat_id)?;
+-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+-                self.note_turn_start(chat_id, &request.cwd);
++                if !quiet {
++                    handle.write_user_message(&user_id, &request.prompt, now_ms())?;
++                    self.note_turn_start(chat_id, &request.cwd);
++                }
+                 if self.is_live(chat_id, &run_id) {
+                     if bootstrap.is_some() {
+                         history_sent.store(true, std::sync::atomic::Ordering::Release);
+                     }
++                    if quiet
++                        && let Some(h) = lock(&self.inner.runs).get(chat_id).filter(|h| h.run_id == run_id)
++                    {
++                        h.compacting.store(COMPACTING_OWN, std::sync::atomic::Ordering::Release);
++                    }
+                     // Working BEFORE the lastMessageAt bump: both ride the
+                     // workspace doc from this one peer, so causal order makes it
+                     // impossible for an observer to hold [new message, old status]
+                     // — that gap read as unseen-with-no-live-run = a phantom
+                     // "completed" flash on every remote send (2026-07-31).
+                     self.set_status(chat_id, SessionStatus::Working, false);
+-                    self.inner.note_message(chat_id, &request.prompt);
++                    if !quiet {
++                        self.inner.note_message(chat_id, &request.prompt);
++                    }
+                     return Ok(run_id);
+                 }
+                 // The run died around the send. If its exit drain already
+@@ -1412,7 +1461,9 @@ impl SessionsEngine {
+                     ledger.len() != before
+                 };
+                 if !reclaimed {
+-                    self.inner.note_message(chat_id, &request.prompt);
++                    if !quiet {
++                        self.inner.note_message(chat_id, &request.prompt);
++                    }
+                     return Ok(run_id);
+                 }
+                 // Keep the already-written doc entry's id for the fresh run
+@@ -1457,7 +1508,7 @@ impl SessionsEngine {
+         if !idle && revival.is_none() && !startup_retry && spawn_attempt == 0 {
+             self.inner.journal.clear_resume_attempts(chat_id);
+         }
+-        if !idle {
++        if !idle && !quiet {
+             // A chat whose last provider session belongs to another harness
+             // has changed provider: mark the seam above this message, before
+             // the resume lookup below turns the foreign session id away.
+@@ -1548,6 +1599,11 @@ impl SessionsEngine {
+         let interrupt_token = CancellationToken::new();
+         let turn = TurnControl::default();
+         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let compacting = Arc::new(std::sync::atomic::AtomicU8::new(if quiet {
++            COMPACTING_OWN
++        } else {
++            NOT_COMPACTING
++        }));
+         let fork_history_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+         let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
+         let voice_active = Arc::new(VoiceActivity::default());
+@@ -1627,6 +1683,7 @@ impl SessionsEngine {
+                 redeliver: Arc::new(Mutex::new(Vec::new())),
+                 turn: turn.clone(),
+                 started: started.clone(),
++                compacting: compacting.clone(),
+                 cancel: cancel_tx,
+                 engine_tx,
+                 pending_inputs,
+@@ -1652,9 +1709,21 @@ impl SessionsEngine {
+         );
+         // AFTER Working (same causal-order guarantee as the steer path): the
+         // lastMessageAt bump must never be observable ahead of the live run.
+-        if !idle {
++        if !idle && !quiet {
+             self.inner.note_message(chat_id, &request.prompt);
+         }
++        // Its divider shows at once (with the context it compacts), and the
++        // journal says what the turn was: a restart doesn't revive it.
++        if quiet {
++            let tokens = handle.doc().context_usage().and_then(|u| u.tokens);
++            if let Some(h) = lock(&self.inner.runs).get(chat_id).filter(|h| h.run_id == run_id) {
++                let _ = h.engine_tx.send(AgentEvent::Compaction {
++                    pre_tokens: tokens,
++                    post_tokens: None,
++                    summary: None,
++                });
++            }
++        }
+ 
+         // Name the chat off the first prompt as soon as the agent answers —
+         // not after the first exchange completes ("called New session for a
+@@ -1662,7 +1731,7 @@ impl SessionsEngine {
+         // skips titled chats; the Done-time call below stays as the retry
+         // for a failed generation). Not before the agent's first output:
+         // the titling agent's own startup competed with this one's.
+-        let title = (!idle)
++        let title = (!idle && !quiet)
+             .then(|| self.inner.titles.get().cloned())
+             .flatten()
+             .map(|titles| {
+@@ -1696,6 +1765,7 @@ impl SessionsEngine {
+                 stops_seen: stops,
+                 fork_history_sent,
+                 started,
++                quiet,
+             },
+             turn,
+             side_chats_only,
+@@ -2391,6 +2461,7 @@ impl SessionsEngine {
+                     if fresh
+                         && !stopped
+                         && !(crashed && tail.finished)
++                        && !tail.compaction
+                         && prompt
+                             .as_ref()
+                             .is_some_and(|(_, text)| !native_command(text, *harness_id)) =>
+@@ -3976,6 +4047,177 @@ fn format_history_prompt(
+     ))
+ }
+ 
++impl Inner {
++    /// A request of the chat's agent leaves now: its prompt cache's lifetime
++    /// counts from here ([`idle_compact::CacheClock`]).
++    fn cache_request_started(&self, chat_id: &str) {
++        lock(&self.idle_compactions)
++            .clock(chat_id)
++            .request_started(now_ms());
++    }
++}
++
++/// A turn of `chat_id` ended: its prompt cache's expiry goes on its context
++/// usage (the app's notice reads it), and a compaction is armed shortly
++/// before it, unless this turn compacted (once per idle spell) or the chat
++/// couldn't compact anyway.
++fn idle_turn_ended(
++    inner: &Arc<Inner>,
++    chat_id: &str,
++    harness_id: HarnessId,
++    compaction_turn: bool,
++    doc: &SessionDoc,
++) {
++    if harness_id != HarnessId::ClaudeCode {
++        return;
++    }
++    let overrides = idle_compact::Overrides::from_env();
++    let mut compactions = lock(&inner.idle_compactions);
++    let Some(clock) = compactions.peek(chat_id) else {
++        return;
++    };
++    if let Err(err) = doc.set_cache_expiry(clock.expires_at()) {
++        tracing::warn!(chat = %chat_id, error = %err, "cache expiry write failed");
++    }
++    if compaction_turn {
++        compactions.disarm(chat_id);
++        return;
++    }
++    let Some(at) = idle_compact::fire_at(&clock, overrides) else {
++        compactions.disarm(chat_id);
++        return;
++    };
++    // Not worth a timer: too small to compact now (it can only shrink
++    // while idle), or turned off. Rechecked in full when it fires.
++    let small = doc
++        .context_usage()
++        .and_then(|u| u.tokens)
++        .is_none_or(|t| t < overrides.min_tokens());
++    let choice = inner.workspace().and_then(|ws| ws.chat_compact_idle(chat_id));
++    let on = choice.unwrap_or_else(|| inner.registry.idle_compact_settings().compact_idle_chats);
++    if small || !on {
++        compactions.disarm(chat_id);
++        return;
++    }
++    let generation = compactions.next_generation();
++    let delay = std::time::Duration::from_millis((at - now_ms()).max(0) as u64);
++    let weak = Arc::downgrade(inner);
++    let chat = chat_id.to_owned();
++    // Armed under the lock: a timer due at once finds itself armed.
++    let task = tokio::spawn(async move {
++        tokio::time::sleep(delay).await;
++        if let Some(inner) = weak.upgrade() {
++            SessionsEngine { inner }
++                .compact_idle_chat(&chat, generation)
++                .await;
++        }
++    });
++    tracing::info!(chat = %chat_id, in_secs = delay.as_secs(), "idle compaction armed");
++    compactions.arm(chat_id, generation, at, task.abort_handle());
++}
++
++impl SessionsEngine {
++    /// The chat's armed compaction (if any) won't run: its own toggle was
++    /// turned off.
++    pub fn disarm_idle_compaction(&self, chat_id: &str) {
++        lock(&self.inner.idle_compactions).disarm(chat_id);
++    }
++
++    /// No armed compaction runs: the device's setting was turned off.
++    pub fn disarm_all_idle_compactions(&self) {
++        lock(&self.inner.idle_compactions).disarm_all();
++    }
++
++    /// When `chat_id`'s compaction is armed to run (Unix ms), if it is.
++    pub fn idle_compaction_armed_at(&self, chat_id: &str) -> Option<i64> {
++        lock(&self.inner.idle_compactions).armed_at(chat_id)
++    }
++
++    /// What decides whether `chat_id` compacts now; `None` when it isn't
++    /// this device's to run (or isn't known here).
++    fn idle_compact_facts(&self, chat_id: &str) -> Option<idle_compact::Facts> {
++        let ws = self.inner.workspace()?;
++        let chat = ws.chat(chat_id).ok()??;
++        if chat.device_id != self.inner.device_id {
++            return None;
++        }
++        let handle = self.doc_handle(chat_id).ok()?;
++        let doc = handle.doc();
++        let usage = doc.context_usage().unwrap_or_default();
++        let queued = !doc.read_queue().unwrap_or_default().is_empty()
++            || doc.read_commands().unwrap_or_default().iter().any(|c| {
++                c.status == zeron_doc::SessionCommandStatus::Pending
++                    && matches!(
++                        c.payload,
++                        zeron_doc::SessionCommandPayload::Run { .. }
++                            | zeron_doc::SessionCommandPayload::Steer { .. }
++                    )
++            });
++        Some(idle_compact::Facts {
++            setting_on: self.inner.registry.idle_compact_settings().compact_idle_chats,
++            chat_choice: ws.chat_compact_idle(chat_id),
++            claude: chat
++                .config
++                .as_ref()
++                .is_some_and(|c| c.harness == HarnessId::ClaudeCode),
++            tokens: usage.tokens,
++            min_tokens: idle_compact::Overrides::from_env().min_tokens(),
++            child: chat.parent_chat_id.is_some(),
++            archived: chat.archived,
++            awaiting_input: self.inner.awaiting_input(chat_id),
++            background: self.holds_background_work(chat_id),
++            queued,
++            turn_running: self.turn_in_flight(chat_id),
++            cache_expired: usage.cache_expires_at.is_none_or(|at| at <= now_ms()),
++        })
++    }
++
++    /// The chat's timer fired: if it is still idle and eligible, `/compact`
++    /// goes to its agent as a run of the engine's own (resuming the
++    /// session), with no user message in the transcript.
++    async fn compact_idle_chat(&self, chat_id: &str, generation: u64) {
++        if !lock(&self.inner.idle_compactions).take_fired(chat_id, generation) {
++            return;
++        }
++        let Some(facts) = self.idle_compact_facts(chat_id) else {
++            return;
++        };
++        if let Err(skip) = idle_compact::eligible(&facts) {
++            tracing::info!(chat = %chat_id, ?skip, "idle compaction skipped");
++            return;
++        }
++        let Some(host) = self.inner.doc_host() else {
++            return;
++        };
++        let Some(mut request) = self
++            .last_request(chat_id)
++            .or_else(|| host.request_from_chat_row(chat_id, idle_compact::COMPACT_PROMPT))
++        else {
++            tracing::info!(chat = %chat_id, "idle compaction skipped: no run config");
++            return;
++        };
++        request.prompt = idle_compact::COMPACT_PROMPT.to_owned();
++        request.resume = None;
++        request.attachments = Vec::new();
++        let harness = host.harness_for_request(chat_id, &request);
++        if harness != HarnessId::ClaudeCode {
++            return;
++        }
++        let id = new_id();
++        {
++            let mut quiet = lock(&self.inner.quiet_runs);
++            if quiet.len() >= 64 {
++                quiet.clear();
++            }
++            quiet.insert(id.clone());
++        }
++        tracing::info!(chat = %chat_id, tokens = ?facts.tokens, "compacting an idle chat before its prompt cache expires");
++        if let Err(err) = self.dispatch(chat_id, harness, request, Some(id)).await {
++            tracing::warn!(chat = %chat_id, error = %err, "idle compaction failed to start");
++        }
++    }
++}
++
+ /// Whether the provider routes this prompt as a native command: a command
+ /// selected in the composer leads it, or its delivered text leads with a
+ /// `/name` in the command grammar (Codex `command_request`, OpenCode
+@@ -4036,6 +4278,10 @@ struct TurnTail {
+     /// Nothing of the parent turn at all, only subagent traffic after the
+     /// last `Done`: that turn had finished.
+     finished: bool,
++    /// The turn compacted the context (the engine's own `/compact` for an
++    /// idle chat has no user message of its own: reviving "the last user
++    /// message" would send an old prompt again).
++    compaction: bool,
+ }
+ 
+ /// [`TurnTail`] from a chat's journal events, newest first, read back to the
+@@ -4068,6 +4314,7 @@ fn turn_tail(events: impl Iterator<Item = AgentEvent>, closed: bool) -> TurnTail
+             | AgentEvent::Visual { .. }
+             | AgentEvent::AssistantMessageCompleted { .. }
+             | AgentEvent::Steered { .. } => tail.reached_provider = true,
++            AgentEvent::Compaction { .. } => tail.compaction = true,
+             _ => {}
+         }
+         tail.finished = false;
+@@ -4563,6 +4810,8 @@ struct RunResumeState {
+     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
+     /// Set once the harness stream is open (see [`RunHandle::started`]).
+     started: Arc<std::sync::atomic::AtomicBool>,
++    /// The engine's own `/compact` for an idle chat ([`idle_compact`]).
++    quiet: bool,
+ }
+ 
+ fn cursor_unstarted_history(
+@@ -4972,7 +5221,9 @@ async fn drive_run(
+             if let Some(lease) = lease {
+                 _execution_lease = Some(lease.clone());
+                 controls.execution_lease = Some(lease);
+-                if let Some(listener) = inner.turn_listener.get() {
++                if !resume_state.quiet
++                    && let Some(listener) = inner.turn_listener.get()
++                {
+                     listener(&chat_id, &request.cwd);
+                 }
+                 let mut wire_request = request;
+@@ -5412,6 +5663,10 @@ async fn drive_run(
+ 
+     let mut final_completed_turn = None;
+     let mut final_outcome = None;
++    // The turn's first request leaves now ([`idle_compact::CacheClock`]).
++    if !resume_state.idle {
++        inner.cache_request_started(&chat_id);
++    }
+     let final_status = loop {
+         let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+             event
+@@ -5486,6 +5741,7 @@ async fn drive_run(
+                     // background task's ending wakes the agent too.)
+                     self_scheduled.woke(tokio::time::Instant::now());
+                     if idle_since.is_some() {
++                        inner.cache_request_started(&chat_id);
+                         tracing::info!(chat = %chat_id, "parked session resumed by a wake turn");
+                         idle_since = None;
+                         wait = None;
+@@ -6030,6 +6286,12 @@ async fn drive_run(
+             }
+             continue;
+         }
++        // The prompt cache a request left: timed from its start, never
++        // journaled ([`idle_compact`]).
++        if let AgentEvent::PromptCache { ttl_secs } = &event {
++            lock(&inner.idle_compactions).clock(&chat_id).usage(*ttl_secs);
++            continue;
++        }
+         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
+         if let AgentEvent::ContextUsage { tokens, window } = &event {
+             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
+@@ -6082,6 +6344,7 @@ async fn drive_run(
+                 idle_since = None;
+                 wait = None;
+                 self_continued_turn = true;
++                inner.cache_request_started(&chat_id);
+                 // The park cleared the fold; rotate to a fresh entry and
+                 // fall through — this event is the new segment's first part.
+                 entry_id = new_id();
+@@ -6307,6 +6570,38 @@ async fn drive_run(
+             event => event,
+         };
+ 
++        // A compaction starting: the context it compacts, as last measured
++        // (a resumed CLI hasn't measured any yet), and the turn holds the
++        // messages sent meanwhile for its end.
++        let event = match event {
++            AgentEvent::Compaction {
++                pre_tokens,
++                post_tokens: None,
++                summary: None,
++            } => {
++                inner.cache_request_started(&chat_id);
++                if let Some(h) = lock(&inner.runs).get(&chat_id).filter(|h| h.run_id == run_id) {
++                    let _ = h.compacting.compare_exchange(
++                        NOT_COMPACTING,
++                        COMPACTING,
++                        std::sync::atomic::Ordering::AcqRel,
++                        std::sync::atomic::Ordering::Acquire,
++                    );
++                }
++                AgentEvent::Compaction {
++                    pre_tokens: pre_tokens.or_else(|| doc.context_usage().and_then(|u| u.tokens)),
++                    post_tokens: None,
++                    summary: None,
++                }
++            }
++            // A tool's result goes back to the provider in a new request.
++            event @ AgentEvent::ToolResult { .. } => {
++                inner.cache_request_started(&chat_id);
++                event
++            }
++            event => event,
++        };
++
+         // A steer boundary splits the assistant entry exactly where the fold resets.
+         if let AgentEvent::Steered {
+             next_assistant_message_id,
+@@ -6314,6 +6609,7 @@ async fn drive_run(
+         } = &event
+         {
+             inner.publish(&chat_id, &event);
++            inner.cache_request_started(&chat_id);
+             // A steer boundary means a real prompt owns the turn again — its
+             // Done will come; the short self-continued window stands down.
+             self_continued_turn = false;
+@@ -6518,10 +6814,24 @@ async fn drive_run(
+             // way (see `continues_with_sent_message`); rows the user queued
+             // themselves still notify.
+             let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
++            // A compaction's end, and its kind: the engine's own is nothing
++            // to tell the person of (no completion badge, no banner).
++            let compacted = lock(&inner.runs)
++                .get(&chat_id)
++                .filter(|h| h.run_id == run_id)
++                .map_or(NOT_COMPACTING, |h| {
++                    h.compacting.swap(NOT_COMPACTING, std::sync::atomic::Ordering::AcqRel)
++                });
++            let compaction_turn = compacted != NOT_COMPACTING
++                || folded.iter().any(|p| matches!(p, MessagePart::Compaction { .. }));
++            if turn_was_active {
++                idle_turn_ended(&inner, &chat_id, harness_id, compaction_turn, &doc);
++            }
+             let completed_turn = (*status == DoneStatus::Completed
+                 && !interrupted
+                 && turn_was_active
+                 && !pending_steer
++                && compacted != COMPACTING_OWN
+                 && !inner.continues_with_sent_message(&chat_id))
+             .then(|| entry_id.clone());
+             // PERSISTENT SESSION: a cleanly completed turn on a steerable
+@@ -8198,6 +8508,47 @@ mod tests {
+         rig.core.sessions.shutdown().await;
+     }
+ 
++    /// A compaction under way takes no steer: a message sent meanwhile
++    /// waits in the queue for its turn to end, as for an agent that can't
++    /// take one mid-turn; the turn over, nothing holds.
++    #[tokio::test]
++    async fn a_message_sent_while_the_context_compacts_waits_for_it() {
++        let rig = wake_rig("chat-compact-queue", false).await;
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        assert!(
++            !rig.core.sessions.defers_to_turn_end(rig.chat, None),
++            "this agent takes a word mid-turn"
++        );
++        rig.feed
++            .send(AgentEvent::Compaction {
++                pre_tokens: Some(250_000),
++                post_tokens: None,
++                summary: None,
++            })
++            .unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
++        assert!(rig.core.sessions.defers_to_turn_end(rig.chat, None));
++        rig.feed
++            .send(AgentEvent::Compaction {
++                pre_tokens: Some(250_000),
++                post_tokens: Some(20_000),
++                summary: None,
++            })
++            .unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        assert!(
++            rig.core.sessions.defers_to_turn_end(rig.chat, None),
++            "its turn hasn't ended"
++        );
++        rig.feed.send(done(DoneStatus::Completed)).unwrap();
++        let s = settled(&rig).await;
++        assert_eq!(s.status, SessionStatus::Idle);
++        assert!(!rig.core.sessions.defers_to_turn_end(rig.chat, None));
++        // A compaction turn arms nothing: once an idle spell.
++        assert_eq!(rig.core.sessions.idle_compaction_armed_at(rig.chat), None);
++        rig.core.sessions.shutdown().await;
++    }
++
+     #[tokio::test]
+     async fn work_ending_with_no_wake_turn_marks_the_held_end_after_its_grace() {
+         let rig = wake_rig("chat-wait-lost", true).await;
+diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
+index be16dcf4fbf737a9f59ac562dae9fa671042bb01..e814397b8a1a9c036bff6b6c2806f40529c350bb 100644
+--- a/crates/engine/src/workspace_host.rs
++++ b/crates/engine/src/workspace_host.rs
+@@ -1362,6 +1362,20 @@ impl WorkspaceHost {
+         Ok(self.mutate(|doc| doc.set_chat_sleep(chat_id, until, Utc::now()))?)
+     }
+ 
++    /// The chat's own "Compact when idle" (any device; `None` follows the
++    /// device's setting).
++    pub fn set_chat_compact_idle(
++        &self,
++        chat_id: &str,
++        compact: Option<bool>,
++    ) -> Result<bool, EngineError> {
++        Ok(self.mutate(|doc| doc.set_chat_compact_idle(chat_id, compact))?)
++    }
++
++    pub fn chat_compact_idle(&self, chat_id: &str) -> Option<bool> {
++        self.read(|doc| doc.chat_compact_idle(chat_id))
++    }
++
+     /// A sleeping chat woken early (its host saw it start asking for the
+     /// person, or fail). `false` when it wasn't asleep.
+     pub fn wake_chat(&self, chat_id: &str, at: chrono::DateTime<Utc>) -> Result<bool, EngineError> {
+diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
+index 9197ed9d295b764d34224585f90931f6f76b5121..86ef22637fe20740426daae237b0469042ea213e 100644
+--- a/crates/engine/tests/e2e.rs
++++ b/crates/engine/tests/e2e.rs
+@@ -3104,7 +3104,8 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
+         handle.doc().context_usage(),
+         Some(zeron_proto::ContextUsage {
+             tokens: Some(0),
+-            window: Some(200000)
++            window: Some(200000),
++            ..Default::default()
+         })
+     );
+     assert_eq!(
+diff --git a/crates/engine/tests/idle_compact_live.rs b/crates/engine/tests/idle_compact_live.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..63e492cbfa4f1ebf665b54b009e26a55369b7e90
+--- /dev/null
++++ b/crates/engine/tests/idle_compact_live.rs
+@@ -0,0 +1,167 @@
++//! Opt-in real-model check of compacting an idle chat: a Claude Code turn
++//! ends, the engine arms its compaction (here 15 s after the turn's last
++//! request rather than 2 min before an hour's cache expires, and for any
++//! chat over 1k tokens), and `/compact` runs on its own: one compaction part
++//! with its before, after and summary, no user message, nothing armed after.
++//!
++//! ZERON_TEST_MODEL=haiku cargo test -p zeron-engine --test idle_compact_live -- --ignored --nocapture
++use std::{sync::Arc, time::Duration};
++use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
++use zeron_engine::{EngineCore, HarnessRegistry};
++use zeron_harness::{ClaudeHarness, Harness};
++use zeron_proto::{ChatConfig, RunRequest, SandboxLevel, SessionStatus};
++
++const CHAT: &str = "idle";
++
++fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
++    core.doc_host
++        .open(CHAT)
++        .unwrap()
++        .doc()
++        .read_entries()
++        .unwrap()
++}
++
++fn compactions(entries: &[SessionMessageEntry]) -> Vec<MessagePart> {
++    entries
++        .iter()
++        .flat_map(|e| e.parts.iter())
++        .filter(|p| matches!(p, MessagePart::Compaction { .. }))
++        .cloned()
++        .collect()
++}
++
++async fn wait(core: &EngineCore, secs: u64, what: &str, mut done: impl FnMut() -> bool) {
++    let ok = tokio::time::timeout(Duration::from_secs(secs), async {
++        while !done() {
++            tokio::time::sleep(Duration::from_millis(100)).await;
++        }
++    })
++    .await
++    .is_ok();
++    if !ok {
++        let all = entries(core);
++        core.shutdown().await;
++        panic!("timeout waiting for {what}: {all:#?}");
++    }
++}
++
++#[tokio::test]
++#[ignore = "uses real model quota; runs Claude Code"]
++async fn an_idle_claude_chat_compacts_before_its_cache_expires() {
++    // SAFETY: tests only; read by the engine as it arms, per turn.
++    unsafe {
++        // (`ZERON_TEST_IDLE_AFTER_MS` past the agent's idle stop, 120 s,
++        // compacts a chat whose agent has stopped: a fresh resume.)
++        let after = std::env::var("ZERON_TEST_IDLE_AFTER_MS").unwrap_or_else(|_| "15000".into());
++        std::env::set_var("ZERON_IDLE_COMPACT_AFTER_MS", after);
++        std::env::set_var("ZERON_IDLE_COMPACT_MIN_TOKENS", "1000");
++    }
++    let model = std::env::var("ZERON_TEST_MODEL").ok();
++    let harness: Arc<dyn Harness> = Arc::new(ClaudeHarness::new());
++    let id = harness.id();
++    let dir = tempfile::tempdir().unwrap();
++    let registry = HarnessRegistry::new();
++    registry.register(harness);
++    let core =
++        EngineCore::assemble(&dir.path().join("engine"), Arc::new(registry), id, None).unwrap();
++    let cwd = dir.path().to_str().unwrap().to_owned();
++    core.workspace
++        .create_space(CHAT, &core.device_id, &cwd, None, false)
++        .unwrap();
++    core.workspace
++        .create_chat(CHAT, Some(CHAT), None, None, None)
++        .unwrap();
++    core.workspace
++        .set_chat_config(
++            CHAT,
++            &ChatConfig {
++                harness: id,
++                model: model.clone(),
++                reasoning: None,
++                model_options: Default::default(),
++                sandbox: SandboxLevel::DangerFullAccess,
++                access: Default::default(),
++                plan: false,
++            },
++        )
++        .unwrap();
++    core.doc_host
++        .queue_command(
++            CHAT,
++            SessionCommandPayload::Run {
++                message_id: "u0".into(),
++                request: RunRequest {
++                    mcp: None,
++                    prompt: "This is an automated test. Remember the code word HERON. Reply with one short sentence.".into(),
++                    harness: Some(id),
++                    model,
++                    reasoning: None,
++                    model_options: Default::default(),
++                    cwd: cwd.clone(),
++                    sandbox: SandboxLevel::DangerFullAccess,
++                    auto_approve: true,
++                    access: Default::default(),
++                    plan: false,
++                    code_mode: false,
++                    attachments: vec![],
++                    worktree: None,
++                    resume: None,
++                    env: Default::default(),
++                    extra_mcp: Vec::new(),
++                },
++            },
++        )
++        .unwrap();
++    let status = |core: &EngineCore| core.sessions.session_status(CHAT).map(|s| s.status);
++    wait(&core, 180, "the first turn's end", || {
++        status(&core) == Some(SessionStatus::Idle)
++            && entries(&core)
++                .iter()
++                .any(|e| e.role == MessageRole::Assistant)
++    })
++    .await;
++    let usage = core.doc_host.open(CHAT).unwrap().doc().context_usage();
++    println!("after the turn: {usage:?}");
++    let armed = core.sessions.idle_compaction_armed_at(CHAT);
++    println!("armed at: {armed:?}");
++    assert!(armed.is_some(), "nothing armed after the turn");
++    assert!(
++        usage.and_then(|u| u.cache_expires_at).is_some(),
++        "no cache expiry written"
++    );
++
++    wait(&core, 300, "the idle compaction to finish", || {
++        let all = entries(&core);
++        let done = compactions(&all).iter().any(|p| {
++            matches!(
++                p,
++                MessagePart::Compaction {
++                    post_tokens: Some(_),
++                    summary: Some(_),
++                    ..
++                }
++            )
++        });
++        done && status(&core) == Some(SessionStatus::Idle)
++    })
++    .await;
++    let all = entries(&core);
++    let parts = compactions(&all);
++    println!("compaction: {parts:#?}");
++    println!(
++        "after the compaction: {:?}",
++        core.doc_host.open(CHAT).unwrap().doc().context_usage()
++    );
++    assert_eq!(parts.len(), 1, "one divider");
++    let users = all.iter().filter(|e| e.role == MessageRole::User).count();
++    assert_eq!(users, 1, "the engine's /compact writes no user message");
++    assert_eq!(
++        core.sessions.idle_compaction_armed_at(CHAT),
++        None,
++        "a compaction arms nothing: once an idle spell"
++    );
++    let session = core.sessions.session_status(CHAT).unwrap();
++    println!("last completed turn: {:?}", session.last_completed_turn);
++    core.shutdown().await;
++}
+diff --git a/crates/harness/src/claude/normalize.rs b/crates/harness/src/claude/normalize.rs
+index d868a7498d460b3be04c41b7fb86ad325f4f72ed..f7b43b203fa5ac5a33db437fe33eb12573f56af4 100644
+--- a/crates/harness/src/claude/normalize.rs
++++ b/crates/harness/src/claude/normalize.rs
+@@ -679,11 +679,73 @@ pub(crate) struct Normalizer {
+     turn_error_shown: bool,
+     /// This turn already said it is retrying the API.
+     retry_noticed: bool,
++    /// The context the last request reported: a compaction's start says
++    /// how much it compacts before its boundary does.
++    last_context_tokens: Option<u64>,
++    /// A compaction's boundary came: the CLI's own user message with its
++    /// summary is next.
++    summary_due: bool,
++}
++
++/// The opening line of the user message the CLI writes after compacting,
++/// before the summary (live-verified 2.1.328).
++const COMPACT_SUMMARY_LEAD: &str = "This session is being continued from a previous conversation";
++
++/// A compaction summary as the CLI wrote it, without its lead-in and the
++/// reminders it carries for the model: what the divider shows when opened.
++fn compaction_summary(text: &str) -> String {
++    let mut text = text.to_owned();
++    // `<system-reminder>…</system-reminder>` blocks are for the model.
++    while let Some(start) = text.find("<system-reminder>") {
++        let Some(end) = text[start..].find("</system-reminder>") else {
++            text.truncate(start);
++            break;
++        };
++        text.replace_range(start..start + end + "</system-reminder>".len(), "");
++    }
++    let body = match text.find("Summary:") {
++        Some(at) => &text[at + "Summary:".len()..],
++        None => text
++            .strip_prefix(COMPACT_SUMMARY_LEAD)
++            .and_then(|rest| rest.split_once('\n').map(|(_, body)| body))
++            .unwrap_or(&text),
++    };
++    // What the CLI tells the model after it (where the full transcript is,
++    // and to go on without asking) is for the model too.
++    let body = COMPACT_SUMMARY_TAILS
++        .iter()
++        .filter_map(|tail| body.find(tail))
++        .min()
++        .map_or(body, |at| &body[..at]);
++    body.trim().to_owned()
++}
++
++/// Where the CLI's own words to the model start, after a summary.
++const COMPACT_SUMMARY_TAILS: [&str; 2] = [
++    "If you need specific details from before compaction",
++    "Continue the conversation from where it left off",
++];
++
++/// How long the prompt cache a request wrote lives, from its usage: an hour
++/// for any 1-hour write, five minutes for a 5-minute one only. `None` for a
++/// request that only read the cache (the lifetime before it carries on).
++fn cache_ttl_secs(usage: &Value) -> Option<u64> {
++    let creation = usage.get("cache_creation")?;
++    let tokens = |key: &str| creation.get(key).and_then(Value::as_u64).unwrap_or(0);
++    if tokens("ephemeral_1h_input_tokens") > 0 {
++        Some(60 * 60)
++    } else if tokens("ephemeral_5m_input_tokens") > 0 {
++        Some(5 * 60)
++    } else {
++        None
++    }
+ }
+ 
+ impl Normalizer {
+     pub fn new() -> Self {
+         Self {
++            last_context_tokens: None,
++            summary_due: false,
+             saw_init: false,
+             last_model: None,
+             agent_tasks: std::collections::HashMap::new(),
+@@ -1191,25 +1253,47 @@ impl Normalizer {
+                     return out;
+                 }
+                 // Compaction runs a whole model call with nothing streamed.
++                // It starts: the transcript's divider says so, with the
++                // context it compacts as last measured.
+                 if f.subtype == "status" && f.status.as_deref() == Some("compacting") {
+-                    return vec![AgentEvent::ReasoningDelta {
+-                        text: String::new(),
+-                    }];
++                    return vec![
++                        AgentEvent::ReasoningDelta {
++                            text: String::new(),
++                        },
++                        AgentEvent::Compaction {
++                            pre_tokens: self.last_context_tokens,
++                            post_tokens: None,
++                            summary: None,
++                        },
++                    ];
+                 }
+                 // The context shrank: report the new occupancy now rather
+-                // than at the next assistant frame.
++                // than at the next assistant frame, and the divider's
++                // before and after.
+                 if f.subtype == "compact_boundary" {
+-                    return f
+-                        .compact_metadata
+-                        .as_ref()
+-                        .and_then(|m| m.get("post_tokens"))
+-                        .and_then(Value::as_u64)
+-                        .map(|tokens| AgentEvent::ContextUsage {
+-                            tokens: Some(tokens),
++                    let tokens = |key: &str| {
++                        f.compact_metadata
++                            .as_ref()
++                            .and_then(|m| m.get(key))
++                            .and_then(Value::as_u64)
++                    };
++                    let (pre, post) = (tokens("pre_tokens"), tokens("post_tokens"));
++                    let Some(post) = post else {
++                        return Vec::new();
++                    };
++                    self.last_context_tokens = Some(post);
++                    self.summary_due = true;
++                    return vec![
++                        AgentEvent::Compaction {
++                            pre_tokens: pre,
++                            post_tokens: Some(post),
++                            summary: None,
++                        },
++                        AgentEvent::ContextUsage {
++                            tokens: Some(post),
+                             window: None,
+-                        })
+-                        .into_iter()
+-                        .collect();
++                        },
++                    ];
+                 }
+                 if f.subtype != "init" || self.saw_init {
+                     return Vec::new();
+@@ -1374,10 +1458,14 @@ impl Normalizer {
+                             .iter()
+                             .filter_map(|key| usage.get(*key).and_then(Value::as_u64))
+                             .fold(0u64, u64::saturating_add);
++                        self.last_context_tokens = Some(tokens);
+                         out.push(AgentEvent::ContextUsage {
+                             tokens: Some(tokens),
+                             window: None,
+                         });
++                        out.push(AgentEvent::PromptCache {
++                            ttl_secs: cache_ttl_secs(usage),
++                        });
+                     }
+                 }
+                 // A failed turn (usage limit, billing, auth, overloaded, …)
+@@ -1446,6 +1534,28 @@ impl Normalizer {
+                     );
+                     return out;
+                 }
++                // The CLI's own message after a compaction carries the
++                // summary the agent goes on from: the divider shows it.
++                if self.summary_due {
++                    let text = match &f.message.content {
++                        Value::String(text) => Some(text.clone()),
++                        _ => f
++                            .message
++                            .blocks()
++                            .find(|b| b.kind == "text")
++                            .map(|b| b.text),
++                    };
++                    if let Some(text) = text.filter(|t| {
++                        f.is_synthetic || t.trim_start().starts_with(COMPACT_SUMMARY_LEAD)
++                    }) {
++                        self.summary_due = false;
++                        return vec![AgentEvent::Compaction {
++                            pre_tokens: None,
++                            post_tokens: None,
++                            summary: Some(compaction_summary(&text)),
++                        }];
++                    }
++                }
+                 // A skill whose result came back without a task start ran
+                 // inline: it never forks now. `tool_result_events` drops that
+                 // pending skill when asked.
+@@ -1611,6 +1721,16 @@ impl Normalizer {
+                 out
+             }
+ 
++            // `/clear`: nothing is in the context now (and nothing cached):
++            // what the chat shows of it starts again from none.
++            Frame::ConversationReset => {
++                self.last_context_tokens = Some(0);
++                vec![AgentEvent::ContextUsage {
++                    tokens: Some(0),
++                    window: None,
++                }]
++            }
++
+             // Control frames are handled by the run loop, not normalized.
+             Frame::ControlRequest(_)
+             | Frame::ControlResponse(_)
+@@ -3296,18 +3416,32 @@ mod tests {
+     fn compaction_is_liveness_then_new_context_usage() {
+         assert_eq!(
+             normalize_one(r#"{"type":"system","subtype":"status","status":"compacting"}"#),
+-            vec![AgentEvent::ReasoningDelta {
+-                text: String::new()
+-            }]
++            vec![
++                AgentEvent::ReasoningDelta {
++                    text: String::new()
++                },
++                AgentEvent::Compaction {
++                    pre_tokens: None,
++                    post_tokens: None,
++                    summary: None
++                }
++            ]
+         );
+         assert_eq!(
+             normalize_one(
+                 r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":180000,"post_tokens":9000}}"#
+             ),
+-            vec![AgentEvent::ContextUsage {
+-                tokens: Some(9000),
+-                window: None
+-            }]
++            vec![
++                AgentEvent::Compaction {
++                    pre_tokens: Some(180000),
++                    post_tokens: Some(9000),
++                    summary: None
++                },
++                AgentEvent::ContextUsage {
++                    tokens: Some(9000),
++                    window: None
++                }
++            ]
+         );
+         assert!(normalize_one(r#"{"type":"system","subtype":"compact_boundary"}"#).is_empty());
+         assert!(
+@@ -3347,6 +3481,117 @@ mod tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod compaction_tests {
++    use super::*;
++
++    fn feed(norm: &mut Normalizer, line: &str) -> Vec<AgentEvent> {
++        norm.normalize(super::super::wire::parse_frame(line).unwrap(), false)
++    }
++
++    fn compactions(events: &[AgentEvent]) -> Vec<AgentEvent> {
++        events
++            .iter()
++            .filter(|e| matches!(e, AgentEvent::Compaction { .. }))
++            .cloned()
++            .collect()
++    }
++
++    /// A manual `/compact` as Claude Code 2.1.328 streams it (captured live,
++    /// trimmed): its start names the context last measured, its boundary
++    /// the before and after, and the CLI's own message after it the summary,
++    /// without the lead-in and the model's reminders. Its replayed
++    /// `Compacted` line is nothing.
++    #[test]
++    fn a_live_compact_gives_its_divider_start_end_and_summary() {
++        let mut norm = Normalizer::new();
++        feed(
++            &mut norm,
++            r#"{"type":"assistant","message":{"model":"m","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":17376,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":17376},"output_tokens":6}}}"#,
++        );
++        let start = feed(
++            &mut norm,
++            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,
++        );
++        assert_eq!(
++            compactions(&start),
++            vec![AgentEvent::Compaction {
++                pre_tokens: Some(17378),
++                post_tokens: None,
++                summary: None
++            }]
++        );
++        let end = feed(
++            &mut norm,
++            r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":18111,"post_tokens":5469,"cumulative_dropped_tokens":12642,"duration_ms":7802}}"#,
++        );
++        assert_eq!(
++            compactions(&end),
++            vec![AgentEvent::Compaction {
++                pre_tokens: Some(18111),
++                post_tokens: Some(5469),
++                summary: None
++            }]
++        );
++        let summary = feed(
++            &mut norm,
++            r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n<system-reminder>\n<tools-used-before-summary>Bash</tools-used-before-summary>\n</system-reminder>\nSummary:\n1. Primary Request and Intent:\n   - Say hi.\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\\x.jsonl\nContinue the conversation from where it left off without asking the user any further questions."},"parent_tool_use_id":null,"session_id":"s","isReplay":false,"isSynthetic":true}"#,
++        );
++        assert_eq!(
++            summary,
++            vec![AgentEvent::Compaction {
++                pre_tokens: None,
++                post_tokens: None,
++                summary: Some("1. Primary Request and Intent:\n   - Say hi.".into())
++            }]
++        );
++        // Said once: the replayed result line after it is no summary.
++        assert!(feed(
++            &mut norm,
++            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"session_id":"s","parent_tool_use_id":null,"isReplay":true}"#,
++        )
++        .is_empty());
++    }
++
++    /// The cache a request wrote lives an hour or five minutes, from its
++    /// usage; a request that only read it carries the lifetime before.
++    #[test]
++    fn a_requests_usage_says_its_cache_lifetime() {
++        let usage = |creation: &str| {
++            let mut norm = Normalizer::new();
++            let line = format!(
++                r#"{{"type":"assistant","message":{{"model":"m","content":[],"usage":{{"input_tokens":2,"cache_read_input_tokens":10,"cache_creation_input_tokens":5{creation},"output_tokens":1}}}}}}"#
++            );
++            feed(&mut norm, &line)
++                .into_iter()
++                .find_map(|e| match e {
++                    AgentEvent::PromptCache { ttl_secs } => Some(ttl_secs),
++                    _ => None,
++                })
++                .expect("a PromptCache event")
++        };
++        assert_eq!(
++            usage(r#","cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5}"#),
++            Some(3600)
++        );
++        assert_eq!(
++            usage(r#","cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0}"#),
++            Some(300)
++        );
++        // Both written: the 1-hour part outlives the rest.
++        assert_eq!(
++            usage(r#","cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":5}"#),
++            Some(3600)
++        );
++        // A pure read, or a CLI that doesn't split it: carried forward.
++        assert_eq!(
++            usage(r#","cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}"#),
++            None
++        );
++        assert_eq!(usage(""), None);
++    }
++}
++
+ #[cfg(test)]
+ mod context_tests {
+     use super::*;
+@@ -3377,4 +3622,23 @@ mod context_tests {
+             }
+         )));
+     }
++
++    /// `/clear` as Claude Code 2.1.328 streams it (captured live): the
++    /// context the chat shows starts again from none.
++    #[test]
++    fn a_clear_empties_the_context() {
++        let mut norm = Normalizer::new();
++        let events = norm.normalize(
++            crate::claude::wire::parse_frame(r#"{"type":"conversation_reset","new_conversation_id":"n","uuid":"n","trigger":"clear","user_message_uuid":"u","timestamp":"2026-11-24T12:34:52.319Z","session_id":"s"}"#)
++                .unwrap(),
++            false,
++        );
++        assert_eq!(
++            events,
++            vec![AgentEvent::ContextUsage {
++                tokens: Some(0),
++                window: None
++            }]
++        );
++    }
+ }
+diff --git a/crates/harness/src/claude/wire.rs b/crates/harness/src/claude/wire.rs
+index c6f7e398fc654f2f7f814fe4388d6185e4257b81..843190fdac4c4c3d4b3523f4781aaae32be09d31 100644
+--- a/crates/harness/src/claude/wire.rs
++++ b/crates/harness/src/claude/wire.rs
+@@ -21,6 +21,8 @@ pub(crate) enum Frame {
+     ControlResponse(ControlResponseFrame),
+     /// Where the CLI has taken one of our stdin user messages.
+     CommandLifecycle(CommandLifecycleFrame),
++    /// The conversation started over (`/clear`): its context is empty.
++    ConversationReset,
+     /// control_cancel_request / anything unknown.
+     Other,
+ }
+@@ -178,6 +180,10 @@ pub(crate) struct MessageFrame {
+     /// snake case.)
+     #[serde(default, rename = "isMeta", alias = "is_meta")]
+     pub is_meta: bool,
++    /// The CLI wrote this user message itself (a compaction's summary is
++    /// one, live-verified 2.1.328), not the person.
++    #[serde(default, rename = "isSynthetic", alias = "is_synthetic")]
++    pub is_synthetic: bool,
+     /// Structured tool outcome. An image result repeats its bytes here when
+     /// the content blocks do not. (`toolUseResult` in a saved transcript,
+     /// `tool_use_result` on the live stream.)
+@@ -431,6 +437,7 @@ fn typed_frame(value: Value) -> Result<Frame, serde_json::Error> {
+         "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
+         "control_response" => Frame::ControlResponse(serde_json::from_value(value)?),
+         "command_lifecycle" => Frame::CommandLifecycle(serde_json::from_value(value)?),
++        "conversation_reset" => Frame::ConversationReset,
+         _ => Frame::Other,
+     };
+     Ok(frame)
+diff --git a/crates/mcp/src/transcript.rs b/crates/mcp/src/transcript.rs
+index 90d1e78ce30eb7e48eb7d1f0d6f0c4be536598d0..a01e3bed46bf210d99e0bbd1c7f5f2ba0b5477fa 100644
+--- a/crates/mcp/src/transcript.rs
++++ b/crates/mcp/src/transcript.rs
+@@ -162,6 +162,20 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
+             // The fork seam is a transcript marker, not agent content: an
+             // orchestrator reads the copied history as ordinary turns.
+             MessagePart::Fork { .. } | MessagePart::Switch { .. } => {}
++            // A compaction reads as the agent's note of it, as a tool's.
++            MessagePart::Compaction {
++                pre_tokens,
++                post_tokens,
++                ..
++            } => {
++                if options.include_tools {
++                    tools.push(match (pre_tokens, post_tokens) {
++                        (Some(pre), Some(post)) => format!("compacted: {pre} → {post} tokens"),
++                        (_, Some(post)) => format!("compacted: → {post} tokens"),
++                        _ => "compacting".to_owned(),
++                    });
++                }
++            }
+         }
+     }
+     RenderedMessage {
+diff --git a/crates/proto/src/agent.rs b/crates/proto/src/agent.rs
+index f9ff17d9ec6bb954e97b2ebe923e46049fe1526c..685ab83caac98a0423d02a3bcf4d65461cce152a 100644
+--- a/crates/proto/src/agent.rs
++++ b/crates/proto/src/agent.rs
+@@ -1299,6 +1299,32 @@ pub enum AgentEvent {
+         tokens: Option<u64>,
+         window: Option<u64>,
+     },
++    /// The agent is compacting its context, or has: `post_tokens` set once
++    /// it's done, `summary` once its summary is known. Each one folds into
++    /// the turn's latest compaction part (one divider per compaction), a
++    /// first one, or one after a finished compaction, starts a new part.
++    /// `pre_tokens` missing is filled in by the engine from the chat's
++    /// context. Old readers skip the event.
++    #[serde(rename_all = "camelCase")]
++    Compaction {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        pre_tokens: Option<u64>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        post_tokens: Option<u64>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        summary: Option<String>,
++    },
++    /// The provider's prompt cache over the conversation, from a request's
++    /// usage (Claude: `cache_creation.ephemeral_1h_input_tokens` and
++    /// `ephemeral_5m_input_tokens`): how long the request's cache write
++    /// lives. `None`: the request only read the cache, so the lifetime of
++    /// the write before it carries on (a read refreshes it). The engine
++    /// times the cache from the request's start; never persisted to docs.
++    #[serde(rename_all = "camelCase")]
++    PromptCache {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        ttl_secs: Option<u64>,
++    },
+     /// The subscription's usage as the provider reported it mid-run (Muse's
+     /// `usage/changed`): the engine records it on the account the run used,
+     /// for the Providers meters. Never persisted to docs.
+@@ -1664,6 +1690,12 @@ mod tests {
+ pub struct ContextUsage {
+     pub tokens: Option<u64>,
+     pub window: Option<u64>,
++    /// When the provider's prompt cache over this context expires (Unix ms),
++    /// as the host last measured it (from the last request's start and its
++    /// cache lifetime). Absent: not known (another agent, an older host).
++    /// The next message after it resends the whole context uncached.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub cache_expires_at: Option<i64>,
+ }
+ 
+ impl ContextUsage {
+diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
+index 81846568e19f67f020e5f363277ca865adfa2cbc..add4865f3dfd93ae68fbe4c5c21510d43db62f4f 100644
+--- a/crates/rpc/src/lib.rs
++++ b/crates/rpc/src/lib.rs
+@@ -77,6 +77,10 @@ pub mod methods {
+     /// replies with the device's fresh `ListHarnesses` catalog.
+     pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
+     pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
++    /// "Compact idle chats" on the target device: `{ compactIdleChats }`
++    /// (set with the same shape; replies with it).
++    pub const GET_IDLE_COMPACT_SETTINGS: &str = "GetIdleCompactSettings";
++    pub const SET_IDLE_COMPACT_SETTINGS: &str = "SetIdleCompactSettings";
+     /// Whether agents' commits on this device credit Zeron
+     /// (`{enabled, cloud}`; set with `{enabled}`).
+     pub const GET_COMMIT_CREDIT: &str = "GetCommitCredit";
+-- 
+2.55.0.windows.2
+
