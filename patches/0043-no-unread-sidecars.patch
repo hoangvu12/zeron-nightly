@@ -1,0 +1,567 @@
+From 73a30f994a704202588d01d1cec0fdb1fac5ec6f Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 19:48:12 +0700
+Subject: [PATCH] The engine stops uploading the chat tail and diff sidecars
+ nothing reads
+
+Two uploads ran for every chat a device hosts, and no client read either:
+
+- the diff sidecar: each checkout's patch, POSTed to {edge}/diff/{chatId}
+  for every chat open on it, on every change (diff_sync);
+- the tail sidecar: the last 64 messages as JSON, PUT to
+  {edge}/chat2/{chatId}/tail on every quiet tick after a change, each one
+  materialized on the blocking pool (doc_host's chat2_maintenance).
+
+Checked again: nothing in the engine, zgx, zeron-client, zeron-mobile or
+the iOS/Android apps GETs either; the edge stores and serves them
+verbatim, and only its smoke scripts read them back. Both are gone, with
+what only they used: DiffSidecar, diff_sync's edge config and HTTP client
+(CheckoutDiffSync::start* lose their edge argument), zeron-doc's
+materialize_tail, SessionTail and TAIL_MESSAGE_COUNT and its test. The
+edge routes stay for engines from before. chat2_maintenance keeps the
+threshold checkpoint. The tool-output sidecar (upload_tool_sidecar) is
+something else and stays. Docs updated.
+---
+ ARCHITECTURE.md                        |   8 +-
+ crates/doc/src/constants.rs            |   2 -
+ crates/doc/src/schema.rs               |  49 +----------
+ crates/engine/src/diff_sync.rs         | 114 +++----------------------
+ crates/engine/src/doc_host.rs          |  61 ++-----------
+ crates/engine/src/lib.rs               |   4 +-
+ crates/engine/tests/diff_sync_churn.rs |   6 --
+ docs/PARITY.md                         |   4 +-
+ docs/chat2-sync.md                     |   4 +-
+ 9 files changed, 31 insertions(+), 221 deletions(-)
+
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index ed10cbd31010f8ad6173b62d0d0ea4d950da79e4..34878bf7a0e2883c0b230b8f0212f45b5fd74c66 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -88,7 +88,7 @@ Deferred product work in this area:
+ 
+ Two persistent doc kinds. When sync is enabled, session docs ride the `chat2` row protocol (Loro updates as append-only rows + Range-resumable checkpoints, `ChatRoom` DO) and the registry rides its own row-frame protocol; local-only profiles persist the same docs without joining rooms:
+ 
+-1. **Session doc** (per chat) — the transcript + durable command queue (`crates/doc`): `meta` map, `messages` list (parts as list-of-maps with **LoroText bodies** — the measured 1.03× oplog shape; never LWW value rewrites), `commands` list with ledger rules 1–3 (append-only per-device entries; host-only outcomes; dedupe/TTL/supersede evaluation). Continuation splitting at 256 KB, render-only tool parts (full inputs stay in the host's local run journal), tail/diff sidecars. Constants: `STREAM_COMMIT_MS=120`, `DO_FLUSH_MS=5s`, compaction at 8 MB, retain 30 d, tail 64.
++1. **Session doc** (per chat) — the transcript + durable command queue (`crates/doc`): `meta` map, `messages` list (parts as list-of-maps with **LoroText bodies** — the measured 1.03× oplog shape; never LWW value rewrites), `commands` list with ledger rules 1–3 (append-only per-device entries; host-only outcomes; dedupe/TTL/supersede evaluation). Continuation splitting at 256 KB, render-only tool parts (full inputs stay in the host's local run journal). Constants: `STREAM_COMMIT_MS=120`, `DO_FLUSH_MS=5s`, compaction at 8 MB, retain 30 d.
+ 
+ 2. **Workspace registry doc** (per profile) — the `registry1` snapshot stores spaces (`id`, `deviceId`, `path`, `name?`, `gitDetected`, `checkoutId`, `repositoryId`), the chats index (`id`, `deviceId`, `title`, `archived`, `cwd`, `branch`, `checkoutId`, `spaceId`, `lastSeenAt`, `lastMessagePreview/At`, `config`), devices, session-status rows, and checkout-diff summary pointers. A space is a device+folder pair in the active profile; the owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC, plus a repository identity (the trunk's root commit, so renames, transfers, and remote spellings don't split a repository; a shallow or empty history falls back to the normalized origin remote, then a device-scoped common-git-dir hash) that groups clones and worktrees of one repository in the sidebar's project mode. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{orgId}/ws`, backed by the private per-user room `reg1/{orgId}/{userId}`; rows are never visible to every member of an organization.
+ 
+@@ -190,12 +190,12 @@ See [`apps/ios/README.md`](apps/ios/README.md), [`apps/android/README.md`](apps/
+ Engine async runtime is **tokio** throughout:
+ 
+ - **Sessions engine:** per-session broadcast hub, on-disk run journal (resumable `seq` replay, crash recovery with `aborted` stamps), persistent steerable sessions (steering mailbox at step/turn boundaries, background subagent/process tracking, stall/idle handling).
+-- **Doc host:** per-chat handle joining rooms when synced, `chat2` row sync + VV backfill, streamed assistant writes at 120 ms commits, host-only command draining with mark-before-execute idempotence in SQLite (`docs.sqlite`), diff sidecar publishing, nudge-driven cold opens.
++- **Doc host:** per-chat handle joining rooms when synced, `chat2` row sync + VV backfill, streamed assistant writes at 120 ms commits, host-only command draining with mark-before-execute idempotence in SQLite (`docs.sqlite`), nudge-driven cold opens.
+ - **Harnesses (`crates/harness`):** one `Harness` trait over native and ACP drivers plus `MockHarness`:
+   - **Native drivers:** Claude Code (`claude` stream-json), Codex (`codex app-server` JSON-RPC), Cursor (pinned `@cursor/sdk` shim), OpenCode (`opencode serve` HTTP/SSE), Pi (JSONL RPC), Muse Code (`muse serve` MSP JSON-RPC).
+   - **Shared ACP driver (`AcpHarness`):** Devin (`devin acp`), Grok (`grok agent stdio`), Hermes (`hermes acp`), fx (`fx acp`), Antigravity (`agy_acp_server`).
+   - Explicit user-triggered CLI installation (`crates/harness/README.md`).
+-- **Repos, worktrees & diffs:** `git` subprocess operations, managed worktrees under `~/.zeron/worktrees`, filesystem watchers (`notify`) + periodic repair, bounded checkout diffs (3 MiB cap, sha256) published to workspace registry summaries and diff sidecars, workspace search via `fff-search`.
++- **Repos, worktrees & diffs:** `git` subprocess operations, managed worktrees under `~/.zeron/worktrees`, filesystem watchers (`notify`) + periodic repair, bounded checkout diffs (3 MiB cap, sha256) published to workspace registry summaries, workspace search via `fff-search`.
+ - **Terminals (`crates/engine/src/terminals/`):** `portable-pty` sessions (1 MB replay buffer, detach ≠ close, Job Objects on Windows), plus direct WebRTC peer-to-peer links (`zeron-term-link`) for remote terminals with seamless relay fallback and numbered/acknowledged input.
+ - **Plugin host & MCP server:** Ed25519 signature verification, snapshot staging, headless plugin services (`service.luau`), guardrails (`zeron-plugin-guard`), and Zeron's MCP server (`crates/mcp`) exposing chat, device, plugin, template, theme, visual, and command tools to agents.
+ - **Agent accounts & auth:** multi-account credential-slot management, usage/rate-limit probes, OAuth flows, WorkOS auth through edge `/auth/*` routes (loopback callback headed, paste-code headless).
+@@ -205,7 +205,7 @@ Engine async runtime is **tokio** throughout:
+ 
+ TypeScript Cloudflare Worker + Durable Objects + R2:
+ 
+-- **`ChatRoom` DO** (per chat): `chat2` append-only Loro update log + Range-resumable checkpoints, hibernatable WebSockets, two-level compaction, daily alarm backups to R2, tail/diff sidecar endpoints.
++- **`ChatRoom` DO** (per chat): `chat2` append-only Loro update log + Range-resumable checkpoints, hibernatable WebSockets, two-level compaction, daily alarm backups to R2, tail/diff sidecar endpoints (kept for engines from before; current engines publish neither, nothing read them).
+ - **`DeviceRoom` DO** (per device): byte-pipe virtual sockets (`{s,k,to,from}` frames) for relay-forwarded RPCs and terminal fallback, single host socket with supersede, durable wake nudges, sidecar slots.
+ - **`RegistryRoom` DO** (per user): private `/registry/{orgId}/ws` → `reg1/{orgId}/{userId}` row sync and ephemeral device presence.
+ - **`PreviewRoom` DO** and **Cloud (`CloudAccount` DO + Workflows + `edge/vault/` `zeron-vault`):** preview tunnelling and hosted per-session Cloud sandboxes with serialized credential refresh.
+diff --git a/crates/doc/src/constants.rs b/crates/doc/src/constants.rs
+index 3163dfd354bd5599c7a416447498753927b6ca71..31bc2b3fab4b38f0118bfb272681c357e5120af0 100644
+--- a/crates/doc/src/constants.rs
++++ b/crates/doc/src/constants.rs
+@@ -17,8 +17,6 @@ pub const STREAM_COMMIT_MS: u64 = 120;
+ pub const DO_FLUSH_MS: u64 = 5_000;
+ /// Byte budget for the in-memory doc LRU on device backends.
+ pub const DOC_LRU_BYTE_BUDGET: usize = 80 * 1024 * 1024;
+-/// Number of trailing messages materialized into the tail sidecar.
+-pub const TAIL_MESSAGE_COUNT: usize = 64;
+ /// Minimum spacing between terminal output batches (ms). Output after a quiet
+ /// spell (an echoed keystroke) is sent at once; only a continuous stream is
+ /// paced, so a flood can't outrun the viewer's frames.
+diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
+index d459ad3604dcda6927ebc5c98511cbdefd57b449..fc19b99f2dc26b1ac33b812bc4a4116f5488dd31 100644
+--- a/crates/doc/src/schema.rs
++++ b/crates/doc/src/schema.rs
+@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
+ use std::collections::BTreeMap;
+ 
+ use crate::commands::{SessionCommandEntry, SessionCommandStatus};
+-use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
++use crate::constants::SESSION_SCHEMA_VERSION;
+ use crate::parts::{MessagePart, MessageStatus, SubagentStatus};
+ 
+ /// The plugins' sends a chat keeps a record of (`SessionDoc::sent_by`).
+@@ -2346,39 +2346,6 @@ pub(crate) fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
+     LoroValue::from(v.clone())
+ }
+ 
+-/// Tail sidecar shape (`SessionTail` in TS).
+-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct SessionTail {
+-    pub chat_id: String,
+-    pub schema_version: u32,
+-    pub messages: Vec<SessionMessageEntry>,
+-    pub total_messages: usize,
+-    pub updated_at: i64,
+-}
+-
+-/// Materialize the last-N joined messages (`materializeTail` in TS).
+-pub fn materialize_tail(
+-    doc: &SessionDoc,
+-    now: i64,
+-    tail_count: usize,
+-) -> Result<SessionTail, DocError> {
+-    let all = join_continuation_entries(doc.read_entries()?);
+-    let total = all.len();
+-    let start = total.saturating_sub(if tail_count == 0 {
+-        TAIL_MESSAGE_COUNT
+-    } else {
+-        tail_count
+-    });
+-    Ok(SessionTail {
+-        chat_id: doc.chat_id().unwrap_or_default(),
+-        schema_version: SESSION_SCHEMA_VERSION,
+-        messages: all[start..].to_vec(),
+-        total_messages: total,
+-        updated_at: now,
+-    })
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -3869,20 +3836,6 @@ mod tests {
+         assert_eq!(commands[0].payload, entry.payload);
+     }
+ 
+-    #[test]
+-    fn tail_materializes_last_n_joined() {
+-        let doc = SessionDoc::init("chat-1").unwrap();
+-        for i in 0..5 {
+-            doc.push_message(&user_entry(&format!("m{i}"), &format!("msg {i}")))
+-                .unwrap();
+-        }
+-        let tail = materialize_tail(&doc, 99, 2).unwrap();
+-        assert_eq!(tail.total_messages, 5);
+-        assert_eq!(tail.messages.len(), 2);
+-        assert_eq!(tail.messages[1].id, "m4");
+-        assert_eq!(tail.chat_id, "chat-1");
+-    }
+-
+     /// 2026-08-10 incident: entries/parts missing strict fields must salvage
+     /// field-by-field — a fresh reader importing a room's merged doc must
+     /// never render a BLANK transcript because some writer (old app version,
+diff --git a/crates/engine/src/diff_sync.rs b/crates/engine/src/diff_sync.rs
+index 79a43b1ae4c2f3117aa8d02efc90ab6495851f3f..faf85f55a6107e0265d4e0306763dca402739581 100644
+--- a/crates/engine/src/diff_sync.rs
++++ b/crates/engine/src/diff_sync.rs
+@@ -4,13 +4,11 @@
+ //! Chats do not own working-tree state: a concrete Git checkout does. This service
+ //! groups this device's chats by their canonical checkout identity (`chat.cwd` →
+ //! [`Repos::checkout_identity`]), computes one bounded atomic snapshot per checkout,
+-//! and publishes it three ways:
++//! and publishes it on the local `WatchCheckoutDiffs` stream (a watch channel
++//! of every checkout's latest [`CheckoutDiff`]), and its git status beside it.
++//! (It once also posted each chat's diff to the edge, `POST /diff/{chatId}`,
++//! for reviewing while the host slept; nothing read it.)
+ //!
+-//! - the local `WatchCheckoutDiffs` stream (a watch channel of every checkout's
+-//!   latest [`CheckoutDiff`]);
+-//! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
+-//!   the checkout (bearer = engine edge token), so "review pending changes while
+-//!   the host sleeps" works;
+ //! Checkout snapshots remain live checkout state. Conversation branch identity
+ //! is captured by the command host and is never rewritten from this watcher;
+ //! otherwise one checkout change would relabel every chat sharing that folder.
+@@ -48,7 +46,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+ use std::time::{Duration, Instant};
+ 
+-use serde::Serialize;
+ use sha2::{Digest, Sha256};
+ use tokio::io::AsyncReadExt;
+ use tokio::sync::{Notify, mpsc, watch};
+@@ -57,7 +54,6 @@ use tokio_util::sync::CancellationToken;
+ use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary};
+ 
+ use crate::EngineError;
+-use crate::doc_host::EdgeConfig;
+ use crate::fs_watch::{FsWatch, FsWatchHub};
+ use crate::repos::{CheckoutIdentity, Repos};
+ use crate::workspace_host::WorkspaceHost;
+@@ -90,27 +86,6 @@ const MAX_WATCH_DIRS: usize = 8_000;
+ /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
+ const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+ 
+-/// Latest-only diff sidecar published to each chat's session DO slot
+-/// (`POST /diff/{chatId}`; shape: edge/src/session-doc/sidecar.ts).
+-#[derive(Debug, Clone, Serialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct DiffSidecar {
+-    pub chat_id: String,
+-    pub device_id: String,
+-    pub checkout_path: String,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub branch: Option<String>,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub head_sha: Option<String>,
+-    pub patch: String,
+-    pub files: Vec<DiffFileSummary>,
+-    pub additions: u32,
+-    pub deletions: u32,
+-    pub truncated: bool,
+-    /// Epoch millis.
+-    pub published_at: i64,
+-}
+-
+ /// One bounded atomic snapshot of a checkout's working tree.
+ #[derive(Debug, Clone)]
+ pub struct DiffSnapshot {
+@@ -193,8 +168,6 @@ struct DiffSyncInner {
+     repos: Repos,
+     workspace: WorkspaceHost,
+     device_id: String,
+-    edge: Option<EdgeConfig>,
+-    http: reqwest::Client,
+     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
+     /// Serializes [`reconcile`] passes. Concurrent passes (chat-watch task vs.
+     /// `reconcile_now`) can both observe a checkout as missing and both
+@@ -212,7 +185,7 @@ struct DiffSyncInner {
+     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
+     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
+     /// The tasks hold `Weak` refs, but an in-flight iteration holds an
+-    /// upgraded Arc — the token cuts it so no sidecar HTTP outlives shutdown.
++    /// upgraded Arc — the token cuts it so no capture outlives shutdown.
+     cancel: CancellationToken,
+     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+     /// chat_id → viewer interest; see [`CheckoutDiffSync::retain_chat`].
+@@ -295,15 +268,10 @@ pub struct CheckoutDiffSync {
+ impl CheckoutDiffSync {
+     /// Build and start the sync loop: follows the workspace chat watch and runs the
+     /// 2-minute repair tick. Requires a tokio runtime.
+-    pub fn start(
+-        repos: Repos,
+-        workspace: WorkspaceHost,
+-        device_id: &str,
+-        edge: Option<EdgeConfig>,
+-    ) -> Self {
++    pub fn start(repos: Repos, workspace: WorkspaceHost, device_id: &str) -> Self {
+         // Grace = one repair interval: an entry must survive at least one full
+         // fresh revalidation pass before reconcile may tear it down.
+-        Self::start_with_orphan_grace(repos, workspace, device_id, edge, REPAIR_INTERVAL)
++        Self::start_with_orphan_grace(repos, workspace, device_id, REPAIR_INTERVAL)
+     }
+ 
+     /// [`CheckoutDiffSync::start`] with an explicit orphan grace — test hook so
+@@ -313,17 +281,9 @@ impl CheckoutDiffSync {
+         repos: Repos,
+         workspace: WorkspaceHost,
+         device_id: &str,
+-        edge: Option<EdgeConfig>,
+         orphan_grace: Duration,
+     ) -> Self {
+-        Self::start_with_timings(
+-            repos,
+-            workspace,
+-            device_id,
+-            edge,
+-            orphan_grace,
+-            INTEREST_LINGER,
+-        )
++        Self::start_with_timings(repos, workspace, device_id, orphan_grace, INTEREST_LINGER)
+     }
+ 
+     /// [`CheckoutDiffSync::start_with_orphan_grace`] plus an explicit interest
+@@ -333,7 +293,6 @@ impl CheckoutDiffSync {
+         repos: Repos,
+         workspace: WorkspaceHost,
+         device_id: &str,
+-        edge: Option<EdgeConfig>,
+         orphan_grace: Duration,
+         interest_linger: Duration,
+     ) -> Self {
+@@ -346,8 +305,6 @@ impl CheckoutDiffSync {
+                 repos,
+                 workspace: workspace.clone(),
+                 device_id: device_id.to_string(),
+-                edge,
+-                http: reqwest::Client::new(),
+                 entries: Mutex::new(HashMap::new()),
+                 reconcile_gate: tokio::sync::Mutex::new(()),
+                 capture_gate: tokio::sync::Mutex::new(()),
+@@ -375,8 +332,8 @@ impl CheckoutDiffSync {
+     }
+ 
+     /// Stop the sync graph and wait for the supervisor to exit. Per-entry
+-    /// tasks observe the same token, so an in-flight `sync_entry` drops its
+-    /// sidecar POST instead of finishing it under a replaced runtime.
++    /// tasks observe the same token, so an in-flight `sync_entry` stops
++    /// instead of finishing under a replaced runtime.
+     /// Idempotent.
+     pub async fn shutdown(&self) {
+         self.inner.cancel.cancel();
+@@ -920,7 +877,7 @@ async fn entry_task(
+             continue;
+         }
+         // The upgraded Arc would let a sync outlive shutdown — race the token
+-        // so an in-flight sidecar POST is dropped, not completed.
++        // so an in-flight capture is dropped, not completed.
+         tokio::select! {
+             _ = cancel.cancelled() => return,
+             _ = sync_entry(&inner, &entry) => {}
+@@ -994,55 +951,6 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
+         }
+     }
+     publish_watch_with(inner, Some(diff));
+-
+-    // Latest-only sidecar to every syncing chat's session DO slot.
+-    let chats = lock(&entry.chats).clone();
+-    // The legacy s2 sidecar route is closed to Cloud runner tokens (and no
+-    // current client reads it), so a Cloud machine doesn't post it.
+-    if let Some(edge) = inner
+-        .edge
+-        .as_ref()
+-        .filter(|_| !crate::runner::is_cloud_platform())
+-    {
+-        for chat in &chats {
+-            let sidecar = DiffSidecar {
+-                chat_id: chat.id.clone(),
+-                device_id: inner.device_id.clone(),
+-                checkout_path: entry.identity.root.to_string_lossy().to_string(),
+-                branch: Some(snapshot.branch.clone()),
+-                head_sha: snapshot.head_sha.clone(),
+-                patch: snapshot.patch.clone(),
+-                files: snapshot.files.clone(),
+-                additions: snapshot.additions,
+-                deletions: snapshot.deletions,
+-                truncated: snapshot.truncated,
+-                published_at: chrono::Utc::now().timestamp_millis(),
+-            };
+-            let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
+-            // Fresh bearer per request — never the boot-time snapshot.
+-            let Ok(bearer) = edge.bearer().await else {
+-                tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (token unavailable)");
+-                continue;
+-            };
+-            let result = inner
+-                .http
+-                .post(&url)
+-                .bearer_auth(&bearer)
+-                .json(&sidecar)
+-                .send()
+-                .await;
+-            match result {
+-                Ok(response) if !response.status().is_success() => {
+-                    tracing::debug!(chat = %chat.id, status = %response.status(),
+-                        "diff-sync: sidecar publish rejected");
+-                }
+-                Err(err) => {
+-                    tracing::debug!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
+-                }
+-                Ok(_) => {}
+-            }
+-        }
+-    }
+ }
+ 
+ /// Re-emit the watch channel from the current entries' cached diffs, replacing (or
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index ee526068c828bdeae28f78c6537e467bacb4e687..ed3ec6d092cb69708097116f53cd43ee5e05db73 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -3935,13 +3935,12 @@ impl DocHost {
+         Ok(())
+     }
+ 
+-    /// chat2 host duties on the doc-quiesce tick (docs/chat2-sync.md C3):
+-    /// - threshold checkpoint: when the room's row log passes 512KB or 200
+-    ///   rows, post a full checkpoint so cold readers load one compact blob
+-    ///   instead of replaying the log (the alert-shaped growth bound);
+-    /// - tail sidecar: publish the last-64 transcript JSON for thin/instant
+-    ///   readers (the iOS fallback path).
+-    async fn chat2_maintenance(&self, handle: &Arc<ChatDocHandle>) {
++    /// chat2 host duty on the doc-quiesce tick (docs/chat2-sync.md C3): when
++    /// the room's row log passes 512KB or 200 rows, post a full checkpoint so
++    /// cold readers load one compact blob instead of replaying the log (the
++    /// alert-shaped growth bound). (It once also put the last 64 messages to
++    /// the edge, `PUT /chat2/{id}/tail`, for thin readers; nothing read them.)
++    fn chat2_maintenance(&self, handle: &Arc<ChatDocHandle>) {
+         if handle.retired.load(Ordering::Relaxed) {
+             return;
+         }
+@@ -3954,49 +3953,6 @@ impl DocHost {
+             Some(client) => client.stats(),
+             None => return,
+         };
+-        let Some(edge) = self.inner.config.edge.clone() else {
+-            return;
+-        };
+-        let chat_id = handle.chat_id.clone();
+-        // A whale's last 64 joined messages can still contain its entire
+-        // history. Materialization/encoding must not occupy a network worker.
+-        let doc = handle.doc.clone();
+-        let body = tokio::task::spawn_blocking(move || {
+-            let tail =
+-                zeron_doc::materialize_tail(&doc, now_ms(), zeron_doc::TAIL_MESSAGE_COUNT).ok()?;
+-            serde_json::to_vec(&tail).ok()
+-        })
+-        .await
+-        .ok()
+-        .flatten();
+-        if let Some(body) = body {
+-            let http = self.inner.http.clone();
+-            let edge_tail = edge.clone();
+-            let chat = chat_id.clone();
+-            self.spawn_worker(async move {
+-                let Ok(bearer) = edge_tail.bearer().await else {
+-                    return;
+-                };
+-                let url = format!(
+-                    "{}/chat2/{}/tail",
+-                    edge_tail.url.trim_end_matches('/'),
+-                    chat
+-                );
+-                let Ok(_permit) = zeron_sync::budget::shared()
+-                    .http(zeron_sync::budget::Priority::Background)
+-                    .await
+-                else {
+-                    return;
+-                };
+-                let _ = http
+-                    .put(&url)
+-                    .bearer_auth(&bearer)
+-                    .header("content-type", "application/json")
+-                    .body(body)
+-                    .send()
+-                    .await;
+-            });
+-        }
+         // Threshold checkpoint, one in flight at a time (review H1).
+         let snapshot = handle
+             .snapshot_bytes
+@@ -8317,9 +8273,8 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
+                 // chat2 has its own coalescing blocking-pool persister. The
+                 // legacy worker must not duplicate every scheduled export.
+                 if handle.persistence.is_none() { host.save_snapshot(&handle); }
+-                // chat2 host duties ride the same quiesce tick (C3):
+-                // threshold checkpoints + the tail sidecar publish.
+-                host.chat2_maintenance(&handle).await;
++                // chat2's threshold checkpoint rides the same quiesce tick (C3).
++                host.chat2_maintenance(&handle);
+                 // Post-quiesce eviction pass: sizes just refreshed.
+                 host.evict_over_budget();
+             }
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 8aa345ef620cc80d103875aed5a301f07286fe7c..e5d2f961c31c9ebff7109bb5d347186940a556cf 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -106,7 +106,7 @@ pub use auth::{
+ };
+ pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
+ pub use diff_sync::{
+-    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TreeSnapshot, TurnSnapshot,
++    CheckoutDiffSync, DiffFileTextPair, DiffSnapshot, TreeSnapshot, TurnSnapshot,
+     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff,
+     discard_working_tree, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
+ };
+@@ -534,7 +534,7 @@ impl EngineCore {
+             registry.clone(),
+             repos.clone(),
+         ));
+-        let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
++        let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id);
+         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
+         let turn_diff = diff_sync.clone();
+         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
+diff --git a/crates/engine/tests/diff_sync_churn.rs b/crates/engine/tests/diff_sync_churn.rs
+index 45e30f0a8adf78d80eb599a83a974393331f242c..9849ae3bddd05a1d625dddcd6ef7527433c3ba33 100644
+--- a/crates/engine/tests/diff_sync_churn.rs
++++ b/crates/engine/tests/diff_sync_churn.rs
+@@ -179,7 +179,6 @@ async fn chat_flap_keeps_entry_and_sustained_absence_removes_it() {
+         core.repos.clone(),
+         core.workspace.clone(),
+         &core.device_id,
+-        None,
+         Duration::from_millis(300),
+     );
+     core.workspace
+@@ -253,7 +252,6 @@ async fn deleted_checkout_is_evicted_after_grace() {
+         core.repos.clone(),
+         core.workspace.clone(),
+         &core.device_id,
+-        None,
+         Duration::from_millis(300),
+     );
+     core.workspace
+@@ -341,7 +339,6 @@ async fn unopened_chats_stay_idle_and_shared_checkout_lasts_until_last_viewer()
+         core.repos.clone(),
+         core.workspace.clone(),
+         &core.device_id,
+-        None,
+         Duration::from_secs(3600),
+         Duration::from_millis(300),
+     );
+@@ -460,7 +457,6 @@ async fn open_archived_chat_is_tracked_until_interest_lapses() {
+         core.repos.clone(),
+         core.workspace.clone(),
+         &core.device_id,
+-        None,
+         Duration::from_secs(3600),
+         Duration::from_millis(300),
+     );
+@@ -533,7 +529,6 @@ async fn discard_works_for_an_untracked_checkout() {
+         core.repos.clone(),
+         core.workspace.clone(),
+         &core.device_id,
+-        None,
+         Duration::from_secs(3600),
+     );
+     let identity = core.repos.checkout_identity(&dir).await.expect("identity");
+@@ -574,7 +569,6 @@ async fn orphaned_entry_skips_captures_and_catches_up_on_return() {
+         core.repos.clone(),
+         core.workspace.clone(),
+         &core.device_id,
+-        None,
+         Duration::from_secs(3600),
+     );
+     core.workspace
+diff --git a/docs/PARITY.md b/docs/PARITY.md
+index ce7ef7e3058f018d088f356c06201849d11fbd7c..a700216e5d857df6fa19dcb228eeef9940cbdcd2 100644
+--- a/docs/PARITY.md
++++ b/docs/PARITY.md
+@@ -52,9 +52,9 @@ not built yet).
+ | --- | --- | --- |
+ | 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `zeron login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `zeron login` first"; `zeron daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
+ | 3.2 Sessions engine | partial | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS. Gaps: idle reaper + 10-min stall watchdog for persistent harness sessions. |
+-| 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
++| 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
+ | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
+-| 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
++| 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256; the diff sidecar post is gone, nothing read it); chat.branch upkeep from HEAD watch; folder listing with timeout. |
+ | 3.7 Auth / uploads / accounts / device-room | done | WorkOS code+loopback and paste-code flows, refresh persistence (0600), org gate, dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
+ 
+ ## §4 Harness
+diff --git a/docs/chat2-sync.md b/docs/chat2-sync.md
+index de477ddced2e41aea62bad2da0f5e686977cd343..35d1d25e98853d57b822cd70a28877f05881f678 100644
+--- a/docs/chat2-sync.md
++++ b/docs/chat2-sync.md
+@@ -104,7 +104,9 @@ the wasm bundling alias eventually die with s2.
+   `checkpointFrontier BLOB` (opaque, client-written), `checkpointSize`,
+   `checkpointSeq`, `tailDirty`.
+ - Sidecars: `tail` and `diff` blobs become **host-published** (`PUT /tail`,
+-  `PUT /diff`), served verbatim. The DO never materializes anything.
++  `PUT /diff`), served verbatim. The DO never materializes anything. (2026-11:
++  no client ever read either, so engines stopped publishing them; the routes
++  stay for engines from before.)
+ 
+ **Protocol** (binary WS frames: 1-byte type + JSON header + raw payload; no
+ loro-protocol, no base64 — 33% base64 overhead matters at 1.2 Mbps):
+-- 
+2.55.0.windows.2
+
