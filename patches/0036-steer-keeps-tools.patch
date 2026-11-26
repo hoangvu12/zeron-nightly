@@ -1,0 +1,1313 @@
+From b2753077aca87082d31f3470d2d02e9a7318815c Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 13:01:47 +0700
+Subject: [PATCH] A steer never kills a running tool: Claude moves it to the
+ background, as its own terminal does
+
+The person's steer during a running command used to stop the turn first
+(an `interrupt`): Claude Code killed the Bash and told the model the person
+didn't want to proceed, so agents halted or thought they were refused.
+
+Claude Code from 2.1.286 takes the person's message as its terminal does:
+`priority: "now"` with `origin: {kind: "human"}` moves a running shell
+command, subagent or MCP call (and from 2.1.287 WebFetch/WebSearch) to the
+background, uninterrupted, and the model reads the message in the same turn.
+On such a CLI (read through the cached version probe) the person's steer
+goes that way and the engine stops nothing first: `steer_stops_tool` is
+version-gated and read off the async threads at dispatch. An older or
+unknown CLI keeps the old path. A message from another chat never claims a
+human origin: `next` while a tool runs, as before. Stop stays a hard stop.
+
+What the CLI sends then, captured live on 2.1.328 (fixtures
+live-2.1.328-steer-{bash,agent,mcp,webfetch}.jsonl):
+- Bash: a result naming its task (`backgroundTaskId`,
+  `backgroundedToDeliverMessage`), `task_updated {is_backgrounded}`, the
+  roster entry, a `task_notification` at its end and a wake turn. It now
+  reads as a background command (no exit code, its note as output) rather
+  than one that exited 0.
+- A subagent: the usual background launch ("Async agent launched"); its
+  chip runs on until its notification, as a background agent's does.
+- MCP: an `mcp_task` in the roster, a "moved to the background" result, a
+  notification and a wake turn. It is listed with the background shells
+  and waited on, as a background agent is.
+- WebFetch: `{detachedToolCall: true}` and one result only; its answer
+  comes in the wake turn. Every turn still ends on its own result.
+
+ACP: a steer into a turn the agent continued on its own (a background
+wake) sent `session/cancel` because a tool was open, killing it. It now
+waits for the open tools and cancels once the last one closes. Tool calls
+in the injection drain are tracked too. Codex, Muse, Cursor, OpenCode and
+Pi already wait for or inject past running tools; ACP's step-boundary
+preempt already waited.
+---
+ crates/engine/src/sessions.rs                 |  11 +-
+ crates/engine/tests/steer_now.rs              |  95 ++++++++++++-
+ crates/harness/src/acp/mod.rs                 |  43 +++++-
+ crates/harness/src/claude/background.rs       |  92 +++++++++++-
+ crates/harness/src/claude/mod.rs              |  99 ++++++++++++-
+ crates/harness/src/claude/normalize.rs        | 132 +++++++++++++++++-
+ crates/harness/src/claude/wire.rs             |  72 +++++++---
+ crates/harness/src/lib.rs                     |   6 +-
+ crates/harness/tests/acp.rs                   |  57 ++++++++
+ crates/harness/tests/claude.rs                | 117 ++++++++++++++++
+ .../claude/live-2.1.328-steer-agent.jsonl     |  31 ++++
+ .../claude/live-2.1.328-steer-bash.jsonl      |  22 +++
+ .../claude/live-2.1.328-steer-mcp.jsonl       |  21 +++
+ .../claude/live-2.1.328-steer-webfetch.jsonl  |  17 +++
+ crates/harness/tests/fixtures/fake-acp.sh     |  16 ++-
+ crates/harness/tests/fixtures/fake-claude.sh  |  32 +++++
+ 16 files changed, 816 insertions(+), 47 deletions(-)
+ create mode 100644 crates/harness/tests/fixtures/claude/live-2.1.328-steer-agent.jsonl
+ create mode 100644 crates/harness/tests/fixtures/claude/live-2.1.328-steer-bash.jsonl
+ create mode 100644 crates/harness/tests/fixtures/claude/live-2.1.328-steer-mcp.jsonl
+ create mode 100644 crates/harness/tests/fixtures/claude/live-2.1.328-steer-webfetch.jsonl
+
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index 4fa2114d9005e43f0a0b988f134971c946fa74e4..4287ea23219ddea4bd4c6f0762ff45f573ff9066 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -1610,6 +1610,13 @@ impl SessionsEngine {
+                 .ok()
+                 .flatten()
+         };
++        // Off the async threads: a driver may ask its CLI's version.
++        let steer_stops_tool = harness.supports_steering() && harness.stops_turn_in_place() && {
++            let harness = harness.clone();
++            tokio::task::spawn_blocking(move || harness.steer_stops_tool())
++                .await
++                .unwrap_or(false)
++        };
+         let side_chats_only = self.inner.side_chats_only(chat_id, harness_id);
+         let code_mode = self.inner.registry.code_mode(harness_id);
+         let zeron_mcp_only = self.inner.zeron_mcp_only(harness_id);
+@@ -1758,9 +1765,7 @@ impl SessionsEngine {
+                 steer_tx,
+                 interrupt_token,
+                 stops_turn_in_place: harness.supports_steering() && harness.stops_turn_in_place(),
+-                steer_stops_tool: harness.supports_steering()
+-                    && harness.stops_turn_in_place()
+-                    && harness.steer_stops_tool(),
++                steer_stops_tool,
+                 open_tools: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                 redeliver_on_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                 redeliver: Arc::new(Mutex::new(Vec::new())),
+diff --git a/crates/engine/tests/steer_now.rs b/crates/engine/tests/steer_now.rs
+index 64bfb3156e7285c47f43b1cd2f72adf5321ccc10..67e6fad979d90288f61db0620ec3b3e5b7c72c77 100644
+--- a/crates/engine/tests/steer_now.rs
++++ b/crates/engine/tests/steer_now.rs
+@@ -5,7 +5,9 @@
+ //! the steer starts the next turn in that same runtime. Steers sent before
+ //! it, which the stop cancels, go again first. Agents that haven't opted
+ //! in (`Harness::steer_stops_tool`) keep the step-boundary wait, and so does
+-//! a message from another chat.
++//! a message from another chat. An agent that can read the steer at once
++//! without that stop (Claude Code from 2.1.286 moves the running command to
++//! the background for the person's steer) never opts in: nothing is stopped.
+ 
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+@@ -45,6 +47,10 @@ struct Ledger {
+ struct StepAgent {
+     ledger: Arc<Ledger>,
+     stops_tool: bool,
++    /// Takes a steer during the command at once, moving the command to the
++    /// background (Claude Code from 2.1.286, for the person's `now`): the
++    /// call returns moved, the steer is read, the command runs on.
++    moves_tools: bool,
+ }
+ 
+ fn done(status: DoneStatus) -> AgentEvent {
+@@ -91,6 +97,7 @@ impl Harness for StepAgent {
+         mut controls: RunControls,
+     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+         let ledger = self.ledger.clone();
++        let self_moves_tools = self.moves_tools;
+         ledger.spawns.fetch_add(1, Ordering::SeqCst);
+         *ledger.turn.lock().unwrap() = Some(controls.turn.clone());
+         let (tx, rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(64);
+@@ -167,7 +174,15 @@ impl Harness for StepAgent {
+                         _ = ledger.release.notified() => break false,
+                         steer = controls.steering.recv() => {
+                             let Some(steer) = steer else { return };
++                            let from_another_chat =
++                                zeron_proto::agent_messages::agent_message_sender(&steer.prompt)
++                                    .is_some();
+                             held.push(steer.prompt);
++                            if self_moves_tools && !from_another_chat {
++                                // Moved, not ended: no exit code, not failed.
++                                turn.set_background(1);
++                                break false;
++                            }
+                         }
+                     }
+                 };
+@@ -216,11 +231,22 @@ struct Rig {
+ }
+ 
+ fn rig(stops_tool: bool) -> Rig {
++    rig_with(stops_tool, false)
++}
++
++/// Claude Code on a CLI that moves running work aside for the person's
++/// steer: it doesn't ask the engine to stop the turn first.
++fn rig_moving_tools() -> Rig {
++    rig_with(false, true)
++}
++
++fn rig_with(stops_tool: bool, moves_tools: bool) -> Rig {
+     let ledger = Arc::new(Ledger::default());
+     let registry = HarnessRegistry::new();
+     registry.register(Arc::new(StepAgent {
+         ledger: ledger.clone(),
+         stops_tool,
++        moves_tools,
+     }));
+     let dir = tempfile::tempdir().unwrap();
+     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+@@ -490,3 +516,70 @@ async fn a_message_from_another_chat_never_stops_the_command() {
+     );
+     rig.core.sessions.shutdown().await;
+ }
++
++/// Claude Code on a CLI that moves running work aside: the person's steer
++/// during a command goes straight to the agent, no stop first. The agent
++/// reads it at once and the command runs on in the background, so the
++/// turn ends completed, not stopped, in the same runtime.
++#[tokio::test]
++async fn a_steer_to_an_agent_that_moves_the_command_aside_stops_nothing() {
++    let rig = rig_moving_tools();
++    let turn = running_a_command(&rig).await;
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    assert!(
++        !rig.core.sessions.steer_stops_tool(CHAT),
++        "a command is open, but this agent doesn't need it stopped"
++    );
++    steer(&rig, "stop and look at the logs", "m-steer");
++    wait_for(
++        || read(&rig).iter().any(|p| p == "stop and look at the logs"),
++        "the steer to be read while the command runs",
++    )
++    .await;
++    wait_for(
++        || status(&rig.core) == Some(SessionStatus::Idle),
++        "the steered turn to end",
++    )
++    .await;
++    assert_eq!(rig.ledger.stops.load(Ordering::SeqCst), 0, "no interrupt");
++    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0, "no teardown");
++    assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 1, "the same runtime");
++    assert!(turn.background_live(), "the command runs on in the background");
++    let doc = rig.core.doc_host.open(CHAT).unwrap();
++    let entries = doc.doc().read_entries().unwrap();
++    assert!(
++        !entries
++            .iter()
++            .any(|e| e.status == Some(MessageStatus::Aborted)),
++        "nothing reads as stopped"
++    );
++    assert_eq!(
++        entries.iter().filter(|e| e.id == "m-steer").count(),
++        1,
++        "the steer is in the transcript once"
++    );
++    rig.core.sessions.shutdown().await;
++}
++
++/// The same agent, a message from another chat: still no stop, and it is
++/// read once the command returns, as before.
++#[tokio::test]
++async fn a_message_from_another_chat_still_waits_for_the_command() {
++    let rig = rig_moving_tools();
++    let _turn = running_a_command(&rig).await;
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    let message =
++        zeron_proto::agent_messages::agent_message("Coordinator (139d8682)", "139d8682", "status?");
++    steer(&rig, &message, "m-agent");
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    assert_eq!(read(&rig).len(), 1, "it waits for the command");
++    rig.ledger.release.notify_one();
++    wait_for(
++        || read(&rig).iter().any(|p| p.ends_with("status?")),
++        "the message at the step boundary",
++    )
++    .await;
++    assert_eq!(rig.ledger.stops.load(Ordering::SeqCst), 0);
++    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
++    rig.core.sessions.shutdown().await;
++}
+diff --git a/crates/harness/src/acp/mod.rs b/crates/harness/src/acp/mod.rs
+index d134cf78daa54373ab969ae793d2e237edef528f..cdc3c7d9c5462c01ca693f3f0bd20b90b64e07db 100644
+--- a/crates/harness/src/acp/mod.rs
++++ b/crates/harness/src/acp/mod.rs
+@@ -6979,6 +6979,10 @@ async fn run_session(session: Session) {
+     const BUSY_RECENT: Duration = Duration::from_secs(3);
+     const CANCEL_FLUSH: Duration = Duration::from_secs(2);
+     let mut cancel_flush_deadline: Option<tokio::time::Instant> = None;
++    // A steer reached a self-continued turn while one of its tools ran: the
++    // cancel waits until no tool is open, so the steer never kills one. A
++    // tool the agent never closes holds the steer until the person stops.
++    let mut unowned_cancel_pending = false;
+     // When our last prompt settled. Only traffic arriving past it (and past
+     // the settled turn's own trailing frames) is an unowned turn: counting
+     // the tail of our own turn as "busy" cancelled an idle session for every
+@@ -7371,6 +7375,17 @@ async fn run_session(session: Session) {
+                         preempt_sent = true;
+                         preempt_deadline = Some(tokio::time::Instant::now() + stop_timeout);
+                     }
++                    // A steer waiting on a self-continued turn's tools: the
++                    // last one closed, so the unowned turn is cancelled now
++                    // and the steer goes at flush.
++                    if unowned_cancel_pending && open_tools.is_empty() {
++                        unowned_cancel_pending = false;
++                        if turn.is_none() && cancel_flush_deadline.is_none() {
++                            client.notify("session/cancel", Some(cancel_params(harness, &session_id)));
++                        }
++                        cancel_flush_deadline
++                            .get_or_insert_with(|| tokio::time::Instant::now() + CANCEL_FLUSH);
++                    }
+                 }
+                 Some(Incoming::Request { id, method, params }) => {
+                     prompt_stall_deadline = None;
+@@ -7478,6 +7493,7 @@ async fn run_session(session: Session) {
+                                     let events =
+                                         session_update_events(&method, &params, &session_id, &mut subagents);
+                                     for ev in events {
++                                        track_open_tools(&ev, &mut open_tools);
+                                         if (preempt_sent
+                                             || stopping
+                                             || interrupted
+@@ -7822,15 +7838,27 @@ async fn run_session(session: Session) {
+                         inline_images,
+                     )
+                     .await;
+-                    if turn.is_none() && cancel_flush_deadline.is_some() {
+-                        // A busy-session cancel is already in flight: this
+-                        // steer lines up behind it and dispatches at flush.
++                    if turn.is_none() && (cancel_flush_deadline.is_some() || unowned_cancel_pending) {
++                        // A busy-session cancel is already in flight, or
++                        // waits for a tool: this steer lines up behind it
++                        // and dispatches at flush.
++                        queued_steers.push_back(prompt);
++                    } else if turn.is_none() && !open_tools.is_empty() {
++                        // Mid self-continued turn with a tool running: a
++                        // steer never kills a running tool. It waits, and
++                        // the cancel goes once no tool is open (the
++                        // notification branch).
++                        tracing::info!(
++                            target: "zeron_harness::acp",
++                            "steer into a self-continuing session; waiting for \
++                             its open tools before cancelling the unowned turn"
++                        );
+                         queued_steers.push_back(prompt);
++                        unowned_cancel_pending = true;
+                     } else if turn.is_none()
+-                        && (!open_tools.is_empty()
+-                            || (last_update_at.elapsed() < BUSY_RECENT
+-                                && prompt_settled_at
+-                                    .is_none_or(|settled| last_update_at > settled + OWN_TAIL)))
++                        && last_update_at.elapsed() < BUSY_RECENT
++                        && prompt_settled_at
++                            .is_none_or(|settled| last_update_at > settled + OWN_TAIL)
+                     {
+                         // Mid self-continued turn (see BUSY_RECENT above):
+                         // cancel it rather than prompt into the starve.
+@@ -7914,6 +7942,7 @@ async fn run_session(session: Session) {
+             _ = turn_control.stop_requested(), if !interrupted => {
+                 queued_steers.clear();
+                 steer_backlog.clear();
++                unowned_cancel_pending = false;
+                 // A steer still in flight goes with the turn too: its answer
+                 // (promptRequired, once the turn is cancelled) would queue it
+                 // again and run the cancelled message after all.
+diff --git a/crates/harness/src/claude/background.rs b/crates/harness/src/claude/background.rs
+index 69ede28b66e495f2f1da5b554cb845e9ffe2e83b..e9fdbbbe8bb32f045b8314e9913a26bd0070b7aa 100644
+--- a/crates/harness/src/claude/background.rs
++++ b/crates/harness/src/claude/background.rs
+@@ -14,8 +14,16 @@
+ //!   task id — so a task whose result never said it (one backgrounded later)
+ //!   is found in the same folder.
+ //!
++//! An MCP call the CLI moved to the background so the person's steer could
++//! reach the model is listed too: `task_type: "mcp_task"`, its task start
++//! naming the call, its description the tool (`server/tool`), its
++//! `task_notification` its end, which wakes the session (live 2.1.328).
++//!
+ //! Background agents are subagents: their chips show them, not this list.
+ 
++/// The roster's task types listed as background work here.
++const LISTED: &[&str] = &["local_bash", "mcp_task"];
++
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+ 
+@@ -29,23 +37,28 @@ use super::wire::{Frame, MessageFrame, SystemFrame};
+ /// session runs many foreground commands that never become tasks.
+ const MAX_COMMANDS: usize = 256;
+ 
+-/// The roster's background agents (`task_type: "local_agent"`), oldest
+-/// first: each reports back when it ends, waking the agent. Other kinds the
++/// The roster's background agents (`task_type: "local_agent"`) and moved
++/// MCP calls (`mcp_task`), oldest first: each reports back when it ends,
++/// waking the agent (an MCP call is a call: it returns). Other kinds the
+ /// CLI may add aren't assumed to.
+ pub(super) fn agents(tasks: Option<&[Value]>) -> Vec<zeron_proto::WaitingOn> {
+     tasks
+         .into_iter()
+         .flatten()
+-        .filter(|task| task.get("task_type").and_then(Value::as_str) == Some("local_agent"))
+         .filter_map(|task| {
++            let (kind, fallback) = match task.get("task_type").and_then(Value::as_str)? {
++                "local_agent" => (zeron_proto::WaitingKind::Agent, "Background agent"),
++                "mcp_task" => (zeron_proto::WaitingKind::Process, "MCP call"),
++                _ => return None,
++            };
+             let id = task.get("task_id").and_then(Value::as_str)?;
+             let label = task
+                 .get("description")
+                 .and_then(Value::as_str)
+                 .map(str::trim)
+                 .filter(|d| !d.is_empty())
+-                .unwrap_or("Background agent");
+-            Some(zeron_proto::WaitingOn::runtime(id.to_owned(), zeron_proto::WaitingKind::Agent, label.to_owned()))
++                .unwrap_or(fallback);
++            Some(zeron_proto::WaitingOn::runtime(id.to_owned(), kind, label.to_owned()))
+         })
+         .collect()
+ }
+@@ -148,7 +161,9 @@ impl BackgroundShells {
+                     .iter()
+                     .flatten()
+                     .filter(|task| {
+-                        task.get("task_type").and_then(Value::as_str) == Some("local_bash")
++                        task.get("task_type")
++                            .and_then(Value::as_str)
++                            .is_some_and(|kind| LISTED.contains(&kind))
+                     })
+                     .filter_map(|task| {
+                         let id = task.get("task_id").and_then(Value::as_str)?;
+@@ -371,6 +386,71 @@ mod tests {
+         );
+     }
+ 
++    /// Plays a live capture, noting the roster as it stood after each
++    /// change: (listed task ids, waits).
++    fn rosters(capture: &str) -> Vec<(Vec<String>, Vec<String>)> {
++        let mut shells = BackgroundShells::default();
++        let mut seen = Vec::new();
++        for line in capture.lines().filter(|l| !l.trim().is_empty()) {
++            let Ok(frame) = parse_frame(line) else { continue };
++            let waits = match &frame {
++                Frame::System(s) if s.subtype == "background_tasks_changed" => {
++                    Some(agents(s.tasks.as_deref()))
++                }
++                _ => None,
++            };
++            shells.observe(&frame);
++            if let Some(waits) = waits {
++                seen.push((
++                    shells.tasks().into_iter().map(|t| t.id).collect(),
++                    waits.into_iter().map(|w| w.label).collect(),
++                ));
++            }
++        }
++        seen
++    }
++
++    /// Live 2.1.328: an MCP call moved aside for the person's steer is
++    /// listed (named for its tool) and waited on until it reports back.
++    #[test]
++    fn an_mcp_call_moved_aside_is_listed_and_waited_on() {
++        let seen = rosters(include_str!(
++            "../../tests/fixtures/claude/live-2.1.328-steer-mcp.jsonl"
++        ));
++        assert_eq!(
++            seen,
++            [
++                (vec!["k2cj2tspc".to_owned()], vec!["slow/slow_wait".to_owned()]),
++                (vec![], vec![]),
++            ]
++        );
++        let mut shells = BackgroundShells::default();
++        feed(
++            &mut shells,
++            &[r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"k2cj2tspc","task_type":"mcp_task","description":"slow/slow_wait"}]}"#],
++        );
++        assert_eq!(shells.tasks()[0].command, "slow/slow_wait");
++    }
++
++    /// Live 2.1.328: a foreground command moved aside for the person's
++    /// steer is listed with its command, as a backgrounded shell is.
++    #[test]
++    fn a_command_moved_aside_is_listed_with_its_command() {
++        let capture = include_str!("../../tests/fixtures/claude/live-2.1.328-steer-bash.jsonl");
++        let mut shells = BackgroundShells::default();
++        let mut listed = None;
++        for line in capture.lines().filter(|l| !l.trim().is_empty()) {
++            let Ok(frame) = parse_frame(line) else { continue };
++            if shells.observe(&frame) && listed.is_none() {
++                listed = shells.tasks().first().cloned();
++            }
++        }
++        let listed = listed.expect("listed once moved");
++        assert_eq!(listed.id, "bt2pfti6l");
++        assert_eq!(listed.command, "ping -n 26 127.0.0.1 > /dev/null; echo pinged");
++        assert!(shells.tasks().is_empty(), "gone once it ended");
++    }
++
+     #[test]
+     fn an_unknown_command_reads_as_its_description() {
+         let mut shells = BackgroundShells::default();
+diff --git a/crates/harness/src/claude/mod.rs b/crates/harness/src/claude/mod.rs
+index 22ccab75760f719705d85bf67bb2d5ec4ef4acc5..44d2df3134900570eba7bdf4ab2e718a9ce17f21 100644
+--- a/crates/harness/src/claude/mod.rs
++++ b/crates/harness/src/claude/mod.rs
+@@ -184,6 +184,39 @@ fn reports_background(version: Option<&semver::Version>) -> bool {
+     version.is_some_and(|version| *version >= REPORTS_BACKGROUND_SINCE)
+ }
+ 
++/// The first CLI that takes the person's steer the way its own terminal
++/// does: a `now` line marked `origin: {kind: "human"}` moves a running shell
++/// command, subagent or MCP call to the background and the model reads the
++/// message in the same turn; nothing is interrupted unless the work can't
++/// move (WebFetch and WebSearch move from 2.1.287). Live-verified on 2.1.328:
++/// the call's result says it was moved (`backgroundTaskId` on a Bash
++/// result, `detachedToolCall` on a fetch), its task reports through the
++/// usual `task_notification` and wakes the session when it ends.
++const STEER_MOVES_TOOLS_SINCE: semver::Version = semver::Version::new(2, 1, 286);
++
++/// Whether a CLI of `version` moves running work aside for a person's steer
++/// ([`STEER_MOVES_TOOLS_SINCE`]); an unknown version is treated as not.
++fn steer_moves_tools(version: Option<&semver::Version>) -> bool {
++    version.is_some_and(|version| *version >= STEER_MOVES_TOOLS_SINCE)
++}
++
++/// How a steer goes out ([`wire::SteerPriority`]). On a CLI that moves
++/// running work aside, the person's own steer is `now` as a human message:
++/// the CLI keeps every tool running and the model reads it at once. A
++/// message from another chat is not the person's: it never claims to be
++/// (an interrupt reads as the person rejecting the call), so it, and every
++/// steer to an older CLI, goes as before — `now` while no tool is open
++/// (streaming text stops), else `next`, after the open tools return.
++fn steer_priority(moves_tools: bool, from_another_chat: bool, tools_open: bool) -> wire::SteerPriority {
++    if moves_tools && !from_another_chat {
++        wire::SteerPriority::NowFromPerson
++    } else if tools_open {
++        wire::SteerPriority::Next
++    } else {
++        wire::SteerPriority::Now
++    }
++}
++
+ /// Shown when a chat's Claude session could not be restored.
+ const SESSION_LOST: &str = "The previous Claude session could not be restored, so this chat \
+      continues in a new one without its earlier context.";
+@@ -1062,11 +1095,19 @@ impl Harness for ClaudeHarness {
+     fn stops_turn_in_place(&self) -> bool {
+         true
+     }
+-    /// A steer during an open tool call: the `interrupt` control request
+-    /// stops the foreground call (a running Bash is killed) and the CLI keeps
+-    /// its background shells and agents (`perTaskStopAffordance`).
++    /// Only on a CLI older than [`STEER_MOVES_TOOLS_SINCE`]: there a steer
++    /// during an open tool call needs the `interrupt` control request to be
++    /// read at once, which kills the foreground call (a running Bash); the
++    /// CLI keeps its background shells and agents. A newer CLI moves the
++    /// running call to the background for the person's steer itself
++    /// ([`steer_priority`]), so nothing is stopped. Blocking: may ask the CLI
++    /// its version once.
+     fn steer_stops_tool(&self) -> bool {
+-        true
++        !steer_moves_tools(
++            self.executable_path()
++                .and_then(|path| crate::executable::binary_version(&path))
++                .as_ref(),
++        )
+     }
+     /// Same launch arguments, cwd and access. The CLI ignores the sandbox
+     /// level, and option spellings that launch the same flags are the same
+@@ -1429,9 +1470,19 @@ impl ClaudeHarness {
+         if let Some(message) = notice {
+             let _ = event_tx.try_send(Ok(AgentEvent::Error { message }));
+         }
++        // Cached by the engine's own probe; off the async threads all the same.
++        let moves_tools = {
++            let exe = exe.clone();
++            tokio::task::spawn_blocking(move || {
++                steer_moves_tools(crate::executable::binary_version(&exe).as_ref())
++            })
++            .await
++            .unwrap_or(false)
++        };
+         tokio::spawn(run_session(Session {
+             normalizer,
+             title_only,
++            moves_tools,
+             exe,
+             launched: request.clone(),
+             child,
+@@ -1630,6 +1681,9 @@ async fn stdin_writer(
+ struct Session {
+     normalizer: Normalizer,
+     title_only: bool,
++    /// The CLI moves running work aside for the person's steer
++    /// ([`steer_moves_tools`]).
++    moves_tools: bool,
+     /// What the process was launched from, for a fresh relaunch when its
+     /// session cannot be restored.
+     exe: PathBuf,
+@@ -1661,6 +1715,7 @@ async fn run_session(session: Session) {
+     let Session {
+         normalizer: mut norm,
+         title_only,
++        moves_tools,
+         exe,
+         launched,
+         mut child,
+@@ -1690,7 +1745,7 @@ async fn run_session(session: Session) {
+     let mut reconfigures = 0u64;
+     let mut mode_switches = 0u64;
+     // Top-level tool calls in flight: a steer must not abort them (see
+-    // `wire::steer_message_line`).
++    // [`steer_priority`]).
+     let mut open_tools = std::collections::HashSet::new();
+     let mut steering_open = true;
+     let mut interrupted = false;
+@@ -2127,10 +2182,15 @@ async fn run_session(session: Session) {
+                     }
+                     let id = uuid::Uuid::new_v4().to_string();
+                     let images = load_image_blocks(&msg.attachments).await;
++                    let priority = steer_priority(
++                        moves_tools,
++                        zeron_proto::agent_messages::agent_message_sender(&msg.prompt).is_some(),
++                        !open_tools.is_empty(),
++                    );
+                     let line = wire::steer_message_line_with_images(
+                         &apply_ultrathink(config.reasoning, &msg.prompt),
+                         &id,
+-                        open_tools.is_empty(),
++                        priority,
+                         &images,
+                     );
+                     pending_steers.push_back(id.clone());
+@@ -3143,6 +3203,33 @@ mod mcp_injection_tests {
+         assert!(!reports_background(None));
+     }
+ 
++    /// The person's steer moves running work aside from 2.1.286, so the
++    /// engine stops nothing first; before it (or unknown) it still does.
++    #[test]
++    fn a_steer_stops_a_tool_only_on_a_cli_that_cannot_move_it() {
++        let v = |text: &str| semver::Version::parse(text).unwrap();
++        assert!(steer_moves_tools(Some(&v("2.1.286"))));
++        assert!(steer_moves_tools(Some(&v("2.1.328"))));
++        assert!(!steer_moves_tools(Some(&v("2.1.285"))));
++        assert!(!steer_moves_tools(Some(&v("2.1.280"))));
++        assert!(!steer_moves_tools(None));
++    }
++
++    #[test]
++    fn steer_priority_by_cli_sender_and_open_tools() {
++        use wire::SteerPriority::{Next, Now, NowFromPerson};
++        // A new CLI, the person: `now` as a human, tool open or not.
++        assert_eq!(steer_priority(true, false, true), NowFromPerson);
++        assert_eq!(steer_priority(true, false, false), NowFromPerson);
++        // Another chat's message never claims to be the person.
++        assert_eq!(steer_priority(true, true, true), Next);
++        assert_eq!(steer_priority(true, true, false), Now);
++        // An older CLI keeps the old path for everyone.
++        assert_eq!(steer_priority(false, false, true), Next);
++        assert_eq!(steer_priority(false, false, false), Now);
++        assert_eq!(steer_priority(false, true, true), Next);
++    }
++
+     fn engine_served() -> zeron_proto::McpServer {
+         zeron_proto::McpServer {
+             name: "zeron".into(),
+diff --git a/crates/harness/src/claude/normalize.rs b/crates/harness/src/claude/normalize.rs
+index d868a7498d460b3be04c41b7fb86ad325f4f72ed..7855924da241bcb1a727cc710067074b372bbae5 100644
+--- a/crates/harness/src/claude/normalize.rs
++++ b/crates/harness/src/claude/normalize.rs
+@@ -355,18 +355,39 @@ fn note_commands(f: &MessageFrame, commands: &mut std::collections::HashMap<Stri
+     }
+ }
+ 
++/// Whether a result frame's `tool_use_result` says its call was moved to
++/// the background, still running, so a steer could reach the model
++/// (live-verified 2.1.328, `now` from the person): a shell's names its task
++/// (`backgroundTaskId`, with `backgroundedToDeliverMessage`), a WebFetch or
++/// WebSearch is `{detachedToolCall: true}` and gets no second result. A
++/// moved MCP call says so only in its text; its `mcp_task` is in the
++/// background roster ([`background`]). A moved subagent's result is the
++/// usual background launch, and its chip runs on until its notification.
++fn moved_to_background(tool_use_result: Option<&Value>) -> bool {
++    tool_use_result.is_some_and(|result| {
++        result
++            .get("backgroundTaskId")
++            .and_then(Value::as_str)
++            .is_some_and(|task| !task.is_empty())
++            || result.get("detachedToolCall").and_then(Value::as_bool) == Some(true)
++    })
++}
++
+ /// A `tool_result` block as its event. A Bash call's carries its output (the
+ /// end of it, [`zeron_proto::command_output_cap`]) and exit code: Claude Code
+ /// leads a failed command's text with `Exit code N`; one that succeeded says
+-/// nothing, so it exited 0 — unless it went to the background, which says
+-/// only that it started. Every other tool's output stays off the event.
++/// nothing, so it exited 0 — unless it went to the background (`moved`, or
++/// launched there), which says only that it runs on: no exit code yet.
++/// Every other tool's output stays off the event.
+ fn tool_result(
+     b: &ContentBlock,
+     commands: &mut std::collections::HashMap<String, bool>,
++    moved: bool,
+ ) -> AgentEvent {
+     let is_error = b.is_error.unwrap_or(false);
+     let (output, exit_code) = match commands.remove(&b.tool_use_id) {
+         Some(background) => {
++            let background = background || moved;
+             let text = result_text(&b.content);
+             let (code, rest) = match text
+                 .strip_prefix("Exit code ")
+@@ -712,6 +733,9 @@ impl Normalizer {
+         clear_inline_skills: bool,
+     ) -> Vec<AgentEvent> {
+         let mut pending = Vec::new();
++        // `tool_use_result` is the frame's: it speaks for a lone result.
++        let moved = moved_to_background(frame.tool_use_result.as_ref())
++            && frame.message.blocks().filter(|b| b.kind == "tool_result").count() == 1;
+         for block in frame.message.blocks() {
+             if block.kind != "tool_result" {
+                 continue;
+@@ -724,7 +748,7 @@ impl Normalizer {
+                 .remove(&block.tool_use_id)
+                 .unwrap_or_else(|| "image.png".into());
+             let images = images_in_content(Some(&block.content), &name);
+-            let event = tool_result(&block, &mut self.command_calls);
++            let event = tool_result(&block, &mut self.command_calls, moved);
+             pending.push((event, name, images));
+         }
+         if pending.len() == 1 && pending[0].2.is_empty() {
+@@ -1865,6 +1889,108 @@ mod tests {
+         Normalizer::new().normalize(frame, false)
+     }
+ 
++    /// Every event a live capture's stdout normalizes to, in order.
++    fn play(capture: &str) -> Vec<AgentEvent> {
++        let mut norm = Normalizer::new();
++        capture
++            .lines()
++            .filter(|line| !line.trim().is_empty())
++            .filter_map(|line| crate::claude::wire::parse_frame(line).ok())
++            .flat_map(|frame| norm.normalize(frame, false))
++            .collect()
++    }
++
++    fn results_for<'a>(events: &'a [AgentEvent], tool: &str) -> Vec<&'a AgentEvent> {
++        events
++            .iter()
++            .filter(|e| matches!(e, AgentEvent::ToolResult { id, .. } if id == tool))
++            .collect()
++    }
++
++    fn dones(events: &[AgentEvent]) -> usize {
++        events.iter().filter(|e| matches!(e, AgentEvent::Done { .. })).count()
++    }
++
++    // Live 2.1.328 captures of the person's steer (`priority: "now"`,
++    // `origin: {kind: "human"}`) sent while a tool ran, from a scratch
++    // folder: each call moved to the background, the steer's turn answered
++    // and ended, and the call's end woke a second turn.
++
++    /// A foreground Bash moved to the background: its result names the task
++    /// and is no exit; the steer's turn and the wake turn each end once.
++    #[test]
++    fn a_command_moved_aside_for_a_steer_reads_as_running_on() {
++        let events = play(include_str!(
++            "../../tests/fixtures/claude/live-2.1.328-steer-bash.jsonl"
++        ));
++        let results = results_for(&events, "toolu_017YWQQLBXFBjrukZH9uurth");
++        let [AgentEvent::ToolResult { is_error, exit_code, output, .. }] = results.as_slice() else {
++            panic!("one result for the moved command: {results:?}");
++        };
++        assert!(!is_error, "moved, not failed");
++        assert_eq!(*exit_code, None, "still running: no exit code");
++        assert!(output.as_deref().is_some_and(|o| o.starts_with("Command was moved to the background")));
++        assert_eq!(dones(&events), 2, "the steer's turn, then the wake turn");
++    }
++
++    /// A WebFetch detached for the steer gets one result, never a second;
++    /// its answer comes in the wake turn, which ends on its own result.
++    #[test]
++    fn a_detached_fetch_has_one_result_and_the_turns_still_end() {
++        let events = play(include_str!(
++            "../../tests/fixtures/claude/live-2.1.328-steer-webfetch.jsonl"
++        ));
++        let results = results_for(&events, "toolu_01RLJKEJoVevfmKHphx646dn");
++        assert_eq!(results.len(), 1, "{results:?}");
++        assert!(matches!(results[0], AgentEvent::ToolResult { is_error: false, exit_code: None, .. }));
++        assert_eq!(dones(&events), 2);
++    }
++
++    /// An MCP call moved aside: one result, not an error; its task's
++    /// notification settles no chip (it is no subagent).
++    #[test]
++    fn a_moved_mcp_call_settles_no_chip() {
++        let events = play(include_str!(
++            "../../tests/fixtures/claude/live-2.1.328-steer-mcp.jsonl"
++        ));
++        let results = results_for(&events, "toolu_015qK9LtYavUHGv2GpSZwtk7");
++        assert_eq!(results.len(), 1, "{results:?}");
++        assert!(matches!(results[0], AgentEvent::ToolResult { is_error: false, .. }));
++        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })));
++        assert_eq!(dones(&events), 2);
++    }
++
++    /// A foreground subagent moved aside: its spawn's result is the usual
++    /// background launch, and its chip runs on — its own Done comes from
++    /// the task notification, after the steer's turn ended.
++    #[test]
++    fn a_subagent_moved_aside_runs_on_until_its_notification() {
++        let spawn = "toolu_01Fk7xWdAA8decVEjD6PAFdQ";
++        let events = play(include_str!(
++            "../../tests/fixtures/claude/live-2.1.328-steer-agent.jsonl"
++        ));
++        let chip_done = events
++            .iter()
++            .position(|e| {
++                matches!(e, AgentEvent::Subagent { parent_tool_use_id, event }
++                    if parent_tool_use_id == spawn
++                        && matches!(**event, AgentEvent::Done { status: DoneStatus::Completed, .. }))
++            })
++            .expect("the chip settles completed");
++        let steer_turn_done = events
++            .iter()
++            .position(|e| matches!(e, AgentEvent::Done { .. }))
++            .expect("the steer's turn ends");
++        assert!(steer_turn_done < chip_done, "the chip outlives the steer's turn");
++        assert_eq!(results_for(&events, spawn).len(), 1);
++        // The subagent's own command ran to its end, inside the chip.
++        assert!(events.iter().any(|e| matches!(e, AgentEvent::Subagent { parent_tool_use_id, event }
++            if parent_tool_use_id == spawn
++                && matches!(&**event, AgentEvent::ToolResult { id, is_error: false, .. }
++                    if id == "toolu_01DBQJiDX66EEiTLXvTXXY7C"))));
++        assert_eq!(dones(&events), 2);
++    }
++
+     #[test]
+     fn a_rejected_window_carried_by_overage_is_not_an_error() {
+         let blocked = normalize_one(
+diff --git a/crates/harness/src/claude/wire.rs b/crates/harness/src/claude/wire.rs
+index c6f7e398fc654f2f7f814fe4388d6185e4257b81..1f12ccf988771baad676e25980b3d221ee5624b4 100644
+--- a/crates/harness/src/claude/wire.rs
++++ b/crates/harness/src/claude/wire.rs
+@@ -503,16 +503,29 @@ pub(crate) fn user_message_line(text: &str) -> String {
+     .to_string()
+ }
+ 
+-/// Fold this input into the next model step without aborting tools or tasks.
+-/// A steer line. `immediate` → `priority: "now"`: streaming text/thinking
+-/// stops at once and the steer is answered next (verified against CLI
+-/// 2.1.280). But `now` also aborts an in-flight MCP tool call ("The tool call
+-/// was interrupted before a result was received"), so while any tool is open
+-/// the steer goes as `next`: the tool finishes and the steer lands right after
+-/// its result, in the same turn. An interrupted turn still emits a `result`.
++/// When the CLI reads a steer line (`SDKUserMessage.priority`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum SteerPriority {
++    /// `now`, no origin: streaming text/thinking stops at once and the
++    /// steer is answered next (verified against CLI 2.1.280). It also
++    /// aborts an in-flight tool call ("The tool call was interrupted before
++    /// a result was received"), so it goes only while no tool is open.
++    Now,
++    /// `next`: read in the same turn once the open tool calls return.
++    Next,
++    /// `now` with `origin: {kind: "human"}`, the person's own message on a
++    /// CLI from 2.1.286: running shell commands, subagents and MCP calls
++    /// (and from 2.1.287 WebFetch/WebSearch) move to the background,
++    /// uninterrupted, and the model reads the message in the same turn
++    /// (live-verified 2.1.328). Only work that can't move is interrupted.
++    NowFromPerson,
++}
++
++/// A steer line, read at `priority`. An interrupted turn still emits a
++/// `result`.
+ #[cfg(test)]
+-pub(crate) fn steer_message_line(text: &str, id: &str, immediate: bool) -> String {
+-    steer_message_line_with_images(text, id, immediate, &[])
++pub(crate) fn steer_message_line(text: &str, id: &str, priority: SteerPriority) -> String {
++    steer_message_line_with_images(text, id, priority, &[])
+ }
+ 
+ /// [`steer_message_line`] carrying inline images ahead of the text, in the
+@@ -520,7 +533,7 @@ pub(crate) fn steer_message_line(text: &str, id: &str, immediate: bool) -> Strin
+ pub(crate) fn steer_message_line_with_images(
+     text: &str,
+     id: &str,
+-    immediate: bool,
++    priority: SteerPriority,
+     images: &[ImageBlock],
+ ) -> String {
+     let content = if images.is_empty() {
+@@ -528,9 +541,13 @@ pub(crate) fn steer_message_line_with_images(
+     } else {
+         Value::Array(content_blocks(text, images))
+     };
+-    serde_json::json!({"type":"user", "uuid":id, "priority": if immediate { "now" } else { "next" },
+-        "message":{"role":"user","content":content}, "parent_tool_use_id":null})
+-    .to_string()
++    let mut line = serde_json::json!({"type":"user", "uuid":id,
++        "priority": if priority == SteerPriority::Next { "next" } else { "now" },
++        "message":{"role":"user","content":content}, "parent_tool_use_id":null});
++    if priority == SteerPriority::NowFromPerson {
++        line["origin"] = json!({"kind": "human"});
++    }
++    line.to_string()
+ }
+ 
+ /// One inline image for a stdin user turn (Anthropic base64 image source).
+@@ -725,13 +742,34 @@ mod tests {
+ 
+     #[test]
+     fn steer_priority_follows_tool_state() {
+-        let now: serde_json::Value =
+-            serde_json::from_str(&steer_message_line("hi", "u1", true)).unwrap();
+-        let next: serde_json::Value =
+-            serde_json::from_str(&steer_message_line("hi", "u2", false)).unwrap();
++        let line = |id, priority| -> serde_json::Value {
++            serde_json::from_str(&steer_message_line("hi", id, priority)).unwrap()
++        };
++        let now = line("u1", SteerPriority::Now);
++        let next = line("u2", SteerPriority::Next);
+         assert_eq!(now["priority"], "now");
+         assert_eq!(next["priority"], "next");
+         assert_eq!(next["uuid"], "u2");
++        // Neither claims to be the person: no origin.
++        assert!(now.get("origin").is_none() && next.get("origin").is_none());
++    }
++
++    /// The person's steer on a CLI that moves running work aside, in the
++    /// shape sent in the live 2.1.328 captures
++    /// (`tests/fixtures/claude/live-2.1.328-steer-*.jsonl`).
++    #[test]
++    fn the_persons_steer_is_now_from_a_human() {
++        let line: serde_json::Value = serde_json::from_str(&steer_message_line(
++            "what is 2+2?",
++            "u3",
++            SteerPriority::NowFromPerson,
++        ))
++        .unwrap();
++        assert_eq!(line["priority"], "now");
++        assert_eq!(line["origin"], serde_json::json!({"kind": "human"}));
++        assert_eq!(line["uuid"], "u3");
++        assert_eq!(line["message"]["content"], "what is 2+2?");
++        assert_eq!(line["parent_tool_use_id"], serde_json::Value::Null);
+     }
+ 
+     #[test]
+diff --git a/crates/harness/src/lib.rs b/crates/harness/src/lib.rs
+index 8f133f518cf85ba6d9f90bc58ffb6777f2689fee..352f7798284272c6d7d97ed97073df42865d859c 100644
+--- a/crates/harness/src/lib.rs
++++ b/crates/harness/src/lib.rs
+@@ -365,7 +365,11 @@ pub trait Harness: Send + Sync {
+     /// agent reads the steer at once, rather than at the next step boundary
+     /// once the call returns. Only for drivers whose in-place stop
+     /// ([`Self::stops_turn_in_place`]) ends the foreground call and keeps
+-    /// the runtime's background work (shells, terminals, agents) running.
++    /// the runtime's background work (shells, terminals, agents) running,
++    /// and only where the agent can't read the steer at once without that
++    /// stop: a steer should never kill a running tool when the agent can
++    /// keep it. Read once per run, off the async threads (it may ask the
++    /// CLI its version).
+     fn steer_stops_tool(&self) -> bool {
+         false
+     }
+diff --git a/crates/harness/tests/acp.rs b/crates/harness/tests/acp.rs
+index 6d44c24ec3c2ac3887cd4100280debca19e3f313..1076e28b775326f28fa26fe08e72221fbd05ed82 100644
+--- a/crates/harness/tests/acp.rs
++++ b/crates/harness/tests/acp.rs
+@@ -689,6 +689,63 @@ async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
+     }));
+ }
+ 
++/// A steer into a turn the agent continued on its own, while that turn's
++/// tool runs: nothing is sent until the tool closes (a cancel then would
++/// kill it); then the unowned turn is cancelled and the steer prompts.
++#[tokio::test]
++async fn a_steer_into_a_self_continued_turn_waits_for_its_running_tool() {
++    let (controls, steer, _token) = controls();
++    let harness = harness();
++    let stream = harness
++        .run(request("scenario:busy-steer"), controls)
++        .await
++        .expect("run starts");
++    let events = tokio::time::timeout(Duration::from_secs(15), async move {
++        let mut events = Vec::new();
++        let mut stream = stream;
++        let mut steer = Some(steer);
++        let (mut settled, mut tool_open, mut sent) = (false, false, false);
++        while let Some(ev) = stream.next().await {
++            let ev = ev.expect("stream event");
++            // The tool opens after the owned turn settled: the agent's own.
++            tool_open |= matches!(&ev, AgentEvent::ToolCall { id, .. } if id == "sc-1");
++            settled |= matches!(ev, AgentEvent::Done { .. });
++            if settled && tool_open && !sent
++                && let Some(steer) = &steer
++            {
++                sent = true;
++                steer
++                    .send(SteerMessage::text("what about now"))
++                    .await
++                    .expect("steer sent");
++            }
++            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "fresh answer") {
++                steer = None;
++            }
++            events.push(ev);
++        }
++        events
++    })
++    .await
++    .expect("run finished in time");
++
++    assert!(
++        !events
++            .iter()
++            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "TOOL-KILLED")),
++        "the steer reached the agent while its tool ran: {events:?}"
++    );
++    let closed = events
++        .iter()
++        .position(|e| matches!(e, AgentEvent::ToolResult { id, .. } if id == "sc-1"))
++        .expect("the tool ran to its end");
++    let answered = events
++        .iter()
++        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "fresh answer"))
++        .expect("the steer was answered");
++    assert!(closed < answered, "{events:?}");
++}
++
+ #[tokio::test]
+ async fn interrupt_sends_session_cancel_and_ends_interrupted() {
+     let (controls, _steer, token) = controls();
+diff --git a/crates/harness/tests/claude.rs b/crates/harness/tests/claude.rs
+index bdc4a337689390e515467945d9e2c2a977309603..d34d7dbd99f8378d4a9bdf86f4a98bad80381ac7 100644
+--- a/crates/harness/tests/claude.rs
++++ b/crates/harness/tests/claude.rs
+@@ -581,6 +581,123 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
+     ));
+ }
+ 
++/// The fake CLI behind a launcher that answers `--version` with `version`,
++/// as the real one does; every other launch runs the fake.
++fn cli_of_version(dir: &std::path::Path, version: &str) -> ClaudeHarness {
++    use std::os::unix::fs::PermissionsExt;
++    let path = dir.join(format!("claude-{version}"));
++    std::fs::write(
++        &path,
++        format!(
++            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo '{version} (Claude Code)'; exit 0; }}\nexec '{}' \"$@\"\n",
++            fixture_path().display()
++        ),
++    )
++    .unwrap();
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
++    ClaudeHarness::new().with_executable(path)
++}
++
++/// Runs `scenario:tool-steer`, steering with `prompt` once the command is
++/// running; the text the fake CLI answers with says how the steer came.
++async fn steer_during_a_command(harness: &ClaudeHarness, prompt: &str) -> Vec<AgentEvent> {
++    let (controls, steer, _token) = controls("A");
++    let stream = harness
++        .run(request("scenario:tool-steer"), controls)
++        .await
++        .expect("run starts");
++    tokio::time::timeout(Duration::from_secs(10), async move {
++        let mut stream = stream;
++        // Open until the run ends: a closed mailbox ends the CLI's stdin.
++        let steer = steer;
++        let mut sent = false;
++        let mut events = Vec::new();
++        while let Some(ev) = stream.next().await {
++            let ev = ev.expect("stream event");
++            if matches!(&ev, AgentEvent::ToolCall { id, .. } if id == "toolu_run") && !sent {
++                sent = true;
++                steer.send(SteerMessage::text(prompt)).await.expect("steer sent");
++            }
++            events.push(ev);
++        }
++        events
++    })
++    .await
++    .expect("run finished in time")
++}
++
++fn steer_shape(events: &[AgentEvent]) -> &str {
++    events
++        .iter()
++        .find_map(|e| match e {
++            AgentEvent::TextDelta { text } => text.strip_prefix("steer:"),
++            _ => None,
++        })
++        .expect("the fake CLI read the steer")
++}
++
++/// The person's steer on a CLI that moves running work aside (2.1.286+)
++/// goes as `now` from a human, and the command it reached reads as moved to
++/// the background: no exit code, not failed.
++#[tokio::test]
++async fn the_persons_steer_during_a_command_is_now_from_a_human_on_a_new_cli() {
++    let dir = tempfile::tempdir().unwrap();
++    let harness = cli_of_version(dir.path(), "2.1.328");
++    assert!(!harness.steer_stops_tool(), "the engine stops nothing first");
++    let events = steer_during_a_command(&harness, "look at the logs").await;
++    assert_eq!(steer_shape(&events), "now-human", "{events:?}");
++    let result = events
++        .iter()
++        .find_map(|e| match e {
++            AgentEvent::ToolResult { id, is_error, exit_code, output, .. } if id == "toolu_run" => {
++                Some((*is_error, *exit_code, output.clone()))
++            }
++            _ => None,
++        })
++        .expect("the command's result");
++    assert_eq!(result.0, false, "moved, not failed");
++    assert_eq!(result.1, None, "still running: no exit code");
++    assert!(
++        result.2.as_deref().is_some_and(|o| o.contains("moved to the background")),
++        "{result:?}"
++    );
++    assert!(matches!(
++        events.last(),
++        Some(AgentEvent::Done { status: DoneStatus::Completed, .. })
++    ));
++}
++
++/// Another chat's message is not the person's: on any CLI it waits for the
++/// running command (`next`) and never claims a human origin.
++#[tokio::test]
++async fn another_chats_message_during_a_command_stays_next() {
++    let dir = tempfile::tempdir().unwrap();
++    let message =
++        zeron_proto::agent_messages::agent_message("Coordinator (139d8682)", "139d8682", "status?");
++    for version in ["2.1.328", "2.1.280"] {
++        let harness = cli_of_version(dir.path(), version);
++        let events = steer_during_a_command(&harness, &message).await;
++        assert_eq!(steer_shape(&events), "next", "{version}: {events:?}");
++    }
++}
++
++/// An older CLI would interrupt the command for a `now` steer: the steer
++/// keeps the old path (`next` while a tool is open), and the engine's stop
++/// stays what reads it at once there.
++#[tokio::test]
++async fn an_older_cli_keeps_the_old_steer_path() {
++    let dir = tempfile::tempdir().unwrap();
++    let harness = cli_of_version(dir.path(), "2.1.280");
++    assert!(harness.steer_stops_tool());
++    let events = steer_during_a_command(&harness, "look at the logs").await;
++    assert_eq!(steer_shape(&events), "next", "{events:?}");
++    let exit = events.iter().find_map(|e| match e {
++        AgentEvent::ToolResult { id, exit_code, .. } if id == "toolu_run" => Some(*exit_code),
++        _ => None,
++    });
++    assert_eq!(exit, Some(Some(0)), "a command that returned exited 0");
++}
++
+ #[tokio::test]
+ async fn interrupt_escalates_to_sigterm_and_ends_with_interrupted_done() {
+     let harness = ClaudeHarness::new()
+diff --git a/crates/harness/tests/fixtures/claude/live-2.1.328-steer-agent.jsonl b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-agent.jsonl
+new file mode 100644
+index 0000000000000000000000000000000000000000..896a05c4183fadee7219be8b6efd295c900160d2
+--- /dev/null
++++ b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-agent.jsonl
+@@ -0,0 +1,31 @@
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"queued","uuid":"55776a43-665b-4e51-8bee-f59271eacce6","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"started","uuid":"e281ac4c-ebf2-4837-908e-5eb935bc73e6","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy6WUqjnoTqUmTqgwGA","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","name":"Agent","input":{"description":"Run 25 second ping test","subagent_type":"general-purpose","model":"opus","run_in_background":false,"prompt":"Run the Bash command `ping -n 26 127.0.0.1 > /dev/null; echo pinged` in the foreground (a deliberate 25 second test command) and report its output."},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":8544,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":8544},"output_tokens":32,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"1f0fdceb-4bd0-4a8d-aa0c-fee9360cb0bf","timestamp":"2026-11-26T05:13:39.376Z","wire_tool_inputs":{"toolu_01Fk7xWdAA8decVEjD6PAFdQ":{"description":"Run 25 second ping test","subagent_type":"general-purpose","model":"opus","run_in_background":false,"prompt":"Run the Bash command `ping -n 26 127.0.0.1 > /dev/null; echo pinged` in the foreground (a deliberate 25 second test command) and report its output."}},"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001"]}
++{"type":"system","subtype":"task_started","task_id":"a54f8f25af17d5645","run_id":"0mwx3kegv-f32268c2","tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","description":"Run 25 second ping test","subagent_type":"general-purpose","is_backgrounded":false,"spawn_depth":1,"task_type":"local_agent","prompt":"Run the Bash command `ping -n 26 127.0.0.1 > /dev/null; echo pinged` in the foreground (a deliberate 25 second test command) and report its output.","uuid":"09514247-cee3-4a93-b5e1-6f8a3044a14d","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Run the Bash command `ping -n 26 127.0.0.1 > /dev/null; echo pinged` in the foreground (a deliberate 25 second test command) and report its output."}]},"parent_tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","agent_id":"a54f8f25af17d5645","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"0618d92e-fdfa-4016-90ac-a60fe7023294","timestamp":"2026-11-26T05:13:39.389Z","subagent_type":"general-purpose","task_description":"Run 25 second ping test"}
++{"type":"system","subtype":"task_progress","task_id":"a54f8f25af17d5645","run_id":"0mwx3kegv-f32268c2","tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","description":"Running Ping localhost 26 times as a 25 second test, then print \"pinged\"","subagent_type":"general-purpose","usage":{"total_tokens":14807,"tool_uses":1,"duration_ms":2147},"last_tool_name":"Bash","uuid":"419576c7-90e6-4c9a-97ba-319eaa8b6b69","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy6hYMakKjMWo3vchL3","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01DBQJiDX66EEiTLXvTXXY7C","name":"Bash","input":{"command":"ping -n 26 127.0.0.1 > /dev/null; echo pinged","description":"Ping localhost 26 times as a 25 second test, then print \"pinged\"","timeout":60000},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":6577,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":6577,"ephemeral_1h_input_tokens":0},"output_tokens":32,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","agent_id":"a54f8f25af17d5645","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"4882aa88-4edb-477f-9bfc-50551fda93a7","timestamp":"2026-11-26T05:13:41.531Z","subagent_type":"general-purpose","task_description":"Run 25 second ping test"}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"queued","uuid":"005429b3-2d61-41e7-b54b-865214971f7e","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a54f8f25af17d5645","run_id":"0mwx3kegv-f32268c2","task_type":"local_agent","subagent_type":"general-purpose","description":"Run 25 second ping test"}],"uuid":"156d6b7a-fb9e-44f1-b459-b90b2aa5e446","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"task_updated","task_id":"a54f8f25af17d5645","run_id":"0mwx3kegv-f32268c2","patch":{"is_backgrounded":true},"uuid":"78cef4ea-8e6e-4d44-bc56-6615319058f9","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: a54f8f25af17d5645 (internal ID - do not mention to user. Use SendMessage with to: 'a54f8f25af17d5645', summary: '<5-10 word recap>' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.\noutput_file: /tmp/claude-1000/e110cc94aacd4e86/0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e/tasks/a54f8f25af17d5645.output\nDo NOT Read or tail this file via the shell tool — it is the full subagent JSONL transcript and reading it will overflow your context. If the user asks for progress, say the agent is still running; you'll get a completion notification."}]}]},"parent_tool_use_id":null,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"a86b94ea-c50a-43d0-b33a-070c8bd084bf","timestamp":"2026-11-26T05:13:43.393Z","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a54f8f25af17d5645","description":"Run 25 second ping test","resolvedModel":"claude-opus-5-5","prompt":"Run the Bash command `ping -n 26 127.0.0.1 > /dev/null; echo pinged` in the foreground (a deliberate 25 second test command) and report its output.","outputFile":"/tmp/claude-1000/e110cc94aacd4e86/0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e/tasks/a54f8f25af17d5645.output","canReadOutputFile":true,"canContinueAgent":true},"tool_result_meta":[{"id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"started","uuid":"8d2d8407-952e-4f53-b903-ee0da675b342","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"c01a6553-ee00-445e-a80b-ca93120a64e5","user_message_uuid":"prompt-0001-0000-0000-000000000001"}
++{"type":"system","subtype":"task_started","task_id":"bhan42vz9","run_id":"0mwx3kiv7-4605d2e0","owned_by_subagent":true,"tool_use_id":"toolu_01DBQJiDX66EEiTLXvTXXY7C","description":"Ping localhost 26 times as a 25 second test, then print \"pinged\"","is_backgrounded":false,"parent_task_id":"a54f8f25af17d5645","task_type":"local_bash","uuid":"5dddf6ac-28ef-4c8b-866b-dabe040c3073","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"thinking_tokens","estimated_tokens":210,"estimated_tokens_delta":160,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"397f7f53-1b74-4d8e-acd1-864af795bcdc","user_message_uuid":"prompt-0001-0000-0000-000000000001"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy6ziUTYQyvdDPqqxrb","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":735,"cache_read_input_tokens":16771,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":735},"output_tokens":2,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"10f9b883-0168-47be-b59c-e6aa8cb470c5","timestamp":"2026-11-26T05:13:45.564Z","thinking_duration_ms":1080,"thinking_display":"updates"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy6ziUTYQyvdDPqqxrb","type":"message","role":"assistant","content":[{"type":"text","text":"2+2 = 4.\n\nI asked for the ping test to run in the foreground, but it started in the background. It's still running, and I'll say \"done\" once it finishes."}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":735,"cache_read_input_tokens":16771,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":735},"output_tokens":2,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"6c13ddb9-fe87-4a87-9daa-6edc877a549d","timestamp":"2026-11-26T05:13:45.567Z"}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"completed","uuid":"4a6fc46e-43db-43b2-820c-647504e80fff","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"duration_api_ms":6875,"stop_reason":"end_turn","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","total_cost_usd":0.12375399999999999,"usage":{"input_tokens":6,"cache_creation_input_tokens":9279,"cache_read_input_tokens":24998,"output_tokens":341,"output_tokens_details":{"thinking_tokens":62},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":9279,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":115,"cache_read_input_tokens":16771,"cache_creation_input_tokens":735,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":735},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":8,"outputTokens":498,"cacheReadInputTokens":33225,"cacheCreationInputTokens":15856,"webSearchRequests":0,"costUSD":0.12375399999999999,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":62,"cacheCreationEphemeral5mInputTokens":6577,"cacheCreationEphemeral1hInputTokens":9279,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":1,"requested":{"background":0,"foreground":1,"unset":0},"started_in_background":0,"max_depth":1,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{"general-purpose":1}},"safety_stops":0,"is_error":false,"num_turns":2,"subtype":"success","api_error_status":null,"result":"2+2 = 4.\n\nI asked for the ping test to run in the foreground, but it started in the background. It's still running, and I'll say \"done\" once it finishes.","ttft_ms":2668,"type":"result","duration_ms":8868,"uuid":"ea682bfe-f447-4236-bbcb-a4d2c1c4b3d3","ttft_stream_ms":1374,"time_to_request_ms":124,"first_content_frame_ms":1374,"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001","steer-0001-0000-0000-000000000001"],"request_sent_wall_ms":1795670016833,"first_request_input_tokens":16773,"first_request_cache_read_input_tokens":8227,"queued_turn_count":0,"result_index":0,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":8,"outputTokens":498,"cacheReadInputTokens":33225,"cacheCreationInputTokens":15856,"webSearchRequests":0,"costUSD":0.12375399999999999,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":62,"cacheCreationEphemeral5mInputTokens":6577,"cacheCreationEphemeral1hInputTokens":9279,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"completed","uuid":"bb6de86c-28cf-4703-b383-34acef9666a0","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"task_notification","task_id":"bhan42vz9","run_id":"0mwx3kiv7-4605d2e0","tool_use_id":"toolu_01DBQJiDX66EEiTLXvTXXY7C","status":"completed","output_file":"","summary":"Ping localhost 26 times as a 25 second test, then print \"pinged\"","uuid":"e37de9ab-b32a-4f35-a7a9-711ecf7025f5","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01DBQJiDX66EEiTLXvTXXY7C","type":"tool_result","content":"pinged","is_error":false}]},"parent_tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","agent_id":"a54f8f25af17d5645","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"9cf08c8b-6987-42a4-84a6-e7b4573614ea","timestamp":"2026-11-26T05:14:07.420Z","tool_result_meta":[{"id":"toolu_01DBQJiDX66EEiTLXvTXXY7C","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}],"subagent_type":"general-purpose","task_description":"Run 25 second ping test"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy8mLcLKpaYGUx2TSEQ","type":"message","role":"assistant","content":[{"type":"text","text":"I ran the command in the foreground and it finished normally. The only output was:\n\n```\npinged\n```\n\nThe ping output went to `/dev/null`, so `pinged` was all that printed. Nothing went wrong."}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":1526,"cache_read_input_tokens":14804,"cache_creation":{"ephemeral_5m_input_tokens":1526,"ephemeral_1h_input_tokens":0},"output_tokens":68,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","agent_id":"a54f8f25af17d5645","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"9415e5f9-3fd3-4a9d-8aa0-b7ccd2dcb8e1","timestamp":"2026-11-26T05:14:09.192Z","subagent_type":"general-purpose","task_description":"Run 25 second ping test"}
++{"type":"system","subtype":"task_updated","task_id":"a54f8f25af17d5645","run_id":"0mwx3kegv-f32268c2","patch":{"status":"completed","end_time":1795670049230},"uuid":"85b8926a-751d-461b-902b-edd86594b977","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"task_notification","task_id":"a54f8f25af17d5645","run_id":"0mwx3kegv-f32268c2","tool_use_id":"toolu_01Fk7xWdAA8decVEjD6PAFdQ","status":"completed","output_file":"/tmp/claude-1000/e110cc94aacd4e86/0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e/tasks/a54f8f25af17d5645.output","summary":"I ran the command in the foreground and it finished normally. The only output was:\n\n```\npinged\n```\n\nThe ping output went to `/dev/null`, so `pinged` was all that printed. Nothing went wrong.","summary_is_report":true,"usage":{"total_tokens":16400,"tool_uses":1,"duration_ms":29844},"uuid":"70fb928e-debd-4815-83b4-4f343e6d3168","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"917deacc-6c2d-4d8c-8deb-5fd2a08f5b97","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy8uR3ffVJfwFiMc3kY","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":9941,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9941},"output_tokens":7,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[{"type":"thinking_dropped","path":"messages.5.content.0","reason":"prefix_binding_mismatch"}],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"7e87ba67-f131-4814-bc7e-730520514f9c","timestamp":"2026-11-26T05:14:11.348Z","thinking_duration_ms":344,"thinking_display":"updates"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy8uR3ffVJfwFiMc3kY","type":"message","role":"assistant","content":[{"type":"text","text":"The ping test finished and printed `pinged`. It took about 30 seconds and ran in the background, not the foreground as asked.\n\ndone"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":9941,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9941},"output_tokens":7,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[{"type":"thinking_dropped","path":"messages.5.content.0","reason":"prefix_binding_mismatch"}],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","uuid":"02e9964f-a5de-4b22-b0b9-7a2c031acdf2","timestamp":"2026-11-26T05:14:11.775Z"}
++{"duration_api_ms":11111,"stop_reason":"end_turn","session_id":"0ee0effb-ec9f-4b0d-b7f2-5db9f34ddb6e","total_cost_usd":0.2187022,"usage":{"input_tokens":4,"cache_creation_input_tokens":9941,"cache_read_input_tokens":8227,"output_tokens":90,"output_tokens_details":{"thinking_tokens":46},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":9941,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":90,"cache_read_input_tokens":8227,"cache_creation_input_tokens":9941,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9941},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":14,"outputTokens":656,"cacheReadInputTokens":56256,"cacheCreationInputTokens":27323,"webSearchRequests":0,"costUSD":0.2187022,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":108,"cacheCreationEphemeral5mInputTokens":8103,"cacheCreationEphemeral1hInputTokens":19220,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","origin":{"kind":"task-notification","producer":"session-task","runId":"0mwx3kegv-f32268c2"},"subagent_stats":{"spawned":1,"requested":{"background":0,"foreground":1,"unset":0},"started_in_background":0,"max_depth":1,"spawned_by_subagents":0,"completed":1,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{"general-purpose":1}},"safety_stops":0,"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"The ping test finished and printed `pinged`. It took about 30 seconds and ran in the background, not the foreground as asked.\n\ndone","ttft_ms":2050,"type":"result","duration_ms":2486,"uuid":"4bf2ac81-ff59-4bca-b264-d8d7cf3fdeae","ttft_stream_ms":1707,"time_to_request_ms":14,"first_content_frame_ms":1707,"queued_turn_count":0,"result_index":1,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":6,"outputTokens":158,"cacheReadInputTokens":23031,"cacheCreationInputTokens":11467,"webSearchRequests":0,"costUSD":0.09494820000000001,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":46,"cacheCreationEphemeral5mInputTokens":1526,"cacheCreationEphemeral1hInputTokens":9941,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
+diff --git a/crates/harness/tests/fixtures/claude/live-2.1.328-steer-bash.jsonl b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-bash.jsonl
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a42d17e2cdb3cd2b9488fc9a5ca7094c965fb76
+--- /dev/null
++++ b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-bash.jsonl
+@@ -0,0 +1,22 @@
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"queued","uuid":"1b51b233-59e6-4a53-ad36-cf49179d8a79","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"started","uuid":"f4fddfd1-78d4-4588-b1dd-d052ff2be361","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"8a936ba4-cc07-4111-b5ac-935456613850","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy6WUMS7ufuG5fJSLmd","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_017YWQQLBXFBjrukZH9uurth","name":"Bash","input":{"command":"ping -n 26 127.0.0.1 > /dev/null; echo pinged","description":"Run 25 second ping test command","timeout":60000},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":8520,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":8520},"output_tokens":32,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"8a936ba4-cc07-4111-b5ac-935456613850","uuid":"9c2f25b4-0957-4846-b8e5-15a8a5bc491c","timestamp":"2026-11-26T05:13:38.822Z","wire_tool_inputs":{"toolu_017YWQQLBXFBjrukZH9uurth":{"command":"ping -n 26 127.0.0.1 > /dev/null; echo pinged","description":"Run 25 second ping test command","timeout":60000}},"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001"]}
++{"type":"system","subtype":"task_started","task_id":"bt2pfti6l","run_id":"0mwx3kgqy-85e4b9aa","tool_use_id":"toolu_017YWQQLBXFBjrukZH9uurth","description":"Run 25 second ping test command","is_backgrounded":false,"task_type":"local_bash","uuid":"82e9fccb-f0a7-4110-976f-384a06495207","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"queued","uuid":"25740ecc-ec41-4bb3-a38d-43a3a00c491f","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bt2pfti6l","run_id":"0mwx3kgqy-85e4b9aa","task_type":"local_bash","description":"Run 25 second ping test command"}],"uuid":"a2d43a96-3c2b-4345-9b37-2795f5359427","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"task_updated","task_id":"bt2pfti6l","run_id":"0mwx3kgqy-85e4b9aa","patch":{"is_backgrounded":true},"uuid":"69896423-9002-4469-b3b3-277d6a56784a","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_017YWQQLBXFBjrukZH9uurth","type":"tool_result","content":"Command was moved to the background (ID: bt2pfti6l) so that a message that arrived while it was running can reach you; it was not interrupted. Output is being written to: /tmp/claude-1000/796303cdef75e0dc/8a936ba4-cc07-4111-b5ac-935456613850/tasks/bt2pfti6l.output. You will be notified when it completes. If it is still running after 30m in the background (plus the timeout it was started with, up to the background maximum), it will be stopped and you will be notified. It is running now: do not start a second copy while it runs. If it is no longer needed, stop it with TaskStop. To check interim output, use Read on that file path.","is_error":false}]},"parent_tool_use_id":null,"session_id":"8a936ba4-cc07-4111-b5ac-935456613850","uuid":"79c79295-bf49-4748-940e-94fd30830b76","timestamp":"2026-11-26T05:13:43.351Z","tool_use_result":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"bt2pfti6l","backgroundedToDeliverMessage":true},"tool_result_meta":[{"id":"toolu_017YWQQLBXFBjrukZH9uurth","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"started","uuid":"a1b1cc18-c6b8-4982-b38b-461be6830eed","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy6zT6aiiDFEaX66C4S","type":"message","role":"assistant","content":[{"type":"text","text":"2+2 = 4. The ping test is still running in the background, and I'll reply once it finishes."}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":498,"cache_read_input_tokens":16747,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":498},"output_tokens":33,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"8a936ba4-cc07-4111-b5ac-935456613850","uuid":"fb324373-bff0-4ad9-8fe2-ff8bcb1e7a39","timestamp":"2026-11-26T05:13:44.634Z"}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"completed","uuid":"21157b9d-9a53-4867-b2c9-72fa39e455d9","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"duration_api_ms":3295,"stop_reason":"end_turn","session_id":"8a936ba4-cc07-4111-b5ac-935456613850","total_cost_usd":0.08066279999999999,"usage":{"input_tokens":6,"cache_creation_input_tokens":9018,"cache_read_input_tokens":24974,"output_tokens":175,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":9018,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":33,"cache_read_input_tokens":16747,"cache_creation_input_tokens":498,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":498},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":6,"outputTokens":175,"cacheReadInputTokens":24974,"cacheCreationInputTokens":9018,"webSearchRequests":0,"costUSD":0.08066279999999999,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":9018,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"safety_stops":0,"is_error":false,"num_turns":2,"subtype":"success","api_error_status":null,"result":"2+2 = 4. The ping test is still running in the background, and I'll reply once it finishes.","ttft_ms":2127,"type":"result","duration_ms":7950,"uuid":"b30ae700-5d81-41cc-9ed4-c43c4a93c4f1","ttft_stream_ms":1380,"time_to_request_ms":128,"first_content_frame_ms":1380,"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001","steer-0001-0000-0000-000000000001"],"request_sent_wall_ms":1795670016823,"first_request_input_tokens":16749,"first_request_cache_read_input_tokens":8227,"queued_turn_count":0,"result_index":0,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":6,"outputTokens":175,"cacheReadInputTokens":24974,"cacheCreationInputTokens":9018,"webSearchRequests":0,"costUSD":0.08066279999999999,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":9018,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"completed","uuid":"544dd023-9e44-4fd6-b31b-696a76e64738","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"task_updated","task_id":"bt2pfti6l","run_id":"0mwx3kgqy-85e4b9aa","patch":{"status":"completed","end_time":1795670044669},"uuid":"e338aeb8-06b7-44d5-bf68-0df0beda7cc6","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"task_notification","task_id":"bt2pfti6l","run_id":"0mwx3kgqy-85e4b9aa","tool_use_id":"toolu_017YWQQLBXFBjrukZH9uurth","status":"completed","output_file":"/tmp/claude-1000/796303cdef75e0dc/8a936ba4-cc07-4111-b5ac-935456613850/tasks/bt2pfti6l.output","summary":"Background command \"Run 25 second ping test command\" completed (exit code 0)","uuid":"a23a599f-3094-4853-8f3b-f32ad6eea547","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"350e54af-8d11-49f1-83a9-e7fb8ed8f787","session_id":"8a936ba4-cc07-4111-b5ac-935456613850"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"8a936ba4-cc07-4111-b5ac-935456613850","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy8ZftMy3tKRNDcUrPt","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01XDYkEVAqUy3HradfoojRTL","name":"Read","input":{"file_path":"/tmp/claude-1000/796303cdef75e0dc/8a936ba4-cc07-4111-b5ac-935456613850/tasks/bt2pfti6l.output"},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":9422,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9422},"output_tokens":33,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"8a936ba4-cc07-4111-b5ac-935456613850","uuid":"3913e6f9-f06c-4875-bbe9-e08cfa57c2f5","timestamp":"2026-11-26T05:14:07.397Z","wire_tool_inputs":{"toolu_01XDYkEVAqUy3HradfoojRTL":{"file_path":"/tmp/claude-1000/796303cdef75e0dc/8a936ba4-cc07-4111-b5ac-935456613850/tasks/bt2pfti6l.output"}}}
++{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01XDYkEVAqUy3HradfoojRTL","type":"tool_result","content":"1\tpinged\n2\t\n3\t[exited with code 0]\n4\t"}]},"parent_tool_use_id":null,"session_id":"8a936ba4-cc07-4111-b5ac-935456613850","uuid":"f48a0ba0-fcfb-4331-bce0-0229ba86fade","timestamp":"2026-11-26T05:14:07.433Z","tool_use_result":{"type":"text","file":{"filePath":"/tmp/claude-1000/796303cdef75e0dc/8a936ba4-cc07-4111-b5ac-935456613850/tasks/bt2pfti6l.output","content":"pinged\n\n[exited with code 0]\n","numLines":4,"startLine":1,"totalLines":4}},"tool_result_meta":[{"id":"toolu_01XDYkEVAqUy3HradfoojRTL","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy8mQLPGPwu2F72VNGY","type":"message","role":"assistant","content":[{"type":"text","text":"done. The command printed \"pinged\" and exited with code 0. It was moved to the background partway through so your question could get through, but it wasn't interrupted."}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":167,"cache_read_input_tokens":17649,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":167},"output_tokens":49,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"8a936ba4-cc07-4111-b5ac-935456613850","uuid":"a05ba222-fc72-4de7-8ced-ce1527bab323","timestamp":"2026-11-26T05:14:09.835Z"}
++{"duration_api_ms":8420,"stop_reason":"end_turn","session_id":"8a936ba4-cc07-4111-b5ac-935456613850","total_cost_usd":0.166314,"usage":{"input_tokens":6,"cache_creation_input_tokens":9589,"cache_read_input_tokens":25876,"output_tokens":187,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":9589,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":49,"cache_read_input_tokens":17649,"cache_creation_input_tokens":167,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":167},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":12,"outputTokens":362,"cacheReadInputTokens":50850,"cacheCreationInputTokens":18607,"webSearchRequests":0,"costUSD":0.166314,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":18607,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","origin":{"kind":"task-notification","producer":"session-task","runId":"0mwx3kgqy-85e4b9aa"},"subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"safety_stops":0,"is_error":false,"num_turns":2,"subtype":"success","api_error_status":null,"result":"done. The command printed \"pinged\" and exited with code 0. It was moved to the background partway through so your question could get through, but it wasn't interrupted.","ttft_ms":2722,"type":"result","duration_ms":5164,"uuid":"aeb7601e-7a9f-4111-be14-ab55aeb786ab","ttft_stream_ms":2017,"time_to_request_ms":16,"first_content_frame_ms":2017,"queued_turn_count":0,"result_index":1,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":6,"outputTokens":187,"cacheReadInputTokens":25876,"cacheCreationInputTokens":9589,"webSearchRequests":0,"costUSD":0.08565120000000001,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":9589,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
+diff --git a/crates/harness/tests/fixtures/claude/live-2.1.328-steer-mcp.jsonl b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-mcp.jsonl
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f360de004234a2529a3c8eeb670ea5a097799e0
+--- /dev/null
++++ b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-mcp.jsonl
+@@ -0,0 +1,21 @@
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"queued","uuid":"e450037d-5655-4f12-b09c-67182dc3afb9","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"started","uuid":"8df583bb-afd2-486c-ae1f-e924bdb2f2d4","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQxyrf6gtgTii1UsYdtz","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_0137EN1QRGmUEhcPGWprNBDS","name":"ToolSearch","input":{"query":"select:mcp__slow__slow_wait","max_results":1},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":16512,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":16512},"output_tokens":32,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","uuid":"9a1d6df7-de2b-4071-83a6-ddb341ef104a","timestamp":"2026-11-26T05:12:08.180Z","wire_tool_inputs":{"toolu_0137EN1QRGmUEhcPGWprNBDS":{"query":"select:mcp__slow__slow_wait","max_results":1}},"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001"]}
++{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_0137EN1QRGmUEhcPGWprNBDS","content":[{"type":"tool_reference","tool_name":"mcp__slow__slow_wait"}]}]},"parent_tool_use_id":null,"session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","uuid":"07faacc7-f8eb-42b1-b8ae-5c7610a2e289","timestamp":"2026-11-26T05:12:08.195Z","tool_use_result":{"matches":["mcp__slow__slow_wait"],"query":"select:mcp__slow__slow_wait","total_deferred_tools":8},"tool_result_meta":[{"id":"toolu_0137EN1QRGmUEhcPGWprNBDS","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQxyydnkbYedHJoy3XRT","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_015qK9LtYavUHGv2GpSZwtk7","name":"mcp__slow__slow_wait","input":{"seconds":25},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":212,"cache_read_input_tokens":16512,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":212},"output_tokens":24,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","uuid":"e9688e88-3b35-44d4-8551-4981eaec1166","timestamp":"2026-11-26T05:12:09.545Z","wire_tool_inputs":{"toolu_015qK9LtYavUHGv2GpSZwtk7":{"seconds":25}},"tool_use_meta":[{"id":"toolu_015qK9LtYavUHGv2GpSZwtk7","display_name":"Slow Wait","server_display_name":"slow","tool_name":"slow_wait"}]}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"queued","uuid":"dc4a6b30-4e9b-447e-b73d-36d62f2ef1fc","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"k2cj2tspc","run_id":"0mwx3ij6r-913fbbfb","task_type":"mcp_task","description":"slow/slow_wait"}],"uuid":"aece9078-87ec-4b88-b724-b72e4aaee58e","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"task_started","task_id":"k2cj2tspc","run_id":"0mwx3ij6r-913fbbfb","tool_use_id":"toolu_015qK9LtYavUHGv2GpSZwtk7","description":"slow/slow_wait","task_type":"mcp_task","uuid":"ab719e70-6cb1-4fa5-b14d-a4c097d194a4","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_015qK9LtYavUHGv2GpSZwtk7","type":"tool_result","content":[{"type":"text","text":"MCP tool \"slow/slow_wait\" was moved to the background as task k2cj2tspc so that a message that arrived while it was running can reach you; it was not interrupted and keeps running; you'll receive a notification with the result when it completes. You can keep working in the meantime. To stop it, use TaskStop with task_id \"k2cj2tspc\". Note: it does not survive exiting this session."}]}]},"parent_tool_use_id":null,"session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","uuid":"a27f4830-c66b-451a-bcd7-8e15c65890b0","timestamp":"2026-11-26T05:12:12.199Z","tool_use_result":[{"type":"text","text":"MCP tool \"slow/slow_wait\" was moved to the background as task k2cj2tspc so that a message that arrived while it was running can reach you; it was not interrupted and keeps running; you'll receive a notification with the result when it completes. You can keep working in the meantime. To stop it, use TaskStop with task_id \"k2cj2tspc\". Note: it does not survive exiting this session."}],"tool_result_meta":[{"id":"toolu_015qK9LtYavUHGv2GpSZwtk7","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"started","uuid":"4c2fcc3e-c38e-4467-8471-acabbcdf46d2","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQxzGrPCqDu4jmrwGDXn","type":"message","role":"assistant","content":[{"type":"text","text":"2+2 = 4. The wait call is still running in the background, and I'll say \"done\" once it finishes."}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":309,"cache_read_input_tokens":16724,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":309},"output_tokens":35,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","uuid":"97b06e3a-d3e4-4933-8515-ae1db7d54d47","timestamp":"2026-11-26T05:12:13.522Z"}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"completed","uuid":"1c1ac9b3-e97a-47cb-afe6-fc012d05ae7e","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"duration_api_ms":4459,"stop_reason":"end_turn","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","total_cost_usd":0.1468112,"usage":{"input_tokens":10,"cache_creation_input_tokens":17033,"cache_read_input_tokens":33236,"output_tokens":193,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":17033,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":35,"cache_read_input_tokens":16724,"cache_creation_input_tokens":309,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":309},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":193,"cacheReadInputTokens":33236,"cacheCreationInputTokens":17033,"webSearchRequests":0,"costUSD":0.1468112,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":17033,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"safety_stops":0,"is_error":false,"num_turns":3,"subtype":"success","api_error_status":null,"result":"2+2 = 4. The wait call is still running in the background, and I'll say \"done\" once it finishes.","ttft_ms":2000,"type":"result","duration_ms":7351,"uuid":"90e029ed-1f45-464d-b0c8-08f0d6dd7906","ttft_stream_ms":1568,"time_to_request_ms":248,"first_content_frame_ms":1569,"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001","steer-0001-0000-0000-000000000001"],"request_sent_wall_ms":1795669926428,"first_request_input_tokens":16514,"first_request_cache_read_input_tokens":0,"queued_turn_count":0,"result_index":0,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":193,"cacheReadInputTokens":33236,"cacheCreationInputTokens":17033,"webSearchRequests":0,"costUSD":0.1468112,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":17033,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"completed","uuid":"247e50da-3146-47a4-8ab9-3276bc439ea7","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"task_updated","task_id":"k2cj2tspc","run_id":"0mwx3ij6r-913fbbfb","patch":{"status":"completed","end_time":1795669954575},"uuid":"d7c9629f-b31e-45f8-aad0-9eba9dfe7f14","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"task_notification","task_id":"k2cj2tspc","run_id":"0mwx3ij6r-913fbbfb","tool_use_id":"toolu_015qK9LtYavUHGv2GpSZwtk7","status":"completed","output_file":"/tmp/claude-1000/f53f94b7d35c4c63/e9570975-a72f-4c7e-86c0-af3a4ba66033/tasks/k2cj2tspc.output","summary":"slow/slow_wait","uuid":"4a41074a-0d6b-483e-b55f-4f7cfd266f65","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"0a8d7a7f-a65e-48e9-951f-f5df5964bc29","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy1vY4yAgVgDrpVYBrJ","type":"message","role":"assistant","content":[{"type":"text","text":"done"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":9101,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9101},"output_tokens":3,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","uuid":"60ae6ee2-f1f3-47a7-add5-f7efa39f9bc2","timestamp":"2026-11-26T05:12:36.004Z"}
++{"duration_api_ms":5852,"stop_reason":"end_turn","session_id":"e9570975-a72f-4c7e-86c0-af3a4ba66033","total_cost_usd":0.2213406,"usage":{"input_tokens":4,"cache_creation_input_tokens":9101,"cache_read_input_tokens":8227,"output_tokens":3,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":9101,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":3,"cache_read_input_tokens":8227,"cache_creation_input_tokens":9101,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9101},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":14,"outputTokens":196,"cacheReadInputTokens":41463,"cacheCreationInputTokens":26134,"webSearchRequests":0,"costUSD":0.2213406,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":26134,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","origin":{"kind":"task-notification","producer":"session-task","runId":"0mwx3ij6r-913fbbfb"},"subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"safety_stops":0,"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"done","ttft_ms":1404,"type":"result","duration_ms":1409,"uuid":"bd90600c-1b24-4e9c-abef-5846ab9753a4","ttft_stream_ms":1400,"time_to_request_ms":15,"first_content_frame_ms":1400,"queued_turn_count":0,"result_index":1,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":4,"outputTokens":3,"cacheReadInputTokens":8227,"cacheCreationInputTokens":9101,"webSearchRequests":0,"costUSD":0.0745294,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":9101,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
+diff --git a/crates/harness/tests/fixtures/claude/live-2.1.328-steer-webfetch.jsonl b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-webfetch.jsonl
+new file mode 100644
+index 0000000000000000000000000000000000000000..84cb46735c747fa5a448e544b0d8317ba5712494
+--- /dev/null
++++ b/crates/harness/tests/fixtures/claude/live-2.1.328-steer-webfetch.jsonl
+@@ -0,0 +1,17 @@
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"queued","uuid":"c77b12c2-9147-4cce-8148-d26fd642f91c","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589"}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"started","uuid":"b91fdc4e-07c1-432c-9f84-de07f2c62ea4","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQxyrcsNiyRRRRay9NNu","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01CGCEZakSgyAHRpR2e29yHL","name":"ToolSearch","input":{"query":"select:WebFetch","max_results":1},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":16717,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":16717},"output_tokens":32,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"3efa3bc9-5fd5-4807-9548-b9eb29fa72d8","timestamp":"2026-11-26T05:12:08.194Z","wire_tool_inputs":{"toolu_01CGCEZakSgyAHRpR2e29yHL":{"query":"select:WebFetch","max_results":1}},"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001"]}
++{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01CGCEZakSgyAHRpR2e29yHL","content":[{"type":"tool_reference","tool_name":"WebFetch"}]}]},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"0d796072-b337-4426-b662-7380e577e657","timestamp":"2026-11-26T05:12:08.211Z","tool_use_result":{"matches":["WebFetch"],"query":"select:WebFetch","total_deferred_tools":7},"tool_result_meta":[{"id":"toolu_01CGCEZakSgyAHRpR2e29yHL","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQxyyqwEhkLZSXnbyeck","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01RLJKEJoVevfmKHphx646dn","name":"WebFetch","input":{"url":"https://httpbin.org/delay/9","prompt":"what is in it"},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":542,"cache_read_input_tokens":16717,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":542},"output_tokens":32,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"30741cb7-d96e-4dcb-8fb5-bf28ff4096b0","timestamp":"2026-11-26T05:12:09.874Z","wire_tool_inputs":{"toolu_01RLJKEJoVevfmKHphx646dn":{"url":"https://httpbin.org/delay/9","prompt":"what is in it"}}}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"queued","uuid":"97bac396-1313-442d-9353-2fd0a899c3ea","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589"}
++{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01RLJKEJoVevfmKHphx646dn","content":"[Still running. The user sent a message while this call loads, and that message follows so you can answer it now. This WebFetch call was not interrupted. Its result will be delivered to you on its own, in a later <task-notification> carrying this tool_use_id. Do not repeat the call, and do not wait, sleep or poll for it. You cannot stop it either, so never say you cancelled or dropped it. If they ask, it is still loading.]"}]},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"b1430be3-c5e5-4504-bf86-96fb1607b9b1","timestamp":"2026-11-26T05:12:12.207Z","tool_use_result":{"detachedToolCall":true},"tool_result_meta":[{"id":"toolu_01RLJKEJoVevfmKHphx646dn","permission_decision":{"decision":"accept","source":"config","reason_type":"mode"}}]}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"started","uuid":"26b49b7f-5a63-4ed6-a15b-19a68aa59f16","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQxzGoACy3UuR3nm4f8y","type":"message","role":"assistant","content":[{"type":"text","text":"2+2 = 4. (The WebFetch is still loading.)"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":362,"cache_read_input_tokens":17259,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":362},"output_tokens":23,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"24730898-6f48-4413-a526-ddb245549ae1","timestamp":"2026-11-26T05:12:13.360Z"}
++{"type":"command_lifecycle","command_uuid":"steer-0001-0000-0000-000000000001","state":"completed","uuid":"e10f3ea6-4347-4f07-a340-5ff675c7ca78","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589"}
++{"duration_api_ms":4608,"stop_reason":"end_turn","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","total_cost_usd":0.15214319999999998,"usage":{"input_tokens":10,"cache_creation_input_tokens":17621,"cache_read_input_tokens":33976,"output_tokens":217,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":17621,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":23,"cache_read_input_tokens":17259,"cache_creation_input_tokens":362,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":362},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":217,"cacheReadInputTokens":33976,"cacheCreationInputTokens":17621,"webSearchRequests":0,"costUSD":0.15214319999999998,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":17621,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"safety_stops":0,"is_error":false,"num_turns":3,"subtype":"success","api_error_status":null,"result":"2+2 = 4. (The WebFetch is still loading.)","ttft_ms":2073,"type":"result","duration_ms":7251,"uuid":"95c5931d-d25e-4f44-be0e-a6083a69a98c","ttft_stream_ms":1676,"time_to_request_ms":288,"first_content_frame_ms":1676,"user_message_uuid":"prompt-0001-0000-0000-000000000001","user_message_uuids":["prompt-0001-0000-0000-000000000001","steer-0001-0000-0000-000000000001"],"request_sent_wall_ms":1795669926410,"first_request_input_tokens":16719,"first_request_cache_read_input_tokens":0,"queued_turn_count":0,"result_index":0,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":217,"cacheReadInputTokens":33976,"cacheCreationInputTokens":17621,"webSearchRequests":0,"costUSD":0.15214319999999998,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":17621,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
++{"type":"command_lifecycle","command_uuid":"prompt-0001-0000-0000-000000000001","state":"completed","uuid":"45d6b323-0021-4e1f-bf62-3e327e36d6c3","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589"}
++{"type":"system","subtype":"init","cwd":"/tmp/steer","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","model":"claude-opus-5-5","claude_code_version":"2.1.328","tools":[]}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy16sQ4s31jYfo4HUfg","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":10022,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10022},"output_tokens":5,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"de36ec1a-3f6e-4865-9143-92195a9768d9","timestamp":"2026-11-26T05:12:24.896Z","thinking_duration_ms":151,"thinking_display":"updates"}
++{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChQy16sQ4s31jYfo4HUfg","type":"message","role":"assistant","content":[{"type":"text","text":"The page is httpbin's echo of the request. The `/delay/9` endpoint waits 9 seconds, then sends back a JSON description of the request it got: a GET with no payload, a Claude Code User-Agent and the origin IP. There's nothing else in it.\n\ndone"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":10022,"cache_read_input_tokens":8227,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10022},"output_tokens":5,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","uuid":"ce3f978b-9db7-4401-8f11-c8c84a23be3e","timestamp":"2026-11-26T05:12:25.792Z"}
++{"duration_api_ms":10410,"stop_reason":"end_turn","session_id":"9fe1cca9-9e38-4332-8263-f7b70053d589","total_cost_usd":0.24402459999999998,"usage":{"input_tokens":4,"cache_creation_input_tokens":10022,"cache_read_input_tokens":8227,"output_tokens":107,"output_tokens_details":{"thinking_tokens":18},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":10022,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":4,"output_tokens":107,"cache_read_input_tokens":8227,"cache_creation_input_tokens":10022,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10022},"type":"message"}],"speed":"standard","fallback_credit":null},"modelUsage":{"claude-opus-5-5":{"inputTokens":505,"outputTokens":621,"cacheReadInputTokens":42203,"cacheCreationInputTokens":27643,"webSearchRequests":0,"costUSD":0.24402459999999998,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":63,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":27643,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","origin":{"kind":"task-notification","producer":"session-task"},"subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"safety_stops":0,"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"The page is httpbin's echo of the request. The `/delay/9` endpoint waits 9 seconds, then sends back a JSON description of the request it got: a GET with no payload, a Claude Code User-Agent and the origin IP. There's nothing else in it.\n\ndone","ttft_ms":1467,"type":"result","duration_ms":2370,"uuid":"935b150e-3069-4af9-8557-781b0b782146","ttft_stream_ms":1316,"time_to_request_ms":15,"first_content_frame_ms":1316,"queued_turn_count":0,"result_index":1,"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":495,"outputTokens":404,"cacheReadInputTokens":8227,"cacheCreationInputTokens":10022,"webSearchRequests":0,"costUSD":0.09188139999999999,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":63,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":10022,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}}}
+diff --git a/crates/harness/tests/fixtures/fake-acp.sh b/crates/harness/tests/fixtures/fake-acp.sh
+index 458b6ab385d43be8a4a9866d65a7dfd59fc9fa02..16a009cc071d943c07ac4a3056ecfbbf0a048aa5 100755
+--- a/crates/harness/tests/fixtures/fake-acp.sh
++++ b/crates/harness/tests/fixtures/fake-acp.sh
+@@ -467,14 +467,24 @@ case "$promptline" in
+   # Prevention: the turn settles, then the agent SELF-CONTINUES (a turn no
+   # prompt started, visible as an open tool call). A steer arriving now
+   # must NOT become a session/prompt (the adapter drops that reply — the
+-  # verified starve): the harness cancels the unowned turn first, then
+-  # prompts after the flush window.
++  # verified starve), and must NOT kill the running tool: the harness waits
++  # for the tool, cancels the unowned turn once it closes, then prompts
++  # after the flush window.
+   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
++  # (Our turn settles first: the tool is the agent's own.)
++  sleep 0.3
+   update '{"sessionUpdate":"tool_call","toolCallId":"sc-1","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
++  # The steer is sent once sc-1 opens; nothing may reach us while it runs.
++  # (`read -t` is bash's; bash reads a pipe a byte at a time, so it takes
++  # no more than the one line.)
++  if bash -c 'read -r -t 2 line'; then
++    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"TOOL-KILLED"}}'
++    exit 1
++  fi
++  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-1","status":"completed","content":[]}'
+   read -r cancelline || exit 1
+   has "$cancelline" '"method":"session/cancel"' || exit 1
+-  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-1","status":"completed","content":[]}'
+   read -r followline || exit 1
+   fid=$(rid "$followline")
+   if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
+diff --git a/crates/harness/tests/fixtures/fake-claude.sh b/crates/harness/tests/fixtures/fake-claude.sh
+index bd7472a53d89516bd84a4d02587dc35604e0c191..ec6c01c02bb8dbdc3a332895411d38d924ad9ef7 100755
+--- a/crates/harness/tests/fixtures/fake-claude.sh
++++ b/crates/harness/tests/fixtures/fake-claude.sh
+@@ -184,6 +184,38 @@ case "$first" in
+   esac
+   ;;
+ 
++*scenario:tool-steer*)
++  # A steer while a foreground Bash runs. The next stdin line is the steer
++  # (an interrupt instead would kill the command): the text says how it
++  # came — `now` from a human, `next`, plain `now`, or an interrupt. As
++  # 2.1.328 does for `now` from a human, the command then moves to the
++  # background (shapes from `live-2.1.328-steer-bash.jsonl`).
++  emit '{"type":"system","subtype":"init","model":"claude-opus-5-5","tools":[],"cwd":"/tmp","session_id":"sess-tool-steer"}'
++  emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_run","name":"Bash","input":{"command":"make test","description":"Run the tests"}}]},"parent_tool_use_id":null,"session_id":"sess-tool-steer"}'
++  emit '{"type":"system","subtype":"task_started","task_id":"bt1","tool_use_id":"toolu_run","description":"Run the tests","is_backgrounded":false,"task_type":"local_bash","session_id":"sess-tool-steer"}'
++  read -r steer || exit 1
++  case "$steer" in
++    *'"subtype":"interrupt"'*) shape=interrupt ;;
++    *'"origin":{"kind":"human"}'*)
++      case "$steer" in *'"priority":"now"'*) shape=now-human ;; *) shape=other-human ;; esac ;;
++    *'"origin"'*) shape=other-origin ;;
++    *'"priority":"next"'*) shape=next ;;
++    *'"priority":"now"'*) shape=now ;;
++    *) shape=none ;;
++  esac
++  if [ "$shape" = now-human ]; then
++    emit '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bt1","task_type":"local_bash","description":"Run the tests"}],"session_id":"sess-tool-steer"}'
++    emit '{"type":"system","subtype":"task_updated","task_id":"bt1","patch":{"is_backgrounded":true},"session_id":"sess-tool-steer"}'
++    emit '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_run","type":"tool_result","content":"Command was moved to the background (ID: bt1) so that a message that arrived while it was running can reach you; it was not interrupted. Output is being written to: /tmp/claude-1000/s/tasks/bt1.output.","is_error":false}]},"parent_tool_use_id":null,"session_id":"sess-tool-steer","tool_use_result":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"bt1","backgroundedToDeliverMessage":true}}'
++  else
++    emit '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_run","type":"tool_result","content":"ok","is_error":false}]},"parent_tool_use_id":null,"session_id":"sess-tool-steer"}'
++  fi
++  # The steer, replayed as the turn takes it up.
++  [ "$shape" = interrupt ] || emit "$steer"
++  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"steer:$shape\"}}}"
++  emit '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-tool-steer"}'
++  ;;
++
+ *scenario:steer*)
+   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
+   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
+-- 
+2.55.0.windows.2
+
