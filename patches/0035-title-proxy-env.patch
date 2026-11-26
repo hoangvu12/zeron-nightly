@@ -1,0 +1,260 @@
+From 3d9ac9a1fd3821cd4a8c818e7fcc451db31d406f Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 12:26:00 +0700
+Subject: [PATCH] Claude titles: carry the user settings' proxy env into the
+ titling run
+
+A titling run starts the CLI with --setting-sources "", which drops the
+env block of ~/.claude/settings.json along with the rest. A gateway or a
+local proxy (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, as cc-switch and
+CLIProxyAPI set it) lives there, so the titling run signed in with the
+CLI's own login, failed with "Authentication failed" three times and fell
+back to the prompt's first words, while chat runs worked.
+
+Carry the provider part of that env (ANTHROPIC_*, AWS_*, the Bedrock/Vertex/Foundry switches,
+and their auth skips, proxies, CA certs, timeouts) into the titling run,
+under what the host set for the run. Settings stay off.
+---
+ crates/harness/src/claude/mod.rs          |  76 +++++++++++++
+ crates/harness/src/claude/settings_env.rs | 128 ++++++++++++++++++++++
+ 2 files changed, 204 insertions(+)
+ create mode 100644 crates/harness/src/claude/settings_env.rs
+
+diff --git a/crates/harness/src/claude/mod.rs b/crates/harness/src/claude/mod.rs
+index 22ccab75760f719705d85bf67bb2d5ec4ef4acc5..3cf25a70b79cd8042210dbd14e21a0d90f93325c 100644
+--- a/crates/harness/src/claude/mod.rs
++++ b/crates/harness/src/claude/mod.rs
+@@ -58,6 +58,7 @@ mod mcp_config;
+ pub use mcp_config::configured_mcp_servers;
+ mod normalize;
+ pub mod refresh_lock;
++mod settings_env;
+ mod wire;
+ 
+ use std::path::PathBuf;
+@@ -675,6 +676,16 @@ impl ClaudeHarness {
+         // from the user's own key, `GH_TOKEN`, …). Never a Claude.ai
+         // subscription token: those stay inside the CLI's own login.
+         crate::apply_run_env(&mut cmd, &request.env);
++        if title_only {
++            // `--setting-sources ""` below drops the user settings' `env`,
++            // where a gateway or proxy is set: carry its provider part over,
++            // under what the host resolved for this run.
++            for (key, value) in settings_env::provider_env(&config_root(&request.env)) {
++                if !request.env.contains_key(&key) {
++                    cmd.env(key, value);
++                }
++            }
++        }
+         cmd.args(Self::launch_args(request));
+         if let Some(resume) = &request.resume {
+             cmd.arg(format!("--resume={resume}"));
+@@ -2723,6 +2734,71 @@ mod tests {
+         }
+     }
+ 
++    /// A titling run loads no settings, but a proxy set in the user
++    /// settings' `env` still carries it: without it the run signs in with
++    /// the CLI's own login and fails. What the host set for the run wins.
++    #[test]
++    fn titling_runs_reach_the_proxy_the_user_settings_name() {
++        let root = tempfile::tempdir().unwrap();
++        std::fs::write(
++            root.path().join("settings.json"),
++            r#"{"env": {
++                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
++                "ANTHROPIC_AUTH_TOKEN": "sk-proxy",
++                "ANTHROPIC_API_KEY": "from-settings",
++                "ENABLE_TOOL_SEARCH": "true"
++            }}"#,
++        )
++        .unwrap();
++        let request = RunRequest {
++            mcp: None,
++            prompt: "Name this chat".into(),
++            harness: None,
++            model: None,
++            reasoning: None,
++            model_options: serde_json::Map::new(),
++            cwd: String::new(),
++            sandbox: zeron_proto::SandboxLevel::ReadOnly,
++            auto_approve: false,
++            access: Default::default(),
++            plan: false,
++            code_mode: false,
++            zeron_mcp_only: false,
++            attachments: Vec::new(),
++            worktree: None,
++            resume: None,
++            env: std::collections::BTreeMap::from([
++                (
++                    "CLAUDE_CONFIG_DIR".to_owned(),
++                    root.path().to_string_lossy().into_owned(),
++                ),
++                ("ANTHROPIC_API_KEY".to_owned(), "from-host".to_owned()),
++            ]),
++            extra_mcp: Vec::new(),
++        };
++        let env_of = |title_only: bool| {
++            let mut cmd =
++                ClaudeHarness::build_command(std::path::Path::new("claude"), &request, title_only);
++            cmd.as_std_mut()
++                .get_envs()
++                .filter_map(|(key, value)| {
++                    Some((
++                        key.to_string_lossy().into_owned(),
++                        value?.to_string_lossy().into_owned(),
++                    ))
++                })
++                .collect::<std::collections::BTreeMap<_, _>>()
++        };
++        let title = env_of(true);
++        assert_eq!(title["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8317");
++        assert_eq!(title["ANTHROPIC_AUTH_TOKEN"], "sk-proxy");
++        assert_eq!(title["ANTHROPIC_API_KEY"], "from-host");
++        assert!(!title.contains_key("ENABLE_TOOL_SEARCH"));
++        // A chat run loads the settings itself.
++        let chat = env_of(false);
++        assert!(!chat.contains_key("ANTHROPIC_BASE_URL"));
++    }
++
+     /// "Only Zeron's MCP servers": the CLI is told to load `--mcp-config`'s
+     /// servers alone and claude.ai's connectors stay off; otherwise neither,
+     /// and a warm process launched the other way isn't taken.
+diff --git a/crates/harness/src/claude/settings_env.rs b/crates/harness/src/claude/settings_env.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6f7b4d215255b5e5c02757ad165ad27e76355b3
+--- /dev/null
++++ b/crates/harness/src/claude/settings_env.rs
+@@ -0,0 +1,128 @@
++//! The provider part of the user's Claude settings `env`, for a titling run.
++//!
++//! A titling run starts the CLI with `--setting-sources ""`, so none of the
++//! user's settings (hooks, plugins, permissions, instructions) reach it. The
++//! `env` block of `settings.json` goes with them, and that is where an
++//! Anthropic-compatible gateway or a local proxy is configured
++//! (`ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN`, as cc-switch and
++//! CLIProxyAPI write it). Without it the titling run signs in with the CLI's
++//! own login, which a proxy user may not have, and every title fails with
++//! "Authentication failed" and falls back to the prompt's first words. Chat
++//! runs load the settings, so they work.
++//!
++//! Only what says where requests go and how they sign in is carried over:
++//! nothing that changes what the CLI may do.
++
++use std::collections::BTreeMap;
++use std::path::Path;
++
++/// Exact keys carried over (compared case-insensitively: Windows'
++/// environment is).
++const KEYS: &[&str] = &[
++    "API_TIMEOUT_MS",
++    "CLAUDE_CODE_OAUTH_TOKEN",
++    "CLAUDE_CODE_USE_BEDROCK",
++    "CLAUDE_CODE_USE_VERTEX",
++    "CLAUDE_CODE_USE_FOUNDRY",
++    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
++    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
++    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
++    "CLOUD_ML_REGION",
++    "HTTP_PROXY",
++    "HTTPS_PROXY",
++    "NO_PROXY",
++    "NODE_EXTRA_CA_CERTS",
++];
++
++/// Prefixes carried over: the Anthropic API's own (base URL, key, token,
++/// headers, model mapping), and Bedrock's and Vertex's credentials and
++/// regions. (Not `CLAUDE_CODE_USE_`: `CLAUDE_CODE_USE_POWERSHELL_TOOL` is
++/// one of those, and it's a tool switch.)
++const PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "VERTEX_REGION_"];
++
++fn carried(key: &str) -> bool {
++    let key = key.to_ascii_uppercase();
++    KEYS.contains(&key.as_str()) || PREFIXES.iter().any(|prefix| key.starts_with(prefix))
++}
++
++/// The provider variables of `{config_root}/settings.json`'s `env` (empty
++/// when there is no such file, it doesn't parse, or it sets none).
++pub(super) fn provider_env(config_root: &Path) -> BTreeMap<String, String> {
++    let Ok(text) = std::fs::read_to_string(config_root.join("settings.json")) else {
++        return BTreeMap::new();
++    };
++    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
++        tracing::debug!(target: "zeron_harness::claude", "user settings.json doesn't parse; titling runs without its env");
++        return BTreeMap::new();
++    };
++    let Some(env) = settings.get("env").and_then(|env| env.as_object()) else {
++        return BTreeMap::new();
++    };
++    env.iter()
++        .filter(|(key, _)| carried(key))
++        .filter_map(|(key, value)| {
++            // The CLI takes numbers and booleans in `env` as their text.
++            let value = match value {
++                serde_json::Value::String(text) => text.clone(),
++                serde_json::Value::Number(number) => number.to_string(),
++                serde_json::Value::Bool(flag) => flag.to_string(),
++                _ => return None,
++            };
++            Some((key.clone(), value))
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn root_with(settings: &str) -> tempfile::TempDir {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("settings.json"), settings).unwrap();
++        dir
++    }
++
++    #[test]
++    fn carries_a_proxys_url_and_token_and_nothing_that_changes_behaviour() {
++        let dir = root_with(
++            r#"{
++                "env": {
++                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
++                    "ANTHROPIC_AUTH_TOKEN": "sk-proxy",
++                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "small-model",
++                    "CLAUDE_CODE_USE_BEDROCK": 1,
++                    "API_TIMEOUT_MS": 600000,
++                    "https_proxy": "http://corp:3128",
++                    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
++                    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "0",
++                    "ENABLE_TOOL_SEARCH": "true",
++                    "BASH_DEFAULT_TIMEOUT_MS": "1000",
++                    "ANTHROPIC_CUSTOM_HEADERS": {"not": "a string"}
++                },
++                "hooks": {}
++            }"#,
++        );
++        let env = provider_env(dir.path());
++        assert_eq!(
++            env,
++            BTreeMap::from([
++                ("ANTHROPIC_BASE_URL".to_owned(), "http://127.0.0.1:8317".to_owned()),
++                ("ANTHROPIC_AUTH_TOKEN".to_owned(), "sk-proxy".to_owned()),
++                ("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_owned(), "small-model".to_owned()),
++                ("CLAUDE_CODE_USE_BEDROCK".to_owned(), "1".to_owned()),
++                ("API_TIMEOUT_MS".to_owned(), "600000".to_owned()),
++                ("https_proxy".to_owned(), "http://corp:3128".to_owned()),
++            ])
++        );
++    }
++
++    #[test]
++    fn no_file_no_env_block_or_bad_json_carries_nothing() {
++        let empty = tempfile::tempdir().unwrap();
++        assert!(provider_env(empty.path()).is_empty());
++        assert!(provider_env(root_with(r#"{"model": "opus"}"#).path()).is_empty());
++        assert!(provider_env(root_with("{ not json").path()).is_empty());
++        assert!(provider_env(root_with(r#"{"env": ["ANTHROPIC_BASE_URL"]}"#).path()).is_empty());
++    }
++}
+-- 
+2.55.0.windows.2
+
