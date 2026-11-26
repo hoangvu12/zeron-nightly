@@ -1,4 +1,4 @@
-From 67442954e555c2c5e62d2c2bd2c554d32736e75d Mon Sep 17 00:00:00 2001
+From d52ede52cf2a66a7db132289f235b4b21ca0cbe4 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Tue, 24 Nov 2026 14:06:44 +0000
 Subject: [PATCH] zgx: a send not delivered can be discarded, and sent again
@@ -46,10 +46,10 @@ way; chat_in_place's Discard and too-large lines (chat_fixture's
  14 files changed, 258 insertions(+), 36 deletions(-)
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff81bdc24d 100644
+index 054e5c7b8100dafd098cebd62a11a81fa33cfa5a..e7d9bd088d1e3804b96e32960360cefb0e5f18cd 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
-@@ -882,6 +882,14 @@ struct Pending {
+@@ -899,6 +899,14 @@ struct Pending {
      row: bool,
      /// The files the engine delivers for it, for a run sent again.
      transfers: Vec<Json>,
@@ -64,7 +64,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
  }
  
  impl Pending {
-@@ -897,6 +905,8 @@ impl Pending {
+@@ -914,6 +922,8 @@ impl Pending {
              ("text", Value::from(words.as_str())),
              ("attachments", carried_value(&self.paths, &quotes, &picks, &comments, &chats)),
              ("waiting", Value::from(self.waiting)),
@@ -73,7 +73,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
              // Still in the engine's outbox, its files uploading: nothing has
              // gone to its chat yet (a Cloud machine isn't woken for it).
              ("held", Value::Bool(self.held)),
-@@ -1307,6 +1317,10 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+@@ -1325,6 +1335,10 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
              held: false,
              row: false,
              transfers: Vec::new(),
@@ -84,7 +84,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
          });
      });
      let c = chats.clone();
-@@ -1412,6 +1426,12 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+@@ -1436,6 +1450,12 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
          let v = pick(&args);
          async move { crate::plugins::preview::refuse("chat.retry")?; v.retry(args).await.map(|_| Value::Nil).map_err(String::from) }
      });
@@ -97,7 +97,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
      // A send in this device's outbox (still uploading, or stopped) taken out
      // for good: `{ id, item, message? }` → whether it was there to take
      // ("unsupported": an engine from before it can).
-@@ -3053,6 +3073,10 @@ impl View {
+@@ -3191,6 +3211,10 @@ impl View {
              held: false,
              row: false,
              transfers: Vec::new(),
@@ -108,7 +108,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
          });
          drop(pending);
          if !fresh && !chats.running(&id) {
-@@ -3144,8 +3168,8 @@ impl View {
+@@ -3282,8 +3306,8 @@ impl View {
                      paths.push(at)
                  }
                  Err(why) => {
@@ -119,7 +119,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
                      return Err(why);
                  }
              }
-@@ -3207,7 +3231,8 @@ impl View {
+@@ -3345,7 +3369,8 @@ impl View {
          // parent's.)
          if fresh && config["harness"].is_null() {
              eprintln!("zeron-zgx: chat: {id}: no agent to send with (the chat isn't known here yet)");
@@ -129,7 +129,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
              return Err("missing");
          }
          // A chat just made: its config goes out now, and its first message
-@@ -3252,7 +3277,7 @@ impl View {
+@@ -3390,7 +3415,7 @@ impl View {
                          // (It runs what its row says, then.)
                          chats.starting.borrow_mut().remove(&id);
                          chats.publish_views();
@@ -138,7 +138,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
                          return Err(engine::outcome(&e));
                      }
                  }
-@@ -3266,7 +3291,7 @@ impl View {
+@@ -3404,7 +3429,7 @@ impl View {
              {
                  p.transfers = transfers;
              }
@@ -147,7 +147,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
          } else if !fresh && runs_otherwise(&chat["config"], &config) {
              // Sent with another agent, model or effort than the chat had (the
              // composer's pick, kept as a draft until now): the chat takes
-@@ -3318,6 +3343,7 @@ impl View {
+@@ -3456,6 +3481,7 @@ impl View {
                  };
                  let waiting = if send["failure"].is_string() { "failed" } else { "sending" };
                  let row = send["queueRow"].as_bool() == Some(true);
@@ -155,7 +155,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
                  let prompts = pending.entry(chat.to_owned()).or_default();
                  match prompts.iter_mut().find(|p| p.id == message) {
                      Some(p) => {
-@@ -3326,6 +3352,7 @@ impl View {
+@@ -3464,6 +3490,7 @@ impl View {
                          p.row = row;
                          p.waiting = waiting;
                          p.retry = None;
@@ -163,7 +163,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
                      }
                      None => {
                          let (words, paths) =
-@@ -3340,6 +3367,10 @@ impl View {
+@@ -3478,6 +3505,10 @@ impl View {
                              held: true,
                              row,
                              transfers: Vec::new(),
@@ -174,7 +174,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
                          });
                          changed = true;
                      }
-@@ -3352,13 +3383,15 @@ impl View {
+@@ -3490,13 +3521,15 @@ impl View {
      }
  
      /// A pending prompt that didn't go: failed, with the command that sends
@@ -192,7 +192,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
          }
          self.publish_messages();
      }
-@@ -3399,12 +3432,13 @@ impl View {
+@@ -3537,12 +3570,13 @@ impl View {
          if self.open_id().as_deref() != Some(&id) {
              return Err("missing");
          }
@@ -208,7 +208,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
          };
          self.publish_messages();
          // In the engine's outbox: the engine has what it takes to send it.
-@@ -3416,20 +3450,56 @@ impl View {
+@@ -3554,20 +3588,56 @@ impl View {
                  .map_err(|e| engine::outcome(&e));
          }
          let Some(run) = run else {
@@ -268,7 +268,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..bf29f603447c02b6385054872bfad3ff
      async fn respond(self: &Rc<Self>, args: Value) -> Result<(), Outcome> {
          let id = args.field("id").map(text).unwrap_or_default();
          let request = args.field("request").map(text).unwrap_or_default();
-@@ -9371,6 +9441,9 @@ mod tests {
+@@ -9622,6 +9692,9 @@ mod tests {
                  held: false,
                  row: false,
                  transfers: Vec::new(),
@@ -360,10 +360,10 @@ index 0a4def0ee29e8737b979d4cde62a8b0540ccc1ac..a10fc4314a0c346b9caf9859681b323b
      view.follow_held(&[held_send("m1", None)]);
      assert_eq!(messages(&view)[0]["waiting"], "sending");
 diff --git a/apps/zgx/src/plugins/preview.rs b/apps/zgx/src/plugins/preview.rs
-index be5a0e4ed5b88611d8a6e781a64c7993124d43d9..850aee12a5134c6141c601956f72c3ca16cfcdb1 100644
+index c6a25f2fe410cb112c636f079715290449051460..02f0ee421421bdfd50e32a02abe562d584cb731a 100644
 --- a/apps/zgx/src/plugins/preview.rs
 +++ b/apps/zgx/src/plugins/preview.rs
-@@ -74,6 +74,7 @@ pub const BLOCKED: &[&str] = &[
+@@ -75,6 +75,7 @@ pub const BLOCKED: &[&str] = &[
      "chat.queue_edit",
      "chat.queue_finish",
      "chat.retry",
@@ -372,10 +372,10 @@ index be5a0e4ed5b88611d8a6e781a64c7993124d43d9..850aee12a5134c6141c601956f72c3ca
      // (Only one that says what an agent may do unasked: `chat.configure`.)
      "chat.configure",
 diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
-index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..0544e471c0af959e07a47fda19645ac9af0cc12e 100644
+index d48095dacb5384a0d790ab25dad3b6b134f50c68..5889d97f49a2fa56841c6ded7c8e922ca8d80b0c 100644
 --- a/apps/zgx/ui/chat_fixture.luau
 +++ b/apps/zgx/ui/chat_fixture.luau
-@@ -417,6 +417,17 @@ end
+@@ -554,6 +554,17 @@ end
  stub.retry = function(id: string, message: string)
  	note(`retry:{id}:{message}`)
  end
@@ -393,7 +393,7 @@ index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..0544e471c0af959e07a47fda19645ac9
  -- This device's outbox, as the engine takes a send out of it (#1256's
  -- RemoveHeldSend): gone from the chat's waiting list, or not there. An
  -- engine from before it refuses.
-@@ -501,6 +512,13 @@ ui.command {
+@@ -638,6 +649,13 @@ ui.command {
  		store.messages:push { id = "lost1", role = "user", text = "Lost on the way", waiting = "failed" }
  	end,
  }
@@ -408,10 +408,10 @@ index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..0544e471c0af959e07a47fda19645ac9
  	note(`interrupt:{id}`)
  end
 diff --git a/apps/zgx/ui/ds/locale_en.luau b/apps/zgx/ui/ds/locale_en.luau
-index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..ad48609d2da64d9502f470be5d873afc7e0ea242 100644
+index f3b2e514af80cb4a913c1aa85749d2899b9bc711..533d23e3f2132b423a90ce5fb69e678ef5a0b066 100644
 --- a/apps/zgx/ui/ds/locale_en.luau
 +++ b/apps/zgx/ui/ds/locale_en.luau
-@@ -573,6 +573,8 @@ return {
+@@ -587,6 +587,8 @@ return {
  	["ds.transcript.switched"] = "Switched from {from} to {to}",
  	["ds.transcript.message_from"] = "Message from",
  	["ds.transcript.not_delivered"] = "Not delivered — send again",
@@ -421,10 +421,10 @@ index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..ad48609d2da64d9502f470be5d873afc
  	["ds.transcript.you"] = "You",
  	["ds.transcript.agent"] = "Agent",
 diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
-index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..a9007a29105012d3abb19c5218e97ecfdcbffaee 100644
+index 972084c45c5df9fea385ac8b12ff09eaee0c9346..c7027c3900c65b9d4cc2061c40b7be26930d54d1 100644
 --- a/apps/zgx/ui/ds/transcript.luau
 +++ b/apps/zgx/ui/ds/transcript.luau
-@@ -100,6 +100,9 @@ export type Message = {
+@@ -105,6 +105,9 @@ export type Message = {
  	-- reply's place.
  	waiting: ("sending" | "working" | "failed")?,
  	since: number?,
@@ -434,7 +434,7 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..a9007a29105012d3abb19c5218e97ecf
  	-- Its blocks laid out compact (Settings' compact transcript): its work
  	-- folded into one group, the reply it ends on shown.
  	compact: { Block }?,
-@@ -131,6 +134,9 @@ export type Props = {
+@@ -136,6 +139,9 @@ export type Props = {
  	on_attach: ((q: Quote.Quote) -> ())?,
  	-- A prompt that wasn't delivered, sent again (by its id).
  	on_retry: ((id: string) -> ())?,
@@ -444,7 +444,7 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..a9007a29105012d3abb19c5218e97ecf
  	-- What an unfinished turn's foot says in its working word's place, when
  	-- there's no turn to speak of (its host gone, its machine asleep): the
  	-- caller's, for a message (nil: the working word). `sending`: a prompt
-@@ -533,9 +539,9 @@ end
+@@ -628,9 +634,9 @@ end
  -- Under a person's newest prompt while its reply hasn't begun, in that
  -- reply's place: "Sending…" while it is on its way, then the turn's working
  -- word and clock, as Zeron's working trailer (transcript.rs); not
@@ -457,7 +457,7 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..a9007a29105012d3abb19c5218e97ecf
  	local function said(): TurnLine?
  		local m = row:get()
  		return if turn_state and m.waiting and m.waiting ~= "failed" then turn_state(m, m.waiting == "sending") else nil
-@@ -582,26 +588,46 @@ local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?
+@@ -677,26 +683,46 @@ local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?
  			}
  		end
  		if kind == "failed" then
@@ -522,17 +522,17 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..a9007a29105012d3abb19c5218e97ecf
  			}
  		end
  		return ui.row {
-@@ -2628,7 +2654,7 @@ local function Transcript(props: Props): Node
+@@ -2743,7 +2769,7 @@ local function Transcript(props: Props): Node
  							find = if find_for then find_for(`{m.id}:u`) else nil,
  						},
  						strip(m, state, hovered),
 -						waiting_line(state, props.on_retry, props.turn_state),
 +						waiting_line(state, props.on_retry, props.on_discard, props.turn_state),
  					}
- 					else reply(m, state, props.draft, hovered, props.compact, { turn_state = props.turn_state, view = list, offset = offset, at_end = at_end, row = outer, pictures = props.pictures, shown_pictures = props.sent_pictures, open = props.open_link, link_menu = props.link_menu, link_chip = props.link_chip, open_subagent = props.on_open_subagent, find = find_for }),
+ 					else reply(m, state, props.draft, hovered, props.compact, { turn_state = props.turn_state, view = list, offset = offset, at_end = at_end, row = outer, pictures = props.pictures, shown_pictures = props.sent_pictures, open = props.open_link, link_menu = props.link_menu, link_chip = props.link_chip, open_subagent = props.on_open_subagent, chat_of = props.chat_of, open_chat = props.open_sender, find = find_for }),
  			},
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..8d60b806537574145fa24a21f35f09eb552bcdb1 100644
+index aa85ac85b87bd3abce3327da5df9a38b4f05249c..0153baa1a78a419b089065a72999565311554ebd 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
 @@ -748,6 +748,8 @@
@@ -545,7 +545,7 @@ index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..8d60b806537574145fa24a21f35f09eb
        "you": "You",
        "agent": "Agent",
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index 727207c87a2a9787abab967f602d11371bcc4f3b..633166964d46c0d7167b7bc014dea57a2c700048 100644
+index af279a99909e4e600544a2b4881504b19a222f10..a22bed075b24e502e8061e74208d820ade923630 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
 @@ -748,6 +748,8 @@
@@ -589,7 +589,7 @@ index 7d2b1092421df86362ced6e126d02aacb1792ee3..e01d9294f04981f53b37c43f81175104
  						pictures = pictures,
  						sent_pictures = sent_pictures,
 diff --git a/apps/zgx/ui/screens/chat/store.luau b/apps/zgx/ui/screens/chat/store.luau
-index f60b45989f4d3fc4419b3cf815ec00c778e56dce..268ba9de0a0e869fc0bb33b410676c5c6355f161 100644
+index f419ccdf2b435f3c009db0e2dec2ecbe95927712..7f1cdfaa879d45674146fb548b990bedaca8f5e6 100644
 --- a/apps/zgx/ui/screens/chat/store.luau
 +++ b/apps/zgx/ui/screens/chat/store.luau
 @@ -247,6 +247,12 @@ function M.retry(id: string, message: string)
@@ -606,17 +606,17 @@ index f60b45989f4d3fc4419b3cf815ec00c778e56dce..268ba9de0a0e869fc0bb33b410676c5c
  	quietly(ui.call("chat.interrupt", id))
  end
 diff --git a/apps/zgx/ui/templates/zeron-v2/.base.json b/apps/zgx/ui/templates/zeron-v2/.base.json
-index eefe38d9b228d5603bc0c172ba9f31b965eb9227..573b21cd9433718f480c83c47b99e8ac2be4ef06 100644
+index c7b4bfed7261bff8fba164091849a7a86f660bed..68b8e43278a33d7f5a65c40eab26b12c8f33a0fa 100644
 --- a/apps/zgx/ui/templates/zeron-v2/.base.json
 +++ b/apps/zgx/ui/templates/zeron-v2/.base.json
 @@ -2,7 +2,7 @@
-   "ds/sidebar.luau": "6d5d8113d5768620",
+   "ds/sidebar.luau": "c9bf56e2bfe86e1b",
    "ds/tokens.luau": "0575770327f5e5f2",
-   "screens/chat/composer.luau": "a451ec6aaa53a23a",
+   "screens/chat/composer.luau": "ea7c318f85c7a305",
 -  "screens/chat/lane_tab.luau": "d9bfbad1abf57f73",
 +  "screens/chat/lane_tab.luau": "a9de653312018e30",
    "screens/panel/init.luau": "a0df0db6e977845f",
-   "screens/shell/init.luau": "302aa5fc3350cd0a",
+   "screens/shell/init.luau": "a537b2952cca2cfb",
    "screens/shell/page.luau": "c60a2e8010d8068e",
 diff --git a/apps/zgx/ui/templates/zeron-v2/screens/chat/lane_tab.luau b/apps/zgx/ui/templates/zeron-v2/screens/chat/lane_tab.luau
 index 242e24a50cfe269474a3db00e8ce9ecc92331516..f979f8486fe05e1cb7a9d9e3254e22864becca4b 100644
@@ -670,5 +670,5 @@ index 35f0ea3babc9544dce4a6c43a29c9a1c05efe650..78431567c566b1213af7bab70ecab661
  	local app = mount("chat_fixture.luau")
  	app:resize(900, 700)
 -- 
-2.50.1
+2.55.0.windows.2
 

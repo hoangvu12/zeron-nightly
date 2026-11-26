@@ -1,4 +1,4 @@
-From 13f8a627ee82419561c087becc7f9f6badbdd9f8 Mon Sep 17 00:00:00 2001
+From 240ffd70d2b3d45c2254bfae02769a6301e569ce Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Tue, 24 Nov 2026 20:30:42 +0700
 Subject: [PATCH] Compact idle chats before their prompt cache expires
@@ -44,14 +44,14 @@ the engine's own compaction, warm or after the agent's idle stop).
  apps/zgx/ui/account/sessions.luau             |   6 +
  apps/zgx/ui/chat_fixture.luau                 |  63 +++
  apps/zgx/ui/ds/compaction.luau                | 146 +++++
- apps/zgx/ui/ds/locale_en.luau                 |  20 +
+ apps/zgx/ui/ds/locale_en.luau                 |   5 +
  apps/zgx/ui/ds/transcript.luau                |  37 +-
- apps/zgx/ui/locales/en.json                   |  22 +-
- apps/zgx/ui/locales/zh-Hans.json              |  22 +-
+ apps/zgx/ui/locales/en.json                   |  20 +-
+ apps/zgx/ui/locales/zh-Hans.json              |  20 +-
  apps/zgx/ui/screens/chat/composer.luau        |  19 +-
  apps/zgx/ui/screens/chat/idle_compact.luau    | 192 +++++++
  apps/zgx/ui/screens/settings/general.luau     |  34 ++
- apps/zgx/ui/screens/shell/sidebar.luau        |  24 +
+ apps/zgx/ui/screens/shell/sidebar.luau        |  25 +
  apps/zgx/ui/settings_stub.luau                |   3 +-
  apps/zgx/ui/shell_fixture.luau                |  13 +-
  apps/zgx/ui/templates/zeron-v2/.base.json     |   2 +-
@@ -67,13 +67,13 @@ the engine's own compaction, warm or after the agent's idle stop).
  crates/engine/src/sessions.rs                 | 367 ++++++++++++-
  crates/engine/src/workspace_host.rs           |  14 +
  crates/engine/tests/e2e.rs                    |   3 +-
- crates/engine/tests/idle_compact_live.rs      | 167 ++++++
+ crates/engine/tests/idle_compact_live.rs      | 168 ++++++
  crates/harness/src/claude/normalize.rs        | 306 ++++++++++-
  crates/harness/src/claude/wire.rs             |   7 +
  crates/mcp/src/transcript.rs                  |  14 +
  crates/proto/src/agent.rs                     |  32 ++
  crates/rpc/src/lib.rs                         |   4 +
- 35 files changed, 2582 insertions(+), 54 deletions(-)
+ 35 files changed, 2567 insertions(+), 52 deletions(-)
  create mode 100644 apps/zgx/ui/ds/compaction.luau
  create mode 100644 apps/zgx/ui/screens/chat/idle_compact.luau
  create mode 100644 apps/zgx/ui/tests/idle_compact.test.luau
@@ -81,10 +81,10 @@ the engine's own compaction, warm or after the agent's idle stop).
  create mode 100644 crates/engine/tests/idle_compact_live.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c4bda4fa4 100644
+index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a044b0d4669 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
-@@ -710,7 +710,7 @@ struct LetGo {
+@@ -723,7 +723,7 @@ struct LetGo {
      built: HashMap<Rc<str>, Built>,
      built_model: Option<Option<String>>,
      context: Option<f64>,
@@ -93,7 +93,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
  }
  
  /// How long a chat let go of is kept for a view to open again, and how many
-@@ -1141,8 +1141,9 @@ struct Open {
+@@ -1168,8 +1168,9 @@ struct Open {
      heard: bool,
      context: Option<f64>,
      /// What the context holds as the agent last reported it: tokens in it
@@ -105,7 +105,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
      queue: Vec<Json>,
      /// Its messages on their way and not yet taken by its agent, as the engine's
      /// `WatchWaitingMessages` lists them (none from an engine without it).
-@@ -2596,7 +2597,7 @@ impl View {
+@@ -2751,7 +2752,7 @@ impl View {
              if let Some(usage) = frame.get("contextUsage").filter(|u| !u.is_null()) {
                  let (tokens, window) = (usage["tokens"].as_f64(), usage["window"].as_f64());
                  open.context = tokens.zip(window).filter(|(_, w)| *w > 0.).map(|(t, w)| (t / w).min(1.));
@@ -114,9 +114,9 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
              }
              // Opened with all its rows (another view's, or its own with the
              // model's name moved): not down to the newest few, until the
-@@ -5480,6 +5481,11 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
-             if image_note_only(entry) {
-                 return None;
+@@ -5704,6 +5705,11 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+             if zeron_proto::delegation::wake_notice(&text).is_some() {
+                 return Some(wake_row(id));
              }
 +            // A bare `/compact`: its compaction's divider says it, as for
 +            // one Zeron sent for an idle chat (which has no prompt).
@@ -126,7 +126,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
              // A message from another chat: its routing header is the agent's to
              // read; the transcript shows who sent it, over its words.
              let sender = zeron_proto::agent_messages::agent_message_sender(&text);
-@@ -5518,6 +5524,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -5742,6 +5748,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
          }
          "assistant" => {
              let streaming = entry["status"].as_str() == Some("streaming");
@@ -136,7 +136,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
              let created = entry["createdAt"].as_f64().unwrap_or(0.) / 1000.;
              let tools: Vec<Value> = entry["parts"]
                  .as_array()
-@@ -5647,6 +5656,48 @@ fn blocks(entry: &Json) -> Value {
+@@ -5934,6 +5943,48 @@ fn delegated_block(parts: &mut Vec<&Json>) -> Option<Value> {
  }
  
  /// The blocks of these parts of a reply (`streaming`: still being written).
@@ -185,7 +185,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
  fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
      let last_ix = parts.len().saturating_sub(1);
      let mut out: Vec<Value> = Vec::new();
-@@ -5726,6 +5777,10 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+@@ -6026,6 +6077,10 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
                      out.push(visual_block(part));
                      continue;
                  }
@@ -196,7 +196,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
                  let words = match kind {
                      Some("text") => part["text"].as_str().unwrap_or_default().to_owned(),
                      Some("error") => format!("> {}", part["message"].as_str().unwrap_or_default()),
-@@ -6728,6 +6783,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -7049,6 +7104,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          ("context", open.context.map(Value::Num).unwrap_or(Value::Nil)),
          ("context_tokens", open.context_usage.0.map(Value::Num).unwrap_or(Value::Nil)),
          ("context_window", open.context_usage.1.map(Value::Num).unwrap_or(Value::Nil)),
@@ -208,7 +208,7 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
          ("ask", ask),
          ("queue", Value::List(queue.into())),
          ("waiting", waiting_value(&open.waiting)),
-@@ -8857,6 +8917,63 @@ mod tests {
+@@ -9178,6 +9238,63 @@ mod tests {
          }
      }
  
@@ -273,10 +273,10 @@ index 3faf30b9401d9fa2dbfe66275f18bd91dc7ecd2f..6feeb7b4e7d970ba0057f833b749738c
      fn a_subagent_is_named_in_its_part_or_is_in_no_row() {
          let part = |extra: Json| {
 diff --git a/apps/zgx/src/sessions.rs b/apps/zgx/src/sessions.rs
-index 7e7c779cb326454d9763bb783e542db05f1f23dd..d0f3610e8437730f11fd32def3f4ffaca3e4effb 100644
+index acbc51e0339753e0d56847f246465a604bb95bb4..83d290d272d04a8c8dbc676ba18abeda70bb4228 100644
 --- a/apps/zgx/src/sessions.rs
 +++ b/apps/zgx/src/sessions.rs
-@@ -746,6 +746,9 @@ fn top_row(
+@@ -764,6 +764,9 @@ fn top_row(
          // only unseen activity, which your own send makes too).
          ("turn", with.turn.as_deref().map_or(Value::Nil, Value::from)),
          ("turn_fresh", Value::from(finished_turn(session, at).1)),
@@ -286,7 +286,7 @@ index 7e7c779cb326454d9763bb783e542db05f1f23dd..d0f3610e8437730f11fd32def3f4ffac
      ]);
      rows.insert(id.to_owned(), Row { moved: moved(c), updated: updated as f64, marks, with, value: value.clone() });
      value
-@@ -953,6 +956,23 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+@@ -971,6 +974,23 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
              }
          }
      });
@@ -311,10 +311,10 @@ index 7e7c779cb326454d9763bb783e542db05f1f23dd..d0f3610e8437730f11fd32def3f4ffac
      host.action("sessions.seen", move |id| {
          let a = a.clone();
 diff --git a/apps/zgx/src/settings.rs b/apps/zgx/src/settings.rs
-index 4884ba294f6cfc1d8b6837d95f945e97be480f93..8e0f09cd7a73a943d87433647dc8f89d1abb20e5 100644
+index dbda3eb5a63b634414abf9f4c8908577c738907b..8bc2d62b84556995cca4719657d23c4da915de2e 100644
 --- a/apps/zgx/src/settings.rs
 +++ b/apps/zgx/src/settings.rs
-@@ -99,6 +99,9 @@ const ENGINE_METHODS: &[&str] = &[
+@@ -105,6 +105,9 @@ const ENGINE_METHODS: &[&str] = &[
      // "Keep Zeron running after you quit" (src/quit_prompt.rs).
      "GetBackgroundSettings",
      "SetBackgroundSettings",
@@ -325,10 +325,10 @@ index 4884ba294f6cfc1d8b6837d95f945e97be480f93..8e0f09cd7a73a943d87433647dc8f89d
      // background" hold while it does.
      "SetViewportFocus",
 diff --git a/apps/zgx/ui/account/sessions.luau b/apps/zgx/ui/account/sessions.luau
-index 7940c4c685c92d1f45994e0568745647491c363c..9edbc26e1f254d8cc9c99782d95c89de70e61b72 100644
+index afccc32fdac6a01fd5a489429076aa31f0722b3f..20f70536771fb7e80d61e96bb012ddf686778737 100644
 --- a/apps/zgx/ui/account/sessions.luau
 +++ b/apps/zgx/ui/account/sessions.luau
-@@ -252,6 +252,12 @@ function M.stop(id: string): any
+@@ -290,6 +290,12 @@ function M.stop(id: string): any
  	return ui.call("chat.interrupt", id)
  end
  
@@ -342,10 +342,10 @@ index 7940c4c685c92d1f45994e0568745647491c363c..9edbc26e1f254d8cc9c99782d95c89de
  	return ui.call("chat.stop_waiting", id)
  end
 diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
-index e12c5d2200a299e1daa8d8b4c2ef518187a4dd12..9dd839a3e180b9fe020436e8a4897c90f60918a9 100644
+index 5889d97f49a2fa56841c6ded7c8e922ca8d80b0c..5e4e6b676f2ba1afba1a95e09ef4bf66aec8c254 100644
 --- a/apps/zgx/ui/chat_fixture.luau
 +++ b/apps/zgx/ui/chat_fixture.luau
-@@ -2192,6 +2192,69 @@ for _, id in { "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9" } do
+@@ -2376,6 +2376,69 @@ for _, id in { "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9" } do
  		end,
  	}
  end
@@ -568,48 +568,13 @@ index 0000000000000000000000000000000000000000..7ef3b2a680db7823514b8b8fc7fd08a1
 +
 +return M
 diff --git a/apps/zgx/ui/ds/locale_en.luau b/apps/zgx/ui/ds/locale_en.luau
-index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..a1219fcd027f97963f8a53de88aa3a78d951489c 100644
+index 533d23e3f2132b423a90ce5fb69e678ef5a0b066..2e142380d3b94e9d1cbf71cee16c0827b9ece205 100644
 --- a/apps/zgx/ui/ds/locale_en.luau
 +++ b/apps/zgx/ui/ds/locale_en.luau
-@@ -464,6 +464,10 @@ return {
- 	["ds.composer.access.supervised_hint"] = "Ask before commands and file changes.",
- 	["ds.composer.access.edits"] = "Auto-accept edits",
- 	["ds.composer.access.edits_hint"] = "Apply edits, ask before other actions.",
-+	["ds.composer.access.auto"] = "Auto",
-+	["ds.composer.access.auto_hint"] = "The agent's reviewer approves safe actions; risky ones ask.",
-+	["ds.composer.access.auto_unavailable"] = "Auto unavailable",
-+	["ds.composer.access.auto_unavailable_hint"] = "This agent doesn't support Auto. Choose another access mode or agent.",
- 	["ds.composer.access.full"] = "Full access",
- 	["ds.composer.access.full_hint"] = "Run commands and edits without asking.",
- 	["ds.composer.plan.mode"] = "Plan mode",
-@@ -496,6 +500,7 @@ return {
- 	["ds.composer.dictate"] = "Dictate",
- 	["ds.composer.queue_message"] = "Queue message",
- 	["ds.composer.send_message"] = "Send message",
-+	["ds.composer.send_auto_unavailable"] = "Auto isn't available for this agent. Choose another access mode to send.",
- 	["ds.composer.stop"] = "Stop",
- 	["ds.composer.back"] = "Back",
- 	["ds.composer.next"] = "Next",
-@@ -569,6 +574,15 @@ return {
- 	["ds.activity.open_subagent"] = "Open subagent {title}",
- 	["ds.activity.subagent"] = "Subagent",
- 	["ds.activity.worked_for"] = "Worked for {secs}s · {summary}",
-+	["ds.activity.review.reviewing"] = "Reviewing…",
-+	["ds.activity.review.approved"] = "Auto-approved",
-+	["ds.activity.review.denied"] = "Blocked by auto-review",
-+	["ds.activity.review.timed-out"] = "Review timed out",
-+	["ds.activity.review.reviewing_hint"] = "The agent's reviewer is checking this before it runs.",
-+	["ds.activity.review.approved_hint"] = "The agent's reviewer judged this safe and let it run.",
-+	["ds.activity.review.denied_hint"] = "The agent's reviewer stopped this. It didn't run.",
-+	["ds.activity.review.timed-out_hint"] = "The agent's reviewer didn't decide in time, so this didn't run.",
-+	["ds.activity.review.risk"] = "Risk: {risk}",
- 	["ds.transcript.copy_message"] = "Copy message",
- 	["ds.transcript.switched"] = "Switched from {from} to {to}",
- 	["ds.transcript.message_from"] = "Message from",
-@@ -589,6 +603,11 @@ return {
- 	["ds.transcript.display_failed"] = "This couldn't be shown",
- 	["ds.transcript.image_failed"] = "Couldn't show this image",
- 	["ds.transcript.visual_failed"] = "Couldn't show this visual",
+@@ -619,6 +619,11 @@ return {
+ 	["ds.transcript.delegated.asks"] = "Has a question",
+ 	["ds.transcript.delegated.failed"] = "Failed",
+ 	["ds.transcript.delegated.untitled"] = "Subagent",
 +	["ds.transcript.compaction.running"] = "Compacting {n} tokens…",
 +	["ds.transcript.compaction.running_unknown"] = "Compacting…",
 +	["ds.transcript.compaction.done"] = "Compacted {pre} → {post} tokens",
@@ -618,19 +583,11 @@ index b241658c811a1de3a3fbc1d642f3ed3cf8e45615..a1219fcd027f97963f8a53de88aa3a78
  	["ds.user_message.open_named"] = "Open {name}",
  	["ds.user_message.appshot_label"] = "{app} Appshot: {title}",
  	["ds.user_message.appshot"] = "{app} · Appshot",
-@@ -733,6 +752,7 @@ return {
- 	["ds.provider_card.use_reset"] = "Use a reset",
- 	["ds.provider_card.connect"] = "Connect a {name} account",
- 	["ds.provider_card.add_account"] = "Add account",
-+	["ds.provider_card.how_it_signs_in"] = "How it signs in on Cloud",
- 	["ds.provider_card.signing_in_to"] = "Signing in to {name}",
- 	["ds.provider_card.signing_in_hint"] = "Waiting for you to finish in the browser. Nothing changes until you switch.",
- 	["ds.provider_card.signing_in"] = "Signing in",
 diff --git a/apps/zgx/ui/ds/transcript.luau b/apps/zgx/ui/ds/transcript.luau
-index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eecc58626b8 100644
+index c7027c3900c65b9d4cc2061c40b7be26930d54d1..c77e32bd8e435cefe722848662747bfdd93a655b 100644
 --- a/apps/zgx/ui/ds/transcript.luau
 +++ b/apps/zgx/ui/ds/transcript.luau
-@@ -57,15 +57,18 @@ local control = require("@self/control")
+@@ -59,18 +59,21 @@ local control = require("@self/control")
  local Quote = require("@self/quote")
  local SelectionMenu = require("@self/selection_menu")
  local Rail = require("@self/rail")
@@ -643,16 +600,19 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eec
  	id: string,
 -	-- A person's, a reply, or the seam where the chat moved to another
 -	-- agent (`[mark] From → [mark] To` over the prompt that moved it).
--	role: "user" | "assistant" | "switch",
 +	-- A person's, a reply, the seam where the chat moved to another
 +	-- agent (`[mark] From → [mark] To` over the prompt that moved it), or
 +	-- where its context was compacted (ds/compaction: `pre`, `post`,
 +	-- `summary`, `live`, `stopped`).
-+	role: "user" | "assistant" | "switch" | "compaction",
+ 	-- ("wake": Zeron's, not a person's: its subagents came to something, and
+ 	-- the agent goes on. Nothing of it shows but the working line while its
+ 	-- turn starts, as a native subagent's return shows nothing.)
+-	role: "user" | "assistant" | "switch" | "wake",
++	role: "user" | "assistant" | "switch" | "wake" | "compaction",
  	text: string,
  	-- A person's: what came with it.
  	attachments: { UserMessage.Attachment }?,
-@@ -110,6 +113,12 @@ export type Message = {
+@@ -118,6 +121,12 @@ export type Message = {
  	to_mark: Mark.Name?,
  	-- A person's that another chat sent: which, and its title when it was sent.
  	sender: { chat: string, title: string }?,
@@ -665,34 +625,34 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eec
  }
  
  export type Props = {
-@@ -227,7 +236,7 @@ export type Draft = { id: string, text: string, part: string?, part_text: string
+@@ -238,7 +247,7 @@ export type Draft = { id: string, text: string, part: string?, part_text: string
  -- its own blocks, opened.
  export type Block = {
  	id: string,
--	kind: "text" | "tools" | "work" | "visual" | "display_failed" | "images",
-+	kind: "text" | "tools" | "work" | "visual" | "display_failed" | "images" | "compaction",
+-	kind: "text" | "tools" | "work" | "visual" | "display_failed" | "images" | "delegated",
++	kind: "text" | "tools" | "work" | "visual" | "display_failed" | "images" | "delegated" | "compaction",
  	text: string?,
  	-- Pictures an agent showed (`show_image`, a generated image), one after
  	-- another: each a path on the chat's host and its name (ds/reply_picture).
-@@ -265,6 +274,7 @@ local ROW_ESTIMATE: any = {
- 	by = "role",
+@@ -283,6 +292,7 @@ local ROW_ESTIMATE: any = {
  	cases = {
  		user = { height = 64, text = { field = "text", size = 15, line = 24, most = 520 } },
+ 		wake = { height = 0 },
 +		compaction = { height = 40 },
  		assistant = {
  			height = 40,
  			has = {
-@@ -277,6 +287,7 @@ local ROW_ESTIMATE: any = {
- 							tools = { height = 38 },
+@@ -296,6 +306,7 @@ local ROW_ESTIMATE: any = {
  							work = { height = 38 },
  							display_failed = { height = 36 },
+ 							delegated = { height = 82 },
 +							compaction = { height = 32 },
  						},
  						default = { height = 320 },
  					},
-@@ -857,6 +868,16 @@ local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message,
- 					else nil,
- 			}
+@@ -988,6 +999,16 @@ local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message,
+ 				return brow:get()
+ 			end, if view then view.chat_of else nil, if view then view.open_chat else nil)
  		end
 +		-- Its context compacted partway through (the agent's own): the
 +		-- divider, as between turns.
@@ -707,7 +667,7 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eec
  		-- An agent's visual: built once, followed by the host (src/visuals.rs).
  		if b.kind == "visual" then
  			return Visual { id = b.id, path = b.path, source = b.source, title = b.title, device = b.device }
-@@ -2595,7 +2616,7 @@ local function Transcript(props: Props): Node
+@@ -2731,7 +2752,7 @@ local function Transcript(props: Props): Node
  				max_w = measure,
  				min_w = 0,
  				-- Anywhere on a message shows its lane (Zeron's entry hover).
@@ -716,10 +676,10 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eec
  					then nil
  					else function(inside: boolean)
  						if inside then
-@@ -2605,6 +2626,12 @@ local function Transcript(props: Props): Node
- 						end
- 					end,
- 				if m.role == "switch" then seam(m)
+@@ -2746,6 +2767,12 @@ local function Transcript(props: Props): Node
+ 						provide = { message = m.id },
+ 						waiting_line(state, nil, props.turn_state),
+ 					}
 +					elseif m.role == "compaction" then Compaction.Compaction {
 +						id = m.id,
 +						now = function(): any
@@ -730,29 +690,27 @@ index 39df3b1435ca0b2d4ddfdba00a4008da92d0afb4..eefb54f88ab33568aaf3f4717a836eec
  						hook = "chat.message.prompt",
  						-- What it is, for a plugin's selector (and the
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..85789dad91ab201398bf0b6a335e56bbe986eb1b 100644
+index 0153baa1a78a419b089065a72999565311554ebd..46089b8b94b72ad68b8a3bfaa537a558a17f9f9e 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
-@@ -763,7 +763,14 @@
-       "new_reply": "New reply",
-       "display_failed": "This couldn't be shown",
-       "image_failed": "Couldn't show this image",
--      "visual_failed": "Couldn't show this visual"
-+      "visual_failed": "Couldn't show this visual",
+@@ -781,6 +781,13 @@
+         "asks": "Has a question",
+         "failed": "Failed",
+         "untitled": "Subagent"
++      },
 +      "compaction": {
 +        "running": "Compacting {n} tokens…",
 +        "running_unknown": "Compacting…",
 +        "done": "Compacted {pre} → {post} tokens",
 +        "done_to": "Compacted to {post} tokens",
 +        "stopped": "Compaction stopped"
-+      }
+       }
      },
      "user_message": {
-       "open_named": "Open {name}",
-@@ -1217,6 +1224,11 @@
-         "on": "Chats keep working, and other devices can reach them.",
-         "off": "When you quit, Zeron stops once its chats are done.",
-         "terms": "background quit close engine agents running stop memory battery"
+@@ -1240,6 +1247,11 @@
+         "label": "Delegate in the background",
+         "description": "Agents hand work to subagents on any provider or device, end their turn, and are woken with the results. Off, they wait for each one. Applies to each chat's next turn.",
+         "terms": "subagents, orchestration, waiting, async"
 +      },
 +      "compact_idle": {
 +        "label": "Compact idle chats",
@@ -761,7 +719,7 @@ index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..85789dad91ab201398bf0b6a335e56bb
        }
      },
      "engine": {
-@@ -2455,7 +2467,9 @@
+@@ -2662,7 +2674,9 @@
          "delete": "Delete…",
          "rename": "Rename…",
          "remove": "Remove…",
@@ -772,7 +730,7 @@ index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..85789dad91ab201398bf0b6a335e56bb
        },
        "project": {
          "rename_title": "Rename project",
-@@ -3021,6 +3035,10 @@
+@@ -3234,6 +3248,10 @@
          "appshot": "Appshot",
          "image": "Image",
          "file": "File"
@@ -784,29 +742,27 @@ index 5e7e799efc0d8a29459492149fbe0aa3f0bb51d2..85789dad91ab201398bf0b6a335e56bb
      },
      "dictation": {
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index 727207c87a2a9787abab967f602d11371bcc4f3b..f7f4ef32a22fe7b09b7e6cb2f9f57b8e904ec351 100644
+index a22bed075b24e502e8061e74208d820ade923630..ac26ce40b7e1853feda2d6cf14ad04136b0b7264 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
-@@ -763,7 +763,14 @@
-       "new_reply": "新回复",
-       "display_failed": "无法显示此内容",
-       "image_failed": "无法显示这张图片",
--      "visual_failed": "无法显示这个可视化"
-+      "visual_failed": "无法显示这个可视化",
+@@ -781,6 +781,13 @@
+         "asks": "有问题",
+         "failed": "失败",
+         "untitled": "子代理"
++      },
 +      "compaction": {
 +        "running": "正在压缩 {n} 个 token…",
 +        "running_unknown": "正在压缩…",
 +        "done": "已压缩 {pre} → {post} 个 token",
 +        "done_to": "已压缩至 {post} 个 token",
 +        "stopped": "压缩已停止"
-+      }
+       }
      },
      "user_message": {
-       "open_named": "打开 {name}",
-@@ -1217,6 +1224,11 @@
-         "on": "对话会继续进行，其他设备也能访问它们。",
-         "off": "退出时，Zeron 会在对话完成后停止。",
-         "terms": "后台 退出 关闭 引擎 智能体 运行 停止 内存 电池 background quit close engine agents"
+@@ -1240,6 +1247,11 @@
+         "label": "在后台委派",
+         "description": "代理将工作交给任意提供方或设备上的子代理，结束自己的回合，并在有结果时被唤醒。关闭后，代理会逐个等待。对每个对话的下一回合生效。",
+         "terms": "子代理, 编排, 等待, 异步"
 +      },
 +      "compact_idle": {
 +        "label": "压缩闲置对话",
@@ -815,7 +771,7 @@ index 727207c87a2a9787abab967f602d11371bcc4f3b..f7f4ef32a22fe7b09b7e6cb2f9f57b8e
        }
      },
      "engine": {
-@@ -2455,7 +2467,9 @@
+@@ -2662,7 +2674,9 @@
          "delete": "删除…",
          "rename": "重命名…",
          "remove": "移除…",
@@ -826,7 +782,7 @@ index 727207c87a2a9787abab967f602d11371bcc4f3b..f7f4ef32a22fe7b09b7e6cb2f9f57b8e
        },
        "project": {
          "rename_title": "重命名项目",
-@@ -3021,6 +3035,10 @@
+@@ -3234,6 +3248,10 @@
          "appshot": "应用截图",
          "image": "图片",
          "file": "文件"
@@ -838,7 +794,7 @@ index 727207c87a2a9787abab967f602d11371bcc4f3b..f7f4ef32a22fe7b09b7e6cb2f9f57b8e
      },
      "dictation": {
 diff --git a/apps/zgx/ui/screens/chat/composer.luau b/apps/zgx/ui/screens/chat/composer.luau
-index de4f291d564a3b1aedbca8866123235a95559ea8..5d8f2d5211c80f8558930c6b8358d54c02dd1768 100644
+index 9b55c46dd02fbeb33d4df84b3e4f1d14ddc51e51..aaa536a02bb72085cc111055862e176bfb675714 100644
 --- a/apps/zgx/ui/screens/chat/composer.luau
 +++ b/apps/zgx/ui/screens/chat/composer.luau
 @@ -32,6 +32,7 @@ local sessions = require("@account/sessions")
@@ -868,7 +824,7 @@ index de4f291d564a3b1aedbca8866123235a95559ea8..5d8f2d5211c80f8558930c6b8358d54c
  	-- This device's outbox for the chat (#1256): sends uploading or stopped,
  	-- each removable where the engine can take one back. Whether it can is
  	-- asked once a chat has one, by taking out a send that isn't there (an
-@@ -1586,9 +1599,9 @@ local function Composer(): Node
+@@ -1603,9 +1616,9 @@ local function Composer(): Node
  			end,
  			-- (The only notice with an action: a sleeping machine's Wake.)
  			on_notice_action = machine.wake,
@@ -1080,7 +1036,7 @@ index 0000000000000000000000000000000000000000..b3d6dae7559988e12ce58bd05eec94fb
 +
 +return M
 diff --git a/apps/zgx/ui/screens/settings/general.luau b/apps/zgx/ui/screens/settings/general.luau
-index caa9a02858b062c2b8edfb5ae5df5dbb79afb42e..f469dd11dd5dcaf2606dfefec75faea38a220363 100644
+index dc789550ccb61ac3500ce6395772552ecbf876c2..9e54e04024027a33438563e15c6c6733a9d1942b 100644
 --- a/apps/zgx/ui/screens/settings/general.luau
 +++ b/apps/zgx/ui/screens/settings/general.luau
 @@ -16,6 +16,7 @@ local search = require("@app/screens/settings/search")
@@ -1099,7 +1055,7 @@ index caa9a02858b062c2b8edfb5ae5df5dbb79afb42e..f469dd11dd5dcaf2606dfefec75faea3
  	{ key = "hide_emails", title = ui.t("settings.general.hide_emails.label"), section = ui.t("settings.general.privacy"), terms = ui.t("settings.general.hide_emails.terms") },
  	{ key = "keep_chats_local", title = ui.t("settings.general.keep_chats_local.label"), section = ui.t("settings.general.privacy"), terms = ui.t("settings.general.keep_chats_local.terms") },
  	{ key = "thread_naming", title = ui.t("settings.general.thread_naming.label"), terms = ui.t("settings.general.thread_naming.terms") },
-@@ -51,6 +53,17 @@ local titles = ui.state("settings_titles", nil :: Titles?)
+@@ -53,6 +55,17 @@ local titles = ui.state("settings_titles", nil :: Titles?)
  -- Whether the engine outlives the app (src/quit_prompt.rs).
  type Background = { keepRunningAfterQuit: boolean }
  local background = ui.state("settings_background", nil :: Background?)
@@ -1117,7 +1073,7 @@ index caa9a02858b062c2b8edfb5ae5df5dbb79afb42e..f469dd11dd5dcaf2606dfefec75faea3
  -- Why one couldn't be had (an outcome word), by name.
  local failed = ui.state("settings_engine_failed", {} :: { [string]: string })
  
-@@ -98,6 +111,7 @@ local function load_all()
+@@ -101,6 +114,7 @@ local function load_all()
  	load("worktrees", "GetWorktreeSettings", worktrees)
  	load("titles", "GetTitleSettings", titles)
  	load("background", "GetBackgroundSettings", background)
@@ -1125,7 +1081,7 @@ index caa9a02858b062c2b8edfb5ae5df5dbb79afb42e..f469dd11dd5dcaf2606dfefec75faea3
  end
  
  -- A change to the engine's: shown now, back as it was if refused.
-@@ -297,6 +311,26 @@ function M.view(): Node
+@@ -300,6 +314,26 @@ function M.view(): Node
  						return background:get() == nil
  					end),
  				}),
@@ -1153,7 +1109,7 @@ index caa9a02858b062c2b8edfb5ae5df5dbb79afb42e..f469dd11dd5dcaf2606dfefec75faea3
  		},
  		ds.Settings.Section {
 diff --git a/apps/zgx/ui/screens/shell/sidebar.luau b/apps/zgx/ui/screens/shell/sidebar.luau
-index 8e78daf1d110a6811c212e21912ca5dd089baaa7..cc68b6c41d55e0792653de6c86ce1fc904c51e14 100644
+index 16326ca4c08cbd723270431cad11278336487276..c450fd283393bb6c8f5727f4345f1d429183007d 100644
 --- a/apps/zgx/ui/screens/shell/sidebar.luau
 +++ b/apps/zgx/ui/screens/shell/sidebar.luau
 @@ -32,6 +32,7 @@ local control = require("@ds/control")
@@ -1164,13 +1120,14 @@ index 8e78daf1d110a6811c212e21912ca5dd089baaa7..cc68b6c41d55e0792653de6c86ce1fc9
  
  export type Props = {
  	collapsed: State<boolean>,
-@@ -1184,6 +1185,28 @@ local function menu(id: string): { any }?
- 			end
- 		end
- 	end
+@@ -1346,6 +1347,29 @@ local function menu_of(wanted: { string }): { any }?
+ 	-- (A side chat's: without what doesn't apply to it.)
+ 	local side = one ~= nil and is_side(one.id)
+ 	local pinned = all_in(ids, shared.places:peek().pinned)
 +	-- A Claude chat's own "Compact when idle" (Settings has the default).
 +	local compact_idle: any = false
-+	if c.harness == "claude-code" and not side then
++	if one ~= nil and one.harness == "claude-code" and not side then
++		local c = one
 +		IdleCompact.load_setting()
 +		compact_idle = {
 +			label = locale.s("shell.sidebar.menu.compact_idle"),
@@ -1190,40 +1147,40 @@ index 8e78daf1d110a6811c212e21912ca5dd089baaa7..cc68b6c41d55e0792653de6c86ce1fc9
 +			end,
 +		}
 +	end
- 	local entries = {
- 		{
+ 	local all: { any } = {
+ 		one ~= nil and {
  			label = locale.s("common.rename"),
-@@ -1211,6 +1234,7 @@ local function menu(id: string): { any }?
- 		if side or activity.on:peek() then false else { label = locale.s("shell.sidebar.menu.move_to"), icon = "folder-with-files", submenu = into },
- 		sleep,
- 		stop_waiting,
+@@ -1376,6 +1400,7 @@ local function menu_of(wanted: { string }): { any }?
+ 		not side and activity.on:peek() and sleep_entry(chats),
+ 		stop_waiting_entry(chats),
+ 		stop_delegated_entry(chats),
 +		compact_idle,
  		{ separator = true },
  		{
  			-- (No key: ⌘⌫ is a text field's, deleting to the line's start.)
 diff --git a/apps/zgx/ui/settings_stub.luau b/apps/zgx/ui/settings_stub.luau
-index 3cc25e608be0f008f5aabf49ae741f479eb45392..aeb0a0c003a3bb6ca5d3d1ad66e4e282543fa076 100644
+index 287481f7265e0ee482806748e80ccfe6a8ea50f7..17db57d6dacc0495a5054806f9d250d18ec82a76 100644
 --- a/apps/zgx/ui/settings_stub.luau
 +++ b/apps/zgx/ui/settings_stub.luau
-@@ -126,6 +126,7 @@ local engine: { [string]: any } = {
- 	GetNativeSubagents = { switchable = { "claude-code" }, off = {} },
+@@ -128,6 +128,7 @@ local engine: { [string]: any } = {
  	GetCodeMode = { supported = { "codex", "muse" }, enabled = {} },
+ 	GetZeronMcpOnly = { supported = { "claude-code", "codex", "pi" }, on = {} },
  	GetBackgroundSettings = { keepRunningAfterQuit = true },
 +	GetIdleCompactSettings = { compactIdleChats = true },
  }
  local banners = { desktop = true, background_only = true, agent_updates = true }
  
-@@ -297,7 +298,7 @@ local answers: { [string]: (arg: any) -> any } = {
+@@ -305,7 +306,7 @@ local answers: { [string]: (arg: any) -> any } = {
  				local w = table.clone(engine[get])
  				w.settings = arg.params
  				engine[get] = w
 -			elseif m == "SetTitleSettings" or m == "SetBackgroundSettings" then
 +			elseif m == "SetTitleSettings" or m == "SetBackgroundSettings" or m == "SetIdleCompactSettings" then
  				engine[get] = arg.params
- 			elseif m == "SetCodeMode" then
+ 			elseif m == "SetZeronMcpOnly" then
  				local cur = engine[get]
 diff --git a/apps/zgx/ui/shell_fixture.luau b/apps/zgx/ui/shell_fixture.luau
-index 23268be4fa0b6d396bcde468850ed47277ab2b50..668df5b68f6cebab8135d61ee3be2fd55d435bbe 100644
+index 9d524f03d0f8dc38ef9df815205c660fabdb3d38..54715a1a3f4b65f3ec380e4a649e9bf98ae79fc4 100644
 --- a/apps/zgx/ui/shell_fixture.luau
 +++ b/apps/zgx/ui/shell_fixture.luau
 @@ -263,7 +263,7 @@ local model = {
@@ -1254,20 +1211,20 @@ index 23268be4fa0b6d396bcde468850ed47277ab2b50..668df5b68f6cebab8135d61ee3be2fd5
  	note(`archive:{id}`)
  	for i, c in model.chats do
 diff --git a/apps/zgx/ui/templates/zeron-v2/.base.json b/apps/zgx/ui/templates/zeron-v2/.base.json
-index eefe38d9b228d5603bc0c172ba9f31b965eb9227..61ff6c5dbe8128ed8b17c069e14b2749e0d70b9f 100644
+index 68b8e43278a33d7f5a65c40eab26b12c8f33a0fa..3879238c9c9c9148d899753240340d04e2cadc7e 100644
 --- a/apps/zgx/ui/templates/zeron-v2/.base.json
 +++ b/apps/zgx/ui/templates/zeron-v2/.base.json
 @@ -1,7 +1,7 @@
  {
-   "ds/sidebar.luau": "6d5d8113d5768620",
+   "ds/sidebar.luau": "c9bf56e2bfe86e1b",
    "ds/tokens.luau": "0575770327f5e5f2",
--  "screens/chat/composer.luau": "a451ec6aaa53a23a",
-+  "screens/chat/composer.luau": "2152ee3bbada9d37",
-   "screens/chat/lane_tab.luau": "d9bfbad1abf57f73",
+-  "screens/chat/composer.luau": "ea7c318f85c7a305",
++  "screens/chat/composer.luau": "dd57d4a3683b1cb1",
+   "screens/chat/lane_tab.luau": "a9de653312018e30",
    "screens/panel/init.luau": "a0df0db6e977845f",
-   "screens/shell/init.luau": "302aa5fc3350cd0a",
+   "screens/shell/init.luau": "a537b2952cca2cfb",
 diff --git a/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau b/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
-index 3b291412de829e7896a924845c5887397db60a00..583465ec1a734cbf869f6329f7bd335cce857471 100644
+index ae04efc6a0903233e8a3a76d9a25631c96377d75..a37fec82429f74b3fbf171ad4f91c20c3b84540c 100644
 --- a/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
 +++ b/apps/zgx/ui/templates/zeron-v2/screens/chat/composer.luau
 @@ -32,6 +32,7 @@ local sessions = require("@account/sessions")
@@ -1297,7 +1254,7 @@ index 3b291412de829e7896a924845c5887397db60a00..583465ec1a734cbf869f6329f7bd335c
  	-- This device's outbox for the chat (#1256): sends uploading or stopped,
  	-- each removable where the engine can take one back. Whether it can is
  	-- asked once a chat has one, by taking out a send that isn't there (an
-@@ -1566,9 +1579,9 @@ local function Composer(): Node
+@@ -1583,9 +1596,9 @@ local function Composer(): Node
  			end,
  			-- (The only notice with an action: a sleeping machine's Wake.)
  			on_notice_action = machine.wake,
@@ -1504,10 +1461,10 @@ index 0000000000000000000000000000000000000000..c58fe79b604939e9ef9cf567b61fb96c
 +	expect(app:error()).to_be(nil)
 +end)
 diff --git a/crates/doc/src/parts.rs b/crates/doc/src/parts.rs
-index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c55969e0b7 100644
+index c97ee3abc06fd00bc174ca90f221712cfdb7c578..b1f3651a9c2ce431f71a07645f4ac24b6f799607 100644
 --- a/crates/doc/src/parts.rs
 +++ b/crates/doc/src/parts.rs
-@@ -377,6 +377,22 @@ pub enum MessagePart {
+@@ -382,6 +382,22 @@ pub enum MessagePart {
          #[serde(default, skip_serializing_if = "Option::is_none")]
          to_harness: Option<String>,
      },
@@ -1530,7 +1487,7 @@ index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c5
  }
  
  impl MessagePart {
-@@ -390,7 +406,8 @@ impl MessagePart {
+@@ -395,7 +411,8 @@ impl MessagePart {
              | MessagePart::Input { id, .. }
              | MessagePart::Error { id, .. }
              | MessagePart::Fork { id, .. }
@@ -1540,7 +1497,7 @@ index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c5
          }
      }
  
-@@ -437,6 +454,7 @@ impl MessagePart {
+@@ -442,6 +459,7 @@ impl MessagePart {
                  ..
              } => source_chat_id.len() + source_title.len(),
              MessagePart::Switch { from, to, .. } => from.len() + to.len(),
@@ -1548,7 +1505,7 @@ index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c5
          }
      }
  }
-@@ -683,6 +701,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
+@@ -728,6 +746,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                  }
              }
          }
@@ -1560,7 +1517,7 @@ index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c5
          AgentEvent::Error { message } => {
              let id = format!("e{}", out.len());
              out.push(MessagePart::Error {
-@@ -759,11 +782,64 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
+@@ -804,11 +827,64 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
          | AgentEvent::Usage { .. }
          | AgentEvent::PlanUsage { .. }
          | AgentEvent::ContextUsage { .. }
@@ -1625,7 +1582,7 @@ index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c5
  /// Stamp sidecar keys onto resolved tool parts that have sidecar content.
  ///
  /// Separate from the fold because the fold is chat-agnostic and pure; the
-@@ -963,6 +1039,34 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
+@@ -1010,6 +1086,34 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
  mod tests {
      use super::*;
  
@@ -1661,10 +1618,10 @@ index 2ea5cc2c3f57c2c705a9c5acd189ca2b0f316c34..3f8714be2d3b6baa9b1d540132fbf0c5
      fn a_review_folds_onto_its_call_and_a_later_one_replaces_it() {
          use zeron_proto::ToolReviewStatus;
 diff --git a/crates/doc/src/registry.rs b/crates/doc/src/registry.rs
-index ed711e5fc690f666e3bfa7a5cdb0908f4d613896..2f95d939b2d573a0a9f767572e8906a2a44ee455 100644
+index 965cfa1f2586cd39f1d5d40a28abd00bf3fc07d3..11fb13ee8acc8f8598fd2ba5f97f663a03c82cbb 100644
 --- a/crates/doc/src/registry.rs
 +++ b/crates/doc/src/registry.rs
-@@ -1677,6 +1677,33 @@ impl RegistryDoc {
+@@ -1679,6 +1679,33 @@ impl RegistryDoc {
          Ok(true)
      }
  
@@ -1699,7 +1656,7 @@ index ed711e5fc690f666e3bfa7a5cdb0908f4d613896..2f95d939b2d573a0a9f767572e8906a2
          Ok(self
              .overlay_row(KIND_CHATS, chat_id)
 diff --git a/crates/doc/src/schema.rs b/crates/doc/src/schema.rs
-index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c700994d907 100644
+index 0b0210e1d0d60723258c7d944a3938d6ec49c80a..d459ad3604dcda6927ebc5c98511cbdefd57b449 100644
 --- a/crates/doc/src/schema.rs
 +++ b/crates/doc/src/schema.rs
 @@ -117,6 +117,15 @@ struct DocPartJson {
@@ -1718,7 +1675,7 @@ index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c70
      /// Tool output summary (additive — absent on old rows and old writers;
      /// pre-strip writers stored up to 4KB of capped output here).
      #[serde(default, skip_serializing_if = "Option::is_none")]
-@@ -295,6 +304,19 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
+@@ -299,6 +308,19 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
              to_harness: to_harness.clone(),
              ..Default::default()
          },
@@ -1738,7 +1695,7 @@ index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c70
      })
  }
  
-@@ -376,6 +398,12 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
+@@ -381,6 +403,12 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
              from_harness: p.from_harness,
              to_harness: p.to_harness,
          },
@@ -1751,7 +1708,7 @@ index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c70
          _ => MessagePart::Text {
              id: p.id,
              text: p.text.unwrap_or_default(),
-@@ -712,7 +740,27 @@ impl SessionDoc {
+@@ -717,7 +745,27 @@ impl SessionDoc {
          let next = zeron_proto::ContextUsage {
              tokens: tokens.or(previous.tokens),
              window: window.filter(|n| *n > 0).or(previous.window),
@@ -1779,9 +1736,9 @@ index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c70
          if next != previous {
              self.doc
                  .get_map("meta")
-@@ -1700,6 +1748,22 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
-     if let Some(review) = &doc_part.review {
-         map.insert("review", loro_value_from_json(review))?;
+@@ -1708,6 +1756,22 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
+     if let Some(chats) = &doc_part.chats {
+         map.insert("chats", loro_value_from_json(&serde_json::json!(chats)))?;
      }
 +    write_compaction_fields(&map, &doc_part)?;
 +    Ok(())
@@ -1802,15 +1759,15 @@ index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c70
      Ok(())
  }
  
-@@ -2243,6 +2307,7 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
-     if let Some(review) = &doc_part.review {
-         map.insert("review", loro_value_from_json(review))?;
+@@ -2258,6 +2322,7 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
+     if let Some(chats) = &doc_part.chats {
+         map.insert("chats", loro_value_from_json(&serde_json::json!(chats)))?;
      }
 +    write_compaction_fields(map, &doc_part)?;
      if let Some(text) = &doc_part.text {
          // Defensive path only — the fold never rewrites earlier text.
          if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
-@@ -3887,7 +3952,8 @@ mod context_usage_tests {
+@@ -3906,7 +3971,8 @@ mod context_usage_tests {
              replica.context_usage(),
              Some(zeron_proto::ContextUsage {
                  tokens: Some(0),
@@ -1821,10 +1778,10 @@ index 021fe35fa33faf6a27a65d236347a44e8413f040..6994b42f11e97283f48c1b899e1e3c70
          );
          host.update_context_usage(None, Some(1_000_000)).unwrap();
 diff --git a/crates/doc/src/transcript_delta.rs b/crates/doc/src/transcript_delta.rs
-index 18cf1407f57eb9fbc42c1362499be1d9e579be0d..4918104dec0516dd75b277e5390778f0b2f2bc00 100644
+index 04f12cc74e8175666f371a253146015cfd3f8bd2..0a56645bd8486bdc72ba8799c2d69c6d968a5e26 100644
 --- a/crates/doc/src/transcript_delta.rs
 +++ b/crates/doc/src/transcript_delta.rs
-@@ -1073,6 +1073,7 @@ mod context_update_tests {
+@@ -1074,6 +1074,7 @@ mod context_update_tests {
              context_usage: Some(zeron_proto::ContextUsage {
                  tokens: Some(0),
                  window: Some(200000),
@@ -2348,19 +2305,19 @@ index 0000000000000000000000000000000000000000..3ddcaf1eda486e7a52c233d1963acf4a
 +    }
 +}
 diff --git a/crates/engine/src/registry.rs b/crates/engine/src/registry.rs
-index 68c8b65d70be7d3969931e9e8178170174499e77..f8b421ec4a6170f1523b6a8287d0d76a59741b32 100644
+index 31a2e144c1ea39033ae66dcc99376eb3dd3ad70e..592911bc1b5307235317494767e9cc1981a913aa 100644
 --- a/crates/engine/src/registry.rs
 +++ b/crates/engine/src/registry.rs
-@@ -113,6 +113,8 @@ struct HarnessPrefsFile {
-     native_subagents_off: Vec<HarnessId>,
-     /// Harnesses the user turned Code Mode on for.
-     code_mode_on: Vec<HarnessId>,
+@@ -118,6 +118,8 @@ struct HarnessPrefsFile {
+     /// Harnesses the user turned "Only Zeron's MCP servers" on for (off
+     /// until they do).
+     zeron_mcp_only_on: Vec<HarnessId>,
 +    /// "Compact idle chats" turned off (Settings → General): on unless set.
 +    compact_idle_chats_off: bool,
      /// The allow-list written back when enablement was a fixed default set.
      /// Read once, folded into `disabled`, and never written again.
      #[serde(skip_serializing)]
-@@ -129,6 +131,15 @@ pub struct TitleSettings {
+@@ -134,6 +136,15 @@ pub struct TitleSettings {
      pub model: Option<String>,
  }
  
@@ -2376,7 +2333,7 @@ index 68c8b65d70be7d3969931e9e8178170174499e77..f8b421ec4a6170f1523b6a8287d0d76a
  /// Per-device native subagent preferences (Settings → Providers).
  #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
  #[serde(default, rename_all = "camelCase")]
-@@ -711,6 +722,17 @@ impl HarnessRegistry {
+@@ -768,6 +779,17 @@ impl HarnessRegistry {
          Ok(())
      }
  
@@ -2395,10 +2352,10 @@ index 68c8b65d70be7d3969931e9e8178170174499e77..f8b421ec4a6170f1523b6a8287d0d76a
      /// by the user's choice, for a driver that can launch without them.
      pub fn native_subagents(&self, id: HarnessId) -> bool {
 diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
-index 0db6239742b097574cb34d83485815c62fe36428..43156a0d2a5f311cb8bdc6a5c088d9d228c4eef0 100644
+index 0e5fb2ffdbc5c06b4c10b7f36e5bfb9bcdafafdc..80b5bf3b130bf946e3dc63daabb33b490927c96f 100644
 --- a/crates/engine/src/rpc.rs
 +++ b/crates/engine/src/rpc.rs
-@@ -911,6 +911,14 @@ enum MutateParams {
+@@ -924,6 +924,14 @@ enum MutateParams {
          #[serde(default)]
          until: Option<i64>,
      },
@@ -2413,7 +2370,7 @@ index 0db6239742b097574cb34d83485815c62fe36428..43156a0d2a5f311cb8bdc6a5c088d9d2
  }
  
  #[derive(Clone)]
-@@ -2458,6 +2466,17 @@ impl EngineRpc {
+@@ -2543,6 +2551,17 @@ impl EngineRpc {
                      .map_err(failed)
                      .map(drop)
              }
@@ -2431,7 +2388,7 @@ index 0db6239742b097574cb34d83485815c62fe36428..43156a0d2a5f311cb8bdc6a5c088d9d2
              MutateParams::MarkChatSeen { chat_id, at } => {
                  let at = at
                      .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-@@ -2712,6 +2731,8 @@ fn forwardable(method: &str) -> bool {
+@@ -2797,6 +2816,8 @@ fn forwardable(method: &str) -> bool {
              | methods::CANCEL_INSTALL
              | methods::GET_TITLE_SETTINGS
              | methods::SET_TITLE_SETTINGS
@@ -2439,8 +2396,8 @@ index 0db6239742b097574cb34d83485815c62fe36428..43156a0d2a5f311cb8bdc6a5c088d9d2
 +            | methods::SET_IDLE_COMPACT_SETTINGS
              | methods::GET_COMMIT_CREDIT
              | methods::SET_COMMIT_CREDIT
-             | methods::GET_NATIVE_SUBAGENTS
-@@ -3648,6 +3669,17 @@ impl RpcService for EngineRpc {
+             | methods::GET_ASYNC_DELEGATION
+@@ -3843,6 +3864,17 @@ impl RpcService for EngineRpc {
                  RpcReply::value(&serde_json::json!({}))
              }
              methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
@@ -2459,7 +2416,7 @@ index 0db6239742b097574cb34d83485815c62fe36428..43156a0d2a5f311cb8bdc6a5c088d9d2
                  Some(credit) => RpcReply::value(&credit.status()),
                  None => Err(RpcError::Failed(
 diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
-index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac715e9f18 100644
+index 0c3890e787be170c0e358d1f28da68b69f3eac35..b16b53b28b8af181f1d59cde804ad2e16414ae57 100644
 --- a/crates/engine/src/sessions.rs
 +++ b/crates/engine/src/sessions.rs
 @@ -174,6 +174,12 @@ struct RunHandle {
@@ -2475,10 +2432,10 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
      /// Engine-level cancel: arms the run task's grace deadline so a harness that
      /// ignores its token can never strand the run.
      cancel: watch::Sender<bool>,
-@@ -352,6 +358,12 @@ struct Inner {
-     warm: Mutex<HashMap<String, warm_start::WarmStart>>,
-     /// Their leases (open, typed) when a test sets them.
-     warm_leases: Mutex<Option<(std::time::Duration, std::time::Duration)>>,
+@@ -381,6 +387,12 @@ struct Inner {
+     /// What each chat's own runtime waits on ([`ParkedWait`]), which its row
+     /// shows together with what it delegated.
+     runtime_waits: Mutex<HashMap<String, zeron_proto::SessionWaiting>>,
 +    /// Each chat's prompt cache, and the compactions armed before it
 +    /// expires ([`idle_compact`]).
 +    idle_compactions: Mutex<idle_compact::IdleCompactions>,
@@ -2487,8 +2444,8 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
 +    quiet_runs: Mutex<std::collections::HashSet<String>>,
  }
  
- /// How long a runtime parked between turns with nothing pending keeps its
-@@ -375,6 +387,12 @@ struct Inner {
+ /// See [`Inner::held_ends`].
+@@ -411,6 +423,12 @@ struct HeldEnd {
  /// it ([`zeron_harness::process::unexpected_descendants`]).
  pub const AGENT_IDLE_STOP: std::time::Duration = std::time::Duration::from_secs(120);
  
@@ -2501,7 +2458,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
  /// The idle window of drivers not stopped after [`AGENT_IDLE_STOP`].
  const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
  
-@@ -465,6 +483,9 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+@@ -501,6 +519,9 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
  
  #[path = "warm_start.rs"]
  mod warm_start;
@@ -2511,16 +2468,16 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
  pub use warm_start::WarmOutcome;
  
  fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-@@ -521,6 +542,8 @@ impl SessionsEngine {
-                 plugins: OnceLock::new(),
-                 warm: Mutex::new(HashMap::new()),
-                 warm_leases: Mutex::new(None),
+@@ -578,6 +599,8 @@ impl SessionsEngine {
+                 held_ends: Mutex::new(HashMap::new()),
+                 resuming: Mutex::default(),
+                 runtime_waits: Mutex::new(HashMap::new()),
 +                idle_compactions: Mutex::new(idle_compact::IdleCompactions::default()),
 +                quiet_runs: Mutex::new(std::collections::HashSet::new()),
              }),
          }
      }
-@@ -1008,6 +1031,13 @@ impl SessionsEngine {
+@@ -1138,6 +1161,13 @@ impl SessionsEngine {
          if !self.turn_in_flight(chat_id) {
              return false;
          }
@@ -2534,10 +2491,10 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
          let live = lock(&self.inner.runs).get(chat_id).map(|h| {
              (
                  h.runtime_config.harness_id,
-@@ -1266,6 +1296,16 @@ impl SessionsEngine {
-         // `drive_run`; normalize here so parked-session routing and mid-turn
+@@ -1397,6 +1427,16 @@ impl SessionsEngine {
          // guards go through `code_mode_changed`.
          request.code_mode = false;
+         request.zeron_mcp_only = false;
 +        // The engine's own `/compact` for an idle chat ([`idle_compact`]):
 +        // no user message, preview, title or turn snapshot. Any other turn
 +        // takes the chat out of its idle spell: a compaction armed for it
@@ -2551,7 +2508,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
          let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
              (
                  h.run_id.clone(),
-@@ -1387,19 +1427,28 @@ impl SessionsEngine {
+@@ -1524,19 +1564,28 @@ impl SessionsEngine {
                      lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
                  }
                  let handle = self.doc_handle(chat_id)?;
@@ -2583,7 +2540,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                      return Ok(run_id);
                  }
                  // The run died around the send. If its exit drain already
-@@ -1412,7 +1461,9 @@ impl SessionsEngine {
+@@ -1549,7 +1598,9 @@ impl SessionsEngine {
                      ledger.len() != before
                  };
                  if !reclaimed {
@@ -2594,7 +2551,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                      return Ok(run_id);
                  }
                  // Keep the already-written doc entry's id for the fresh run
-@@ -1457,7 +1508,7 @@ impl SessionsEngine {
+@@ -1594,7 +1645,7 @@ impl SessionsEngine {
          if !idle && revival.is_none() && !startup_retry && spawn_attempt == 0 {
              self.inner.journal.clear_resume_attempts(chat_id);
          }
@@ -2603,7 +2560,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
              // A chat whose last provider session belongs to another harness
              // has changed provider: mark the seam above this message, before
              // the resume lookup below turns the foreign session id away.
-@@ -1548,6 +1599,11 @@ impl SessionsEngine {
+@@ -1687,6 +1738,11 @@ impl SessionsEngine {
          let interrupt_token = CancellationToken::new();
          let turn = TurnControl::default();
          let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2615,7 +2572,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
          let fork_history_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
          let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
          let voice_active = Arc::new(VoiceActivity::default());
-@@ -1627,6 +1683,7 @@ impl SessionsEngine {
+@@ -1766,6 +1822,7 @@ impl SessionsEngine {
                  redeliver: Arc::new(Mutex::new(Vec::new())),
                  turn: turn.clone(),
                  started: started.clone(),
@@ -2623,7 +2580,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                  cancel: cancel_tx,
                  engine_tx,
                  pending_inputs,
-@@ -1652,9 +1709,21 @@ impl SessionsEngine {
+@@ -1793,9 +1850,21 @@ impl SessionsEngine {
          );
          // AFTER Working (same causal-order guarantee as the steer path): the
          // lastMessageAt bump must never be observable ahead of the live run.
@@ -2646,7 +2603,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
  
          // Name the chat off the first prompt as soon as the agent answers —
          // not after the first exchange completes ("called New session for a
-@@ -1662,7 +1731,7 @@ impl SessionsEngine {
+@@ -1803,7 +1872,7 @@ impl SessionsEngine {
          // skips titled chats; the Done-time call below stays as the retry
          // for a failed generation). Not before the agent's first output:
          // the titling agent's own startup competed with this one's.
@@ -2655,7 +2612,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
              .then(|| self.inner.titles.get().cloned())
              .flatten()
              .map(|titles| {
-@@ -1696,6 +1765,7 @@ impl SessionsEngine {
+@@ -1837,6 +1906,7 @@ impl SessionsEngine {
                  stops_seen: stops,
                  fork_history_sent,
                  started,
@@ -2663,7 +2620,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
              },
              turn,
              side_chats_only,
-@@ -2391,6 +2461,7 @@ impl SessionsEngine {
+@@ -2567,6 +2637,7 @@ impl SessionsEngine {
                      if fresh
                          && !stopped
                          && !(crashed && tail.finished)
@@ -2671,7 +2628,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                          && prompt
                              .as_ref()
                              .is_some_and(|(_, text)| !native_command(text, *harness_id)) =>
-@@ -3976,6 +4047,177 @@ fn format_history_prompt(
+@@ -4417,6 +4488,177 @@ fn format_history_prompt(
      ))
  }
  
@@ -2849,7 +2806,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
  /// Whether the provider routes this prompt as a native command: a command
  /// selected in the composer leads it, or its delivered text leads with a
  /// `/name` in the command grammar (Codex `command_request`, OpenCode
-@@ -4036,6 +4278,10 @@ struct TurnTail {
+@@ -4477,6 +4719,10 @@ struct TurnTail {
      /// Nothing of the parent turn at all, only subagent traffic after the
      /// last `Done`: that turn had finished.
      finished: bool,
@@ -2860,7 +2817,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
  }
  
  /// [`TurnTail`] from a chat's journal events, newest first, read back to the
-@@ -4068,6 +4314,7 @@ fn turn_tail(events: impl Iterator<Item = AgentEvent>, closed: bool) -> TurnTail
+@@ -4509,6 +4755,7 @@ fn turn_tail(events: impl Iterator<Item = AgentEvent>, closed: bool) -> TurnTail
              | AgentEvent::Visual { .. }
              | AgentEvent::AssistantMessageCompleted { .. }
              | AgentEvent::Steered { .. } => tail.reached_provider = true,
@@ -2868,7 +2825,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
              _ => {}
          }
          tail.finished = false;
-@@ -4563,6 +4810,8 @@ struct RunResumeState {
+@@ -5006,6 +5253,8 @@ struct RunResumeState {
      fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
      /// Set once the harness stream is open (see [`RunHandle::started`]).
      started: Arc<std::sync::atomic::AtomicBool>,
@@ -2877,7 +2834,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
  }
  
  fn cursor_unstarted_history(
-@@ -4972,7 +5221,9 @@ async fn drive_run(
+@@ -5433,7 +5682,9 @@ async fn drive_run(
              if let Some(lease) = lease {
                  _execution_lease = Some(lease.clone());
                  controls.execution_lease = Some(lease);
@@ -2888,7 +2845,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                      listener(&chat_id, &request.cwd);
                  }
                  let mut wire_request = request;
-@@ -5412,6 +5663,10 @@ async fn drive_run(
+@@ -5873,6 +6124,10 @@ async fn drive_run(
  
      let mut final_completed_turn = None;
      let mut final_outcome = None;
@@ -2899,7 +2856,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
      let final_status = loop {
          let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
              event
-@@ -5486,6 +5741,7 @@ async fn drive_run(
+@@ -5947,6 +6202,7 @@ async fn drive_run(
                      // background task's ending wakes the agent too.)
                      self_scheduled.woke(tokio::time::Instant::now());
                      if idle_since.is_some() {
@@ -2907,7 +2864,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                          tracing::info!(chat = %chat_id, "parked session resumed by a wake turn");
                          idle_since = None;
                          wait = None;
-@@ -6030,6 +6286,12 @@ async fn drive_run(
+@@ -6493,6 +6749,12 @@ async fn drive_run(
              }
              continue;
          }
@@ -2920,7 +2877,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
          // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
          if let AgentEvent::ContextUsage { tokens, window } = &event {
              if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
-@@ -6082,6 +6344,7 @@ async fn drive_run(
+@@ -6545,6 +6807,7 @@ async fn drive_run(
                  idle_since = None;
                  wait = None;
                  self_continued_turn = true;
@@ -2928,7 +2885,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                  // The park cleared the fold; rotate to a fresh entry and
                  // fall through — this event is the new segment's first part.
                  entry_id = new_id();
-@@ -6307,6 +6570,38 @@ async fn drive_run(
+@@ -6784,6 +7047,38 @@ async fn drive_run(
              event => event,
          };
  
@@ -2967,7 +2924,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
          // A steer boundary splits the assistant entry exactly where the fold resets.
          if let AgentEvent::Steered {
              next_assistant_message_id,
-@@ -6314,6 +6609,7 @@ async fn drive_run(
+@@ -6791,6 +7086,7 @@ async fn drive_run(
          } = &event
          {
              inner.publish(&chat_id, &event);
@@ -2975,7 +2932,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
              // A steer boundary means a real prompt owns the turn again — its
              // Done will come; the short self-continued window stands down.
              self_continued_turn = false;
-@@ -6518,10 +6814,24 @@ async fn drive_run(
+@@ -6999,10 +7295,24 @@ async fn drive_run(
              // way (see `continues_with_sent_message`); rows the user queued
              // themselves still notify.
              let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
@@ -3000,7 +2957,7 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
                  && !inner.continues_with_sent_message(&chat_id))
              .then(|| entry_id.clone());
              // PERSISTENT SESSION: a cleanly completed turn on a steerable
-@@ -8198,6 +8508,47 @@ mod tests {
+@@ -8677,6 +8987,47 @@ mod tests {
          rig.core.sessions.shutdown().await;
      }
  
@@ -3049,10 +3006,10 @@ index 44c84a716746acd5132769cf58915d3557551d73..09d35d325df9d150ef670ece0efbe3ac
      async fn work_ending_with_no_wake_turn_marks_the_held_end_after_its_grace() {
          let rig = wake_rig("chat-wait-lost", true).await;
 diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
-index be16dcf4fbf737a9f59ac562dae9fa671042bb01..e814397b8a1a9c036bff6b6c2806f40529c350bb 100644
+index a91ccef5f2310580a522819cd9ddbf18e384d9ad..45ee49ba9ebc078482078fd2f6beecce350d9c92 100644
 --- a/crates/engine/src/workspace_host.rs
 +++ b/crates/engine/src/workspace_host.rs
-@@ -1362,6 +1362,20 @@ impl WorkspaceHost {
+@@ -1383,6 +1383,20 @@ impl WorkspaceHost {
          Ok(self.mutate(|doc| doc.set_chat_sleep(chat_id, until, Utc::now()))?)
      }
  
@@ -3074,10 +3031,10 @@ index be16dcf4fbf737a9f59ac562dae9fa671042bb01..e814397b8a1a9c036bff6b6c2806f405
      /// person, or fail). `false` when it wasn't asleep.
      pub fn wake_chat(&self, chat_id: &str, at: chrono::DateTime<Utc>) -> Result<bool, EngineError> {
 diff --git a/crates/engine/tests/e2e.rs b/crates/engine/tests/e2e.rs
-index 9197ed9d295b764d34224585f90931f6f76b5121..86ef22637fe20740426daae237b0469042ea213e 100644
+index 8d34a64895b1c6a2d416e41ec908ee8b23abbb75..0dfbfc25811999a6a0dbb681af72887ef09c5b67 100644
 --- a/crates/engine/tests/e2e.rs
 +++ b/crates/engine/tests/e2e.rs
-@@ -3104,7 +3104,8 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
+@@ -3107,7 +3107,8 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
          handle.doc().context_usage(),
          Some(zeron_proto::ContextUsage {
              tokens: Some(0),
@@ -3089,10 +3046,10 @@ index 9197ed9d295b764d34224585f90931f6f76b5121..86ef22637fe20740426daae237b04690
      assert_eq!(
 diff --git a/crates/engine/tests/idle_compact_live.rs b/crates/engine/tests/idle_compact_live.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..63e492cbfa4f1ebf665b54b009e26a55369b7e90
+index 0000000000000000000000000000000000000000..a942310d06084a975925dc1a95c2dcb4e4728023
 --- /dev/null
 +++ b/crates/engine/tests/idle_compact_live.rs
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,168 @@
 +//! Opt-in real-model check of compacting an idle chat: a Claude Code turn
 +//! ends, the engine arms its compaction (here 15 s after the turn's last
 +//! request rather than 2 min before an hour's cache expires, and for any
@@ -3199,6 +3156,7 @@ index 0000000000000000000000000000000000000000..63e492cbfa4f1ebf665b54b009e26a55
 +                    access: Default::default(),
 +                    plan: false,
 +                    code_mode: false,
++                    zeron_mcp_only: false,
 +                    attachments: vec![],
 +                    worktree: None,
 +                    resume: None,
@@ -3676,7 +3634,7 @@ index c6f7e398fc654f2f7f814fe4388d6185e4257b81..843190fdac4c4c3d4b3523f4781aaae3
      };
      Ok(frame)
 diff --git a/crates/mcp/src/transcript.rs b/crates/mcp/src/transcript.rs
-index 90d1e78ce30eb7e48eb7d1f0d6f0c4be536598d0..a01e3bed46bf210d99e0bbd1c7f5f2ba0b5477fa 100644
+index 8553483f473fe73c5239ca427eaf9557cf7f0890..22aff4451189a0669fc258be7f2cbff1feafa76b 100644
 --- a/crates/mcp/src/transcript.rs
 +++ b/crates/mcp/src/transcript.rs
 @@ -162,6 +162,20 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
@@ -3701,10 +3659,10 @@ index 90d1e78ce30eb7e48eb7d1f0d6f0c4be536598d0..a01e3bed46bf210d99e0bbd1c7f5f2ba
      }
      RenderedMessage {
 diff --git a/crates/proto/src/agent.rs b/crates/proto/src/agent.rs
-index f9ff17d9ec6bb954e97b2ebe923e46049fe1526c..685ab83caac98a0423d02a3bcf4d65461cce152a 100644
+index 6c036682749225c5aa78fbc1e539c344b0428ba6..5876c35ca610e01cfda3eec46e9f71e72bdf8c17 100644
 --- a/crates/proto/src/agent.rs
 +++ b/crates/proto/src/agent.rs
-@@ -1299,6 +1299,32 @@ pub enum AgentEvent {
+@@ -1324,6 +1324,32 @@ pub enum AgentEvent {
          tokens: Option<u64>,
          window: Option<u64>,
      },
@@ -3737,7 +3695,7 @@ index f9ff17d9ec6bb954e97b2ebe923e46049fe1526c..685ab83caac98a0423d02a3bcf4d6546
      /// The subscription's usage as the provider reported it mid-run (Muse's
      /// `usage/changed`): the engine records it on the account the run used,
      /// for the Providers meters. Never persisted to docs.
-@@ -1664,6 +1690,12 @@ mod tests {
+@@ -1704,6 +1730,12 @@ mod tests {
  pub struct ContextUsage {
      pub tokens: Option<u64>,
      pub window: Option<u64>,
@@ -3751,7 +3709,7 @@ index f9ff17d9ec6bb954e97b2ebe923e46049fe1526c..685ab83caac98a0423d02a3bcf4d6546
  
  impl ContextUsage {
 diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
-index 81846568e19f67f020e5f363277ca865adfa2cbc..add4865f3dfd93ae68fbe4c5c21510d43db62f4f 100644
+index f3189549fe70a42e6069d988269db32e797653cf..998b9966ca2de753db1668d4afb66a052d41f60f 100644
 --- a/crates/rpc/src/lib.rs
 +++ b/crates/rpc/src/lib.rs
 @@ -77,6 +77,10 @@ pub mod methods {
