@@ -1,0 +1,85 @@
+From 117d4dfa5b69d2c837b358945dc60cb2bd1d156f Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 14:13:32 +0700
+Subject: [PATCH] Menus: a row that opens a submenu lines up with the rows
+ beside it on Windows
+
+zgx gives a ui.menu_item WinUI's margin on Windows (4 across, 2 down)
+unless the row sets one. Menu.look's rows are full width and inset by
+their group, so a submenu's trigger (a chat menu's Copy, Sleep, Move to)
+sat 4 in from Rename and Archive, 2 lower. Menu.look sets no margin, so
+every menu_item built with it (context menu, composer, select, split
+button, file viewer) lines up as a ui.row does. tests/menu_rows_line_up
+checks a chat menu's rows; composer_place's submenu gap test passes on
+Windows with it.
+---
+ apps/zgx/ui/ds/menu.luau                      |  4 ++
+ apps/zgx/ui/tests/menu_rows_line_up.test.luau | 41 +++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+ create mode 100644 apps/zgx/ui/tests/menu_rows_line_up.test.luau
+
+diff --git a/apps/zgx/ui/ds/menu.luau b/apps/zgx/ui/ds/menu.luau
+index fcbcc6c5926e48da57a763d86c3a83dc8a2b0a0b..20c0a8b2ce05934322eb83940e241943e1fd2bf3 100644
+--- a/apps/zgx/ui/ds/menu.luau
++++ b/apps/zgx/ui/ds/menu.luau
+@@ -114,6 +114,10 @@ end
+ -- a menu row. `tall`: it grows past a row (a description under it).
+ function M.look(props: { [any]: any }, tall: boolean?): { [any]: any }
+ 	props.w_full = true
++	-- No margin: a `ui.menu_item` has WinUI's on Windows (4 across, 2
++	-- down), which would set it in from the rows beside it.
++	props.mx = props.mx or 0
++	props.my = props.my or 0
+ 	props.px = "$space.2"
+ 	props.gap = "$space.2"
+ 	props.rounded = M.row_radius()
+diff --git a/apps/zgx/ui/tests/menu_rows_line_up.test.luau b/apps/zgx/ui/tests/menu_rows_line_up.test.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..d53d310bd6b2be8b3a432bc1d7f91920ae299351
+--- /dev/null
++++ b/apps/zgx/ui/tests/menu_rows_line_up.test.luau
+@@ -0,0 +1,41 @@
++-- A menu's rows line up: one opening a submenu (zgx's `ui.menu_item`, its
++-- trigger) starts, ends and stands as tall as a plain row beside it. On
++-- Windows zgx gives a menu item WinUI's margin (4 across, 2 down) unless
++-- the row says otherwise, which pushed "Copy" and "Sleep" in from "Rename"
++-- in a chat's menu. On the shell in ui/shell_fixture.luau.
++
++local SIDE = "#shell-sidebar"
++
++local function box(line: string): (number, number, number, number)
++	local x, y, w, h = line:match(" (%-?[%d.]+),(%-?[%d.]+) ([%d.]+)x([%d.]+)")
++	return tonumber(x) :: number, tonumber(y) :: number, tonumber(w) :: number, tonumber(h) :: number
++end
++
++-- A row of the open menu, by its name: its box.
++local function row(app: any, name: string): (number, number, number, number)
++	for line in app:tree():gmatch("[^\n]+") do
++		if line:find(` menuitem "{name}"`, 1, true) then
++			return box(line)
++		end
++	end
++	error(`no menu row "{name}" in:\n{app:tree()}`)
++end
++
++test("a chat's menu: Copy and Move to, which open submenus, line up with Rename and Archive, a row apart", function()
++	local app = mount("shell_fixture.luau")
++	app:resize(1200, 900)
++	app:frames(30)
++	app:right_click(`{SIDE} >> role:button "Write the docs"`)
++	app:frames(30)
++	local rx, ry, rw, rh = row(app, "Rename")
++	local _, py = row(app, "Pin")
++	local step = py - ry
++	for _, name in { "Copy", "Move to", "Archive" } do
++		local x, _, w, h = row(app, name)
++		expect(`{name}: x {x}, w {w}, h {h}`).to_be(`{name}: x {rx}, w {rw}, h {rh}`)
++	end
++	-- No room of its own round a submenu's row: Copy is a row under Pin.
++	local _, cy = row(app, "Copy")
++	expect(`Copy {cy - py} under Pin`).to_be(`Copy {step} under Pin`)
++	expect(app:error()).to_be_nil()
++end)
+-- 
+2.55.0.windows.2
+
