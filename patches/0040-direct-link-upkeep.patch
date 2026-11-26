@@ -1,0 +1,596 @@
+From 60635786590c8add66b22970aaea3bd1cc1c4185 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 19:32:37 +0700
+Subject: [PATCH] The direct link to a shown chat's computer is kept up, says
+ which way it went, and skips host-only adapters
+
+- A chat hosted on another of the person's computers, opened in a window,
+  gets the direct link to that computer ready and keeps it up while it
+  shows: zgx asks WarmDeviceLink when the chat opens and every 60 s after
+  (the engine closes a link unused for five minutes), and stops when
+  another chat opens there or the engine says there's no link to keep
+  (hosted here, a host on the relay alone, an engine from before).
+- Once a link is up, each end logs at INFO which way it went, from the
+  ICE stats: "direct link up" with route = "host 192.168.1.20:50123 ->
+  srflx 203.0.113.9:61002 udp, rtt 2 ms" (the selected candidate pair's
+  types, addresses and ports, and its round trip). Peers::route gives the
+  same line on demand. A slow link was otherwise a guess.
+- On Windows, ICE no longer binds the host-only virtual switches WSL,
+  Hyper-V, Docker Desktop, VirtualBox and VMware add (vEthernet (WSL),
+  vEthernet (Default Switch), ...). Nothing else can reach them, and each
+  connectivity check from them to another network failed with
+  WSAENETUNREACH (10051), about fifty ERRORs a pairing. When no addresses
+  were configured, PreviewService now passes the IPv4 addresses of the
+  adapters that are up (GetAdaptersAddresses), minus those switches,
+  instead of the 0.0.0.0 wildcard. A virtual switch with a default gateway
+  stays (a Hyper-V external switch carries the real LAN on vEthernet), as
+  does a tailnet's adapter. Read afresh for each connection. If the
+  adapters can't be listed or nothing is left, the wildcard, as before.
+  Elsewhere nothing changes. windows-sys gains the IpHelper, Ndis and
+  Foundation features (no new crates).
+
+Tests: peer's an_open_link_says_which_way_it_goes (a loopback pair: both
+ends name the host pair); interfaces' host_only_switches_are_left_out_and_real_networks_kept
+(the adapters of the desktop that logged the 10051s),
+a_virtual_switch_carrying_the_lan_stays and
+nothing_usable_binds_nothing_so_the_wildcard_stays. The Windows listing
+type-checks for x86_64-pc-windows-msvc; it hasn't run on Windows yet.
+---
+ apps/zgx/src/chat.rs             |  30 ++++
+ crates/preview/Cargo.toml        |   7 +-
+ crates/preview/src/interfaces.rs | 259 +++++++++++++++++++++++++++++++
+ crates/preview/src/lib.rs        |   1 +
+ crates/preview/src/peer.rs       | 116 +++++++++++++-
+ 5 files changed, 409 insertions(+), 4 deletions(-)
+ create mode 100644 crates/preview/src/interfaces.rs
+
+diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
+index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c3449ce40 100644
+--- a/apps/zgx/src/chat.rs
++++ b/apps/zgx/src/chat.rs
+@@ -876,6 +876,8 @@ struct View {
+     pending: RefCell<HashMap<String, Vec<Pending>>>,
+     /// Moves on every open: an older watch's frames are dropped.
+     generation: Cell<u64>,
++    /// Moves on every open: an older chat's link stops being kept warm.
++    link_kept: Cell<u64>,
+     /// A finished subagent's transcript, read whole from its uploaded blob
+     /// (a lane's): nothing to watch while it stands.
+     snapshot: Cell<bool>,
+@@ -1227,6 +1229,7 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+         open: RefCell::default(),
+         pending: RefCell::default(),
+         generation: Cell::new(0),
++        link_kept: Cell::new(0),
+         snapshot: Cell::new(false),
+     });
+     chats.views.borrow_mut().push(Rc::downgrade(&view));
+@@ -1515,6 +1518,7 @@ fn lane_view(host: &ScriptHost, slot: &str) -> Rc<View> {
+         open: RefCell::default(),
+         pending: RefCell::default(),
+         generation: Cell::new(0),
++        link_kept: Cell::new(0),
+         snapshot: Cell::new(false),
+     });
+     chats.views.borrow_mut().push(Rc::downgrade(&view));
+@@ -2609,6 +2613,7 @@ impl View {
+         }
+         self.draft.set(draft_value("", ""));
+         self.subscribe();
++        self.keep_link_warm();
+         let held = chats.held.borrow().clone();
+         self.follow_held(&held);
+         self.publish_messages();
+@@ -2657,6 +2662,28 @@ impl View {
+         });
+     }
+ 
++    /// While a chat hosted on another device shows, the direct link to
++    /// that device is got ready and kept up: a file or a long reply then
++    /// takes it from the first byte instead of starting on the relay while
++    /// pairing is under way. Asked again every [`LINK_KEPT_EVERY`] (the
++    /// engine closes a link unused for five minutes); it stops when another
++    /// chat opens here, or when the engine says there's no link to keep
++    /// (hosted here, a host on the relay alone, an engine from before).
++    fn keep_link_warm(self: &Rc<Self>) {
++        let turn = self.link_kept.get() + 1;
++        self.link_kept.set(turn);
++        let Some(id) = self.open_id() else { return };
++        let weak = Rc::downgrade(self);
++        engine::get().spawn(async move {
++            while warm_link(&id).await {
++                zgx::timer::sleep(LINK_KEPT_EVERY).await;
++                if weak.upgrade().is_none_or(|view| view.link_kept.get() != turn) {
++                    return;
++                }
++            }
++        });
++    }
++
+     fn open_id(&self) -> Option<String> {
+         self.open.borrow().as_ref().map(|o| o.id.clone())
+     }
+@@ -4113,6 +4140,9 @@ async fn warm(args: Value) -> Result<Value, Outcome> {
+     Ok(answer["outcome"].as_str().map(Value::from).unwrap_or(Value::Nil))
+ }
+ 
++/// How often a shown chat's direct link is asked to stay up.
++const LINK_KEPT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
++
+ /// Ask the engine to get the direct link to `chat`'s host ready
+ /// (`WarmDeviceLink`): pairing takes most of a second, and a file sent while
+ /// it's under way used to start, and stay, on the slow relay. `false`: the
+diff --git a/crates/preview/Cargo.toml b/crates/preview/Cargo.toml
+index 04cf0a014894162d66411309c4ac08a55add24eb..f687494df8a937eb5e2b3e93e5a192464130ef17 100644
+--- a/crates/preview/Cargo.toml
++++ b/crates/preview/Cargo.toml
+@@ -29,7 +29,12 @@ http-body-util = "0.1"
+ webrtc = "0.20.2"
+ 
+ [target.'cfg(windows)'.dependencies]
+-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
++windows-sys = { version = "0.61", features = [
++    "Win32_Foundation",
++    "Win32_NetworkManagement_IpHelper",
++    "Win32_NetworkManagement_Ndis",
++    "Win32_Networking_WinSock",
++] }
+ 
+ [dev-dependencies]
+ tempfile.workspace = true
+diff --git a/crates/preview/src/interfaces.rs b/crates/preview/src/interfaces.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..12fab02de5a632ce092e69e8f7da9d929cd0fae4
+--- /dev/null
++++ b/crates/preview/src/interfaces.rs
+@@ -0,0 +1,259 @@
++//! Which local addresses ICE gathers host candidates from.
++//!
++//! The wildcard (`0.0.0.0:0`) binds a socket on every IPv4 interface. On a
++//! Windows machine with WSL, Hyper-V or Docker Desktop that includes their
++//! host-only switches (`vEthernet (WSL)`, `vEthernet (Default Switch)`). No
++//! other device can reach those, and every connectivity check sent from them
++//! to another network fails with WSAENETUNREACH (10051): about fifty ERRORs
++//! a pairing, and checks that only delay the ones that can work.
++//!
++//! So on Windows the wildcard becomes the addresses of the adapters that are
++//! up, minus host-only virtual switches. A virtual switch with a default
++//! gateway stays: a Hyper-V external switch carries the machine's real LAN
++//! on a `vEthernet` adapter. When the adapters can't be listed, or nothing is
++//! left, the wildcard stays as it was.
++// (Only Windows lists its adapters; elsewhere ICE binds every interface.)
++#![cfg_attr(not(any(windows, test)), allow(dead_code))]
++use std::net::Ipv4Addr;
++
++/// What ICE binds when told nothing else.
++pub(crate) const WILDCARD: &str = "0.0.0.0:0";
++
++/// A network adapter, as far as choosing candidates goes.
++#[derive(Debug, Clone, Default)]
++pub(crate) struct Adapter {
++    pub name: String,
++    pub description: String,
++    pub up: bool,
++    pub loopback: bool,
++    /// It has a default gateway: other networks are reached through it.
++    pub gateway: bool,
++    pub ipv4: Vec<Ipv4Addr>,
++}
++
++/// Names of virtual switches and host-only adapters, lowercase.
++const VIRTUAL: &[&str] = &[
++    "vethernet",
++    "hyper-v",
++    "wsl",
++    "virtualbox",
++    "vbox",
++    "vmware",
++    "docker",
++];
++
++impl Adapter {
++    /// A virtual switch only this machine and its VMs are on.
++    fn host_only(&self) -> bool {
++        let name = self.name.to_lowercase();
++        let description = self.description.to_lowercase();
++        !self.gateway
++            && VIRTUAL
++                .iter()
++                .any(|word| name.contains(word) || description.contains(word))
++    }
++}
++
++/// The addresses to bind, one `ip:0` per usable IPv4 address, in adapter
++/// order. Loopback and link-local are left out, as the wildcard's expansion
++/// leaves them out.
++pub(crate) fn bind_addrs(adapters: &[Adapter]) -> Vec<String> {
++    let mut addrs: Vec<String> = Vec::new();
++    for adapter in adapters
++        .iter()
++        .filter(|a| a.up && !a.loopback && !a.host_only())
++    {
++        for ip in &adapter.ipv4 {
++            if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
++                continue;
++            }
++            let addr = format!("{ip}:0");
++            if !addrs.contains(&addr) {
++                addrs.push(addr);
++            }
++        }
++    }
++    addrs
++}
++
++/// The addresses to bind for a new connection when none were configured.
++/// Read afresh each time, so a network that changed is followed.
++pub(crate) fn default_udp_addrs() -> Vec<String> {
++    #[cfg(windows)]
++    match windows::adapters() {
++        Ok(adapters) => {
++            let addrs = bind_addrs(&adapters);
++            let skipped: Vec<&str> = adapters
++                .iter()
++                .filter(|a| a.up && a.host_only())
++                .map(|a| a.name.as_str())
++                .collect();
++            if !addrs.is_empty() {
++                tracing::debug!(?addrs, ?skipped, "preview ICE binds these addresses");
++                return addrs;
++            }
++        }
++        Err(error) => tracing::debug!(%error, "network adapters not listed; ICE binds every interface"),
++    }
++    vec![WILDCARD.to_owned()]
++}
++
++#[cfg(windows)]
++mod windows {
++    use super::Adapter;
++    use std::net::Ipv4Addr;
++    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
++    use windows_sys::Win32::NetworkManagement::IpHelper::{
++        GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
++        GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK,
++        IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
++    };
++    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
++    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN};
++    use windows_sys::core::PWSTR;
++
++    /// The machine's adapters with their IPv4 addresses and whether each has
++    /// a gateway.
++    pub(super) fn adapters() -> std::io::Result<Vec<Adapter>> {
++        let flags = GAA_FLAG_INCLUDE_GATEWAYS
++            | GAA_FLAG_SKIP_ANYCAST
++            | GAA_FLAG_SKIP_MULTICAST
++            | GAA_FLAG_SKIP_DNS_SERVER;
++        // Microsoft's advice: start at 15 KB, grow to what the call asks for.
++        let mut size: u32 = 15 * 1024;
++        let mut buffer: Vec<u64>;
++        let mut tries = 0;
++        loop {
++            // u64s, so the list is 8-byte aligned as its structs need.
++            buffer = vec![0u64; (size as usize).div_ceil(8)];
++            // SAFETY: `buffer` holds `size` writable bytes, and `size` says so.
++            let status = unsafe {
++                GetAdaptersAddresses(
++                    u32::from(AF_INET),
++                    flags,
++                    std::ptr::null(),
++                    buffer.as_mut_ptr().cast(),
++                    &mut size,
++                )
++            };
++            match status {
++                ERROR_SUCCESS => break,
++                ERROR_BUFFER_OVERFLOW if tries < 3 => tries += 1,
++                _ => return Err(std::io::Error::from_raw_os_error(status as i32)),
++            }
++        }
++        let mut adapters = Vec::new();
++        let mut next = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
++        // SAFETY: on success the buffer holds a linked list the call wrote,
++        // every pointer in it into the buffer (or null), which lives until
++        // the end of this function.
++        while let Some(adapter) = unsafe { next.as_ref() } {
++            let mut ipv4 = Vec::new();
++            let mut unicast: *const IP_ADAPTER_UNICAST_ADDRESS_LH = adapter.FirstUnicastAddress;
++            while let Some(address) = unsafe { unicast.as_ref() } {
++                if let Some(ip) = unsafe { v4(address.Address.lpSockaddr) } {
++                    ipv4.push(ip);
++                }
++                unicast = address.Next;
++            }
++            adapters.push(Adapter {
++                name: unsafe { wide(adapter.FriendlyName) },
++                description: unsafe { wide(adapter.Description) },
++                up: adapter.OperStatus == IfOperStatusUp,
++                loopback: adapter.IfType == IF_TYPE_SOFTWARE_LOOPBACK,
++                gateway: !adapter.FirstGatewayAddress.is_null(),
++                ipv4,
++            });
++            next = adapter.Next;
++        }
++        Ok(adapters)
++    }
++
++    /// The IPv4 address a socket address holds, if it holds one.
++    ///
++    /// SAFETY: `address` is null or points at a socket address of its
++    /// family's size.
++    unsafe fn v4(address: *const SOCKADDR) -> Option<Ipv4Addr> {
++        let family = unsafe { address.as_ref()? }.sa_family;
++        if family != AF_INET {
++            return None;
++        }
++        let address = unsafe { &*address.cast::<SOCKADDR_IN>() };
++        // Network byte order, as it lies in memory.
++        let raw = unsafe { address.sin_addr.S_un.S_addr };
++        Some(Ipv4Addr::from(raw.to_ne_bytes()))
++    }
++
++    /// A NUL-terminated UTF-16 string.
++    ///
++    /// SAFETY: `text` is null or NUL-terminated.
++    unsafe fn wide(text: PWSTR) -> String {
++        if text.is_null() {
++            return String::new();
++        }
++        let mut len = 0;
++        while unsafe { *text.add(len) } != 0 {
++            len += 1;
++        }
++        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn adapter(name: &str, description: &str, gateway: bool, ip: &str) -> Adapter {
++        Adapter {
++            name: name.into(),
++            description: description.into(),
++            up: true,
++            loopback: false,
++            gateway,
++            ipv4: vec![ip.parse().unwrap()],
++        }
++    }
++
++    /// The adapters of the desktop whose pairings logged ~50 10051 ERRORs.
++    #[test]
++    fn host_only_switches_are_left_out_and_real_networks_kept() {
++        let adapters = [
++            adapter("Ethernet", "Intel(R) Ethernet Connection", true, "192.168.1.20"),
++            adapter("vEthernet (WSL (Hyper-V firewall))", "Hyper-V Virtual Ethernet Adapter", false, "172.29.32.1"),
++            adapter("vEthernet (Default Switch)", "Hyper-V Virtual Ethernet Adapter #2", false, "172.18.48.1"),
++            adapter("Tailscale", "Tailscale Tunnel", false, "100.95.236.38"),
++            adapter("VirtualBox Host-Only Network", "VirtualBox Host-Only Ethernet Adapter", false, "192.168.56.1"),
++            adapter("Wi-Fi", "Intel(R) Wi-Fi 6E AX211", true, "192.168.1.21"),
++            Adapter {
++                loopback: true,
++                ..adapter("Loopback Pseudo-Interface 1", "Software Loopback Interface 1", false, "127.0.0.1")
++            },
++            Adapter {
++                up: false,
++                ..adapter("Ethernet 2", "Realtek USB GbE", true, "10.0.0.5")
++            },
++            adapter("Ethernet 3", "Realtek USB GbE", false, "169.254.10.2"),
++        ];
++        assert_eq!(
++            bind_addrs(&adapters),
++            ["192.168.1.20:0", "100.95.236.38:0", "192.168.1.21:0"],
++            "a tailnet stays: it is routed, though it has no gateway"
++        );
++    }
++
++    #[test]
++    fn a_virtual_switch_carrying_the_lan_stays() {
++        // A Hyper-V external switch: the machine's own network, on vEthernet.
++        let adapters = [adapter("vEthernet (External)", "Hyper-V Virtual Ethernet Adapter", true, "192.168.1.30")];
++        assert_eq!(bind_addrs(&adapters), ["192.168.1.30:0"]);
++    }
++
++    #[test]
++    fn nothing_usable_binds_nothing_so_the_wildcard_stays() {
++        let adapters = [adapter("vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter", false, "172.29.32.1")];
++        assert!(bind_addrs(&adapters).is_empty());
++        assert!(bind_addrs(&[]).is_empty());
++        #[cfg(not(windows))]
++        assert_eq!(default_udp_addrs(), [WILDCARD]);
++    }
++}
+diff --git a/crates/preview/src/lib.rs b/crates/preview/src/lib.rs
+index 5c0307526c04037e64c870313d0e4c35640d0aa0..a1c63bb374b96a8664c9bdf31bdfe623122c6d7d 100644
+--- a/crates/preview/src/lib.rs
++++ b/crates/preview/src/lib.rs
+@@ -3,6 +3,7 @@
+ //! transports preview requests or response bodies.
+ pub mod catalog;
+ pub mod discovery;
++mod interfaces;
+ pub mod login;
+ pub mod mux;
+ pub mod peer;
+diff --git a/crates/preview/src/peer.rs b/crates/preview/src/peer.rs
+index a337e2c32221cd10fd533cc980e495c5613c6c93..93dd819e0d67e7cf0101ace2f2f3edbd4c2caf18 100644
+--- a/crates/preview/src/peer.rs
++++ b/crates/preview/src/peer.rs
+@@ -20,7 +20,8 @@ use webrtc::{
+         PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
+         RTCIceCandidateInit, RTCIceCandidateType, RTCIceGatheringState, RTCIceServer,
+         RTCPeerConnectionIceEvent,
+-        RTCPeerConnectionState, RTCSessionDescription, SettingEngine,
++        RTCPeerConnectionState, RTCSessionDescription, RTCStatsReport, RTCStatsReportEntry,
++        SettingEngine, StatsSelector,
+     },
+ };
+ 
+@@ -97,7 +98,7 @@ impl Peers {
+                     ],
+                     ..Default::default()
+                 }],
+-                udp_addrs: vec!["0.0.0.0:0".into()],
++                udp_addrs: vec![crate::interfaces::WILDCARD.into()],
+             })),
+             receiver,
+         )
+@@ -124,6 +125,15 @@ impl Peers {
+         inner.udp_addrs = addrs;
+         Ok(())
+     }
++    /// What a new connection binds: as configured, or when nothing was,
++    /// the interfaces other devices could reach (see [`crate::interfaces`]).
++    fn udp_addrs(&self) -> Vec<String> {
++        if self.0.udp_addrs == [crate::interfaces::WILDCARD] {
++            crate::interfaces::default_udp_addrs()
++        } else {
++            self.0.udp_addrs.clone()
++        }
++    }
+     async fn send(&self, to: &str, signal: Signal) -> anyhow::Result<()> {
+         tokio::select! { _ = self.0.stop.cancelled() => anyhow::bail!("preview networking stopped"), result = self.0.output.send(OutgoingSignal { to: to.into(), signal }) => { result?; Ok(()) } }
+     }
+@@ -158,7 +168,7 @@ impl Peers {
+                         .build(),
+                 )
+                 .with_handler(handler.clone())
+-                .with_udp_addrs(self.0.udp_addrs.clone())
++                .with_udp_addrs(self.udp_addrs())
+                 .with_data_channel_send_buffer_limit(256 * 1024)
+                 .with_sctp_receive_buffer_size(512 * 1024)
+                 .build()
+@@ -168,6 +178,25 @@ impl Peers {
+             let channel = pc.create_data_channel("zeron-preview-v1", None).await?;
+             handler.attach(channel);
+         }
++        // Once up, say which way the link went: a LAN, a tailnet, through
++        // NAT. A slow link is otherwise a guess.
++        {
++            let pc = Arc::downgrade(&pc);
++            let mut up = receiver.clone();
++            let stop = stop.clone();
++            let device = device.to_owned();
++            tokio::spawn(async move {
++                let came_up = tokio::select! {
++                    _ = stop.cancelled() => false,
++                    up = async { up.wait_for(|mux| mux.is_some()).await.is_ok() } => up,
++                };
++                let Some(pc) = pc.upgrade().filter(|_| came_up) else { return };
++                match selected_route(pc.as_ref()).await {
++                    Some(route) => tracing::info!(device, %route, "direct link up"),
++                    None => tracing::info!(device, "direct link up; its ICE route isn't known"),
++                }
++            });
++        }
+         tracing::debug!(initiator, "created preview peer");
+         Ok(Arc::new(Peer {
+             session,
+@@ -384,6 +413,12 @@ impl Peers {
+         }
+         result.context("Could not connect directly to this device. Check that both devices are online and their networks allow WebRTC.")?
+     }
++    /// The way the open connection to `device` goes, as ICE chose it:
++    /// `host 192.168.1.5:50123 -> host 192.168.1.9:61002 udp, rtt 2 ms`.
++    pub async fn route(&self, device: &str) -> Option<String> {
++        let pc = self.0.peers.lock().await.get(device)?.pc.clone();
++        selected_route(pc.as_ref()).await
++    }
+     /// The open connection to `device`, without pairing.
+     pub async fn ready(&self, device: &str) -> Option<Mux> {
+         let mux = self
+@@ -477,6 +512,56 @@ impl Peers {
+         self.0.changed.notify_waiters();
+     }
+ }
++async fn selected_route(pc: &dyn PeerConnection) -> Option<String> {
++    let report = pc
++        .get_stats(std::time::Instant::now(), StatsSelector::None)
++        .await;
++    describe_route(&report)
++}
++
++/// The candidate pair ICE selected, from a stats report.
++fn describe_route(report: &RTCStatsReport) -> Option<String> {
++    let selected = report
++        .transport()
++        .map(|transport| transport.selected_candidate_pair_id.as_str())
++        .filter(|id| !id.is_empty());
++    let pair = report
++        .candidate_pairs()
++        .find(|pair| selected.map_or(pair.nominated, |id| pair.stats.id == id))?;
++    // Candidates are filed as `RTCLocalIceCandidate_<id>` /
++    // `RTCRemoteIceCandidate_<id>`; a pair names them by `<id>`.
++    let candidate = |id: &str| {
++        let suffix = format!("_{id}");
++        report.iter().find_map(|entry| match entry {
++            RTCStatsReportEntry::LocalCandidate(c) | RTCStatsReportEntry::RemoteCandidate(c)
++                if c.stats.id == id || c.stats.id.ends_with(&suffix) =>
++            {
++                Some(c)
++            }
++            _ => None,
++        })
++    };
++    let end = |id: &str| match candidate(id) {
++        Some(c) => format!(
++            "{} {}:{}",
++            c.candidate_type,
++            c.address.as_deref().unwrap_or("?"),
++            c.port
++        ),
++        // A peer-reflexive candidate learned from a check isn't filed.
++        None => "unlisted".to_owned(),
++    };
++    let protocol = candidate(&pair.local_candidate_id)
++        .map(|c| c.protocol.clone())
++        .unwrap_or_else(|| "udp".into());
++    Some(format!(
++        "{} -> {} {protocol}, rtt {:.0} ms",
++        end(&pair.local_candidate_id),
++        end(&pair.remote_candidate_id),
++        pair.current_round_trip_time * 1000.0
++    ))
++}
++
+ /// The public addresses a description says its device has.
+ fn public_addresses(sdp: &str) -> HashSet<IpAddr> {
+     sdp.lines()
+@@ -802,6 +887,31 @@ mod tests {
+         forwards.iter().for_each(|forward| forward.abort());
+         result.expect("stalled");
+     }
++    /// Which way a link went is known once it's up, from both ends: the
++    /// pair ICE selected, its candidate types, addresses and ports.
++    #[tokio::test]
++    async fn an_open_link_says_which_way_it_goes() {
++        let stop = CancellationToken::new();
++        let (a, b, forwards) = loopback_pair(&stop);
++        let result = tokio::time::timeout(Duration::from_secs(30), async {
++            echo_round(&b, "a").await;
++            for (peers, other) in [(&a, "b"), (&b, "a")] {
++                let route = peers.route(other).await.expect("a selected pair");
++                assert!(
++                    route.starts_with("host 127.0.0.1:") && route.contains("-> "),
++                    "{route}"
++                );
++                assert!(route.contains("udp, rtt "), "{route}");
++            }
++            assert!(a.route("nobody").await.is_none());
++        })
++        .await;
++        stop.cancel();
++        a.clear().await;
++        b.clear().await;
++        forwards.iter().for_each(|forward| forward.abort());
++        result.expect("stalled");
++    }
+     #[tokio::test]
+     async fn a_device_that_left_is_not_offered_to_again_at_once() {
+         let stop = CancellationToken::new();
+-- 
+2.55.0.windows.2
+
