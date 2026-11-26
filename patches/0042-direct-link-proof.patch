@@ -1,0 +1,1217 @@
+From 7c20e0be53d203a6acf2554eaa87254b70867c0f Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 19:45:25 +0700
+Subject: [PATCH] A direct link proves which of the person's devices it's from,
+ and plugins' calls take it
+
+A direct link's far end was the signaling's word, unproven, so its calls
+were served as an unverified peer's and plugins' calls (reviews,
+decisions, installs from another device, a plugin's deliveries, service
+and agent calls) kept to the relay, whose edge checks a dial's proof.
+
+- Each link now proves its device first, with the proof the relay dial
+  already sends the edge: the device's registered signing key over
+  "zeron-device-link:v1:{host}:direct-{nonce}:{ts}", the nonce the host's
+  for this link (DirectHello: {} -> {device, nonce}, then
+  {device, key, signature, ts} -> {device}). The host checks it against the
+  account's keys (GET /plugin-keys, kept in <data>/device-keys.json):
+  the key is the named device's, not revoked, the signature holds, the
+  time is within 5 minutes, and the device is the one the transport says.
+  Proven, the link's calls are served as that device's
+  (Caller::Peer{device: Some}), as a stamped relay dial's are. Not proven
+  (no key yet, a host from before answering unknown method, keys
+  unreadable): served as before.
+- The account's keys are read again when the copy here is 10 minutes old,
+  or lacks the key asked about (at most every 30 s); a revoked key stops
+  counting then. With the edge out of reach the copy counts for an hour.
+- Roads::for_method sends a call that needs the verified caller
+  (needs_verified_caller) down a direct link only once it proved this
+  device (Links::proven_client), else the relay. Plugins take Roads now
+  (Plugins::set_roads): forward_call (ServePluginCall), ServePluginAgents,
+  PluginDeliver (both places) and CheckPluginKey. rpc.rs forward's plugin
+  methods follow the same rule.
+- Nothing in the check is tied to WebRTC: device_proof (Claim, Verifier,
+  check, AccountKeys) and direct_rpc::proven_service / direct_rpc::prove
+  work over any byte stream between two devices.
+
+Tests: device_proof's a_claim_proves_the_device_its_key_is_registered_to
+(another host, link, device, time, a revoked or unknown key) and
+keys_are_read_when_stale_or_missing_and_a_revocation_counts; direct_rpc's
+a_link_that_proves_its_device_is_served_as_that_devices (and a host from
+before) and plugin_calls_take_a_link_that_proved_this_device.
+---
+ crates/engine/src/device_proof.rs | 300 +++++++++++++++++++++++
+ crates/engine/src/direct_rpc.rs   | 385 ++++++++++++++++++++++++++++--
+ crates/engine/src/lib.rs          |  17 +-
+ crates/engine/src/plugins/mod.rs  | 135 +++++++++--
+ crates/rpc/src/lib.rs             |   8 +
+ 5 files changed, 807 insertions(+), 38 deletions(-)
+ create mode 100644 crates/engine/src/device_proof.rs
+
+diff --git a/crates/engine/src/device_proof.rs b/crates/engine/src/device_proof.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8e5f7be95
+--- /dev/null
++++ b/crates/engine/src/device_proof.rs
+@@ -0,0 +1,300 @@
++//! Which of the person's devices is at the far end of a link the edge doesn't
++//! stand behind: a direct WebRTC link ([`crate::direct_rpc`]), or any other
++//! road between two of their computers.
++//!
++//! On the relay the edge checks a dial's proof and stamps the device on every
++//! frame, so the host serves the call as `Caller::Peer{device: Some(..)}`, and
++//! plugins trust it. Elsewhere the far end proves it to the host itself, with
++//! the same proof: its registered signing key over
++//! [`zeron_rpc::caller_proof_message`] (`zeron-device-link:v1:{host}:{link}:{ts}`),
++//! where `link` names this one link (the host's nonce, so a proof made for one
++//! link can't open another). The host checks it against the account's keys
++//! (`GET /plugin-keys`, kept in `<data>/device-keys.json`): the key is the
++//! named device's, not revoked, and the signature holds.
++//!
++//! Nothing here knows the transport: [`Claim`] crosses as JSON, and
++//! [`Verifier`] is what a host asks.
++
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicI64, Ordering};
++
++use base64::Engine as _;
++use serde::{Deserialize, Serialize};
++
++use crate::plugins::keys::{KeyDirectory, KeyRow};
++
++/// `<data>/device-keys.json`: the account's keys, by device.
++pub const FILE: &str = "device-keys.json";
++/// How far a claim's time (epoch ms) may be from the host's, either way:
++/// clocks differ, and a claim is made for a link as it opens.
++pub const CLAIM_SKEW_MS: i64 = 5 * 60 * 1000;
++/// The account's keys are read again when the copy here is older than this:
++/// a revoked key stops counting within it.
++pub const KEYS_FRESH_MS: i64 = 10 * 60 * 1000;
++/// Past this the copy isn't trusted at all (the edge out of reach that long).
++pub const KEYS_TRUSTED_MS: i64 = 60 * 60 * 1000;
++/// A key not on the copy (made since it was read) sends for the keys again
++/// at most this often.
++pub const MISS_GAP_MS: i64 = 30 * 1000;
++
++/// A device's word for who it is, for one link.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Claim {
++    pub device: String,
++    /// Its registered signing key (b64url).
++    pub key: String,
++    /// The key's signature (b64url) over
++    /// [`zeron_rpc::caller_proof_message`]`(host, link, ts)`.
++    pub signature: String,
++    /// Epoch ms.
++    pub ts: i64,
++}
++
++impl Claim {
++    /// This device's claim for `link` to `host`, signed with its key
++    /// (`prove`: the relay dial's [`zeron_rpc::CallerProofFn`]). `None`: no
++    /// key to sign with yet.
++    pub fn make(prove: &zeron_rpc::CallerProofFn, host: &str, link: &str) -> Option<Self> {
++        let ts = now_ms();
++        let proof = prove(host, link, ts)?;
++        Some(Self {
++            device: proof.device,
++            key: proof.key,
++            signature: proof.signature,
++            ts,
++        })
++    }
++}
++
++/// Why a claim wasn't taken.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Refused {
++    /// Made too long ago, or for later.
++    Stale,
++    /// No key of the account's is this one.
++    UnknownKey,
++    Revoked,
++    /// The key is another device's.
++    OtherDevice,
++    BadSignature,
++    /// The account's keys couldn't be read, and no copy here is recent.
++    NoKeys,
++}
++
++impl std::fmt::Display for Refused {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(match self {
++            Self::Stale => "the proof is too old",
++            Self::UnknownKey => "the key isn't one of the account's",
++            Self::Revoked => "the key was revoked",
++            Self::OtherDevice => "the key is another device's",
++            Self::BadSignature => "the signature doesn't hold",
++            Self::NoKeys => "the account's keys couldn't be read",
++        })
++    }
++}
++
++/// What a host asks to know which device a link is from.
++#[async_trait::async_trait]
++pub trait Verifier: Send + Sync + 'static {
++    /// The device `claim` proves for `link` to `host`.
++    async fn verify(&self, claim: &Claim, host: &str, link: &str) -> Result<String, Refused>;
++}
++
++pub fn now_ms() -> i64 {
++    chrono::Utc::now().timestamp_millis()
++}
++
++/// `claim` checked against the account's key `rows` at `now` (epoch ms): the
++/// device it proves, or why not.
++pub fn check(claim: &Claim, host: &str, link: &str, now: i64, rows: &[KeyRow]) -> Result<String, Refused> {
++    if (now - claim.ts).abs() > CLAIM_SKEW_MS {
++        return Err(Refused::Stale);
++    }
++    let row = rows.iter().find(|row| row.key == claim.key).ok_or(Refused::UnknownKey)?;
++    if row.revoked_at.is_some() {
++        return Err(Refused::Revoked);
++    }
++    if row.device_id.is_empty() || row.device_id != claim.device {
++        return Err(Refused::OtherDevice);
++    }
++    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
++    let (Ok(key), Ok(signature)) = (b64.decode(&claim.key), b64.decode(&claim.signature)) else {
++        return Err(Refused::BadSignature);
++    };
++    let message = zeron_rpc::caller_proof_message(host, link, claim.ts);
++    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
++        .verify(message.as_bytes(), &signature)
++        .map_err(|_| Refused::BadSignature)?;
++    Ok(claim.device.clone())
++}
++
++/// The copy of the account's keys kept here.
++#[derive(Clone, Debug, Default, Serialize, Deserialize)]
++struct Copy {
++    account: String,
++    rows: Vec<KeyRow>,
++    /// Epoch ms.
++    read_at: i64,
++}
++
++/// The account's keys as a host checks claims against them: read from the
++/// edge when the copy here is stale or lacks the key asked about, kept in
++/// `<data>/device-keys.json` so a restart offline still knows them.
++pub struct AccountKeys {
++    data_dir: PathBuf,
++    copy: tokio::sync::Mutex<Option<Copy>>,
++    missed_at: AtomicI64,
++}
++
++impl AccountKeys {
++    pub fn new(data_dir: &Path) -> Self {
++        Self {
++            data_dir: data_dir.to_owned(),
++            copy: tokio::sync::Mutex::new(None),
++            missed_at: AtomicI64::new(i64::MIN / 2),
++        }
++    }
++
++    /// `claim` checked against `account`'s keys, read through `directory`
++    /// (the edge) when the copy here won't do.
++    pub async fn verify(
++        &self,
++        directory: Option<&dyn KeyDirectory>,
++        account: Option<&str>,
++        claim: &Claim,
++        host: &str,
++        link: &str,
++    ) -> Result<String, Refused> {
++        let account = account.ok_or(Refused::NoKeys)?;
++        let now = now_ms();
++        let mut copy = self.copy.lock().await;
++        if copy.is_none() {
++            *copy = std::fs::read(self.data_dir.join(FILE))
++                .ok()
++                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
++        }
++        let ours = copy.as_ref().filter(|c| c.account == account);
++        let stale = ours.is_none_or(|c| now - c.read_at >= KEYS_FRESH_MS);
++        let missing = ours.is_some_and(|c| !c.rows.iter().any(|row| row.key == claim.key))
++            && now - self.missed_at.load(Ordering::Relaxed) >= MISS_GAP_MS;
++        if (stale || missing)
++            && let Some(directory) = directory
++        {
++            if missing {
++                self.missed_at.store(now, Ordering::Relaxed);
++            }
++            match directory.keys_since(0).await {
++                Ok((rows, _)) => {
++                    let read = Copy {
++                        account: account.to_owned(),
++                        rows,
++                        read_at: now,
++                    };
++                    let bytes = serde_json::to_vec_pretty(&read).unwrap_or_default();
++                    if let Err(error) = crate::runner::write_private_atomic(&self.data_dir.join(FILE), &bytes) {
++                        tracing::warn!(%error, "couldn't keep the account's device keys");
++                    }
++                    *copy = Some(read);
++                }
++                Err(error) => tracing::info!(%error, "the account's device keys couldn't be read; the copy here is used"),
++            }
++        }
++        let copy = copy
++            .as_ref()
++            .filter(|c| c.account == account && now - c.read_at < KEYS_TRUSTED_MS)
++            .ok_or(Refused::NoKeys)?;
++        check(claim, host, link, now, &copy.rows)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::plugins::keys::tests::FakeDirectory;
++    use crate::plugins::signing;
++
++    const HOST: &str = "desktop";
++    const LINK: &str = "direct-n0nce";
++
++    /// The laptop's key, registered to it, and its claim for [`LINK`].
++    fn laptop(dir: &Path) -> (KeyRow, zeron_rpc::CallerProofFn) {
++        let key = signing::load_or_create_key(dir).unwrap();
++        let row = KeyRow {
++            key: key.public(),
++            fingerprint: String::new(),
++            device_id: "laptop".into(),
++            created_at: 1,
++            revoked_at: None,
++        };
++        let dir = dir.to_owned();
++        let prove: zeron_rpc::CallerProofFn = std::sync::Arc::new(move |host: &str, link: &str, ts: i64| {
++            let (key, signature) = signing::device_link_proof(&dir, host, link, ts)?;
++            Some(zeron_rpc::CallerProof { device: "laptop".into(), key, signature })
++        });
++        (row, prove)
++    }
++
++    #[test]
++    fn a_claim_proves_the_device_its_key_is_registered_to() {
++        let dir = tempfile::tempdir().unwrap();
++        let (row, prove) = laptop(dir.path());
++        let claim = Claim::make(&prove, HOST, LINK).expect("a key to sign with");
++        let now = claim.ts;
++        assert_eq!(check(&claim, HOST, LINK, now, std::slice::from_ref(&row)), Ok("laptop".into()));
++
++        // For another host or another link, it proves nothing.
++        assert_eq!(check(&claim, "server", LINK, now, std::slice::from_ref(&row)), Err(Refused::BadSignature));
++        assert_eq!(check(&claim, HOST, "direct-other", now, std::slice::from_ref(&row)), Err(Refused::BadSignature));
++        // Nor as another device, nor with its time moved.
++        let other = Claim { device: "server".into(), ..claim.clone() };
++        assert_eq!(check(&other, HOST, LINK, now, std::slice::from_ref(&row)), Err(Refused::OtherDevice));
++        let moved = Claim { ts: claim.ts + 1, ..claim.clone() };
++        assert_eq!(check(&moved, HOST, LINK, now, std::slice::from_ref(&row)), Err(Refused::BadSignature));
++        // Not long after it was made.
++        assert_eq!(
++            check(&claim, HOST, LINK, now + CLAIM_SKEW_MS + 1, std::slice::from_ref(&row)),
++            Err(Refused::Stale)
++        );
++        // Not with its key revoked, or not the account's.
++        let revoked = KeyRow { revoked_at: Some(2), ..row.clone() };
++        assert_eq!(check(&claim, HOST, LINK, now, &[revoked]), Err(Refused::Revoked));
++        assert_eq!(check(&claim, HOST, LINK, now, &[]), Err(Refused::UnknownKey));
++        // A key registered to no device in particular proves none.
++        let anyone = KeyRow { device_id: String::new(), ..row };
++        assert_eq!(check(&claim, HOST, LINK, now, &[anyone]), Err(Refused::OtherDevice));
++    }
++
++    #[tokio::test]
++    async fn keys_are_read_when_stale_or_missing_and_a_revocation_counts() {
++        let host_dir = tempfile::tempdir().unwrap();
++        let laptop_dir = tempfile::tempdir().unwrap();
++        let (row, prove) = laptop(laptop_dir.path());
++        let edge = FakeDirectory::default();
++        let keys = AccountKeys::new(host_dir.path());
++        let claim = Claim::make(&prove, HOST, LINK).unwrap();
++
++        // Signed out: no account to read keys for.
++        assert_eq!(keys.verify(Some(&edge), None, &claim, HOST, LINK).await, Err(Refused::NoKeys));
++        // The edge doesn't know it yet.
++        assert_eq!(keys.verify(Some(&edge), Some("acct"), &claim, HOST, LINK).await, Err(Refused::UnknownKey));
++        // Registered since: a missing key reads them again (once a while).
++        edge.rows.lock().unwrap().push(row.clone());
++        keys.missed_at.store(i64::MIN / 2, Ordering::Relaxed);
++        assert_eq!(keys.verify(Some(&edge), Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
++        // Kept here: with the edge out of reach, a restart still knows them.
++        let again = AccountKeys::new(host_dir.path());
++        assert_eq!(again.verify(None, Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
++        // Not for another account.
++        assert_eq!(again.verify(None, Some("other"), &claim, HOST, LINK).await, Err(Refused::NoKeys));
++
++        // Revoked on the edge: counted once the copy is read again.
++        edge.rows.lock().unwrap()[0].revoked_at = Some(5);
++        keys.copy.lock().await.as_mut().unwrap().read_at -= KEYS_FRESH_MS;
++        assert_eq!(keys.verify(Some(&edge), Some("acct"), &claim, HOST, LINK).await, Err(Refused::Revoked));
++
++        // A copy too old to trust, the edge out of reach: nothing proven.
++        keys.copy.lock().await.as_mut().unwrap().read_at -= KEYS_TRUSTED_MS;
++        assert_eq!(keys.verify(None, Some("acct"), &claim, HOST, LINK).await, Err(Refused::NoKeys));
++    }
++}
+diff --git a/crates/engine/src/direct_rpc.rs b/crates/engine/src/direct_rpc.rs
+index 519f6bb914c5f85d516a85c1aa35005de253b0eb..48b43f4ce1a9d15d809e345e25a2ef9bf6d80ec5 100644
+--- a/crates/engine/src/direct_rpc.rs
++++ b/crates/engine/src/direct_rpc.rs
+@@ -12,9 +12,11 @@
+ //!   ([`crate::EngineCore::start_host_relay`]), with the service the relay
+ //!   serves, behind the same guard ([`zeron_rpc::device_room::peer_service`]):
+ //!   local-only calls refused, the rest answered as a peer's. The device a
+-//!   direct link names is the signaling's claim, not proven, so calls are
+-//!   served as an unverified peer, as an unstamped relay dial's are. Cloud
+-//!   machines may not open one, as for terminals.
++//!   direct link names is the signaling's claim, not proven: calls are
++//!   served as an unverified peer, as an unstamped relay dial's are, until
++//!   the link proves it ([`methods::DIRECT_HELLO`], [`crate::device_proof`]).
++//!   Then they're served as that device's, as a stamped relay dial's are.
++//!   Cloud machines may not open one, as for terminals.
+ //! - **Client** ([`Links`]): a call that would cross the relay takes an open
+ //!   direct link instead, when the host says it serves one
+ //!   ([`zeron_proto::capabilities::DIRECT_RPC_V1`]) and the two are paired.
+@@ -23,8 +25,9 @@
+ //! - **Roads** ([`Roads`]): the one place a call to another device picks
+ //!   its road, direct first, else the relay. Device-addressed calls
+ //!   (`targetDeviceId`, streams too), a message's files and the command
+-//!   relay all go through it. A call the host trusts only for the device
+-//!   the edge verified ([`needs_verified_caller`]) takes the relay alone.
++//!   relay all go through it. A call the host trusts only for a verified
++//!   device ([`needs_verified_caller`]: plugins' calls) takes a direct link
++//!   only when it proved this device, else the relay.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::sync::{Arc, Mutex, PoisonError};
+@@ -35,6 +38,8 @@ use tokio::sync::mpsc;
+ use tokio::time::Instant;
+ use zeron_rpc::{LinkCache, RpcClient, RpcError, RpcService, methods};
+ 
++use crate::device_proof::{Claim, Verifier};
++
+ /// The stream id direct RPC is served under.
+ pub const SERVICE: &str = "rpc";
+ 
+@@ -42,6 +47,10 @@ pub const SERVICE: &str = "rpc";
+ /// characters, a long chat's transcript a few MB. Past it the link closes.
+ const MAX_FRAME: usize = 64 * 1024 * 1024;
+ 
++/// How long a link's proof of its device may take as it opens: two round
++/// trips, and the host reading the account's keys when it hasn't lately.
++const PROVE_TIMEOUT: Duration = Duration::from_secs(10);
++
+ /// How long a call waits for the `rpc` stream to open on a paired
+ /// connection. Past it the call takes the relay; the opening goes on, and
+ /// the link it makes is there for the next call.
+@@ -98,14 +107,25 @@ fn next_gap(previous: Option<Duration>, first: Duration, cap: Duration) -> Durat
+ /// host holds the service while it runs; once it's gone, so is direct RPC.
+ pub struct Service {
+     service: std::sync::Weak<dyn RpcService>,
++    /// This device, and what checks a link's proof of the device at its far
++    /// end. Without: every link is served as an unverified peer's.
++    proof: Option<(String, Arc<dyn Verifier>)>,
+ }
+ 
+ impl Service {
+     pub fn new(service: &Arc<dyn RpcService>) -> Self {
+         Self {
+             service: Arc::downgrade(service),
++            proof: None,
+         }
+     }
++
++    /// Links that prove their device (`host`: this one's id) are served as
++    /// that device's.
++    pub fn proving(mut self, host: &str, verifier: Arc<dyn Verifier>) -> Self {
++        self.proof = Some((host.to_owned(), verifier));
++        self
++    }
+ }
+ 
+ /// Whether `peer` may open direct RPC here: another of the person's own
+@@ -137,10 +157,13 @@ impl zeron_preview::mux::Connector for Service {
+             .upgrade()
+             .ok_or_else(|| anyhow::anyhow!("this device isn't serving other devices now"))?;
+         let (ours, theirs) = tokio::io::duplex(1024 * 1024);
+-        let guarded = zeron_rpc::device_room::peer_service(service, None);
++        let device = peer.unwrap_or_default().to_owned();
++        let guarded = match &self.proof {
++            Some((host, verifier)) => proven_service(service, host, &device, verifier.clone()),
++            None => zeron_rpc::device_room::peer_service(service, None),
++        };
+         // This end's log says it too, not only the caller's ("calls to this
+         // device take a new road"): either computer's log proves the road.
+-        let device = peer.unwrap_or_default().to_owned();
+         tracing::info!(device, "direct RPC link serving calls from this device");
+         tokio::spawn(async move {
+             serve(guarded, ours).await;
+@@ -150,6 +173,116 @@ impl zeron_preview::mux::Connector for Service {
+     }
+ }
+ 
++/// `service` as one link from `peer` (the transport's claim) sees it: as an
++/// unverified peer's until the link proves which device it's from
++/// ([`methods::DIRECT_HELLO`]), then as that device's. Any road between two of
++/// the person's devices may serve this; the far end calls [`prove`].
++pub fn proven_service(
++    service: Arc<dyn RpcService>,
++    host: &str,
++    peer: &str,
++    verifier: Arc<dyn Verifier>,
++) -> Arc<dyn RpcService> {
++    Arc::new(Proven {
++        unverified: zeron_rpc::device_room::peer_service(service.clone(), None),
++        service,
++        verified: std::sync::OnceLock::new(),
++        host: host.to_owned(),
++        peer: peer.to_owned(),
++        nonce: uuid::Uuid::new_v4().simple().to_string(),
++        verifier,
++    })
++}
++
++/// What a link's proof signs for: this link, by the host's nonce.
++fn link_name(nonce: &str) -> String {
++    format!("direct-{nonce}")
++}
++
++struct Proven {
++    service: Arc<dyn RpcService>,
++    unverified: Arc<dyn RpcService>,
++    /// Set once, when the link proved its device.
++    verified: std::sync::OnceLock<Arc<dyn RpcService>>,
++    host: String,
++    peer: String,
++    nonce: String,
++    verifier: Arc<dyn Verifier>,
++}
++
++#[async_trait::async_trait]
++impl RpcService for Proven {
++    async fn handle(
++        &self,
++        method: &str,
++        params: serde_json::Value,
++    ) -> Result<zeron_rpc::RpcReply, RpcError> {
++        if method == methods::DIRECT_HELLO {
++            return self.hello(params).await;
++        }
++        let service = self.verified.get().unwrap_or(&self.unverified);
++        service.handle(method, params).await
++    }
++}
++
++impl Proven {
++    /// `{}` → `{device, nonce}`: what to sign. A [`Claim`] → `{device}`, the
++    /// device proven; refused, the link stays an unverified peer's.
++    async fn hello(&self, params: serde_json::Value) -> Result<zeron_rpc::RpcReply, RpcError> {
++        if params.get("key").is_none() {
++            return zeron_rpc::RpcReply::value(&serde_json::json!({
++                "device": self.host,
++                "nonce": self.nonce,
++            }));
++        }
++        let claim: Claim = zeron_rpc::parse_params(params)?;
++        // The device the transport says it is: one device can't prove
++        // itself on another's link.
++        let proven = if claim.device != self.peer {
++            Err(crate::device_proof::Refused::OtherDevice)
++        } else {
++            self.verifier
++                .verify(&claim, &self.host, &link_name(&self.nonce))
++                .await
++        };
++        match proven {
++            Ok(device) => {
++                let served = zeron_rpc::device_room::peer_service(self.service.clone(), Some(device.clone()));
++                let _ = self.verified.set(served);
++                tracing::info!(device, "direct RPC link proved its device; served as that device's");
++                zeron_rpc::RpcReply::value(&serde_json::json!({ "device": device }))
++            }
++            Err(why) => {
++                tracing::info!(device = %self.peer, %why, "direct RPC link didn't prove its device; served as an unverified one");
++                Err(RpcError::Failed(format!("not proven: {why}")))
++            }
++        }
++    }
++}
++
++/// Prove this device to the host of `client`'s link, `host`, with `prove`
++/// (the relay dial's proof: this device's registered key). `Err`: the link
++/// stays an unverified peer's (a host from before, no key here yet, or the
++/// host couldn't check it).
++pub async fn prove(client: &RpcClient, host: &str, prove: &zeron_rpc::CallerProofFn) -> Result<String, String> {
++    let asked = client
++        .call(methods::DIRECT_HELLO, serde_json::json!({}))
++        .await
++        .map_err(|e| e.to_string())?;
++    let (Some(far), Some(nonce)) = (asked["device"].as_str(), asked["nonce"].as_str()) else {
++        return Err("the host didn't say what to sign".into());
++    };
++    if far != host {
++        return Err(format!("the link reached {far}, not {host}"));
++    }
++    let claim = Claim::make(prove, host, &link_name(nonce)).ok_or("this device has no key to prove itself with")?;
++    let proven = client
++        .call(methods::DIRECT_HELLO, serde_json::to_value(&claim).unwrap_or_default())
++        .await
++        .map_err(|e| e.to_string())?;
++    Ok(proven["device"].as_str().unwrap_or_default().to_owned())
++}
++
+ /// Serve `service` on one byte stream of newline-delimited frames, until
+ /// either side closes it.
+ pub async fn serve<S>(service: Arc<dyn RpcService>, io: S)
+@@ -259,6 +392,8 @@ impl Pairing for zeron_preview::PreviewService {
+ pub struct Links {
+     pairing: Arc<dyn Pairing>,
+     state: Arc<Mutex<State>>,
++    /// Proves this device to each link's host as it opens ([`prove`]).
++    prover: Arc<Mutex<Option<zeron_rpc::CallerProofFn>>>,
+ }
+ 
+ #[derive(Default)]
+@@ -280,6 +415,8 @@ struct State {
+ struct Link {
+     client: Arc<RpcClient>,
+     used: Instant,
++    /// The host took this device's proof: calls are served as its own.
++    proven: bool,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -302,9 +439,27 @@ impl Links {
+         Self {
+             pairing,
+             state: Arc::default(),
++            prover: Arc::default(),
+         }
+     }
+ 
++    /// Prove this device to each link's host with `prover` (the relay
++    /// dial's proof), so calls on it are served as this device's.
++    pub fn prove_with(&self, prover: zeron_rpc::CallerProofFn) {
++        *self.prover.lock().unwrap_or_else(PoisonError::into_inner) = Some(prover);
++    }
++
++    /// [`Self::client`], when its link proved this device: what a call
++    /// that needs the verified caller may take.
++    pub async fn proven_client(&self, device: &str) -> Option<Arc<RpcClient>> {
++        let client = self.client(device).await?;
++        self.state()
++            .links
++            .get(device)
++            .is_some_and(|link| link.proven && Arc::ptr_eq(&link.client, &client))
++            .then_some(client)
++    }
++
+     fn state(&self) -> std::sync::MutexGuard<'_, State> {
+         lock(&self.state)
+     }
+@@ -438,22 +593,29 @@ impl Links {
+     }
+ 
+     async fn open(&self, device: &str) -> Option<Arc<RpcClient>> {
+-        let opened = self.pairing.open(device).await;
++        let opened = match self.pairing.open(device).await {
++            Ok(stream) => {
++                let client = Arc::new(client(stream));
++                let proven = self.prove(&client, device).await;
++                Ok((client, proven))
++            }
++            Err(error) => Err(error),
++        };
+         let mut state = self.state();
+         state.opening.remove(device);
+         match opened {
+-            Ok(stream) => {
++            Ok((client, proven)) => {
+                 state.backoff.remove(device);
+-                let client = Arc::new(client(stream));
+                 state.links.insert(
+                     device.to_owned(),
+                     Link {
+                         client: client.clone(),
+                         used: Instant::now(),
++                        proven,
+                     },
+                 );
+                 drop(state);
+-                tracing::info!(device, "direct RPC link up");
++                tracing::info!(device, proven, "direct RPC link up");
+                 self.keep(device, &client);
+                 Some(client)
+             }
+@@ -477,6 +639,24 @@ impl Links {
+         }
+     }
+ 
++    /// Prove this device on a link to `device` just opened, before any call
++    /// takes it.
++    async fn prove(&self, client: &RpcClient, device: &str) -> bool {
++        let prover = self.prover.lock().unwrap_or_else(PoisonError::into_inner).clone();
++        let Some(prover) = prover else { return false };
++        match tokio::time::timeout(PROVE_TIMEOUT, prove(client, device, &prover)).await {
++            Ok(Ok(_)) => true,
++            Ok(Err(why)) => {
++                tracing::info!(device, %why, "direct RPC link didn't prove this device; plugin calls take the relay");
++                false
++            }
++            Err(_) => {
++                tracing::info!(device, "direct RPC link's proof of this device took too long; plugin calls take the relay");
++                false
++            }
++        }
++    }
++
+     /// Ask for pairing with `device`, unless it was asked for lately.
+     fn warm(&self, device: &str) {
+         {
+@@ -582,12 +762,12 @@ impl Links {
+     }
+ }
+ 
+-/// Calls whose host trusts the caller only as the device the edge verified
+-/// on a relay link (`Caller::Peer{device: Some(..)}`): plugins' reviews,
+-/// decisions and installs from another device, and what one plugin sends
+-/// another's (its sender). A direct link's far end is the signaling's
+-/// claim, not proven, so it's served as an unverified peer, and these would
+-/// be refused or come from "Another device". They take the relay alone.
++/// Calls whose host trusts the caller only as a verified device
++/// (`Caller::Peer{device: Some(..)}`): plugins' reviews, decisions and
++/// installs from another device, and what one plugin sends another's (its
++/// sender). On a direct link that didn't prove this device they'd be refused
++/// or come from "Another device", so they take one only once it proved it
++/// ([`Links::proven_client`]), else the relay, whose edge vouches.
+ pub fn needs_verified_caller(method: &str) -> bool {
+     matches!(
+         method,
+@@ -658,9 +838,18 @@ impl Roads {
+     }
+ 
+     /// A client for a call of `method` to `target`: the direct link first,
+-    /// unless the call needs the relay's verified caller.
++    /// and for a call that needs the verified caller, only a direct link
++    /// that proved this device.
+     pub async fn for_method(&self, target: &str, method: &str) -> Result<Road, RpcError> {
+         if needs_verified_caller(method) {
++            if (self.serves_direct)(target)
++                && let Some(client) = self.direct.proven_client(target).await
++            {
++                return Ok(Road {
++                    client,
++                    direct: true,
++                });
++            }
+             return self.by_relay(target).await;
+         }
+         self.client(target).await
+@@ -966,8 +1155,9 @@ mod tests {
+         assert!(!links.state().warming.contains("cloud-0b59268e"));
+     }
+ 
+-    /// What a plugin's host trusts as its caller is the device the edge
+-    /// verified: those calls never take a direct link. The rest may.
++    /// What a plugin's host trusts as its caller is a verified device:
++    /// those calls take a direct link only once it proved this device
++    /// (below). The rest take any.
+     #[test]
+     fn calls_that_need_the_verified_caller_keep_to_the_relay() {
+         for method in [
+@@ -1025,4 +1215,159 @@ mod tests {
+         assert!(!peer_allowed(None));
+         assert!(!peer_allowed(Some("cloud-0b59268e")));
+     }
++
++    /// The account's keys as a test host knows them.
++    struct Rows(Vec<crate::plugins::keys::KeyRow>);
++
++    #[async_trait::async_trait]
++    impl Verifier for Rows {
++        async fn verify(
++            &self,
++            claim: &Claim,
++            host: &str,
++            link: &str,
++        ) -> Result<String, crate::device_proof::Refused> {
++            crate::device_proof::check(claim, host, link, crate::device_proof::now_ms(), &self.0)
++        }
++    }
++
++    /// `device`'s signing key in `dir`: its row on the account, and what
++    /// proves it on a link.
++    fn signer(
++        dir: &std::path::Path,
++        device: &str,
++    ) -> (crate::plugins::keys::KeyRow, zeron_rpc::CallerProofFn) {
++        let key = crate::plugins::signing::load_or_create_key(dir).unwrap();
++        let row = crate::plugins::keys::KeyRow {
++            key: key.public(),
++            fingerprint: String::new(),
++            device_id: device.into(),
++            created_at: 1,
++            revoked_at: None,
++        };
++        let (dir, device) = (dir.to_owned(), device.to_owned());
++        let prove: zeron_rpc::CallerProofFn = Arc::new(move |host: &str, link: &str, ts: i64| {
++            let (key, signature) = crate::plugins::signing::device_link_proof(&dir, host, link, ts)?;
++            Some(zeron_rpc::CallerProof {
++                device: device.clone(),
++                key,
++                signature,
++            })
++        });
++        (row, prove)
++    }
++
++    /// A link that proves its device is served as that device's, as a
++    /// stamped relay dial is; one that doesn't stays an unverified peer's.
++    #[tokio::test]
++    async fn a_link_that_proves_its_device_is_served_as_that_devices() {
++        use zeron_preview::mux::Connector as _;
++        let dir = tempfile::tempdir().unwrap();
++        let (row, prove) = signer(dir.path(), "laptop");
++        let service: Arc<dyn RpcService> = Arc::new(Echo);
++        let host = Service::new(&service).proving("desktop", Arc::new(Rows(vec![row.clone()])));
++
++        let link = client(host.connect_from(Some("laptop"), SERVICE).await.unwrap());
++        let unproven = link.call("Ping", json!({})).await.unwrap();
++        assert_eq!(unproven["caller"], json!({ "peer": null }), "until it proves it");
++        assert_eq!(super::prove(&link, "desktop", &prove).await, Ok("laptop".into()));
++        let proven = link.call("Ping", json!({})).await.unwrap();
++        assert_eq!(proven["caller"], json!({ "peer": "laptop" }));
++        // Still behind the relay's guard.
++        assert!(link.call(methods::ACCESS_TOKEN, json!({})).await.is_err());
++
++        // A proof for the host it reached, not another.
++        let link = client(host.connect_from(Some("laptop"), SERVICE).await.unwrap());
++        assert!(super::prove(&link, "server", &prove).await.is_err());
++
++        // The laptop's key on another device's link proves nothing.
++        let link = client(host.connect_from(Some("phone"), SERVICE).await.unwrap());
++        assert!(super::prove(&link, "desktop", &prove).await.is_err());
++        let still = link.call("Ping", json!({})).await.unwrap();
++        assert_eq!(still["caller"], json!({ "peer": null }));
++
++        // A key that isn't the account's, or was revoked.
++        let other = tempfile::tempdir().unwrap();
++        let (_, stranger) = signer(other.path(), "laptop");
++        let link = client(host.connect_from(Some("laptop"), SERVICE).await.unwrap());
++        assert!(super::prove(&link, "desktop", &stranger).await.is_err());
++        let revoked = crate::plugins::keys::KeyRow {
++            revoked_at: Some(2),
++            ..row
++        };
++        let host = Service::new(&service).proving("desktop", Arc::new(Rows(vec![revoked])));
++        let link = client(host.connect_from(Some("laptop"), SERVICE).await.unwrap());
++        assert!(super::prove(&link, "desktop", &prove).await.is_err());
++
++        // A host from before: nothing to sign, the link as it was.
++        let old = Service::new(&service);
++        let link = client(old.connect_from(Some("laptop"), SERVICE).await.unwrap());
++        assert!(super::prove(&link, "desktop", &prove).await.is_err());
++        let as_before = link.call("Ping", json!({})).await.unwrap();
++        assert_eq!(as_before["caller"], json!({ "peer": null }));
++    }
++
++    /// The desktop's direct host, as the laptop's pairing reaches it.
++    struct ToDesktop(Service);
++
++    #[async_trait::async_trait]
++    impl Pairing for ToDesktop {
++        async fn ready(&self, _device: &str) -> bool {
++            true
++        }
++
++        fn warm(&self, _device: &str) {}
++
++        async fn open(&self, _device: &str) -> anyhow::Result<zeron_preview::mux::BoxIo> {
++            use zeron_preview::mux::Connector as _;
++            self.0.connect_from(Some("laptop"), SERVICE).await
++        }
++    }
++
++    /// Plugins' calls take a direct link that proved this device, and the
++    /// relay when it didn't (no key here yet, a host from before).
++    #[tokio::test]
++    async fn plugin_calls_take_a_link_that_proved_this_device() {
++        let dir = tempfile::tempdir().unwrap();
++        let (row, prove) = signer(dir.path(), "laptop");
++        let service: Arc<dyn RpcService> = Arc::new(Echo);
++        let desktop = || {
++            Arc::new(ToDesktop(
++                Service::new(&service).proving("desktop", Arc::new(Rows(vec![row.clone()]))),
++            ))
++        };
++        let mut relay = zeron_rpc::LinkCacheConfig::new(
++            "http://127.0.0.1:9",
++            Arc::new(zeron_rpc::StaticToken("t".into())),
++        );
++        relay.probe_timeout = Duration::from_millis(200);
++        let relay = LinkCache::new(relay);
++        let road = |links: &Links| Roads::new(relay.clone(), links.clone(), Arc::new(|_: &str| true));
++        let bounded = |call| tokio::time::timeout(Duration::from_secs(10), call);
++
++        let proving = Links::over(desktop());
++        proving.prove_with(prove.clone());
++        let roads = road(&proving);
++        let taken = bounded(roads.for_method("desktop", methods::SERVE_PLUGIN_CALL))
++            .await
++            .expect("bounded")
++            .expect("the direct link");
++        assert!(taken.direct);
++        let reply = taken.client.call(methods::SERVE_PLUGIN_CALL, json!({})).await.unwrap();
++        assert_eq!(reply["caller"], json!({ "peer": "laptop" }));
++
++        // No key here to prove it with: the direct link carries the rest,
++        // and plugins' calls take the relay (none here: refused).
++        let unproven = Links::over(desktop());
++        let roads = road(&unproven);
++        let any = bounded(roads.for_method("desktop", methods::READ_WORKSPACE_FILE))
++            .await
++            .expect("bounded")
++            .expect("the direct link");
++        assert!(any.direct);
++        let plugin = bounded(roads.for_method("desktop", methods::SERVE_PLUGIN_CALL))
++            .await
++            .expect("bounded");
++        assert!(plugin.is_err() || plugin.is_ok_and(|road| !road.direct), "never the unproven link");
++    }
+ }
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 9d2b31427088e9af97237ff5fea533a16bb9d58c..8aa345ef620cc80d103875aed5a301f07286fe7c 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -53,6 +53,7 @@ pub mod deferred;
+ pub mod desktop_notify;
+ pub mod device_stats;
+ pub mod diff_sync;
++pub mod device_proof;
+ pub mod direct_rpc;
+ pub mod doc_host;
+ mod fs_watch;
+@@ -631,8 +632,9 @@ impl EngineCore {
+     ///
+     /// Calls to another device take the direct link first where it's up
+     /// (direct_rpc::Roads): device-addressed calls and their streams, a
+-    /// message's files and the command relay. Plugins' calls keep to the
+-    /// relay, whose link the edge proves came from the device it names.
++    /// message's files, the command relay, and plugins' calls once the link
++    /// proved this device to its host (device_proof); else the relay, whose
++    /// edge proves which device a link came from.
+     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+         self.plugins.set_links(links.clone());
+         *self
+@@ -673,8 +675,12 @@ impl EngineCore {
+                 .find(|d| d.id == device)
+                 .is_some_and(|d| d.supports(zeron_proto::capabilities::DIRECT_RPC_V1))
+         });
++        // Each direct link proves this device to its host as it opens, as a
++        // relay dial is proven to the edge.
++        direct.prove_with(self.plugins.device_link_prover());
+         let roads = direct_rpc::Roads::new(links, direct, serves_direct);
+         self.doc_host.set_roads(roads.clone());
++        self.plugins.set_roads(roads.clone());
+         *self
+             .roads
+             .lock()
+@@ -768,9 +774,14 @@ impl EngineCore {
+         // it doesn't advertise one, and the person's devices reach it by the
+         // relay and the edge's store.
+         if !runner::is_cloud_platform() {
++            // A link that proves its device (device_proof, against the
++            // account's keys) is served as that device's.
+             self.previews.serve_streams(
+                 direct_rpc::SERVICE,
+-                Arc::new(direct_rpc::Service::new(&service)),
++                Arc::new(
++                    direct_rpc::Service::new(&service)
++                        .proving(&self.device_id, self.plugins.device_verifier()),
++                ),
+             );
+         }
+         zeron_rpc::HostRelay::spawn(config, service, on_nudge)
+diff --git a/crates/engine/src/plugins/mod.rs b/crates/engine/src/plugins/mod.rs
+index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4949c0b8d 100644
+--- a/crates/engine/src/plugins/mod.rs
++++ b/crates/engine/src/plugins/mod.rs
+@@ -214,6 +214,62 @@ fn is_change(event: &notify::Event) -> bool {
+ }
+ 
+ /// The engine's plugin service. Cheap to clone.
++/// How a plugin call reaches another device: by the roads (direct_rpc) once
++/// the engine set them, where a call that needs this device proven takes a
++/// direct link only when that link proved it, else the relay alone.
++#[derive(Clone)]
++struct PeerLinks {
++    relay: Arc<zeron_rpc::LinkCache>,
++    roads: Option<crate::direct_rpc::Roads>,
++}
++
++impl PeerLinks {
++    /// A client for `method` to `target`, and whether it's the direct link.
++    async fn client(&self, target: &str, method: &str) -> Result<(Arc<zeron_rpc::RpcClient>, bool), RpcError> {
++        match &self.roads {
++            Some(roads) => {
++                let road = roads.for_method(target, method).await?;
++                Ok((road.client, road.direct))
++            }
++            None => Ok((self.relay.client(target).await?, false)),
++        }
++    }
++
++    /// A call on that road failed or timed out: the next one opens afresh.
++    fn suspect(&self, target: &str, direct: bool) {
++        match &self.roads {
++            Some(roads) => roads.suspect(target, direct),
++            None => self.relay.invalidate(target),
++        }
++    }
++}
++
++/// Another device's direct link, checked against the account's keys
++/// (device_proof): this device's sign-in reads them. Holds the plugins
++/// weakly: the direct link's host end (kept by the preview service) must not
++/// keep the engine alive after shutdown.
++struct DeviceVerifier(std::sync::Weak<Inner>);
++
++#[async_trait::async_trait]
++impl crate::device_proof::Verifier for DeviceVerifier {
++    async fn verify(
++        &self,
++        claim: &crate::device_proof::Claim,
++        host: &str,
++        link: &str,
++    ) -> Result<String, crate::device_proof::Refused> {
++        let inner = self.0.upgrade().ok_or(crate::device_proof::Refused::NoKeys)?;
++        let plugins = Plugins { inner };
++        let directory = plugins.directory();
++        let account = plugins.account();
++        plugins
++            .inner
++            .device_keys
++            .verify(directory.as_deref(), account.as_deref(), claim, host, link)
++            .await
++    }
++}
++
+ #[derive(Clone)]
+ pub struct Plugins {
+     inner: Arc<Inner>,
+@@ -234,6 +290,12 @@ struct Inner {
+     scans: std::sync::atomic::AtomicUsize,
+     account: Mutex<Option<AccountFn>>,
+     links: Mutex<Option<Arc<zeron_rpc::LinkCache>>>,
++    /// Every road to another device (direct_rpc): a direct link that proved
++    /// this device carries plugin calls, the relay the rest.
++    roads: Mutex<Option<crate::direct_rpc::Roads>>,
++    /// The account's keys, by device: what another device's direct link is
++    /// checked against (device_proof).
++    device_keys: crate::device_proof::AccountKeys,
+     state: Mutex<State>,
+     cache: Mutex<KeyCache>,
+     lookup_failed: Mutex<HashMap<String, Instant>>,
+@@ -524,6 +586,8 @@ impl Plugins {
+                 scans: Default::default(),
+                 account: Mutex::new(None),
+                 links: Mutex::new(None),
++                roads: Mutex::new(None),
++                device_keys: crate::device_proof::AccountKeys::new(data_dir),
+                 state: Mutex::new(state),
+                 cache: Mutex::new(cache),
+                 lookup_failed: Mutex::new(HashMap::new()),
+@@ -624,6 +688,37 @@ impl Plugins {
+         *lock(&self.inner.links) = Some(links);
+     }
+ 
++    /// What checks another device's proof on a direct link to this one.
++    pub fn device_verifier(&self) -> Arc<dyn crate::device_proof::Verifier> {
++        Arc::new(DeviceVerifier(Arc::downgrade(&self.inner)))
++    }
++
++    /// What proves this device to another's direct link: its registered key
++    /// over the link (as a relay dial is proven). Nothing before it has one.
++    pub fn device_link_prover(&self) -> zeron_rpc::CallerProofFn {
++        let (dir, device) = (self.inner.data_dir.clone(), self.inner.device_id.clone());
++        Arc::new(move |host: &str, link: &str, ts: i64| {
++            let (key, signature) = signing::device_link_proof(&dir, host, link, ts)?;
++            Some(zeron_rpc::CallerProof { device: device.clone(), key, signature })
++        })
++    }
++
++    /// The roads to other devices: plugin calls take a direct link once it
++    /// proved which device it's from, the relay otherwise.
++    pub fn set_roads(&self, roads: crate::direct_rpc::Roads) {
++        *lock(&self.inner.roads) = Some(roads);
++    }
++
++    /// How a plugin call reaches another device, once this device is
++    /// connected at all.
++    fn peer_links(&self) -> Option<PeerLinks> {
++        let relay = lock(&self.inner.links).clone()?;
++        Some(PeerLinks {
++            relay,
++            roads: lock(&self.inner.roads).clone(),
++        })
++    }
++
+     /// Follow `auth`: the account for lookups, and on every sign-in change a
+     /// key registration and a rescan.
+     pub fn attach_auth(&self, auth: crate::Auth) {
+@@ -1126,12 +1221,13 @@ impl Plugins {
+     /// Tell `device` a key was revoked, so it checks its own now rather
+     /// than at its next regular check (best effort: offline, it checks then).
+     fn tell_key_revoked(&self, device: String) {
+-        let (Some(links), Ok(runtime)) = (lock(&self.inner.links).clone(), tokio::runtime::Handle::try_current()) else {
++        let (Some(links), Ok(runtime)) = (self.peer_links(), tokio::runtime::Handle::try_current()) else {
+             return;
+         };
+         runtime.spawn(async move {
+             let told = tokio::time::timeout(DELIVER_TIMEOUT, async {
+-                links.client(&device).await?.call(methods::CHECK_PLUGIN_KEY, serde_json::json!({})).await
++                let (client, _) = links.client(&device, methods::CHECK_PLUGIN_KEY).await?;
++                client.call(methods::CHECK_PLUGIN_KEY, serde_json::json!({})).await
+             })
+             .await;
+             if !matches!(told, Ok(Ok(_))) {
+@@ -2594,7 +2690,7 @@ impl Plugins {
+             "author_key": author_identity(&entry),
+             "data": p.data,
+         });
+-        let links = lock(&self.inner.links).clone();
++        let links = self.peer_links();
+         let results = futures::future::join_all(targets.into_iter().map(|target| {
+             let deliver = deliver.clone();
+             let links = links.clone();
+@@ -2606,8 +2702,10 @@ impl Plugins {
+                 let Some(links) = links else {
+                     return (target, outcome::OFFLINE.to_owned());
+                 };
++                let mut direct = false;
+                 let reply = tokio::time::timeout(DELIVER_TIMEOUT, async {
+-                    let client = links.client(&target).await?;
++                    let (client, on_direct) = links.client(&target, methods::PLUGIN_DELIVER).await?;
++                    direct = on_direct;
+                     client.call(methods::PLUGIN_DELIVER, deliver).await
+                 })
+                 .await;
+@@ -2621,7 +2719,7 @@ impl Plugins {
+                     Ok(Err(RpcError::UnknownMethod(_))) => outcome::NOT_INSTALLED.to_owned(),
+                     Ok(Err(_)) | Err(_) => {
+                         if reply.is_err() {
+-                            links.invalidate(&target);
++                            links.suspect(&target, direct);
+                         }
+                         outcome::OFFLINE.to_owned()
+                     }
+@@ -2932,12 +3030,15 @@ impl Plugins {
+             unverified_from: false,
+         };
+         let name = self.device_name(&target);
+-        let Some(links) = lock(&self.inner.links).clone() else {
++        let Some(links) = self.peer_links() else {
+             return Refusal::new(reason::OFFLINE, format!("{name} can't be reached: this device isn't connected")).to_json();
+         };
+         let params = serde_json::to_value(&call).unwrap_or_default();
++        let mut direct = false;
+         let reply = tokio::time::timeout(service::DEFAULT_TIMEOUT + LINK_SLACK, async {
+-            links.client(&target).await?.call(methods::SERVE_PLUGIN_AGENTS, params).await
++            let (client, on_direct) = links.client(&target, methods::SERVE_PLUGIN_AGENTS).await?;
++            direct = on_direct;
++            client.call(methods::SERVE_PLUGIN_AGENTS, params).await
+         })
+         .await;
+         match reply {
+@@ -2949,12 +3050,12 @@ impl Plugins {
+             .to_json(),
+             Ok(Err(error)) => {
+                 if matches!(error, RpcError::Closed | RpcError::Transport(_)) {
+-                    links.invalidate(&target);
++                    links.suspect(&target, direct);
+                 }
+                 Refusal::new(reason::OFFLINE, format!("{name} can't be reached right now ({error})")).to_json()
+             }
+             Err(_) => {
+-                links.invalidate(&target);
++                links.suspect(&target, direct);
+                 Refusal::new(reason::TIMEOUT, format!("{name} didn't answer in time")).to_json()
+             }
+         }
+@@ -3049,7 +3150,7 @@ impl Plugins {
+             devices.retain(|_, until| *until > now);
+             devices.keys().cloned().collect()
+         };
+-        let (Some(links), Ok(runtime)) = (lock(&self.inner.links).clone(), tokio::runtime::Handle::try_current())
++        let (Some(links), Ok(runtime)) = (self.peer_links(), tokio::runtime::Handle::try_current())
+         else {
+             return;
+         };
+@@ -3064,7 +3165,8 @@ impl Plugins {
+             let (links, deliver, this, plugin) = (links.clone(), deliver.clone(), self.clone(), plugin.to_owned());
+             runtime.spawn(async move {
+                 let reply = tokio::time::timeout(DELIVER_TIMEOUT, async {
+-                    links.client(&target).await?.call(methods::PLUGIN_DELIVER, deliver).await
++                    let (client, _) = links.client(&target, methods::PLUGIN_DELIVER).await?;
++                    client.call(methods::PLUGIN_DELIVER, deliver).await
+                 })
+                 .await;
+                 let gone = match &reply {
+@@ -3116,13 +3218,16 @@ impl Plugins {
+     /// One call to another device's service, over the device link.
+     async fn forward_call(&self, target: &str, call: ServeParams) -> serde_json::Value {
+         let name = self.device_name(target);
+-        let Some(links) = lock(&self.inner.links).clone() else {
++        let Some(links) = self.peer_links() else {
+             return Refusal::new(reason::OFFLINE, format!("{name} can't be reached: this device isn't connected")).to_json();
+         };
+         let wait = clamp_timeout(call.timeout) + LINK_SLACK;
+         let params = serde_json::to_value(&call).unwrap_or_default();
++        let mut direct = false;
+         let reply = tokio::time::timeout(wait, async {
+-            links.client(target).await?.call(methods::SERVE_PLUGIN_CALL, params).await
++            let (client, on_direct) = links.client(target, methods::SERVE_PLUGIN_CALL).await?;
++            direct = on_direct;
++            client.call(methods::SERVE_PLUGIN_CALL, params).await
+         })
+         .await;
+         match reply {
+@@ -3135,13 +3240,13 @@ impl Plugins {
+             Ok(Err(RpcError::BadParams(why))) => Refusal::new(reason::BAD_CALL, why).to_json(),
+             Ok(Err(error)) => {
+                 if matches!(error, RpcError::Closed | RpcError::Transport(_)) {
+-                    links.invalidate(target);
++                    links.suspect(target, direct);
+                 }
+                 Refusal::new(reason::OFFLINE, format!("{name} can't be reached right now ({error})")).to_json()
+             }
+             Err(_) => {
+                 // Perhaps a dead link: the next call dials again.
+-                links.invalidate(target);
++                links.suspect(target, direct);
+                 Refusal::new(reason::TIMEOUT, format!("{name} didn't answer within {} s", wait.as_secs())).to_json()
+             }
+         }
+diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
+index cea954bef75f07fe506205f0e10b33d90655a9ca..d2021687cea11c848c3b69a07dc779f5526a7751 100644
+--- a/crates/rpc/src/lib.rs
++++ b/crates/rpc/src/lib.rs
+@@ -432,6 +432,14 @@ pub mod methods {
+     /// asks it of its own engine. An engine without it answers unknown
+     /// method, and the first call pairs as before.
+     pub const WARM_DEVICE_LINK: &str = "WarmDeviceLink";
++    /// The first call on a direct link between two of the person's devices
++    /// (the engine's direct_rpc), answered by the link's host end, never the
++    /// service behind it: `{}` → `{device, nonce}`, then
++    /// `{device, key, signature, ts}` (the key's signature over
++    /// [`crate::caller_proof_message`]`(host, "direct-"+nonce, ts)`) →
++    /// `{device}`, after which the link's calls are served as that device's.
++    /// A host from before answers unknown method; the link stays unverified.
++    pub const DIRECT_HELLO: &str = "DirectHello";
+     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+     /// One chunk of an image an agent's reply names in Markdown
+     /// (`![alt](path)`), read only from inside that chat's working folder.
+-- 
+2.55.0.windows.2
+
