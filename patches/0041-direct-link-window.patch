@@ -1,0 +1,422 @@
+From 7da28b2e4357a6946f9297e7aca468fded391990 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 19:35:56 +0700
+Subject: [PATCH] A stream on the direct link widens its window, so a file
+ crosses a long link at full speed
+
+Each preview mux stream had a fixed 64 KiB receive window: one window a
+round trip, about 0.7 MB/s across the 89 ms between the person's two
+computers, where plain TCP carried 11 MB/s. Behind it the DataChannel's
+256 KiB send buffer and the 512 KiB SCTP receive buffer capped any window
+at about 2.9 MB/s.
+
+- A sender that runs out of window asks for more (a MORE frame, behind
+  what it sent, at most once per 10 ms). The receiver answers once all
+  that came before the ask has gone to its reader, doubling the stream's
+  window up to 1 MiB (mux::MAX_WINDOW: a 90 ms round trip at about
+  11 MB/s). A reader that stopped never gets that far and keeps the
+  window it had.
+- Only between two ends that both said they take more: each sends a GROW
+  frame first, on stream 0, saying the most credit it takes. An end from
+  before ignores frames for stream 0, so it never hears of it, never gets
+  credit past 64 KiB (which it would end the connection over) and never
+  gets a MORE frame (an unknown kind, same). Streams with it run as
+  before.
+- The DataChannel's send buffer is MAX_WINDOW and the SCTP receive buffer
+  twice that, so a grown window isn't capped below it.
+
+Tests (mux, over a stand-in link that delays each frame):
+a_window_grows_to_fill_a_long_link: 2 MiB across a 90 ms round trip took
+2.96 s at 64 KiB (0.71 MB/s) and 0.56 s (3.77 MB/s) grown, five runs
+alike;
+an_end_from_before_keeps_its_window_and_the_link: new to old, old to new
+and old to old, 1 MiB each, the connection held;
+a_reader_that_stopped_holds_back_its_window. Not measured between two
+real computers yet.
+---
+ crates/preview/src/mux.rs  | 256 ++++++++++++++++++++++++++++++++++++-
+ crates/preview/src/peer.rs |   8 +-
+ 2 files changed, 258 insertions(+), 6 deletions(-)
+
+diff --git a/crates/preview/src/mux.rs b/crates/preview/src/mux.rs
+index ed64c8a9124ff7c4390a1dff49ef46016628d963..ee5b40f83bc029fb8ad90bdd3a48610150776b78 100644
+--- a/crates/preview/src/mux.rs
++++ b/crates/preview/src/mux.rs
+@@ -1,6 +1,15 @@
+ //! Bounded, bidirectional streams over either a socket or an ordered DataChannel.
+ //! Each stream has an independent receive window, so a stalled response does
+ //! not stall other requests. END is a half-close; CANCEL aborts both directions.
++//!
++//! A stream starts with a [`WINDOW`] of 64 KiB: one window a round trip, about
++//! 0.7 MB/s across a 90 ms link. A sender that runs out of window asks for
++//! more ([`MORE`]), behind what it sent; a receiver doubles it, up to
++//! [`MAX_WINDOW`], once its reader has taken all that came before the ask (a
++//! reader that stopped never gets that far). Only between two ends that said they take more (a [`GROW`]
++//! frame, the first each end sends): an end from before it refuses credit past
++//! 64 KiB and ends the connection on a frame kind it doesn't know, but drops
++//! frames for stream 0 unread, the GROW frame among them.
+ use std::{
+     collections::HashMap,
+     io,
+@@ -18,7 +27,11 @@ use tokio::{
+ use tokio_util::sync::CancellationToken;
+ 
+ const CHUNK: usize = 8192;
++/// A stream's receive window to start with, and an older end's only one.
+ const WINDOW: usize = 65536;
++/// The most a stream's window grows to: a 90 ms round trip at about 11 MB/s,
++/// what plain TCP carried between two of the person's machines that far apart.
++pub const MAX_WINDOW: usize = 1024 * 1024;
+ const MAX_STREAMS: usize = 64;
+ const OPEN: u8 = 1;
+ const DATA: u8 = 2;
+@@ -29,6 +42,15 @@ const WS_DATA: u8 = 6;
+ const WS_CLOSE: u8 = 7;
+ const CREDIT: u8 = 8;
+ const READY: u8 = 9;
++/// On stream 0, which no stream uses: the most credit this end takes for a
++/// stream, `u32` big-endian. Sent once, first.
++const GROW: u8 = 10;
++/// The sender ran out of window: a wider one would carry more. Sent only to
++/// an end that sent GROW.
++const MORE: u8 = 11;
++/// A sender asks for more at most this often: a window doubles at most once
++/// for each.
++const ASK_GAP: std::time::Duration = std::time::Duration::from_millis(10);
+ 
+ pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+@@ -145,6 +167,11 @@ struct Inner {
+     ids: AtomicU32,
+     parity: u32,
+     stop: CancellationToken,
++    /// The most credit this end takes for a stream: [`MAX_WINDOW`], or an
++    /// older end's [`WINDOW`] (tests play one).
++    takes: usize,
++    /// The most the other end takes: [`WINDOW`] until its GROW frame says.
++    peer_takes: AtomicUsize,
+ }
+ #[derive(Clone)]
+ pub struct Mux(Arc<Inner>);
+@@ -154,8 +181,23 @@ impl Mux {
+         connector: Arc<dyn Connector>,
+         initiator: bool,
+         stop: CancellationToken,
++    ) -> Self {
++        Self::start_taking(transport, connector, initiator, stop, MAX_WINDOW)
++    }
++    /// [`Self::start`] for an end that takes up to `takes` credit a stream:
++    /// [`WINDOW`] plays an end from before windows grew.
++    fn start_taking(
++        transport: Arc<dyn Transport>,
++        connector: Arc<dyn Connector>,
++        initiator: bool,
++        stop: CancellationToken,
++        takes: usize,
+     ) -> Self {
+         let (outgoing, mut output) = mpsc::channel::<Frame>(64);
++        if takes > WINDOW {
++            // First out: nothing is queued yet.
++            let _ = outgoing.try_send(Frame::new(GROW, 0, (takes as u32).to_be_bytes().to_vec()));
++        }
+         let parity = if initiator { 1 } else { 0 };
+         let mux = Self(Arc::new(Inner {
+             slots: Mutex::new(HashMap::new()),
+@@ -163,6 +205,8 @@ impl Mux {
+             ids: AtomicU32::new(if initiator { 1 } else { 2 }),
+             parity,
+             stop,
++            takes,
++            peer_takes: AtomicUsize::new(WINDOW),
+         }));
+         let writer = transport.clone();
+         let cancel = mux.0.stop.clone();
+@@ -214,7 +258,8 @@ impl Mux {
+             "preview stream limit reached"
+         );
+         let (app, bridge) = tokio::io::duplex(WINDOW);
+-        let (incoming, mut input) = mpsc::channel::<Frame>(WINDOW + 2);
++        // (Frames, not bytes: a window's worth of one-byte frames fits.)
++        let (incoming, mut input) = mpsc::channel::<Frame>(MAX_WINDOW + 2);
+         let (ready, result) = oneshot::channel();
+         let slot = Arc::new(Slot {
+             incoming,
+@@ -231,6 +276,7 @@ impl Mux {
+             let (mut read, mut write) = tokio::io::split(bridge);
+             let sending = async {
+                 let mut bytes = vec![0; CHUNK];
++                let mut asked: Option<std::time::Instant> = None;
+                 loop {
+                     let length = read.read(&mut bytes).await?;
+                     if length == 0 {
+@@ -242,7 +288,19 @@ impl Mux {
+                         .await?;
+                         break;
+                     }
+-                    let permit = slot.credit.acquire_many(length as u32).await?;
++                    let permit = match slot.credit.try_acquire_many(length as u32) {
++                        Ok(permit) => permit,
++                        Err(_) => {
++                            if mux.0.takes > WINDOW
++                                && mux.0.peer_takes.load(Ordering::Relaxed) > WINDOW
++                                && asked.is_none_or(|at| at.elapsed() >= ASK_GAP)
++                            {
++                                asked = Some(std::time::Instant::now());
++                                mux.send(Frame::new(MORE, id, Vec::new())).await?;
++                            }
++                            slot.credit.acquire_many(length as u32).await?
++                        }
++                    };
+                     permit.forget();
+                     mux.send(Frame::new(
+                         if websocket { WS_DATA } else { DATA },
+@@ -254,11 +312,25 @@ impl Mux {
+                 anyhow::Ok(())
+             };
+             let receiving = async {
++                let mut window = WINDOW;
+                 while let Some(frame) = input.recv().await {
+                     if matches!(frame.kind, END | WS_CLOSE) {
+                         write.shutdown().await?;
+                         return anyhow::Ok(());
+                     }
++                    if frame.kind == MORE {
++                        // All the sender sent before it asked is with the
++                        // reader: the window, not the reader, holds it back.
++                        let limit = mux.0.takes.min(mux.0.peer_takes.load(Ordering::Relaxed));
++                        if window < limit {
++                            let more = window.min(limit - window);
++                            window += more;
++                            slot.receive_credit.fetch_add(more, Ordering::Relaxed);
++                            mux.send(Frame::new(CREDIT, id, (more as u32).to_be_bytes().to_vec()))
++                                .await?;
++                        }
++                        continue;
++                    }
+                     write.write_all(&frame.data).await?;
+                     slot.receive_credit
+                         .fetch_add(frame.data.len(), Ordering::Relaxed);
+@@ -334,6 +406,14 @@ impl Mux {
+             });
+             return Ok(());
+         }
++        if frame.id == 0 && frame.kind == GROW && self.0.takes > WINDOW {
++            anyhow::ensure!(frame.data.len() == 4, "invalid preview window");
++            let takes = u32::from_be_bytes(frame.data.try_into().unwrap()) as usize;
++            self.0
++                .peer_takes
++                .store(takes.clamp(WINDOW, MAX_WINDOW), Ordering::Relaxed);
++            return Ok(());
++        }
+         let slot = self.0.slots.lock().unwrap().get(&frame.id).cloned();
+         let Some(slot) = slot else {
+             return Ok(());
+@@ -355,12 +435,19 @@ impl Mux {
+                 let count = u32::from_be_bytes(frame.data.try_into().unwrap()) as usize;
+                 anyhow::ensure!(
+                     count > 0
+-                        && count <= WINDOW
+-                        && slot.credit.available_permits() + count <= WINDOW,
++                        && count <= self.0.takes
++                        && slot.credit.available_permits() + count <= self.0.takes,
+                     "invalid preview receive window"
+                 );
+                 slot.credit.add_permits(count);
+             }
++            MORE => {
++                anyhow::ensure!(self.0.takes > WINDOW, "unknown preview frame");
++                // In line behind the data: answered once that's been read.
++                if slot.incoming.try_send(frame).is_err() {
++                    slot.cancel.cancel();
++                }
++            }
+             DATA | WS_DATA | END | WS_CLOSE => {
+                 // The peer cannot queue more than its advertised window. Tiny
+                 // frames are bounded too: abusive streams are cancelled.
+@@ -455,3 +542,164 @@ pub fn local(connector: Arc<dyn Connector>, stop: CancellationToken) -> Mux {
+     );
+     client
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use anyhow::Context as _;
++    use std::time::{Duration, Instant};
++
++    type Due = (tokio::time::Instant, Vec<u8>);
++
++    /// One end of a link that carries any amount, `delay` each way.
++    struct Delayed {
++        out: mpsc::UnboundedSender<Due>,
++        inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<Due>>,
++        delay: Duration,
++    }
++    #[async_trait::async_trait]
++    impl Transport for Delayed {
++        async fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
++            let due = tokio::time::Instant::now() + self.delay;
++            self.out
++                .send((due, bytes.to_vec()))
++                .map_err(|_| anyhow::anyhow!("link closed"))
++        }
++        async fn receive(&self) -> anyhow::Result<Vec<u8>> {
++            let (due, bytes) = self.inbox.lock().await.recv().await.context("link closed")?;
++            tokio::time::sleep_until(due).await;
++            Ok(bytes)
++        }
++    }
++
++    fn delayed_link(delay: Duration) -> (Arc<Delayed>, Arc<Delayed>) {
++        let (a_out, b_in) = mpsc::unbounded_channel();
++        let (b_out, a_in) = mpsc::unbounded_channel();
++        let end = |out, inbox| {
++            Arc::new(Delayed {
++                out,
++                inbox: tokio::sync::Mutex::new(inbox),
++                delay,
++            })
++        };
++        (end(a_out, a_in), end(b_out, b_in))
++    }
++
++    /// A service that reads all it's sent, then says how much.
++    struct Sink;
++    #[async_trait::async_trait]
++    impl Connector for Sink {
++        async fn connect(&self, _service: &str) -> anyhow::Result<BoxIo> {
++            let (client, server) = tokio::io::duplex(WINDOW);
++            tokio::spawn(async move {
++                let (mut read, mut write) = tokio::io::split(server);
++                let (mut total, mut buffer) = (0u64, vec![0; WINDOW]);
++                while let Ok(read) = read.read(&mut buffer).await
++                    && read > 0
++                {
++                    total += read as u64;
++                }
++                let _ = write.write_all(&total.to_be_bytes()).await;
++                let _ = write.shutdown().await;
++            });
++            Ok(Box::new(client))
++        }
++    }
++
++    /// `bytes` up a stream between ends taking `client` and `host` credit,
++    /// `delay` each way: how long until the host said it had them all, and
++    /// how many it said.
++    async fn upload(client: usize, host: usize, bytes: usize, delay: Duration) -> (Duration, u64) {
++        let stop = CancellationToken::new();
++        let (a, b) = delayed_link(delay);
++        let sender = Mux::start_taking(a, Arc::new(Sink), true, stop.child_token(), client);
++        let _host = Mux::start_taking(b, Arc::new(Sink), false, stop.child_token(), host);
++        let mut stream = sender.open("sink", false).await.expect("open");
++        let started = Instant::now();
++        let piece = vec![7u8; 64 * 1024];
++        let mut left = bytes;
++        while left > 0 {
++            let n = left.min(piece.len());
++            stream.write_all(&piece[..n]).await.expect("write");
++            left -= n;
++        }
++        stream.shutdown().await.expect("end");
++        let mut said = [0u8; 8];
++        stream.read_exact(&mut said).await.expect("the host's count");
++        let took = started.elapsed();
++        assert!(!sender.is_closed(), "the connection held");
++        stop.cancel();
++        (took, u64::from_be_bytes(said))
++    }
++
++    /// 2 MiB across a 90 ms round trip. 64 KiB a round trip took about 3 s
++    /// (0.7 MB/s); the window grown takes it in well under a second.
++    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++    async fn a_window_grows_to_fill_a_long_link() {
++        const BYTES: usize = 2 * 1024 * 1024;
++        let delay = Duration::from_millis(45);
++        let (fixed, got) = upload(WINDOW, WINDOW, BYTES, delay).await;
++        assert_eq!(got, BYTES as u64);
++        let (grown, got) = upload(MAX_WINDOW, MAX_WINDOW, BYTES, delay).await;
++        assert_eq!(got, BYTES as u64);
++        let rate = |took: Duration| BYTES as f64 / took.as_secs_f64() / 1e6;
++        eprintln!(
++            "2 MiB over a 90 ms round trip: 64 KiB window {:.2} s ({:.2} MB/s), grown {:.2} s ({:.2} MB/s)",
++            fixed.as_secs_f64(),
++            rate(fixed),
++            grown.as_secs_f64(),
++            rate(grown)
++        );
++        assert!(fixed >= Duration::from_millis(90 * 28), "64 KiB a round trip: {fixed:?}");
++        assert!(grown * 3 < fixed, "grown {grown:?} against {fixed:?}");
++    }
++
++    /// An end from before windows grew neither gets credit past 64 KiB (it
++    /// would end the connection) nor gives it: streams run as before, either
++    /// way round.
++    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++    async fn an_end_from_before_keeps_its_window_and_the_link() {
++        const BYTES: usize = 1024 * 1024;
++        let delay = Duration::from_millis(1);
++        for (client, host) in [(MAX_WINDOW, WINDOW), (WINDOW, MAX_WINDOW), (WINDOW, WINDOW)] {
++            let (_, got) = upload(client, host, BYTES, delay).await;
++            assert_eq!(got, BYTES as u64, "client takes {client}, host {host}");
++        }
++    }
++
++    /// A window grows only for a stream whose reader keeps up: one that
++    /// stopped reading holds what it held when it stopped, far short of
++    /// the most a window grows to.
++    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++    async fn a_reader_that_stopped_holds_back_its_window() {
++        struct Stalled;
++        #[async_trait::async_trait]
++        impl Connector for Stalled {
++            async fn connect(&self, _service: &str) -> anyhow::Result<BoxIo> {
++                let (client, server) = tokio::io::duplex(1024);
++                tokio::spawn(async move {
++                    tokio::time::sleep(Duration::from_secs(60)).await;
++                    drop(server);
++                });
++                Ok(Box::new(client))
++            }
++        }
++        let stop = CancellationToken::new();
++        let (a, b) = delayed_link(Duration::from_millis(1));
++        let sender = Mux::start(a, Arc::new(Sink), true, stop.child_token());
++        let _host = Mux::start(b, Arc::new(Stalled), false, stop.child_token());
++        let mut stream = sender.open("stalled", false).await.expect("open");
++        let piece = vec![7u8; 8 * 1024];
++        let mut sent = 0;
++        while tokio::time::timeout(Duration::from_millis(500), stream.write_all(&piece))
++            .await
++            .is_ok()
++        {
++            sent += piece.len();
++            assert!(sent < MAX_WINDOW / 2, "{sent} bytes went to a reader that stopped");
++        }
++        // Its window and the buffers either side of it.
++        assert!(sent >= 2 * WINDOW, "{sent}");
++        stop.cancel();
++    }
++}
+diff --git a/crates/preview/src/peer.rs b/crates/preview/src/peer.rs
+index 93dd819e0d67e7cf0101ace2f2f3edbd4c2caf18..c09bbabfad7d5e47957db35d8e49dc68ccfb7245 100644
+--- a/crates/preview/src/peer.rs
++++ b/crates/preview/src/peer.rs
+@@ -169,8 +169,12 @@ impl Peers {
+                 )
+                 .with_handler(handler.clone())
+                 .with_udp_addrs(self.udp_addrs())
+-                .with_data_channel_send_buffer_limit(256 * 1024)
+-                .with_sctp_receive_buffer_size(512 * 1024)
++                // What may be on its way at once: a grown stream window
++                // (`mux::MAX_WINDOW`), and room to receive one with another
++                // stream's beside it. At 256/512 KiB a 90 ms link carried
++                // at most 2.9 MB/s however wide the window.
++                .with_data_channel_send_buffer_limit(crate::mux::MAX_WINDOW)
++                .with_sctp_receive_buffer_size(2 * crate::mux::MAX_WINDOW as u32)
+                 .build()
+                 .await?,
+         );
+-- 
+2.55.0.windows.2
+
