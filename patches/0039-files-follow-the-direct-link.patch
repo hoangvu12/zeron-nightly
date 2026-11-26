@@ -1,0 +1,1012 @@
+From e894b27e3df7833260bc2a423121caf213117e8e Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 19:15:37 +0700
+Subject: [PATCH] A file to another of the person's computers moves to the
+ direct link when it comes up
+
+A message's files picked their road once per attempt. A 2.1 MB image sent
+while pairing was 0.84 s from done started on the relay and stayed there
+for all of its 21.7 s, though the direct link was up for nearly all of it.
+
+- push_attachments asks Roads for the road each time the window has room
+  for more chunks, not once per attempt. A file under way on the relay
+  moves to the direct link as soon as that comes up, and back if it drops.
+  The host keeps each chunk whichever road carried it (UploadChunk is
+  idempotent per seq), and the commit takes the road picked last.
+- A transfer of 256 KiB or more waits up to 1.5 s for a pairing already
+  under way (Links::client_within, Roads::client_within) instead of
+  starting on the relay. Nothing under way, or a failure a moment ago: the
+  relay at once, as before.
+- A file attached in a chat's composer gets the link to that chat's host
+  ready before Send: the composer calls chat.warm_link, zgx calls the
+  engine's new local-only WarmDeviceLink {chatId | deviceId} -> {warming},
+  and Roads::warm pairs, opens the rpc stream and keeps an open one from
+  closing as idle (Links::warm_link, one at a time per device, never to a
+  Cloud machine). An engine without it answers unknown method and the
+  first call pairs as before.
+
+Tests: flaky_link_attachments'
+a_big_file_waits_a_moment_for_a_pairing_under_way_and_goes_direct and
+a_file_on_the_relay_moves_to_the_direct_link_when_it_comes_up (a stand-in
+pairing in front of B's real direct host); direct_rpc's
+a_pairing_under_way_is_waited_for_a_moment and
+a_link_warmed_ahead_is_up_for_the_first_call; zgx's
+chat_warm_link.test.luau.
+---
+ apps/zgx/src/chat.rs                          |  18 +
+ apps/zgx/ui/chat_fixture.luau                 |  14 +
+ apps/zgx/ui/screens/chat/composer.luau        |  20 ++
+ apps/zgx/ui/screens/chat/store.luau           |   7 +
+ apps/zgx/ui/tests/chat_warm_link.test.luau    |  25 ++
+ crates/engine/src/direct_rpc.rs               | 203 ++++++++++-
+ crates/engine/src/doc_host.rs                 |  77 ++++-
+ crates/engine/src/rpc.rs                      |  19 ++
+ crates/engine/tests/flaky_link_attachments.rs | 316 +++++++++++++++++-
+ crates/rpc/src/lib.rs                         |   9 +
+ 10 files changed, 693 insertions(+), 15 deletions(-)
+ create mode 100644 apps/zgx/ui/tests/chat_warm_link.test.luau
+
+diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
+index 2cb5423b4684242cb33614359c5450f3b1be451e..a675ac80a421b69ca05a516053fb957bae8d65a3 100644
+--- a/apps/zgx/src/chat.rs
++++ b/apps/zgx/src/chat.rs
+@@ -1414,6 +1414,12 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+     // A new chat's agent, started before its first message (screens/chat/warm).
+     host.async_action("chat.warm", move |args| async move { warm(args).await.map_err(String::from) });
+     host.async_action("chat.unwarm", move |args| async move { unwarm(args).await.map_err(String::from) });
++    // The direct link to a chat's host, got ready before what's about to go
++    // there (a file attached in its composer): `{ id }`.
++    host.async_action("chat.warm_link", move |args| async move {
++        let id = args.field("id").map(text).filter(|id| plain_id(id)).ok_or("missing")?;
++        Ok::<Value, String>(Value::Bool(warm_link(&id).await))
++    });
+     host.async_action("chat.warm_cleared", move |args| async move { warm_cleared(args).await.map_err(String::from) });
+     host.action("chat.warm_taken", move |id| warm_taken(&text(&id)));
+     let pick = which.clone();
+@@ -4107,6 +4113,18 @@ async fn warm(args: Value) -> Result<Value, Outcome> {
+     Ok(answer["outcome"].as_str().map(Value::from).unwrap_or(Value::Nil))
+ }
+ 
++/// Ask the engine to get the direct link to `chat`'s host ready
++/// (`WarmDeviceLink`): pairing takes most of a second, and a file sent while
++/// it's under way used to start, and stay, on the slow relay. `false`: the
++/// chat is hosted here, its host takes the relay alone, or the engine is
++/// from before it.
++async fn warm_link(chat: &str) -> bool {
++    engine::get()
++        .call("WarmDeviceLink", json!({ "chatId": chat }))
++        .await
++        .is_ok_and(|reply| reply["warming"].as_bool() == Some(true))
++}
++
+ /// Stop a warm start: `{ id }`.
+ async fn unwarm(args: Value) -> Result<Value, Outcome> {
+     let id = args.field("id").map(text).filter(|id| plain_id(id)).ok_or("missing")?;
+diff --git a/apps/zgx/ui/chat_fixture.luau b/apps/zgx/ui/chat_fixture.luau
+index 5e4e6b676f2ba1afba1a95e09ef4bf66aec8c254..a3aec75b81a012aeadadbf78fd51eff65dc41a95 100644
+--- a/apps/zgx/ui/chat_fixture.luau
++++ b/apps/zgx/ui/chat_fixture.luau
+@@ -1139,6 +1139,20 @@ ui.command { id = "theme_dark", title = "Dark theme", run = function() ui.theme.
+ ui.command { id = "opaque", title = "Opaque surfaces", run = function() require("@ds/material").frosted:set(false) end }
+ ui.command { id = "frosted", title = "Frosted surfaces", run = function() require("@ds/material").frosted:set(true) end }
+ 
++-- The link to a chat's host warmed ahead of use (store.warm_link): noted
++-- `warm_link:<id>`.
++stub.warm_link = function(id: string)
++	note(`warm_link:{id}`)
++end
++-- A file attached in the open chat's composer, as one dropped is.
++ui.command {
++	id = "attach_file",
++	title = "A file attached",
++	run = function()
++		chat.shared.attach_files({ { name = "notes.txt", path = "/tmp/notes.txt" } })
++	end,
++}
++
+ -- A passage of a reply attached, as the transcript's selection Attach does.
+ ui.command {
+ 	id = "attach_passage",
+diff --git a/apps/zgx/ui/screens/chat/composer.luau b/apps/zgx/ui/screens/chat/composer.luau
+index aaa536a02bb72085cc111055862e176bfb675714..9bfc2defa5b71aec808ca9df3e3950b52faf8ad4 100644
+--- a/apps/zgx/ui/screens/chat/composer.luau
++++ b/apps/zgx/ui/screens/chat/composer.luau
+@@ -513,6 +513,26 @@ local function Composer(): Node
+ 	}
+ 	-- A new chat's agent, started as the person opens it or types (see
+ 	-- screens/chat/warm), with the send's own choices.
++	-- A file or picture attached for a chat on another device: the link to
++	-- that device pairs now, while the message is still being written, so
++	-- Send finds it up and the bytes don't crawl over the relay
++	-- (store.warm_link; nothing for a chat hosted here).
++	local attached_seen = 0
++	ui.effect(function()
++		local id = session_id:get()
++		local files = 0
++		for _, item in shared.cargo:get() do
++			local kind = Carried.kind(item)
++			if kind == "file" or kind == "image" or kind == "appshot" then
++				files += 1
++			end
++		end
++		if id ~= nil and files > attached_seen then
++			store.warm_link(id)
++		end
++		attached_seen = files
++	end)
++
+ 	local warm = Warm.bind {
+ 		session = function(): string?
+ 			return session_id:get()
+diff --git a/apps/zgx/ui/screens/chat/store.luau b/apps/zgx/ui/screens/chat/store.luau
+index 7f1cdfaa879d45674146fb548b990bedaca8f5e6..2df6fd22c71bb1782c20a38cbd46394e0ddda582 100644
+--- a/apps/zgx/ui/screens/chat/store.luau
++++ b/apps/zgx/ui/screens/chat/store.luau
+@@ -229,6 +229,13 @@ function M.refs(path: string, device: string?): any
+ 	return ui.call("chat.refs", { path = path, device = device })
+ end
+ 
++-- Get the direct link to chat `id`'s host ready ahead of what's about to go
++-- there (a file attached): the engine pairs now, not when Send is pressed.
++-- Nothing for a chat hosted here.
++function M.warm_link(id: string)
++	quietly(ui.call("chat.warm_link", { id = id }))
++end
++
+ -- The clipboard's picture written out as a PNG to send (src/pasted.rs): a
+ -- promise of its path, nil when the clipboard holds none.
+ function M.paste_image(): any
+diff --git a/apps/zgx/ui/tests/chat_warm_link.test.luau b/apps/zgx/ui/tests/chat_warm_link.test.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c0b4a203951ad17ed250b791da6ac369104e384
+--- /dev/null
++++ b/apps/zgx/ui/tests/chat_warm_link.test.luau
+@@ -0,0 +1,25 @@
++-- A file attached in a chat's composer gets the direct link to the chat's
++-- host ready while the message is still being written
++-- (screens/chat/composer, store.warm_link): the engine pairs then, so Send
++-- finds the link up instead of starting the bytes on the relay. On
++-- ui/chat_fixture.luau, which notes `warm_link:<id>`.
++
++local function settle(app: any)
++	app:frames(30)
++end
++
++local function calls(app: any): string
++	return app:state("calls") or ""
++end
++
++test("a file attached in a chat's composer warms the link to its host", function()
++	local app = mount("chat_fixture.luau")
++	app:resize(1200, 800)
++	settle(app)
++	app:command("go_s2")
++	settle(app)
++	expect(calls(app)).never.to_contain("warm_link:")
++	app:command("attach_file")
++	settle(app)
++	expect(calls(app)).to_contain("warm_link:s2")
++end)
+diff --git a/crates/engine/src/direct_rpc.rs b/crates/engine/src/direct_rpc.rs
+index b31c3a6676b6002c543c63b2ef0581514567c995..519f6bb914c5f85d516a85c1aa35005de253b0eb 100644
+--- a/crates/engine/src/direct_rpc.rs
++++ b/crates/engine/src/direct_rpc.rs
+@@ -69,6 +69,21 @@ const PING_TIMEOUT: Duration = Duration::from_secs(10);
+ /// links: the next call opens it again.
+ const IDLE_CLOSE: Duration = Duration::from_secs(5 * 60);
+ 
++/// How long a pairing goes on before it gives up by itself
++/// (`zeron_preview`'s connect): asked for less than this long ago, one is
++/// under way.
++const PAIRING_GIVES_UP: Duration = Duration::from_secs(30);
++
++/// How often a call waiting on a pairing under way looks again.
++const PAIRING_POLL: Duration = Duration::from_millis(50);
++
++/// A transfer this big waits up to [`BULK_PATIENCE`] for a pairing under way
++/// rather than starting on the relay: the relay carries about 0.1 MB/s
++/// (a 2.1 MB image took 21.7 s on 2026-11-26 while the direct link came up
++/// 0.84 s in), so the wait pays for itself within the first megabyte.
++pub const BULK_BYTES: u64 = 256 * 1024;
++pub const BULK_PATIENCE: Duration = Duration::from_millis(1500);
++
+ /// The wait after `previous` (none: the first), doubling up to `cap`.
+ fn next_gap(previous: Option<Duration>, first: Duration, cap: Duration) -> Duration {
+     previous.map_or(first, |gap| (gap * 2).min(cap))
+@@ -255,6 +270,9 @@ struct State {
+     backoff: HashMap<String, Wait>,
+     /// Pairing asked for, and not up yet.
+     warm: HashMap<String, Wait>,
++    /// Devices a link is being got ready for ahead of a call
++    /// ([`Links::warm_link`]): one at a time.
++    warming: HashSet<String>,
+     /// The road the last call to each device took.
+     roads: HashMap<String, bool>,
+ }
+@@ -350,6 +368,75 @@ impl Links {
+         }
+     }
+ 
++    /// [`Self::client`], waiting up to `patience` for a pairing under way
++    /// (or a stream opening) to come up rather than taking the relay at once.
++    /// Nothing under way, or a failure a moment ago: `None` at once.
++    pub async fn client_within(
++        &self,
++        device: &str,
++        patience: Duration,
++    ) -> Option<Arc<RpcClient>> {
++        let deadline = Instant::now() + patience;
++        loop {
++            if let Some(client) = self.client(device).await {
++                return Some(client);
++            }
++            let now = Instant::now();
++            if now >= deadline || !self.under_way(device) {
++                return None;
++            }
++            tokio::time::sleep(PAIRING_POLL.min(deadline - now)).await;
++        }
++    }
++
++    /// A pairing with `device` asked for lately and not given up yet, or its
++    /// stream opening, and no failure to open a moment ago.
++    fn under_way(&self, device: &str) -> bool {
++        let state = self.state();
++        let now = Instant::now();
++        if state.backoff.get(device).is_some_and(|wait| now < wait.until) {
++            return false;
++        }
++        state.opening.contains(device)
++            || state.warm.get(device).is_some_and(|wait| {
++                wait.until
++                    .checked_sub(wait.gap)
++                    .is_some_and(|asked| now < asked + PAIRING_GIVES_UP)
++            })
++    }
++
++    /// Get a link to `device` ready ahead of the calls a person is about to
++    /// make (a file attached, a chat on that device opened): pair, open the
++    /// stream, and keep an open one from closing as idle. Returns at once;
++    /// the work goes on in the background, one at a time per device.
++    pub fn warm_link(&self, device: &str) {
++        if zeron_proto::is_cloud_device(device, "") {
++            return;
++        }
++        {
++            let mut state = self.state();
++            if let Some(link) = state.links.get_mut(device)
++                && !link.client.is_closed()
++            {
++                link.used = Instant::now();
++                return;
++            }
++            if !state.warming.insert(device.to_owned()) {
++                return;
++            }
++        }
++        let this = self.clone();
++        let device = device.to_owned();
++        tokio::spawn(async move {
++            let up = this
++                .client_within(&device, PAIRING_GIVES_UP)
++                .await
++                .is_some();
++            this.state().warming.remove(&device);
++            tracing::debug!(device, up, "direct RPC link warmed ahead of use");
++        });
++    }
++
+     async fn open(&self, device: &str) -> Option<Arc<RpcClient>> {
+         let opened = self.pairing.open(device).await;
+         let mut state = self.state();
+@@ -582,8 +669,14 @@ impl Roads {
+     /// A client for `target`: the direct link when it serves one and it's
+     /// up, else the relay (and pairing starts, for the next call).
+     pub async fn client(&self, target: &str) -> Result<Road, RpcError> {
++        self.client_within(target, Duration::ZERO).await
++    }
++
++    /// [`Self::client`], waiting up to `patience` for a pairing already under
++    /// way before taking the relay (a big transfer: [`BULK_PATIENCE`]).
++    pub async fn client_within(&self, target: &str, patience: Duration) -> Result<Road, RpcError> {
+         if (self.serves_direct)(target) {
+-            if let Some(client) = self.direct.client(target).await {
++            if let Some(client) = self.direct.client_within(target, patience).await {
+                 self.direct.note_road(target, true);
+                 return Ok(Road {
+                     client,
+@@ -613,6 +706,16 @@ impl Roads {
+         }
+     }
+ 
++    /// Get the direct link to `target` ready ahead of use, if it serves one
++    /// ([`Links::warm_link`]). `false`: it doesn't (the relay it is).
++    pub fn warm(&self, target: &str) -> bool {
++        if !(self.serves_direct)(target) {
++            return false;
++        }
++        self.direct.warm_link(target);
++        true
++    }
++
+     /// Signed out: every link closes.
+     pub fn disconnect_all(&self) {
+         self.direct.close_all();
+@@ -765,6 +868,104 @@ mod tests {
+         assert_eq!(reply["caller"], json!({ "peer": null }));
+     }
+ 
++    /// A stand-in pairing that comes up `after` this long once asked for,
++    /// whose streams reach an [`Echo`] host.
++    struct SlowPairing {
++        asked: Mutex<Option<Instant>>,
++        after: Duration,
++        opens: std::sync::atomic::AtomicUsize,
++    }
++
++    impl SlowPairing {
++        fn new(after: Duration) -> Arc<Self> {
++            Arc::new(Self {
++                asked: Mutex::new(None),
++                after,
++                opens: Default::default(),
++            })
++        }
++    }
++
++    #[async_trait::async_trait]
++    impl Pairing for SlowPairing {
++        async fn ready(&self, _device: &str) -> bool {
++            self.asked
++                .lock()
++                .unwrap()
++                .is_some_and(|asked| asked.elapsed() >= self.after)
++        }
++
++        fn warm(&self, _device: &str) {
++            self.asked.lock().unwrap().get_or_insert_with(Instant::now);
++        }
++
++        async fn open(&self, _device: &str) -> anyhow::Result<zeron_preview::mux::BoxIo> {
++            self.opens
++                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++            let (near, far) = tokio::io::duplex(64 * 1024);
++            tokio::spawn(serve(
++                zeron_rpc::device_room::peer_service(Arc::new(Echo), None),
++                far,
++            ));
++            Ok(Box::new(near))
++        }
++    }
++
++    /// A call that can wait (a big file) waits for a pairing under way, a
++    /// moment at most; one that can't takes the relay at once, as before.
++    #[tokio::test]
++    async fn a_pairing_under_way_is_waited_for_a_moment() {
++        let links = Links::over(SlowPairing::new(Duration::from_millis(300)));
++        assert!(links.client("laptop").await.is_none(), "not paired yet");
++        let started = Instant::now();
++        let client = links
++            .client_within("laptop", BULK_PATIENCE)
++            .await
++            .expect("up within the wait");
++        assert!(started.elapsed() < BULK_PATIENCE);
++        client.call("Ping", json!({})).await.expect("answered");
++
++        // One that takes longer than the wait: the relay, at the wait's end.
++        let links = Links::over(SlowPairing::new(Duration::from_secs(10)));
++        let started = Instant::now();
++        assert!(
++            links
++                .client_within("laptop", Duration::from_millis(200))
++                .await
++                .is_none()
++        );
++        assert!(started.elapsed() < Duration::from_secs(1));
++    }
++
++    /// Warmed ahead of use (a file attached, a chat opened), the link is up
++    /// for the first call, which then takes no detour by the relay.
++    #[tokio::test]
++    async fn a_link_warmed_ahead_is_up_for_the_first_call() {
++        let pairing = SlowPairing::new(Duration::from_millis(200));
++        let links = Links::over(pairing.clone());
++        links.warm_link("laptop");
++        links.warm_link("laptop"); // one at a time
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !links.state().links.contains_key("laptop") {
++            assert!(Instant::now() < deadline, "the warmed link never opened");
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++        assert!(links.client("laptop").await.is_some());
++        assert_eq!(
++            pairing.opens.load(std::sync::atomic::Ordering::SeqCst),
++            1
++        );
++        // Warming an open link only keeps it from closing as idle.
++        links.warm_link("laptop");
++        assert_eq!(
++            pairing.opens.load(std::sync::atomic::Ordering::SeqCst),
++            1
++        );
++        // Never to a Cloud machine.
++        links.warm_link("cloud-0b59268e");
++        assert!(!links.state().warming.contains("cloud-0b59268e"));
++    }
++
+     /// What a plugin's host trusts as its caller is the device the edge
+     /// verified: those calls never take a direct link. The rest may.
+     #[test]
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index 142c3433dbf912bfe3bf6d6fa85bd22fb87bec04..ee526068c828bdeae28f78c6537e467bacb4e687 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -1843,14 +1843,38 @@ impl DocHost {
+     /// A client for an RPC call to `target`: the direct link when it serves
+     /// one and it's up, else the relay. `true` with it when it's direct.
+     async fn peer_client(&self, target: &str) -> Result<(Arc<zeron_rpc::RpcClient>, bool), String> {
++        self.peer_client_within(target, std::time::Duration::ZERO).await
++    }
++
++    /// [`Self::peer_client`], waiting up to `patience` for a pairing already
++    /// under way to come up rather than taking the relay at once.
++    async fn peer_client_within(
++        &self,
++        target: &str,
++        patience: std::time::Duration,
++    ) -> Result<(Arc<zeron_rpc::RpcClient>, bool), String> {
+         let roads = self.roads().ok_or_else(|| "peer links not wired".to_string())?;
+         let road = roads
+-            .client(target)
++            .client_within(target, patience)
+             .await
+             .map_err(|e| format!("peer link: {e}"))?;
+         Ok((road.client, road.direct))
+     }
+ 
++    /// Get the direct link to the host of `chat` ready ahead of use (a file
++    /// attached for it, the chat opened): pairing takes most of a second, and
++    /// a file that starts on the relay meanwhile crawls. `None`: hosted here,
++    /// unknown, or no roads; `Some(false)`: its host takes the relay alone.
++    pub fn warm_link_to_host_of(&self, chat: &str) -> Option<bool> {
++        let target = self.remote_host_for(chat)?;
++        Some(self.roads()?.warm(&target))
++    }
++
++    /// Get the direct link to `device` ready ahead of use.
++    pub fn warm_link_to(&self, device: &str) -> bool {
++        device != self.device_id() && self.roads().is_some_and(|roads| roads.warm(device))
++    }
++
+     /// A call to `target` timed out or its link failed: drop that link, so
+     /// the next call dials afresh instead of feeding a dead pipe.
+     fn peer_link_suspect(&self, target: &str, direct: bool) {
+@@ -6159,7 +6183,11 @@ impl DocHost {
+ 
+     /// One transfer attempt: chunked `UploadChunk` + `UploadCommit` straight
+     /// over the peer link (same wire the UI's legacy path used, so old and
+-    /// new engines interoperate). Timeouts mark the link suspect —
++    /// new engines interoperate). The road is picked again each time the
++    /// window has room (and for each commit): a direct link that comes up
++    /// mid-file takes the rest, and one that drops hands it back to the relay,
++    /// the host keeping each chunk by its `seq` whichever road carried it.
++    /// Timeouts mark the link suspect —
+     /// `invalidate` drops the cached socket so the retry dials fresh instead
+     /// of feeding a zombie pipe forever (2026-08-19 incident).
+     ///
+@@ -6181,8 +6209,22 @@ impl DocHost {
+         let Some(uploads) = self.inner.uploads.get() else {
+             return Err(Permanent("uploads not wired".into()));
+         };
+-        let (client, direct) = self.peer_client(target).await.map_err(Transient)?;
+-        let suspect = || self.peer_link_suspect(target, direct);
++        // A big transfer waits a moment for a pairing under way: the relay
++        // carries about 0.1 MB/s, the direct link many times that.
++        let mut size = 0u64;
++        for transfer in transfers {
++            let source = uploads.pending_target(&transfer.upload_id, &transfer.file_name);
++            size += tokio::fs::metadata(&source).await.map(|m| m.len()).unwrap_or(0);
++        }
++        let patience = if size >= crate::direct_rpc::BULK_BYTES {
++            crate::direct_rpc::BULK_PATIENCE
++        } else {
++            std::time::Duration::ZERO
++        };
++        let (mut client, mut direct) = self
++            .peer_client_within(target, patience)
++            .await
++            .map_err(Transient)?;
+         for transfer in transfers {
+             // Bytes come from the uploads jail only — a transfer names an
+             // upload identity, never an arbitrary path.
+@@ -6194,7 +6236,7 @@ impl DocHost {
+                 Ok(HostHolds::Committed) => continue, // landed on an earlier attempt
+                 Ok(HostHolds::Chunks(staged)) => staged,
+                 Err(err) => {
+-                    suspect();
++                    self.peer_link_suspect(target, direct);
+                     return Err(Transient(err));
+                 }
+             };
+@@ -6221,36 +6263,46 @@ impl DocHost {
+                 host: self,
+                 upload_id: &transfer.upload_id,
+             };
+-            let mut todo = todo.into_iter();
++            let mut todo = todo.into_iter().peekable();
+             let mut in_flight = FuturesUnordered::new();
+             loop {
++                // The road again, each time the window has room: the direct
++                // link may have come up (or dropped) since the last chunk.
++                if in_flight.len() < TRANSFER_WINDOW && todo.peek().is_some() {
++                    (client, direct) = self.peer_client(target).await.map_err(Transient)?;
++                }
+                 while in_flight.len() < TRANSFER_WINDOW
+                     && let Some((seq, start, end)) = todo.next()
+                 {
+                     let params = serde_json::json!({
+                         "uploadId": transfer.upload_id, "seq": seq, "data": &b64[start..end],
+                     });
+-                    let call = client.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
++                    // Each chunk holds its own road, so the next pick can
++                    // change it while this one is in flight.
++                    let road = client.clone();
++                    let on_direct = direct;
+                     in_flight.push(async move {
++                        let call = road.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
+                         (
+                             end - start,
++                            on_direct,
+                             tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await,
+                         )
+                     });
+                 }
+-                let Some((sent, outcome)) = in_flight.next().await else {
++                let Some((sent, on_direct, outcome)) = in_flight.next().await else {
+                     break; // every chunk landed
+                 };
+                 match outcome {
+                     Err(_) => {
+-                        suspect();
++                        self.peer_link_suspect(target, on_direct);
+                         return Err(Transient("chunk push timed out; peer link suspect".into()));
+                     }
+                     Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
+                         return Err(Permanent(format!("host refused chunk: {err}")));
+                     }
+                     Ok(Err(err)) => {
+-                        suspect();
++                        self.peer_link_suspect(target, on_direct);
+                         return Err(Transient(format!("chunk push failed: {err}")));
+                     }
+                     Ok(Ok(_)) => {}
+@@ -6263,20 +6315,21 @@ impl DocHost {
+                     total,
+                 );
+             }
++            (client, direct) = self.peer_client(target).await.map_err(Transient)?;
+             let params = serde_json::json!({
+                 "uploadId": transfer.upload_id, "fileName": transfer.file_name,
+             });
+             let call = client.call(zeron_rpc::methods::UPLOAD_COMMIT, params);
+             match tokio::time::timeout(TRANSFER_COMMIT_TIMEOUT, call).await {
+                 Err(_) => {
+-                    suspect();
++                    self.peer_link_suspect(target, direct);
+                     return Err(Transient("commit timed out; peer link suspect".into()));
+                 }
+                 Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
+                     return Err(Permanent(format!("host refused commit: {err}")));
+                 }
+                 Ok(Err(err)) => {
+-                    suspect();
++                    self.peer_link_suspect(target, direct);
+                     return Err(Transient(format!("commit failed: {err}")));
+                 }
+                 Ok(Ok(_)) => {}
+diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
+index 8773dafddc1e5cbe2be9c65997816cc4446bd549..dcc4639f62398d7cd4ca77f5c6712a19aa367b86 100644
+--- a/crates/engine/src/rpc.rs
++++ b/crates/engine/src/rpc.rs
+@@ -4066,6 +4066,25 @@ impl RpcService for EngineRpc {
+                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+             }
++            methods::WARM_DEVICE_LINK => {
++                #[derive(Deserialize)]
++                #[serde(rename_all = "camelCase")]
++                struct WarmLinkParams {
++                    #[serde(default)]
++                    chat_id: Option<String>,
++                    #[serde(default)]
++                    device_id: Option<String>,
++                }
++                let p: WarmLinkParams = parse_params(params)?;
++                let warming = match (p.chat_id.as_deref(), p.device_id.as_deref()) {
++                    (Some(chat), _) => self.doc_host.warm_link_to_host_of(chat).unwrap_or(false),
++                    (None, Some(device)) => self.doc_host.warm_link_to(device),
++                    (None, None) => {
++                        return Err(RpcError::BadParams("name a chatId or a deviceId".into()));
++                    }
++                };
++                RpcReply::value(&serde_json::json!({ "warming": warming }))
++            }
+             methods::WARM_START => {
+                 #[derive(Deserialize)]
+                 #[serde(rename_all = "camelCase")]
+diff --git a/crates/engine/tests/flaky_link_attachments.rs b/crates/engine/tests/flaky_link_attachments.rs
+index 23b3d9ab6b42e8580ef72991b748d06a45637a4e..c6bb397aec72dd487fa1e23505e872ff0a1ea828 100644
+--- a/crates/engine/tests/flaky_link_attachments.rs
++++ b/crates/engine/tests/flaky_link_attachments.rs
+@@ -52,6 +52,19 @@ struct RelayState {
+ /// socket once it has carried [`CHUNKS_PER_CONNECTION`] `UploadChunk` calls.
+ /// `chunks` counts every chunk it carried to the host.
+ async fn flaky_device_room(chunks: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
++    device_room(chunks, CHUNKS_PER_CONNECTION, None).await
++}
++
++/// Called with the count of chunks the room has carried, after each one.
++type OnChunk = Arc<dyn Fn(usize) + Send + Sync>;
++
++/// [`flaky_device_room`], cutting a client after `cut_after` chunks, and
++/// telling `on_chunk` of each one it carries.
++async fn device_room(
++    chunks: Arc<AtomicUsize>,
++    cut_after: usize,
++    on_chunk: Option<OnChunk>,
++) -> (String, tokio::task::JoinHandle<()>) {
+     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+     let url = format!(
+         "http://127.0.0.1:{}",
+@@ -65,6 +78,7 @@ async fn flaky_device_room(chunks: Arc<AtomicUsize>) -> (String, tokio::task::Jo
+             };
+             let state = state.clone();
+             let chunks = chunks.clone();
++            let on_chunk = on_chunk.clone();
+             tokio::spawn(async move {
+                 let mut uri = String::new();
+                 let Ok(ws) = tokio_tungstenite::accept_hdr_async(
+@@ -132,9 +146,12 @@ async fn flaky_device_room(chunks: Arc<AtomicUsize>) -> (String, tokio::task::Jo
+                         }
+                     }
+                     if is_chunk {
+-                        chunks.fetch_add(1, Ordering::SeqCst);
++                        let count = chunks.fetch_add(1, Ordering::SeqCst) + 1;
++                        if let Some(on_chunk) = &on_chunk {
++                            on_chunk(count);
++                        }
+                         carried += 1;
+-                        if carried >= CHUNKS_PER_CONNECTION {
++                        if carried >= cut_after {
+                             break; // the link drops
+                         }
+                     }
+@@ -375,3 +392,298 @@ async fn a_file_over_a_link_that_keeps_dropping_resumes_and_lands_whole() {
+     core_a.shutdown().await;
+     core_b.shutdown().await;
+ }
++
++// ---------------------------------------------------------------------------
++// The direct link: a file takes it as soon as it's up
++// ---------------------------------------------------------------------------
++
++/// What reached B over the direct link, by method.
++type Seen = Arc<Mutex<Vec<String>>>;
++
++/// B's service as its direct link serves it, noting each call that came
++/// that way.
++struct NotedDirect {
++    inner: Arc<dyn zeron_rpc::RpcService>,
++    seen: Seen,
++}
++
++#[async_trait]
++impl zeron_rpc::RpcService for NotedDirect {
++    async fn handle(
++        &self,
++        method: &str,
++        params: serde_json::Value,
++    ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
++        self.seen.lock().expect("lock").push(method.to_owned());
++        self.inner.handle(method, params).await
++    }
++}
++
++/// A stand-in for the WebRTC pairing between A and B, in front of B's real
++/// direct RPC host. It comes up `after` asked for (`None`: only when
++/// [`Pairing::set_up`] says so).
++struct Pairing {
++    host: zeron_engine::direct_rpc::Service,
++    after: Option<Duration>,
++    asked: Mutex<Option<std::time::Instant>>,
++    up: std::sync::atomic::AtomicBool,
++}
++
++impl Pairing {
++    fn set_up(&self) {
++        self.up.store(true, Ordering::SeqCst);
++    }
++}
++
++#[async_trait]
++impl zeron_engine::direct_rpc::Pairing for Pairing {
++    async fn ready(&self, _device: &str) -> bool {
++        self.up.load(Ordering::SeqCst)
++            || self.after.is_some_and(|after| {
++                self.asked
++                    .lock()
++                    .expect("lock")
++                    .is_some_and(|asked| asked.elapsed() >= after)
++            })
++    }
++
++    fn warm(&self, _device: &str) {
++        self.asked
++            .lock()
++            .expect("lock")
++            .get_or_insert_with(std::time::Instant::now);
++    }
++
++    async fn open(&self, device: &str) -> anyhow::Result<zeron_preview::mux::BoxIo> {
++        use zeron_preview::mux::Connector as _;
++        anyhow::ensure!(
++            zeron_engine::direct_rpc::Pairing::ready(self, device).await,
++            "not paired"
++        );
++        self.host
++            .connect_from(Some("device-a"), zeron_engine::direct_rpc::SERVICE)
++            .await
++    }
++}
++
++/// A and B in a room that never cuts a link (`on_chunk` hears of each chunk
++/// it carries), B's direct host behind a [`Pairing`] that comes up `after`
++/// asked for, and A's registry row for B saying B serves direct RPC.
++struct DirectPair {
++    core_a: EngineCore,
++    core_b: EngineCore,
++    pairing: Arc<Pairing>,
++    seen: Seen,
++    relayed: Arc<AtomicUsize>,
++    _direct_service: Arc<dyn zeron_rpc::RpcService>,
++    _host: zeron_rpc::HostRelay,
++    _relay: tokio::task::JoinHandle<()>,
++}
++
++async fn direct_pair(
++    dirs: &std::path::Path,
++    after: Option<Duration>,
++    on_chunk: impl Fn(usize, &Pairing) + Send + Sync + 'static,
++) -> DirectPair {
++    let core_b = assemble(&dirs.join("b"), "device-b");
++    let seen = Seen::default();
++    let direct_service: Arc<dyn zeron_rpc::RpcService> = Arc::new(NotedDirect {
++        inner: core_b.rpc_service(),
++        seen: seen.clone(),
++    });
++    let pairing = Arc::new(Pairing {
++        host: zeron_engine::direct_rpc::Service::new(&direct_service),
++        after,
++        asked: Mutex::new(None),
++        up: Default::default(),
++    });
++    let relayed = Arc::new(AtomicUsize::new(0));
++    let hook = {
++        let pairing = Arc::downgrade(&pairing);
++        Arc::new(move |count: usize| {
++            if let Some(pairing) = pairing.upgrade() {
++                on_chunk(count, &pairing);
++            }
++        })
++    };
++    let (relay_url, relay) = device_room(relayed.clone(), usize::MAX, Some(hook)).await;
++    let host = core_b.start_host_relay(&relay_url);
++
++    let core_a = assemble(&dirs.join("a"), "device-a");
++    let mut capabilities = zeron_proto::capabilities::current();
++    capabilities.push(zeron_proto::capabilities::DIRECT_RPC_V1.to_owned());
++    core_a.workspace.upsert_device_row(&Device {
++        id: "device-b".into(),
++        name: "b".into(),
++        platform: "linux".into(),
++        last_seen_at: Some(chrono::Utc::now()),
++        created_at: None,
++        version: Some("0.3.21".into()),
++        cursor_sdk_version: None,
++        capabilities,
++    });
++    core_a.set_direct_links(zeron_engine::direct_rpc::Links::over(pairing.clone()));
++    let mut link_config =
++        LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
++    link_config.probe_timeout = Duration::from_secs(5);
++    core_a.set_links(LinkCache::new(link_config));
++    DirectPair {
++        core_a,
++        core_b,
++        pairing,
++        seen,
++        relayed,
++        _direct_service: direct_service,
++        _host: host,
++        _relay: relay,
++    }
++}
++
++/// A message with a file of `size` bytes, sent from A to the chat on B;
++/// returns the bytes and how many chunks they make.
++async fn send_file(pair: &DirectPair, upload: &str, size: u32) -> (Vec<u8>, usize) {
++    let bytes: Vec<u8> = (0..size)
++        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
++        .collect();
++    let total_chunks = BASE64.encode(&bytes).len().div_ceil(60_000);
++    let client_a = zeron_rpc::memory_client(pair.core_a.rpc_service());
++    client_a
++        .call(
++            methods::MUTATE,
++            serde_json::json!({ "op": "createChat", "chatId": CHAT, "deviceId": "device-b" }),
++        )
++        .await
++        .expect("createChat on A");
++    pair.core_b
++        .workspace
++        .rename_chat(CHAT, "Pre-titled")
++        .expect("pre-title on B (no auto-title harness run)");
++    let encoded = BASE64.encode(&bytes);
++    for (seq, piece) in encoded.as_bytes().chunks(500_000).enumerate() {
++        client_a
++            .call(
++                methods::UPLOAD_CHUNK,
++                serde_json::json!({
++                    "uploadId": upload, "seq": seq,
++                    "data": std::str::from_utf8(piece).expect("base64 is ascii"),
++                }),
++            )
++            .await
++            .expect("stage chunk on A");
++    }
++    client_a
++        .call(
++            methods::UPLOAD_COMMIT,
++            serde_json::json!({ "uploadId": upload, "fileName": "big.bin" }),
++        )
++        .await
++        .expect("commit on A");
++    let reference = format!("pending://{upload}/big.bin");
++    let command = serde_json::to_value(SessionCommandPayload::Run {
++        request: RunRequest {
++            mcp: None,
++            prompt: format!("look at this\n\nAttached files:\n- {reference}"),
++            harness: None,
++            model: None,
++            reasoning: None,
++            model_options: Default::default(),
++            cwd: "~".into(),
++            sandbox: SandboxLevel::WorkspaceWrite,
++            auto_approve: true,
++            access: Default::default(),
++            plan: false,
++            code_mode: false,
++            zeron_mcp_only: false,
++            attachments: vec![reference.clone()],
++            worktree: None,
++            resume: None,
++            env: Default::default(),
++            extra_mcp: Vec::new(),
++        },
++        message_id: format!("msg-{upload}"),
++    })
++    .expect("command json");
++    client_a
++        .call(
++            methods::QUEUE_COMMAND,
++            serde_json::json!({
++                "chatId": CHAT,
++                "command": command,
++                "transfers": [{ "uploadId": upload, "fileName": "big.bin" }],
++            }),
++        )
++        .await
++        .expect("queue on A");
++    (bytes, total_chunks)
++}
++
++/// The message ran on B, with the file whole there.
++async fn ran_with_the_file(pair: &DirectPair, dirs: &std::path::Path, name: &str, bytes: &[u8]) {
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
++    while complete_assistant_count(&pair.core_b) < 1 {
++        assert!(
++            tokio::time::Instant::now() < deadline,
++            "the message never ran on B; {} chunks relayed, {} direct",
++            pair.relayed.load(Ordering::SeqCst),
++            came_direct(&pair.seen, methods::UPLOAD_CHUNK),
++        );
++        tokio::time::sleep(Duration::from_millis(100)).await;
++    }
++    let landed = find_file(&dirs.join("b"), name).expect("B committed the file");
++    assert_eq!(std::fs::read(landed).expect("read landed file"), bytes, "whole");
++}
++
++fn came_direct(seen: &Seen, method: &str) -> usize {
++    seen.lock()
++        .expect("lock")
++        .iter()
++        .filter(|m| m.as_str() == method)
++        .count()
++}
++
++/// The 2.1 MB image of 2026-11-26 started on the relay while pairing was
++/// 0.84 s from done, and took 21.7 s there. A big file now waits a moment for
++/// a pairing under way, and goes direct, every chunk.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_big_file_waits_a_moment_for_a_pairing_under_way_and_goes_direct() {
++    let dirs = tempfile::tempdir().expect("tempdir");
++    let pair = direct_pair(dirs.path(), Some(Duration::from_millis(300)), |_, _| {}).await;
++    let (bytes, total_chunks) = send_file(&pair, "att-wait", 1_500_000).await;
++    ran_with_the_file(&pair, dirs.path(), "att-wait-big.bin", &bytes).await;
++    assert_eq!(pair.relayed.load(Ordering::SeqCst), 0, "no chunk took the relay");
++    assert_eq!(came_direct(&pair.seen, methods::UPLOAD_CHUNK), total_chunks);
++    assert_eq!(came_direct(&pair.seen, methods::UPLOAD_COMMIT), 1);
++    pair.core_a.shutdown().await;
++    pair.core_b.shutdown().await;
++}
++
++/// A file under way on the relay moves to the direct link when that comes
++/// up: the road is picked again each time the window has room, and the host
++/// keeps each chunk whichever road carried it.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_file_on_the_relay_moves_to_the_direct_link_when_it_comes_up() {
++    let dirs = tempfile::tempdir().expect("tempdir");
++    let pair = direct_pair(dirs.path(), None, |count, pairing| {
++        if count == 8 {
++            pairing.set_up();
++        }
++    })
++    .await;
++    let (bytes, total_chunks) = send_file(&pair, "att-move", 1_500_000).await;
++    ran_with_the_file(&pair, dirs.path(), "att-move-big.bin", &bytes).await;
++    let relayed = pair.relayed.load(Ordering::SeqCst);
++    let direct = came_direct(&pair.seen, methods::UPLOAD_CHUNK);
++    assert!(relayed >= 8, "{relayed} relayed");
++    assert!(direct > 0, "none moved to the direct link ({relayed} relayed)");
++    assert!(
++        relayed < total_chunks,
++        "the rest stayed on the relay: {relayed} of {total_chunks}"
++    );
++    assert!(relayed + direct >= total_chunks);
++    assert!(
++        pair.pairing.up.load(Ordering::SeqCst),
++        "the pairing came up mid-file"
++    );
++    pair.core_a.shutdown().await;
++    pair.core_b.shutdown().await;
++}
+diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
+index 092fc84a4b9cae44d8fffd8da431268d4e6df1e4..cea954bef75f07fe506205f0e10b33d90655a9ca 100644
+--- a/crates/rpc/src/lib.rs
++++ b/crates/rpc/src/lib.rs
+@@ -425,6 +425,13 @@ pub mod methods {
+     /// sends only the rest. Hosts without it answer unknown method; the
+     /// sender then sends everything, as before.
+     pub const UPLOAD_STATUS: &str = "UploadStatus";
++    /// `{chatId?, deviceId?}` → `{warming}`: get the direct link to another
++    /// of the person's computers (a chat's host, or the device named) ready
++    /// ahead of the calls about to go there: a file attached in the
++    /// composer, a chat on that device opened. Local-only: this device's app
++    /// asks it of its own engine. An engine without it answers unknown
++    /// method, and the first call pairs as before.
++    pub const WARM_DEVICE_LINK: &str = "WarmDeviceLink";
+     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+     /// One chunk of an image an agent's reply names in Markdown
+     /// (`![alt](path)`), read only from inside that chat's working folder.
+@@ -790,6 +797,8 @@ pub fn local_only(method: &str) -> bool {
+             // This device's background engine: whether it outlives its app.
+             | methods::GET_BACKGROUND_SETTINGS
+             | methods::SET_BACKGROUND_SETTINGS
++            // This device's links to the others, warmed for its own app.
++            | methods::WARM_DEVICE_LINK
+             | methods::QUIT_CHECK
+             | methods::APP_QUITTING
+             // An API key typed into this device's app: stored here alone.
+-- 
+2.55.0.windows.2
+
