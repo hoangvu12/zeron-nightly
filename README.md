@@ -79,7 +79,7 @@ Set `enabled = false` to park an entry. The release notes say when a pinned
 PR has new commits, is in upstream (then delete the entry) or was closed. A
 PR whose base is another branch (such as the frozen `zeron/zgx`) can conflict
 with `main`: carry it as a patch file merged onto `main` instead
-(`design-plugin-apis` says how).
+(as `design-plugin-apis` was, until #1392 moved to `main`).
 
 Make patch files with `git format-patch --full-index`: CI's clone has no
 blobs to fall back on, so `git am -3` needs the full ids.

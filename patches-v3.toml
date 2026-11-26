@@ -61,18 +61,26 @@ name = "agent-steers-wait-for-tools"
 file = "patches/0008-agent-steers-wait-for-tools.patch"
 note = "An agent's send_message to a busy chat no longer stops the command that chat is running (the agent there read the stop as its call declined, and waited for nobody): it goes by the mailbox (Steer at_once false) and lands at the next step. The person's own steers are still read at once, and a steer that stops a command now tells the agent it was stopped, not declined. Rebased onto main, which has upstream's own fix for the same bug (d071ed2db: a steer with the from-another-chat header never stops a command). This patch replaces that guard in steer_now with its own at_once flag, so an agent's explicit mode 'steer' still stops the command (with the note), as child-chats-report-back's tests expect; upstream's test sends at_once false, as an agent's ordinary send does. A steer from a peer without this patch (a Cloud machine on upstream Zeron) has no at_once and is read at once, as before d071ed2db."
 
+# Child reports: off since 2026-11-26, to try upstream's own (#1597, background
+# subagent chats with a parent that waits). Every child-reports entry below is
+# parked with them: none had applied since upstream main moved past their
+# base (2026-11-24). Drop them if upstream's does the job.
+
 [[patch]]
 name = "child-chats-report-back"
+enabled = false
 file = "patches/0007-child-chats-report-back.patch"
 note = "Subagents and side chats report back to the chat that made them when their turn ends, a few seconds apart at most, never waiting on a stuck sibling. Kept in the chats themselves, so restarts and other devices lose none. A steer's stop is no stop, and a stop's report never takes the place of the end's. Goes after agent-steers-wait-for-tools, which its tests need. Regenerated onto main 2e72f94e6 (#1495's perf merge, #1458): its report-back lines go into main's shorter MCP instructions; run_journal.rs's last_append sits on main's RunJournal beside its flusher; ds/transcript.luau's report cards and spawn blocks go into main's windowed blocks_of (its `block`); ds/activity.luau's subagent_child goes to main's Tree; screens/chat/session.luau's children and agent_mark go on main's one Transcript."
 
 [[patch]]
 name = "child-reports-follow-ups"
+enabled = false
 file = "patches/0009-child-reports-follow-ups.patch"
 note = "What real use of child-chats-report-back found: a turn a child starts on its own (its tests done, a timer) reports as a follow-up; a reply repeating what the child sent isn't said twice; a child's answer to a thanks doesn't wake its parent; the still-working note is short and right across devices; a report after the person's Stop still wakes the parent; after a handoff the new orchestrator gets the children, and nobody writes to an archived chat; a restart or another chat's Stop isn't the person's; a turn that ended on an error reports failed; Pi's info toasts stay out of replies, and Pi without a Zeron account still counts as connected. Applies on top of child-chats-report-back."
 
 [[patch]]
 name = "child-reports-held-stop"
+enabled = false
 file = "patches/0010-child-reports-held-stop.patch"
 note = "The person's Stop on a child is held for two minutes: what they write to it meanwhile corrects the parent's task, so the parent hears nothing until the child's normal finished report, and the child stays on its wait. A Stop left standing reports once the hold is out; an agent's Stop or a Zeron restart still reports at once. Once the person writes to a child otherwise, it is theirs and its ends no longer report. Applies on top of child-reports-follow-ups."
 
@@ -86,17 +94,9 @@ note = "A long page in a reply (a phone screenshot, taller than 2:1) shows its t
 
 [[patch]]
 name = "design-plugin-apis"
-file = "patches/0018-design-plugin-apis.patch"
-note = "#1392 at 6094319cb as one file, merged onto main: the Design plugin's plugin APIs (#1362 tool images, #1363 service memory, #1366 zeron.eval, #1367 measure_text/load_font in services, #1378 fonts, #1379 fetch bytes in base64, #1380 a service's zeron.db, #1398 zeron.write_file and files.write, and a plugin window's memory from its manifest, which was 0013). #1392's base is still the frozen zeron/zgx, and main moved the same Cargo.toml lines (its zgx pin) and the consent fixture, so a `pr` entry conflicts. Its zgx is hoangvu12/zgx 2d6d52fbc, kept on branch nightly-design-2d6d52fb so a force-push of a PR can't take it away: ebebffb01 (nightly-design-ebebffb0: #2110 at 4914d045a, on zgx main 126357bb5, with #2299's tile fixes cherry-picked on, as they sat on #2110's earlier head a37e02b67, and #2285 (middle-mouse press), #2297 (full screen) and #2298 (display scale) merged) with main's pin, zeronsh/zgx b80a8af1c, merged in. Before that it was ebebffb01, and 24b35872 (nightly-design-24b35872) before that. Regenerated onto main 2e72f94e6: plugins/mod.rs gives a plugin's window its memory, then main's reload (held until the window's first load); the root Cargo.lock takes smallvec 1.16.5, which the zgx merge asks for. 2d6d52fbc is 9a65480ee (the merge below) with zgx's fabb111f reverted (2026-11-18): with it, rows a list builds in spare time hear on_visible a frame late, and main's transcript (#1495), which builds a reply's runs only once they're near, showed nothing for two steps when a synced chat scrolled up was republished without its last two rows, then whole (transcript_scroll_tests' LastRowsDroppedOnce). fabb111f is in zeronsh/zgx main but not main's pin b80a8af1c, so main hits it at its next zgx bump; drop the revert once zgx or the transcript handles it. It carries everything 0012's nightly-design-export (1890c055) did, so that patch is gone. The consent fixture lists both main's draft and #1392's fonts; both lockfiles are regenerated. Regenerated onto main fb09b2391 (0.3.8, #1499): main's Cargo.lock again, then cargo's, as above. Regenerated onto main 46f18fe43 (#1539's zgx pin b8f298b6b): its zgx is hoangvu12/zgx 39fa8866a (nightly-design-39fa8866), which is 9a65480ee with b8f298b6b merged in and no fabb111f revert, since b8f298b6b carries zgx#2386, the fix for fabb111f's frame-late row reports (zgx main has had #2110 since e35626b88, so the fork now adds only #2299, #2285, #2297 and #2298). Main's \"scene3d\" permission and #1392's \"fonts\" are both kept in manifest.rs, grants.rs, words.luau and the locales, and both lockfiles are main's, then cargo's (smallvec 1.16.5 again)."
-# When #1392 moves: in a checkout assembled up to here minus this entry, merge
-# the new head, take main's side of apps/zgx/Cargo.toml with each zgx rev
-# moved to #1392's (and the comment above `zgx =`), union the consent
-# fixture's permission lists, take main's apps/zgx/Cargo.lock and let
-# `cargo metadata` (root and apps/zgx) update both locks, check both with
-# `cargo metadata --locked`, then regenerate this file as one commit with
-# `git format-patch --full-index`. Keep a new zgx rev on a branch of its own
-# on hoangvu12/zgx (never a force-pushed one), as nightly-design-24b35872 is.
-# Once #1392 is retargeted to main upstream, make this a `pr` entry again.
+pr = 1392
+sha = "f3b87280db7bfa477e4691d8ab8a8e467bdf1739"
+note = "The Design plugin's plugin APIs in one PR: tool images, service memory, zeron.eval, measure_text/load_font in services, fonts, fetch bytes in base64, a service's zeron.db, zeron.write_file and files.write, and a plugin window's memory from its manifest. Back to a `pr` entry on 2026-11-26, now that #1392 targets main: the patch file (0018, #1392 at 6094319cb on main 46f18fe43) had conflicted with main's zgx pin since 2026-11-23, and from 2026-11-25 couldn't apply at all. #1392 merges onto main ae294f534 cleanly and keeps main's zgx pin, so the four zgx PRs the old patch's zgx fork carried (#2299 canvas tile fixes, #2285 middle-mouse press, #2297 full screen, #2298 display scale) are out until zgx merges them."
 
 [[patch]]
 name = "plugin-windows"
@@ -106,21 +106,25 @@ note = "A plugin's declared `ui.window`s open in the zgx app (zgx_run::follow_wi
 
 [[patch]]
 name = "child-reports-one-rule"
+enabled = false
 file = "patches/0014-child-reports-one-rule.patch"
 note = "Child reports follow one rule: the first turn of a child after its parent's message answers it, whoever wrote in between; the person's Stop is filed quietly, an agent's Stop still reports. A question's report names its request_id and drops once that exact question is answered; reports from children on other devices are kept until they rest. A subagent created on a host that won't report back says so at creation. Needs #1458 (agents' device commands, upstream since e91a75b02) and child-reports-held-stop."
 
 [[patch]]
 name = "child-reports-holds-and-groups"
+enabled = false
 file = "patches/0015-child-reports-holds-and-groups.patch"
 note = "Child reports wake the parent less, and only with something new: a progress message can wait for its child's end (FYIs never wake alone); a report the parent's agent already read with read_chat isn't said again; a child that keeps coming back is paused after 20 reports until the person writes; while the person talks to the parent, its children's reports go with their next message (or after 5 quiet minutes); and create_chats notify:\"all\" hears from a group of children once, when all are done (30-minute fallback). Held reports are kept in the chat, and reports a restart caught after they reached the transcript but before the agent read them go again; one caught between the queue and the transcript is still lost, as any queued message is (a core queue follow-up). Applies on top of child-reports-one-rule. Regenerated onto main fb09b2391 (0.3.8, #1499): its crates/ui part goes, with the v2 app. Regenerated onto main 46f18fe43 (#1530, #1511, #1546, #1551): a queued row keeps both main's `config` (#1546's provider switch from the queue) and its own `held`, in the struct, its Loro map and its JSON; `dispatch_queued` sets the row's config on the request first, then adds what's held to the person's words; its new rows and test fixtures say `config: None` and its RunRequests `code_mode: false` (#1551). Main's Stop now leaves the sends it cancels paused in the queue rather than writing them to the transcript (#1546), which the held-report drain already allows for. Its test a_members_end_waits_in_its_group_in_a_row_of_its_own fails, as it did before this regeneration: its last commit takes a member's held end out of the group, which the test (from its 8th commit) doesn't expect yet."
 
 [[patch]]
 name = "child-reports-watch"
+enabled = false
 file = "patches/0016-child-reports-watch.patch"
 note = "The parent's device reports for a child whose device doesn't (an older Zeron, like Linux SG before this), or that updated after its turn and has been back online two minutes without reporting: once the child's chat, synced here, shows the very turn its registry row names, by the same rule and keys its own host would use, re-checked as the report is built. If the reply hasn't synced 10 minutes on and the outcome is this request's, the parent hears its status alone and the full report follows. A turn a shutdown cut is left for its host to revive. The parent's notes say when a child's device is offline or its status unconfirmed, and a subagent created on such a device is said to be reported for by the parent's watcher. Applies on top of child-reports-holds-and-groups. Regenerated onto main 46f18fe43 (#1530, #1511, #1546, #1551): its conflicts were only because holds-and-groups didn't apply; its test fixture's question says `note: None` (main's reviewer note on UserInputQuestion). #1530 (reopening a remote chat asks the room and its host for what it missed) helps a watched child's copy catch up, but doesn't report for it: the watch stays."
 
 [[patch]]
 name = "child-reports-run-command"
+enabled = false
 file = "patches/0017-child-reports-run-command.patch"
 note = "A command a child left running with run_command (#1458, upstream) never wakes it, so it no longer holds back the follow-up its runtime's own background work wakes it for. An end with only such commands lists them and lets no follow-up through, the parent's note no longer lists that child as still working for it, and a thanks answered under one stays quiet. Applies on top of child-reports-watch. Regenerated onto main 46f18fe43: its session_reports.rs conflict was only because holds-and-groups didn't apply; its code is unchanged."
 
@@ -219,7 +223,7 @@ note = "A Claude chat left idle past its prompt cache's hour sends its whole con
 [[patch]]
 name = "lcd-text"
 file = "patches/0034-lcd-text.patch"
-note = "Text on the PC's 24-inch 1080p screens at 100% read blurry beside Windows' own (2026-11-26): zgx draws greyscale coverage, so each stem of Geist (hinted vertically only) lands on two columns at part strength, which zgx#1516's whole-pixel places and firmed edges can't do better; Windows' text is sharp because ClearType covers each subpixel apart. The patch moves apps/zgx's zgx pin (Cargo.toml's 14 revs and the lockfile's sources, nothing else) to hoangvu12/zgx 998140e69, branch nightly-lcd-998140e6: main's pin zeronsh/zgx b9e744ddd with one commit on it (also on zgx main as branch lcd-text, not yet a PR). Glyphs keyed CacheKeyFlags::LCD are swash subpixel masks, drawn by a dual-source pipeline (Shading::Lcd) blending each channel by its own coverage; only into an opaque window's own target, below 2x, off macOS, on a device with dual-source blending, so frosted or transparent windows and isolated layers keep greyscale. zgx-desktop follows Windows' ClearType setting (on, RGB or BGR), read again on a settings change; ZGX_LCD_TEXT=0, rgb or bgr overrides it. The LCD pipeline compiles once (~140 ms on the first frame after an install, then from zgx's shader cache). Checked on the PC (RTX 5050, Direct3D 12): zgx-gpu's tests/lcd_text.rs (6) and the rest of zgx-gpu's suite pass, clippy clean. When main moves its zgx pin, this conflicts and is dropped (the build goes on without it): cherry-pick 998140e69 onto the new pin, push it as nightly-lcd-<sha>, and regenerate the patch from main (the 14 revs swapped, then `cargo update --workspace` in apps/zgx). design-plugin-apis moves the same pin: if it comes back, merge this branch into its zgx fork and drop this entry."
+note = "Text on the PC's 24-inch 1080p screens at 100% read blurry beside Windows' own (2026-11-26): zgx draws greyscale coverage, so each stem of Geist (hinted vertically only) lands on two columns at part strength, which zgx#1516's whole-pixel places and firmed edges can't do better; Windows' text is sharp because ClearType covers each subpixel apart. The patch moves apps/zgx's zgx pin (Cargo.toml's 14 revs and the lockfile's sources, nothing else) to hoangvu12/zgx 998140e69, branch nightly-lcd-998140e6: main's pin zeronsh/zgx b9e744ddd with one commit on it (also on zgx main as branch lcd-text, not yet a PR). Glyphs keyed CacheKeyFlags::LCD are swash subpixel masks, drawn by a dual-source pipeline (Shading::Lcd) blending each channel by its own coverage; only into an opaque window's own target, below 2x, off macOS, on a device with dual-source blending, so frosted or transparent windows and isolated layers keep greyscale. zgx-desktop follows Windows' ClearType setting (on, RGB or BGR), read again on a settings change; ZGX_LCD_TEXT=0, rgb or bgr overrides it. The LCD pipeline compiles once (~140 ms on the first frame after an install, then from zgx's shader cache). Checked on the PC (RTX 5050, Direct3D 12): zgx-gpu's tests/lcd_text.rs (6) and the rest of zgx-gpu's suite pass, clippy clean. When main moves its zgx pin, this conflicts and is dropped (the build goes on without it): cherry-pick 998140e69 onto the new pin, push it as nightly-lcd-<sha>, and regenerate the patch from main (the 14 revs swapped, then `cargo update --workspace` in apps/zgx). Should the nightly need its own zgx fork again (the Design plugin's open zgx PRs), build it on this branch and drop this entry."
 
 # Between the person's devices.
 
