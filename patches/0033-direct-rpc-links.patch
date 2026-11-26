@@ -1,0 +1,941 @@
+From d5b111fd2140ea1bf07147d2c6ee8bce7449b092 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 09:32:02 +0700
+Subject: [PATCH] Calls to another of the person's computers take a direct link
+ when one is up
+
+Every call between devices crossed the edge's device-room relay, even
+for a laptop and a PC on one network: a message's files to a chat on the
+other computer too, and a relay link that drops every minute or two
+could not carry them. Terminals already take a direct WebRTC link
+(zeron_preview) when the two devices can reach each other.
+
+direct_rpc.rs serves the same RPC over that link: one `rpc` stream of
+newline-delimited JSON frames per connection.
+
+- Host: served beside the relay host, with the relay's service and the
+  relay's guard (zeron_rpc::device_room::peer_service, now public):
+  local-only calls refused, the rest answered as an unverified peer's, as
+  an unstamped relay dial's are. Cloud machines may not open one and
+  don't serve one, as for terminals. Advertised as direct-rpc-v1.
+- Client: a queued attachment's chunks, its UploadStatus and commit, and
+  the command relay take the direct link when the host advertises it and
+  the two are paired. Not paired yet: the relay carries the call and
+  pairing starts, so a retry finds the link up; with the resumed
+  transfers, a file moves from one road to the other without starting
+  over.
+- Nothing waits long on the direct road. A link that closed reads closed
+  (RpcClient::is_closed: a clean close sets no close_reason), so a call
+  is never handed to a dead one. Open links are pinged every 15 s and
+  dropped when the far end stops answering, and closed after 5 minutes
+  unused, as the relay's are. A stream that fails to open sends calls by
+  the relay for 5 s, doubling to 60 s on failures in a row. Pairing is
+  asked for at most every 30 s per device, doubling to 5 minutes while it
+  never comes up. A stream opens on a task of its own, one per device at
+  a time, so a call that stops waiting doesn't cut a pairing off half-way.
+- The log says when calls to a device switch between the direct road and
+  the relay.
+
+Tests: direct_rpc's calls_cross_a_byte_stream_and_are_served_as_a_peers,
+the_relays_refusals_hold_on_a_direct_link_too,
+only_the_owners_own_computers_may_open_one,
+the_host_end_holds_its_service_weakly,
+a_client_whose_link_dropped_reads_closed and
+waits_double_from_the_first_to_the_cap.
+---
+ crates/engine/src/direct_rpc.rs     | 593 ++++++++++++++++++++++++++++
+ crates/engine/src/doc_host.rs       |  92 +++--
+ crates/engine/src/lib.rs            |  14 +
+ crates/engine/src/workspace_host.rs |   4 +
+ crates/proto/src/workspace.rs       |   6 +
+ crates/rpc/src/client.rs            |   5 +
+ crates/rpc/src/device_room.rs       |  10 +
+ 7 files changed, 702 insertions(+), 22 deletions(-)
+ create mode 100644 crates/engine/src/direct_rpc.rs
+
+diff --git a/crates/engine/src/direct_rpc.rs b/crates/engine/src/direct_rpc.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1b8f8fffa413436d4ed72c46dcb1d2d3eb4e282
+--- /dev/null
++++ b/crates/engine/src/direct_rpc.rs
+@@ -0,0 +1,593 @@
++//! Engine-to-engine RPC over a direct peer connection: the WebRTC link
++//! terminals already take between the person's own computers
++//! (`zeron_preview`, `terminals::link`), when the two can reach each other.
++//!
++//! The device-room relay carries every call between devices through the
++//! edge, even for two computers on one network. A message's files to a chat
++//! on another computer went that way too, and a relay link that drops every
++//! minute or two could not carry them. This is a second road for those calls:
++//! the same RPC, as newline-delimited JSON frames over one `rpc` stream.
++//!
++//! - **Host** ([`Service`]): served alongside the relay host
++//!   ([`crate::EngineCore::start_host_relay`]), with the service the relay
++//!   serves, behind the same guard ([`zeron_rpc::device_room::peer_service`]):
++//!   local-only calls refused, the rest answered as a peer's. The device a
++//!   direct link names is the signaling's claim, not proven, so calls are
++//!   served as an unverified peer, as an unstamped relay dial's are. Cloud
++//!   machines may not open one, as for terminals.
++//! - **Client** ([`Links`]): a call that would cross the relay takes an open
++//!   direct link instead, when the host says it serves one
++//!   ([`zeron_proto::capabilities::DIRECT_RPC_V1`]) and the two are paired.
++//!   Not paired yet: the relay carries this call and pairing starts, so a
++//!   retry finds the direct link up. Nothing waits on one.
++
++use std::collections::{HashMap, HashSet};
++use std::sync::{Arc, Mutex, PoisonError};
++use std::time::Duration;
++
++use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
++use tokio::sync::mpsc;
++use tokio::time::Instant;
++use zeron_rpc::{RpcClient, RpcService};
++
++/// The stream id direct RPC is served under.
++pub const SERVICE: &str = "rpc";
++
++/// The longest frame either end reads: a chunk of a file is 60,000 base64
++/// characters, a long chat's transcript a few MB. Past it the link closes.
++const MAX_FRAME: usize = 64 * 1024 * 1024;
++
++/// How long a call waits for the `rpc` stream to open on a paired
++/// connection. Past it the call takes the relay; the opening goes on, and
++/// the link it makes is there for the next call.
++const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// After the stream failed to open (a blip, mostly: the connection closing
++/// as it opened, the host restarting), the relay alone for this long,
++/// doubling with each failure in a row up to [`OPEN_BACKOFF_CAP`].
++const OPEN_BACKOFF: Duration = Duration::from_secs(5);
++const OPEN_BACKOFF_CAP: Duration = Duration::from_secs(60);
++
++/// Pairing is asked for at most this often per device, doubling while it
++/// never comes up (two networks that can't reach each other) up to
++/// [`WARM_GAP_CAP`]. A pairing gives up after 30 s by itself, so one is in
++/// flight at a time.
++const WARM_GAP: Duration = Duration::from_secs(30);
++const WARM_GAP_CAP: Duration = Duration::from_secs(5 * 60);
++
++/// An open link is asked something this often, so one whose far end stopped
++/// answering is dropped before a call is handed to it.
++const PING_EVERY: Duration = Duration::from_secs(15);
++const PING_TIMEOUT: Duration = Duration::from_secs(10);
++
++/// A link no call used for this long is closed, as the relay closes its idle
++/// links: the next call opens it again.
++const IDLE_CLOSE: Duration = Duration::from_secs(5 * 60);
++
++/// The wait after `previous` (none: the first), doubling up to `cap`.
++fn next_gap(previous: Option<Duration>, first: Duration, cap: Duration) -> Duration {
++    previous.map_or(first, |gap| (gap * 2).min(cap))
++}
++
++/// The host end: each `rpc` stream a peer opens is one RPC connection to
++/// `service`, guarded as relay clients are.
++///
++/// It holds the service weakly: the engine's preview service keeps this,
++/// and the doc host keeps the preview service ([`Links`]), so a strong
++/// reference would keep the whole engine alive after it shut down. The relay
++/// host holds the service while it runs; once it's gone, so is direct RPC.
++pub struct Service {
++    service: std::sync::Weak<dyn RpcService>,
++}
++
++impl Service {
++    pub fn new(service: &Arc<dyn RpcService>) -> Self {
++        Self {
++            service: Arc::downgrade(service),
++        }
++    }
++}
++
++/// Whether `peer` may open direct RPC here: another of the person's own
++/// computers. A Cloud machine runs agent code; a link it opens back over a
++/// connection this device made to it must not reach this device's RPC.
++fn peer_allowed(peer: Option<&str>) -> bool {
++    peer.is_some_and(|peer| !zeron_proto::is_cloud_device(peer, ""))
++}
++
++#[async_trait::async_trait]
++impl zeron_preview::mux::Connector for Service {
++    /// This device asking itself: it has its own IPC for that.
++    async fn connect(&self, _service: &str) -> anyhow::Result<zeron_preview::mux::BoxIo> {
++        anyhow::bail!("direct RPC is for the owner's other devices")
++    }
++
++    async fn connect_from(
++        &self,
++        peer: Option<&str>,
++        service: &str,
++    ) -> anyhow::Result<zeron_preview::mux::BoxIo> {
++        anyhow::ensure!(service == SERVICE, "unknown direct RPC stream {service}");
++        anyhow::ensure!(
++            peer_allowed(peer),
++            "direct RPC here is only for the owner's devices"
++        );
++        let service = self
++            .service
++            .upgrade()
++            .ok_or_else(|| anyhow::anyhow!("this device isn't serving other devices now"))?;
++        let (ours, theirs) = tokio::io::duplex(1024 * 1024);
++        let guarded = zeron_rpc::device_room::peer_service(service, None);
++        tokio::spawn(serve(guarded, ours));
++        Ok(Box::new(theirs))
++    }
++}
++
++/// Serve `service` on one byte stream of newline-delimited frames, until
++/// either side closes it.
++pub async fn serve<S>(service: Arc<dyn RpcService>, io: S)
++where
++    S: AsyncRead + AsyncWrite + Send + 'static,
++{
++    let (out, inbound) = bridge(io);
++    zeron_rpc::serve_connection(service, out, inbound).await;
++}
++
++/// An RPC client over one byte stream of newline-delimited frames.
++pub fn client<S>(io: S) -> RpcClient
++where
++    S: AsyncRead + AsyncWrite + Send + 'static,
++{
++    let (out, inbound) = bridge(io);
++    RpcClient::new(out, inbound)
++}
++
++/// Frames to and from a byte stream: what's sent on the returned sender is
++/// written as one line; each line read arrives on the receiver. Both end when
++/// the stream does. JSON frames never hold a raw newline.
++fn bridge<S>(io: S) -> (mpsc::Sender<String>, mpsc::Receiver<String>)
++where
++    S: AsyncRead + AsyncWrite + Send + 'static,
++{
++    let (read, mut write) = tokio::io::split(io);
++    let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
++    let (in_tx, in_rx) = mpsc::channel::<String>(64);
++    tokio::spawn(async move {
++        while let Some(frame) = out_rx.recv().await {
++            let sent = async {
++                write.write_all(frame.as_bytes()).await?;
++                write.write_all(b"\n").await?;
++                write.flush().await
++            };
++            if sent.await.is_err() {
++                break;
++            }
++        }
++        let _ = write.shutdown().await;
++    });
++    tokio::spawn(async move {
++        let mut read = BufReader::new(read);
++        let mut line = String::new();
++        loop {
++            line.clear();
++            match (&mut read)
++                .take(MAX_FRAME as u64 + 1)
++                .read_line(&mut line)
++                .await
++            {
++                Ok(0) | Err(_) => break,
++                Ok(_) if line.len() > MAX_FRAME => {
++                    tracing::warn!("direct RPC: a frame over {MAX_FRAME} bytes; closing");
++                    break;
++                }
++                Ok(_) => {}
++            }
++            let frame = line.trim_end_matches(['\n', '\r']);
++            if frame.is_empty() {
++                continue;
++            }
++            if in_tx.send(frame.to_owned()).await.is_err() {
++                break;
++            }
++        }
++    });
++    (out_tx, in_rx)
++}
++
++/// The client end: one direct RPC client per device, opened over the paired
++/// connection when there is one.
++///
++/// Nothing a call does waits long on the direct road: a link that isn't up
++/// yet, is opening, or failed a moment ago sends the call by the relay. Open
++/// links are pinged, so one whose far end went quiet is dropped before a call
++/// is handed to it, and closed once no call has used them for a while.
++#[derive(Clone)]
++pub struct Links {
++    previews: zeron_preview::PreviewService,
++    state: Arc<Mutex<State>>,
++}
++
++#[derive(Default)]
++struct State {
++    links: HashMap<String, Link>,
++    /// Devices whose stream is opening now: one opening at a time.
++    opening: HashSet<String>,
++    /// After a stream failed to open.
++    backoff: HashMap<String, Wait>,
++    /// Pairing asked for, and not up yet.
++    warm: HashMap<String, Wait>,
++    /// The road the last call to each device took.
++    roads: HashMap<String, bool>,
++}
++
++struct Link {
++    client: Arc<RpcClient>,
++    used: Instant,
++}
++
++#[derive(Clone, Copy)]
++struct Wait {
++    until: Instant,
++    gap: Duration,
++}
++
++fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
++    state.lock().unwrap_or_else(PoisonError::into_inner)
++}
++
++impl Links {
++    pub fn new(previews: zeron_preview::PreviewService) -> Self {
++        Self {
++            previews,
++            state: Arc::default(),
++        }
++    }
++
++    fn state(&self) -> std::sync::MutexGuard<'_, State> {
++        lock(&self.state)
++    }
++
++    /// A direct client for `device`, if one is up or the paired connection
++    /// opens one now. `None`: take the relay (and pairing starts for next
++    /// time). The caller has checked the device serves direct RPC.
++    pub async fn client(&self, device: &str) -> Option<Arc<RpcClient>> {
++        if zeron_proto::is_cloud_device(device, "") {
++            return None;
++        }
++        {
++            let mut state = self.state();
++            if let Some(link) = state.links.get_mut(device) {
++                // (A clean close sets no reason: ask whether it closed.)
++                if !link.client.is_closed() {
++                    link.used = Instant::now();
++                    return Some(link.client.clone());
++                }
++                state.links.remove(device);
++            }
++            if state.opening.contains(device)
++                || state
++                    .backoff
++                    .get(device)
++                    .is_some_and(|wait| Instant::now() < wait.until)
++            {
++                return None;
++            }
++        }
++        if !self.previews.peer_ready(device).await {
++            self.warm(device);
++            return None;
++        }
++        {
++            let mut state = self.state();
++            state.warm.remove(device);
++            if !state.opening.insert(device.to_owned()) {
++                return None;
++            }
++        }
++        // Opened on a task of its own: a call that stops waiting doesn't cut
++        // the opening off half-way (which can leave the pairing under it
++        // stuck), and what it opens is kept for the next call.
++        let this = self.clone();
++        let target = device.to_owned();
++        let opening = tokio::spawn(async move { this.open(&target).await });
++        match tokio::time::timeout(OPEN_TIMEOUT, opening).await {
++            Ok(Ok(client)) => client,
++            Ok(Err(_)) => {
++                self.state().opening.remove(device);
++                None
++            }
++            Err(_) => {
++                tracing::info!(
++                    device,
++                    "direct RPC stream still opening; the relay carries this call"
++                );
++                None
++            }
++        }
++    }
++
++    async fn open(&self, device: &str) -> Option<Arc<RpcClient>> {
++        let opened = self.previews.open_peer_stream(device, SERVICE).await;
++        let mut state = self.state();
++        state.opening.remove(device);
++        match opened {
++            Ok(stream) => {
++                state.backoff.remove(device);
++                let client = Arc::new(client(stream));
++                state.links.insert(
++                    device.to_owned(),
++                    Link {
++                        client: client.clone(),
++                        used: Instant::now(),
++                    },
++                );
++                drop(state);
++                tracing::info!(device, "direct RPC link up");
++                self.keep(device, &client);
++                Some(client)
++            }
++            Err(error) => {
++                let gap = next_gap(
++                    state.backoff.get(device).map(|wait| wait.gap),
++                    OPEN_BACKOFF,
++                    OPEN_BACKOFF_CAP,
++                );
++                state.backoff.insert(
++                    device.to_owned(),
++                    Wait {
++                        until: Instant::now() + gap,
++                        gap,
++                    },
++                );
++                tracing::info!(device, %error, retry_in_secs = gap.as_secs(),
++                    "direct RPC stream didn't open; the relay carries calls");
++                None
++            }
++        }
++    }
++
++    /// Ask for pairing with `device`, unless it was asked for lately.
++    fn warm(&self, device: &str) {
++        {
++            let mut state = self.state();
++            let wait = state.warm.get(device).copied();
++            if wait.is_some_and(|wait| Instant::now() < wait.until) {
++                return;
++            }
++            let gap = next_gap(wait.map(|wait| wait.gap), WARM_GAP, WARM_GAP_CAP);
++            state.warm.insert(
++                device.to_owned(),
++                Wait {
++                    until: Instant::now() + gap,
++                    gap,
++                },
++            );
++        }
++        self.previews.warm_peer(device);
++    }
++
++    /// Watch an open link: dropped once it closes, stops answering, or no
++    /// call has used it for [`IDLE_CLOSE`]. Holds it weakly, so dropping it
++    /// from the map closes it.
++    fn keep(&self, device: &str, client: &Arc<RpcClient>) {
++        let link = Arc::downgrade(client);
++        let state = Arc::downgrade(&self.state);
++        let device = device.to_owned();
++        tokio::spawn(async move {
++            loop {
++                tokio::time::sleep(PING_EVERY).await;
++                let (Some(client), Some(state)) = (link.upgrade(), state.upgrade()) else {
++                    return;
++                };
++                let idle = match lock(&state).links.get(&device) {
++                    Some(held) if Arc::ptr_eq(&held.client, &client) => {
++                        held.used.elapsed() >= IDLE_CLOSE
++                    }
++                    _ => return, // dropped or replaced
++                };
++                let why = if client.is_closed() {
++                    Some("closed")
++                } else if idle {
++                    Some("idle")
++                } else {
++                    let ping = client.call(zeron_rpc::methods::ENGINE_INFO, serde_json::json!({}));
++                    match tokio::time::timeout(PING_TIMEOUT, ping).await {
++                        Err(_)
++                        | Ok(Err(
++                            zeron_rpc::RpcError::Transport(_) | zeron_rpc::RpcError::Closed,
++                        )) => Some("unanswered"),
++                        // Any answer, even a refusal, says the far end is there.
++                        Ok(_) => None,
++                    }
++                };
++                if let Some(why) = why {
++                    let mut state = lock(&state);
++                    if state
++                        .links
++                        .get(&device)
++                        .is_some_and(|held| Arc::ptr_eq(&held.client, &client))
++                    {
++                        state.links.remove(&device);
++                    }
++                    tracing::info!(
++                        device,
++                        why,
++                        "direct RPC link closed; the relay carries calls"
++                    );
++                    return;
++                }
++            }
++        });
++    }
++
++    /// The direct link to `device` failed a call: the next one opens afresh
++    /// (or takes the relay).
++    pub fn invalidate(&self, device: &str) {
++        self.state().links.remove(device);
++    }
++
++    /// Note the road a call to `device` took: logged when it changes, so the
++    /// log says when calls went direct and when they fell back to the relay.
++    pub fn note_road(&self, device: &str, direct: bool) {
++        let changed = self.state().roads.insert(device.to_owned(), direct) != Some(direct);
++        let road = if direct { "direct" } else { "relay" };
++        if changed {
++            tracing::info!(device, road, "calls to this device take a new road");
++        } else {
++            tracing::debug!(device, road, "peer call");
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::{Value, json};
++    use zeron_rpc::{RpcError, RpcReply};
++
++    struct Echo;
++
++    #[async_trait::async_trait]
++    impl RpcService for Echo {
++        async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
++            let caller = match zeron_rpc::caller() {
++                zeron_rpc::Caller::Peer { device } => json!({ "peer": device }),
++                _ => json!("not a peer"),
++            };
++            RpcReply::value(&json!({ "method": method, "params": params, "caller": caller }))
++        }
++    }
++
++    #[tokio::test]
++    async fn calls_cross_a_byte_stream_and_are_served_as_a_peers() {
++        let (near, far) = tokio::io::duplex(64 * 1024);
++        tokio::spawn(serve(
++            zeron_rpc::device_room::peer_service(Arc::new(Echo), None),
++            far,
++        ));
++        let client = client(near);
++        // A frame far larger than the duplex buffer, as a file's chunk is.
++        let data = "A".repeat(200_000);
++        let reply = client
++            .call(
++                zeron_rpc::methods::UPLOAD_CHUNK,
++                json!({ "uploadId": "u", "seq": 0, "data": data }),
++            )
++            .await
++            .expect("call crosses");
++        assert_eq!(reply["method"], "UploadChunk");
++        assert_eq!(
++            reply["params"]["data"].as_str().map(str::len),
++            Some(200_000)
++        );
++        assert_eq!(reply["caller"], json!({ "peer": null }));
++        // Several at once, answered each to its own call.
++        let calls = (0..8).map(|i| client.call("Ping", json!({ "i": i })));
++        for (i, reply) in futures::future::join_all(calls)
++            .await
++            .into_iter()
++            .enumerate()
++        {
++            assert_eq!(reply.expect("ping")["params"]["i"], i);
++        }
++    }
++
++    /// A blip costs the direct road seconds, not the ten minutes it used to;
++    /// failures in a row wait longer, never past the cap.
++    #[test]
++    fn waits_double_from_the_first_to_the_cap() {
++        let first = OPEN_BACKOFF;
++        let mut gap = next_gap(None, first, OPEN_BACKOFF_CAP);
++        assert_eq!(gap, Duration::from_secs(5));
++        let mut seen = vec![gap];
++        for _ in 0..6 {
++            gap = next_gap(Some(gap), first, OPEN_BACKOFF_CAP);
++            seen.push(gap);
++        }
++        assert_eq!(
++            seen.iter().map(Duration::as_secs).collect::<Vec<_>>(),
++            [5, 10, 20, 40, 60, 60, 60]
++        );
++        assert_eq!(
++            next_gap(None, WARM_GAP, WARM_GAP_CAP),
++            Duration::from_secs(30)
++        );
++        assert_eq!(
++            next_gap(Some(Duration::from_secs(240)), WARM_GAP, WARM_GAP_CAP),
++            WARM_GAP_CAP
++        );
++    }
++
++    /// A link that dropped says so, so a cached client isn't handed a call
++    /// nobody will answer.
++    #[tokio::test]
++    async fn a_client_whose_link_dropped_reads_closed() {
++        let (near, far) = tokio::io::duplex(64 * 1024);
++        let host = tokio::spawn(serve(
++            zeron_rpc::device_room::peer_service(Arc::new(Echo), None),
++            far,
++        ));
++        let client = client(near);
++        client.call("Ping", json!({})).await.expect("ping");
++        assert!(!client.is_closed());
++        host.abort();
++        tokio::time::timeout(std::time::Duration::from_secs(5), client.closed())
++            .await
++            .expect("the drop is noticed");
++        assert!(client.is_closed());
++        assert!(
++            client.close_reason().is_none(),
++            "a clean close has no reason"
++        );
++    }
++
++    #[tokio::test]
++    async fn the_relays_refusals_hold_on_a_direct_link_too() {
++        let (near, far) = tokio::io::duplex(64 * 1024);
++        tokio::spawn(serve(
++            zeron_rpc::device_room::peer_service(Arc::new(Echo), None),
++            far,
++        ));
++        let client = client(near);
++        let local_only = zeron_rpc::methods::ACCESS_TOKEN;
++        assert!(zeron_rpc::local_only(local_only));
++        let refused = client.call(local_only, json!({})).await;
++        assert!(
++            matches!(refused, Err(RpcError::Failed(ref m)) if m.contains("local IPC")),
++            "{refused:?}"
++        );
++    }
++
++    /// The host end keeps the engine's service only while the relay host
++    /// does: it must never be what keeps an engine alive after shutdown.
++    #[tokio::test]
++    async fn the_host_end_holds_its_service_weakly() {
++        use zeron_preview::mux::Connector as _;
++        let service: Arc<dyn RpcService> = Arc::new(Echo);
++        let host = Service::new(&service);
++        assert!(host.connect_from(Some("cloud-1"), SERVICE).await.is_err());
++        assert!(host.connect_from(Some("laptop"), "rpcx").await.is_err());
++        assert!(host.connect_from(None, SERVICE).await.is_err());
++        // Nothing but the relay host's reference keeps it.
++        assert_eq!(Arc::strong_count(&service), 1);
++        drop(service);
++        assert!(host.connect_from(Some("laptop"), SERVICE).await.is_err());
++
++        // While it's held, a peer's stream is a working connection.
++        let service: Arc<dyn RpcService> = Arc::new(Echo);
++        let host = Service::new(&service);
++        let io = host
++            .connect_from(Some("laptop"), SERVICE)
++            .await
++            .expect("a peer's stream");
++        let reply = client(io).call("Ping", json!({})).await.expect("served");
++        assert_eq!(reply["caller"], json!({ "peer": null }));
++    }
++
++    #[test]
++    fn only_the_owners_own_computers_may_open_one() {
++        assert!(peer_allowed(Some("laptop-device-id")));
++        assert!(!peer_allowed(None));
++        assert!(!peer_allowed(Some("cloud-0b59268e")));
++    }
++}
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index a8eb3ead8f584db584776ae944ae7978f98fc691..d26a535556f1202c012e956c9d5345bb204bc861 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -380,6 +380,9 @@ struct DocHostInner {
+     /// Peer links (engine assembly, edge runtimes only) — the transport that
+     /// pushes queued attachment bytes to a remote host.
+     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
++    /// Direct peer links (crate::direct_rpc): taken before the relay when a
++    /// host serves them and the two devices are paired.
++    direct: OnceLock<crate::direct_rpc::Links>,
+     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
+     /// discipline — diff_sync's untimed client hung on dead links).
+     http: reqwest::Client,
+@@ -1474,6 +1477,7 @@ impl DocHost {
+                 connectivity_grace: Mutex::new(DegradeGrace::default()),
+                 executing: Mutex::new(HashSet::new()),
+                 links: OnceLock::new(),
++                direct: OnceLock::new(),
+                 http: reqwest::Client::builder()
+                     .pool_max_idle_per_host(2)
+                     .pool_idle_timeout(std::time::Duration::from_secs(10))
+@@ -1825,6 +1829,58 @@ impl DocHost {
+         let _ = self.inner.links.set(links);
+     }
+ 
++    /// Wire direct peer links (engine assembly): the road taken before the
++    /// relay to a host that serves it, once the two devices are paired.
++    pub fn set_direct_links(&self, direct: crate::direct_rpc::Links) {
++        let _ = self.inner.direct.set(direct);
++    }
++
++    /// A client for an RPC call to `target`: the direct link when it serves
++    /// one and it's up, else the relay. `true` with it when it's direct.
++    async fn peer_client(&self, target: &str) -> Result<(Arc<zeron_rpc::RpcClient>, bool), String> {
++        if let Some(direct) = self.inner.direct.get()
++            && self.device_supports(target, zeron_proto::capabilities::DIRECT_RPC_V1)
++        {
++            if let Some(client) = direct.client(target).await {
++                direct.note_road(target, true);
++                return Ok((client, true));
++            }
++            direct.note_road(target, false);
++        }
++        let links = self
++            .inner
++            .links
++            .get()
++            .ok_or_else(|| "peer links not wired".to_string())?;
++        let client = links
++            .client(target)
++            .await
++            .map_err(|e| format!("peer link: {e}"))?;
++        Ok((client, false))
++    }
++
++    /// A call to `target` timed out or its link failed: drop that link, so
++    /// the next call dials afresh instead of feeding a dead pipe.
++    fn peer_link_suspect(&self, target: &str, direct: bool) {
++        if direct {
++            if let Some(links) = self.inner.direct.get() {
++                links.invalidate(target);
++            }
++        } else if let Some(links) = self.inner.links.get() {
++            links.invalidate(target);
++        }
++    }
++
++    /// Whether `device`'s registry row says it can do `capability`.
++    fn device_supports(&self, device: &str, capability: &str) -> bool {
++        self.workspace()
++            .and_then(|ws| ws.read_devices().ok())
++            .into_iter()
++            .flatten()
++            .find(|d| d.id == device)
++            .is_some_and(|d| d.supports(capability))
++    }
++
+     /// Boot recovery has been through every chat it cut off, and each it means
+     /// to pick back up is marked: queues it restored can go now, or after those
+     /// turns.
+@@ -5836,25 +5892,19 @@ impl DocHost {
+         if !supported {
+             return Err("host does not support relay delivery (version gate)".into());
+         }
+-        let links = self
+-            .inner
+-            .links
+-            .get()
+-            .ok_or_else(|| "peer links not wired".to_string())?;
+-        let client = links
+-            .client(target)
+-            .await
+-            .map_err(|e| format!("peer link: {e}"))?;
++        // The direct link when there's one up: the command goes as its
++        // files did.
++        let (client, direct) = self.peer_client(target).await?;
+         let params = serde_json::json!({ "chatId": chat_id, "entry": entry });
+         let call = client.call(zeron_rpc::methods::RELAY_COMMAND, params);
+         match tokio::time::timeout(RELAY_CALL_TIMEOUT, call).await {
+             Err(_) => {
+-                links.invalidate(target);
++                self.peer_link_suspect(target, direct);
+                 Err("relay call timed out; peer link suspect".into())
+             }
+             Ok(Err(zeron_rpc::RpcError::Failed(err))) => Err(format!("host refused: {err}")),
+             Ok(Err(err)) => {
+-                links.invalidate(target);
++                self.peer_link_suspect(target, direct);
+                 Err(format!("relay call failed: {err}"))
+             }
+             Ok(Ok(reply)) => Ok(match reply.get("outcome").and_then(|v| v.as_str()) {
+@@ -6147,16 +6197,14 @@ impl DocHost {
+     ) -> Result<(), TransferError> {
+         use TransferError::{Permanent, Transient};
+         use futures::{StreamExt, stream::FuturesUnordered};
+-        let Some(links) = self.inner.links.get() else {
++        if self.inner.links.get().is_none() && self.inner.direct.get().is_none() {
+             return Err(Permanent("peer links not wired".into()));
+-        };
++        }
+         let Some(uploads) = self.inner.uploads.get() else {
+             return Err(Permanent("uploads not wired".into()));
+         };
+-        let client = links
+-            .client(target)
+-            .await
+-            .map_err(|e| Transient(format!("peer link: {e}")))?;
++        let (client, direct) = self.peer_client(target).await.map_err(Transient)?;
++        let suspect = || self.peer_link_suspect(target, direct);
+         for transfer in transfers {
+             // Bytes come from the uploads jail only — a transfer names an
+             // upload identity, never an arbitrary path.
+@@ -6168,7 +6216,7 @@ impl DocHost {
+                 Ok(HostHolds::Committed) => continue, // landed on an earlier attempt
+                 Ok(HostHolds::Chunks(staged)) => staged,
+                 Err(err) => {
+-                    links.invalidate(target);
++                    suspect();
+                     return Err(Transient(err));
+                 }
+             };
+@@ -6217,14 +6265,14 @@ impl DocHost {
+                 };
+                 match outcome {
+                     Err(_) => {
+-                        links.invalidate(target);
++                        suspect();
+                         return Err(Transient("chunk push timed out; peer link suspect".into()));
+                     }
+                     Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
+                         return Err(Permanent(format!("host refused chunk: {err}")));
+                     }
+                     Ok(Err(err)) => {
+-                        links.invalidate(target);
++                        suspect();
+                         return Err(Transient(format!("chunk push failed: {err}")));
+                     }
+                     Ok(Ok(_)) => {}
+@@ -6243,14 +6291,14 @@ impl DocHost {
+             let call = client.call(zeron_rpc::methods::UPLOAD_COMMIT, params);
+             match tokio::time::timeout(TRANSFER_COMMIT_TIMEOUT, call).await {
+                 Err(_) => {
+-                    links.invalidate(target);
++                    suspect();
+                     return Err(Transient("commit timed out; peer link suspect".into()));
+                 }
+                 Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
+                     return Err(Permanent(format!("host refused commit: {err}")));
+                 }
+                 Ok(Err(err)) => {
+-                    links.invalidate(target);
++                    suspect();
+                     return Err(Transient(format!("commit failed: {err}")));
+                 }
+                 Ok(Ok(_)) => {}
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index a584c059664aaeeebcbe8416a3ed62f438c7562d..c0c14a4946ce41369adea884f5d03166be28aeb3 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -53,6 +53,7 @@ pub mod deferred;
+ pub mod desktop_notify;
+ pub mod device_stats;
+ pub mod diff_sync;
++pub mod direct_rpc;
+ pub mod doc_host;
+ mod fs_watch;
+ mod git_tree;
+@@ -443,6 +444,9 @@ impl EngineCore {
+             terminals::link::SERVICE_PREFIX,
+             Arc::new(terminals::link::Service::new(terminals.clone())),
+         );
++        // Calls to other devices take a direct link when one is up
++        // (direct_rpc); the host side is served with the relay host.
++        doc_host.set_direct_links(direct_rpc::Links::new(previews.clone()));
+         let uploads = Uploads::from_root_with_fallback(
+             profile.uploads_root(),
+             legacy_uploads_root.as_deref(),
+@@ -697,6 +701,16 @@ impl EngineCore {
+         if let Some(activity) = self.relay_activity() {
+             service = activity.wrap(service);
+         }
++        // The same service to the owner's other computers over a direct link
++        // (direct_rpc), when they can reach this one. Not on a Cloud machine:
++        // it doesn't advertise one, and the person's devices reach it by the
++        // relay and the edge's store.
++        if !runner::is_cloud_platform() {
++            self.previews.serve_streams(
++                direct_rpc::SERVICE,
++                Arc::new(direct_rpc::Service::new(&service)),
++            );
++        }
+         zeron_rpc::HostRelay::spawn(config, service, on_nudge)
+     }
+ 
+diff --git a/crates/engine/src/workspace_host.rs b/crates/engine/src/workspace_host.rs
+index a91ccef5f2310580a522819cd9ddbf18e384d9ad..653c427b94cecc84d8f3b71963c57fd34a8b8038 100644
+--- a/crates/engine/src/workspace_host.rs
++++ b/crates/engine/src/workspace_host.rs
+@@ -188,6 +188,10 @@ fn device_capabilities() -> Vec<String> {
+     if crate::doc_host::relay_layer_enabled() {
+         capabilities.push(zeron_proto::relay_gen::CHAT_RELAY_CAPABILITY.to_string());
+     }
++    // Cloud machines don't take direct links (crate::direct_rpc).
++    if !crate::runner::is_cloud_platform() {
++        capabilities.push(zeron_proto::capabilities::DIRECT_RPC_V1.to_string());
++    }
+     capabilities
+ }
+ 
+diff --git a/crates/proto/src/workspace.rs b/crates/proto/src/workspace.rs
+index 69b17520144714f930d4dbcdb666bd5d92f62c72..138b050b6bf2fd188875d2a1b5f87ea92c55f1eb 100644
+--- a/crates/proto/src/workspace.rs
++++ b/crates/proto/src/workspace.rs
+@@ -50,6 +50,12 @@ pub mod capabilities {
+     /// such a host until its bytes are stored; older hosts get them over the
+     /// peer link, as they always did.
+     pub const ATTACHMENT_STORE_V1: &str = "attachment-store-v1";
++    /// The device answers RPC from the person's other computers over a
++    /// direct peer connection (the one terminals use), as it does over the
++    /// device-room relay: a message's files go straight there when the two
++    /// can reach each other. Advertised only by engines on a person's own
++    /// computers, so not in [`CURRENT`].
++    pub const DIRECT_RPC_V1: &str = "direct-rpc-v1";
+ 
+     /// This device's agents delegate in the background (Settings → General).
+     /// A device set up later follows the account's others by it; advertised
+diff --git a/crates/rpc/src/client.rs b/crates/rpc/src/client.rs
+index a7f1a43e04934937214424ba61e9836fbe00ed89..60cd8a13ee2fe786217b4da4966cef8fcb41eaee 100644
+--- a/crates/rpc/src/client.rs
++++ b/crates/rpc/src/client.rs
+@@ -155,6 +155,11 @@ impl RpcClient {
+         self.close_reason.get().cloned()
+     }
+ 
++    /// The connection has closed: a call now would never be answered.
++    pub fn is_closed(&self) -> bool {
++        *self.closed.borrow()
++    }
++
+     /// Resolves once the connection has closed (the server went away). An
+     /// in-memory client's never does while its service lives.
+     pub async fn closed(&self) {
+diff --git a/crates/rpc/src/device_room.rs b/crates/rpc/src/device_room.rs
+index bfe4fad4a2142ef10d945a8d5be19d791ee910ab..b6e2ecdea05bbcf8f3f2327b6c29462b1797a657 100644
+--- a/crates/rpc/src/device_room.rs
++++ b/crates/rpc/src/device_room.rs
+@@ -383,6 +383,16 @@ impl RpcService for RelayGuard {
+     }
+ }
+ 
++/// `service` as another device sees it over any link, not only the relay: what
++/// a relay client may call, served as [`crate::Caller::Peer`] with `device`
++/// when the link proved which device it is.
++pub fn peer_service(service: Arc<dyn RpcService>, device: Option<String>) -> Arc<dyn RpcService> {
++    Arc::new(RelayGuard {
++        inner: service,
++        device,
++    })
++}
++
+ /// The host end of the relay: one outbound WebSocket to our own DeviceRoom DO, serving
+ /// `service` to every client conn through virtual string-frame connections. Immortal
+ /// supervisor: quiet while signed out, reconnects with backoff when the socket drops
+-- 
+2.55.0.windows.2
+

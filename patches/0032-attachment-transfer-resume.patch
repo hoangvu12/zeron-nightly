@@ -1,0 +1,1231 @@
+From d4a6ba6c8570bc8a3a64a7161862c491cc16acb6 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Thu, 26 Nov 2026 09:24:41 +0700
+Subject: [PATCH] Attachments to another device resume after a dropped link,
+ and keep trying while their message waits
+
+A file sent to a chat on another of the person's devices went over the
+peer link one 60,000-character chunk at a time, each waiting for the
+host's answer before the next. When the link dropped, the next attempt
+started again from the file's first byte, and after 15 minutes of
+attempts the sender gave up and the host rejected the message
+("attachments never arrived"). A link that drops every minute or two
+(seen on 2026-11-25 between a laptop and a PC) could not carry a file
+that took longer than the gap between drops: retrying sometimes worked,
+and sometimes nothing ever did.
+
+- UploadStatus (new): the host says what it holds of an upload, committed
+  or which chunks are staged and how long each is. Asking counts as
+  hearing from the sender. Hosts without it are sent everything.
+- The sender asks first, then sends only the missing chunks, six in
+  flight at once instead of one.
+- Chunks are written aside and renamed, so a chunk the host reports is
+  whole.
+- The sender keeps trying for as long as its command waits (pending and
+  unexpired; a queued row while it's in the queue, up to a day), not for
+  a fixed 15 minutes. The command relay does the same.
+- The host waits for a command's bytes until it hasn't heard from their
+  sender for 15 minutes, instead of 15 minutes after the send.
+- zgx hands the files of a message to a chat on any other device to its
+  engine, which delivers them as above, as it did for Cloud chats only.
+  It uploaded them to the host inside the send before, relay chunk by
+  relay chunk, so a link dropping mid-file failed the whole send ("Not
+  delivered"). A chat on this device, or an engine too old to know the
+  attachment store, still uploads straight to its host.
+
+Tests: uploads' status_says_what_is_staged_so_a_sender_can_resume,
+doc_host's transfer_resume_tests, tests/flaky_link_attachments.rs (a
+34-chunk file through a device room that cuts the link every 10 chunks),
+and zgx's the_engine_delivers_files_to_any_other_device_once_it_knows_how.
+---
+ apps/zgx/src/chat.rs                          |  36 +-
+ apps/zgx/src/chat_pending_tests.rs            |  16 +-
+ crates/engine/src/doc_host.rs                 | 276 +++++++++++--
+ crates/engine/src/doc_host_attachments.rs     |  28 +-
+ crates/engine/src/rpc.rs                      |   9 +
+ crates/engine/src/uploads.rs                  | 126 +++++-
+ crates/engine/tests/flaky_link_attachments.rs | 377 ++++++++++++++++++
+ crates/rpc/src/lib.rs                         |   5 +
+ 8 files changed, 794 insertions(+), 79 deletions(-)
+ create mode 100644 crates/engine/tests/flaky_link_attachments.rs
+
+diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
+index 4811134fdababcdd40c17cd3d760c18e7c08b7bf..f558f907684ac7bb61d57a3150ed648d577350c3 100644
+--- a/apps/zgx/src/chat.rs
++++ b/apps/zgx/src/chat.rs
+@@ -3238,8 +3238,8 @@ impl View {
+         // (Each file here, by what it was sent as: an Appshot's context names
+         // its picture by the path the agent has.)
+         let mut sent_as: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+-        // (Asked once, when there's a file to send: `store_takes_files`.)
+-        let mut through_store = None;
++        // (Asked once, when there's a file to send: `engine_delivers_files`.)
++        let mut delivered = None;
+         let mut transfers: Vec<Json> = Vec::new();
+         for a in req.field("attachments").map(Value::list).unwrap_or_default() {
+             let path = a.field("path").map(text).unwrap_or_default();
+@@ -3256,15 +3256,15 @@ impl View {
+                 paths.push(path);
+                 continue;
+             }
+-            let store = match through_store {
+-                Some(store) => store,
++            let by_engine = match delivered {
++                Some(by_engine) => by_engine,
+                 None => {
+-                    let store = goes_through_store(target.as_deref()).await;
+-                    through_store = Some(store);
+-                    store
++                    let by_engine = engine_delivers(target.as_deref()).await;
++                    delivered = Some(by_engine);
++                    by_engine
+                 }
+             };
+-            let uploaded = if store {
++            let uploaded = if by_engine {
+                 stage(&path, &name).await.map(|(reference, transfer)| {
+                     transfers.push(transfer);
+                     reference
+@@ -4161,22 +4161,26 @@ async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static
+ /// store (crates/proto `capabilities::ATTACHMENT_STORE_V1`).
+ const ATTACHMENT_STORE_V1: &str = "attachment-store-v1";
+ 
+-/// Whether a chat's files go through the edge's store: its machine may be
+-/// asleep, so they can't wait on reaching it. Any other chat, or an engine
+-/// that doesn't know the store, uploads straight to the host.
+-fn store_takes_files(target: Option<&str>, capabilities: &Json) -> bool {
+-    target.is_some_and(|device| zeron_proto::is_cloud_device(device, ""))
++/// Whether this device's engine takes a chat's files on and delivers them in
++/// the background: for any chat another device hosts. A Cloud machine's go
++/// through the edge's store (it may be asleep); another computer's over the
++/// link to it, resuming where a dropped link left off. Uploading them to the
++/// host inside the send instead failed the whole send on any drop. A chat
++/// here, or an engine too old to know the store (and so the escort's
++/// holds), uploads straight to the host.
++fn engine_delivers_files(target: Option<&str>, capabilities: &Json) -> bool {
++    target.is_some()
+         && capabilities
+             .as_array()
+             .is_some_and(|list| list.iter().any(|c| c.as_str() == Some(ATTACHMENT_STORE_V1)))
+ }
+ 
+-async fn goes_through_store(target: Option<&str>) -> bool {
+-    if !target.is_some_and(|device| zeron_proto::is_cloud_device(device, "")) {
++async fn engine_delivers(target: Option<&str>) -> bool {
++    if target.is_none() {
+         return false;
+     }
+     match engine::get().call("EngineInfo", json!({})).await {
+-        Ok(info) => store_takes_files(target, &info["capabilities"]),
++        Ok(info) => engine_delivers_files(target, &info["capabilities"]),
+         Err(_) => false,
+     }
+ }
+diff --git a/apps/zgx/src/chat_pending_tests.rs b/apps/zgx/src/chat_pending_tests.rs
+index 0a4def0ee29e8737b979d4cde62a8b0540ccc1ac..58bd0e3a4310c56256868e2ef6c0b2d7eb3afdc3 100644
+--- a/apps/zgx/src/chat_pending_tests.rs
++++ b/apps/zgx/src/chat_pending_tests.rs
+@@ -241,14 +241,18 @@ fn a_row_leaving_the_outbox_is_the_queues_to_show() {
+ }
+ 
+ #[test]
+-fn only_a_cloud_chat_on_an_engine_that_knows_the_store_goes_through_it() {
++fn the_engine_delivers_files_to_any_other_device_once_it_knows_how() {
+     let knows = json!(["message-queue-v1", "attachment-store-v1"]);
+     let older = json!(["message-queue-v1"]);
+-    assert!(store_takes_files(Some("cloud-machine"), &knows));
+-    assert!(!store_takes_files(Some("cloud-machine"), &older));
+-    assert!(!store_takes_files(Some("cloud-machine"), &Json::Null));
+-    assert!(!store_takes_files(Some("desktop-at-home"), &knows));
+-    assert!(!store_takes_files(None, &knows));
++    // A Cloud machine's go by the store, another computer's over the link:
++    // either way the engine takes them on and the send doesn't wait on them.
++    assert!(engine_delivers_files(Some("cloud-machine"), &knows));
++    assert!(engine_delivers_files(Some("desktop-at-home"), &knows));
++    // An engine too old for it, or one that didn't say: uploaded in the send.
++    assert!(!engine_delivers_files(Some("cloud-machine"), &older));
++    assert!(!engine_delivers_files(Some("desktop-at-home"), &Json::Null));
++    // A chat here: straight to this engine, as ever.
++    assert!(!engine_delivers_files(None, &knows));
+ }
+ 
+ #[test]
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index e83ded0c4b6a9528cb48f2400fabb5cc18b0d1a6..a8eb3ead8f584db584776ae944ae7978f98fc691 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -127,15 +127,22 @@ enum SyncAdmission {
+ /// the link suspect; attempts retry on this backoff, cut short by the online
+ /// bus / system wake.
+ const TRANSFER_CHUNK_B64: usize = 60_000;
++/// Chunks of one file in flight at once. One at a time, each chunk waited a
++/// whole relay round trip; a few at once keep the link busy, so a transfer
++/// finishes sooner and a flaky link has less time to drop it.
++const TRANSFER_WINDOW: usize = 6;
+ const TRANSFER_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+ const TRANSFER_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+ const TRANSFER_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+ const TRANSFER_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+-/// A command whose attachment bytes are still in transit waits at most this
+-/// long before the drain rejects it loudly (and the transfer task gives up on
+-/// the same clock) — a chat must never wedge behind bytes that aren't coming.
+-/// Bytes safely in the edge's store ARE coming: a Cloud host checks there
+-/// before this cap applies (doc_host_attachments.rs), however long it slept.
++/// A command whose attachment bytes are still in transit waits until its
++/// sender has been silent this long, then the drain rejects it loudly: a chat
++/// must never wedge behind bytes that aren't coming. Each attempt the sender
++/// makes counts (a chunk, or asking what's landed), so a transfer over a link
++/// that keeps dropping waits as long as its sender keeps trying. The sender
++/// tries for as long as the command waits. Bytes safely in the edge's store
++/// ARE coming: a Cloud host checks there before this cap applies
++/// (doc_host_attachments.rs), however long it slept.
+ const ATTACHMENT_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+ const ATTACHMENT_WAIT_MAX_MS: i64 = ATTACHMENT_WAIT_MAX.as_millis() as i64;
+ /// Re-check cadence while a chat's queue is deferred on in-transit bytes
+@@ -152,14 +159,14 @@ enum TransferError {
+ 
+ /// Peer-relay delivery fallback pacing (`spawn_command_delivery`): the grace
+ /// the normal rows→edge path gets before the relay road opens, the poll while
+-/// waiting, the relay retry curve, its per-call deadline, and the give-up cap
+-/// (the command stays durably queued in the doc regardless).
++/// waiting, the relay retry curve and its per-call deadline. It retries for as
++/// long as the command waits (the command stays durably queued in the doc
++/// regardless).
+ const ROWS_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+ const ROWS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+ const RELAY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+ const RELAY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+ const RELAY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+-const RELAY_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+ /// Hosts below this stamped engine version don't serve `RelayCommand`.
+ const RELAY_MIN_VERSION: (u64, u64, u64) = (0, 2, 12);
+ 
+@@ -393,6 +400,66 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+ }
+ 
++/// What a transfer's bytes are for: it goes on while that still waits.
++#[derive(Debug)]
++pub(crate) enum Awaiting {
++    /// A command in the chat's doc, by id.
++    Command(String),
++    /// A row in the chat's queue, by id, sent at `issued_at` (ms).
++    Row { id: String, issued_at: i64 },
++}
++
++/// What a host already holds of one upload, as its `UploadStatus` says.
++enum HostHolds {
++    /// Assembled: nothing more to send.
++    Committed,
++    /// Staged chunks as `(seq, base64 length)`; none from a host too old to
++    /// say, which then gets every chunk, as before.
++    Chunks(Vec<(u64, u64)>),
++}
++
++/// Ask a host what it holds of an upload. `Err` only when the link failed: a
++/// host that can't say (too old, or it refused) is sent everything.
++async fn upload_status(
++    client: &zeron_rpc::RpcClient,
++    transfer: &crate::uploads::AttachmentTransfer,
++) -> Result<HostHolds, String> {
++    let params = serde_json::json!({
++        "uploadId": transfer.upload_id, "fileName": transfer.file_name,
++    });
++    let call = client.call(zeron_rpc::methods::UPLOAD_STATUS, params);
++    match tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await {
++        Err(_) => Err("upload status timed out; peer link suspect".into()),
++        Ok(Err(err @ (zeron_rpc::RpcError::Transport(_) | zeron_rpc::RpcError::Closed))) => {
++            Err(format!("upload status failed: {err}"))
++        }
++        Ok(Err(_)) => Ok(HostHolds::Chunks(Vec::new())),
++        Ok(Ok(reply)) => Ok(
++            match serde_json::from_value::<crate::uploads::UploadStatus>(reply) {
++                Ok(status) if status.committed => HostHolds::Committed,
++                Ok(status) => HostHolds::Chunks(status.chunks),
++                Err(_) => HostHolds::Chunks(Vec::new()),
++            },
++        ),
++    }
++}
++
++/// The chunks of a `b64_len`-character upload still to send, as `(seq,
++/// start, end)` into its base64: each one the host doesn't hold exactly as it
++/// would be sent (missing, or of another length: a write cut short, or
++/// another chunking). A file of no bytes is one empty chunk, as the host's
++/// commit needs one.
++fn chunks_to_send(b64_len: usize, chunk: usize, staged: &[(u64, u64)]) -> Vec<(u64, usize, usize)> {
++    let count = b64_len.div_ceil(chunk).max(1);
++    (0..count)
++        .map(|i| {
++            let start = i * chunk;
++            (i as u64, start, (start + chunk).min(b64_len))
++        })
++        .filter(|(seq, start, end)| !staged.contains(&(*seq, (end - start) as u64)))
++        .collect()
++}
++
+ /// The queued-attachment transfers a command's `pending://` refs imply —
+ /// shared by the retry escort and the retry re-issue.
+ fn command_transfers(entry: &SessionCommandEntry) -> Vec<crate::uploads::AttachmentTransfer> {
+@@ -4675,7 +4742,7 @@ impl DocHost {
+         }
+         handle.doc.push_queued(&item)?;
+         handle.publish_queue();
+-        self.spawn_row_transfers(chat_id, transfers);
++        self.spawn_row_transfers(chat_id, &item.id, item.issued_at, transfers);
+         // Same reasoning as a command: the user is acting in this chat again.
+         self.unarchive_on_send(chat_id);
+         self.nudge_remote_host(chat_id);
+@@ -5631,12 +5698,15 @@ impl DocHost {
+             let Some(target) = host.remote_host_for(&chat) else {
+                 return; // local host (or no row yet claimed remotely)
+             };
+-            if !transfers.is_empty() && !host.deliver_attachments(&chat, &transfers).await {
++            if !transfers.is_empty()
++                && !host
++                    .deliver_attachments(&chat, Awaiting::Command(entry.id.clone()), &transfers)
++                    .await
++            {
+                 return; // gave up; the drain's wait cap surfaces the failure
+             }
+             let mut wake = zeron_sync::wake::subscribe();
+             let mut online = zeron_sync::wake::subscribe_online();
+-            let give_up = tokio::time::Instant::now() + RELAY_GIVE_UP;
+             let grace_end = tokio::time::Instant::now() + ROWS_GRACE;
+             while tokio::time::Instant::now() < grace_end {
+                 if host.rows_flushed(&chat) {
+@@ -5661,9 +5731,9 @@ impl DocHost {
+                             "peer-relay delivery retrying");
+                     }
+                 }
+-                if tokio::time::Instant::now() >= give_up {
+-                    tracing::warn!(chat = %chat, command = %entry.id,
+-                        "peer-relay delivery gave up; command remains queued in the doc");
++                if !host.command_waiting(&chat, &entry.id) {
++                    tracing::info!(chat = %chat, command = %entry.id,
++                        "peer-relay delivery stopped: the command no longer waits");
+                     return;
+                 }
+                 while wake.try_recv().is_ok() {}
+@@ -5680,17 +5750,24 @@ impl DocHost {
+ 
+     /// Step 1 of the escort: push staged bytes until they land (event-driven
+     /// backoff), `true` on success. Re-resolves the host each attempt (a
+-    /// claim can move the chat).
++    /// claim can move the chat). Tries for as long as the command waits: until
++    /// it's taken, refused (a host that stopped hearing from us rejects it),
++    /// removed or expired. Each attempt resumes where the last one stopped.
+     async fn deliver_attachments(
+         &self,
+         chat: &str,
++        awaiting: Awaiting,
+         transfers: &[crate::uploads::AttachmentTransfer],
+     ) -> bool {
+         let mut wake = zeron_sync::wake::subscribe();
+         let mut online = zeron_sync::wake::subscribe_online();
+         let mut backoff = TRANSFER_BACKOFF_BASE;
+-        let deadline = tokio::time::Instant::now() + ATTACHMENT_WAIT_MAX;
+         loop {
++            if !self.still_awaited(chat, &awaiting) {
++                tracing::info!(chat = %chat, ?awaiting,
++                    "queued attachment transfer stopped: nothing waits for it");
++                return false;
++            }
+             let Some(target) = self.remote_host_for(chat) else {
+                 return true; // became locally hosted: bytes already here
+             };
+@@ -5715,10 +5792,6 @@ impl DocHost {
+                         "queued attachment transfer retrying");
+                 }
+             }
+-            if tokio::time::Instant::now() >= deadline {
+-                tracing::warn!(chat = %chat, "queued attachment transfer gave up (wait cap)");
+-                return false;
+-            }
+             while wake.try_recv().is_ok() {}
+             while online.try_recv().is_ok() {}
+             tokio::select! {
+@@ -6061,12 +6134,19 @@ impl DocHost {
+     /// new engines interoperate). Timeouts mark the link suspect —
+     /// `invalidate` drops the cached socket so the retry dials fresh instead
+     /// of feeding a zombie pipe forever (2026-08-19 incident).
++    ///
++    /// Resumes: it first asks the host what it holds (`UploadStatus`) and
++    /// sends only the chunks missing there, [`TRANSFER_WINDOW`] at a time. A
++    /// link that drops every minute or two used to restart a transfer from
++    /// its first byte each time, and a file that took longer than the gap
++    /// between drops never got there.
+     async fn push_attachments(
+         &self,
+         target: &str,
+         transfers: &[crate::uploads::AttachmentTransfer],
+     ) -> Result<(), TransferError> {
+         use TransferError::{Permanent, Transient};
++        use futures::{StreamExt, stream::FuturesUnordered};
+         let Some(links) = self.inner.links.get() else {
+             return Err(Permanent("peer links not wired".into()));
+         };
+@@ -6084,26 +6164,58 @@ impl DocHost {
+             let bytes = tokio::fs::read(&source)
+                 .await
+                 .map_err(|e| Permanent(format!("staged attachment missing: {e}")))?;
++            let staged = match upload_status(&client, transfer).await {
++                Ok(HostHolds::Committed) => continue, // landed on an earlier attempt
++                Ok(HostHolds::Chunks(staged)) => staged,
++                Err(err) => {
++                    links.invalidate(target);
++                    return Err(Transient(err));
++                }
++            };
+             // Progress entry for the sender's thumbnail ring, updated per
+             // landed chunk. The guard retires it on EVERY exit — commit,
+             // timeout, refusal — so a dead attempt falls back to the
+-            // indeterminate spinner and the retry re-publishes from 0.
++            // indeterminate spinner and the retry re-publishes from what
++            // the host already holds.
+             let total = bytes.len() as u64;
+-            self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, 0, total);
++            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
++            let todo = chunks_to_send(b64.len(), TRANSFER_CHUNK_B64, &staged);
++            let unsent: usize = todo.iter().map(|(_, start, end)| end - start).sum();
++            // b64 → raw: 4 chars carry 3 bytes; min-clamp absorbs the final
++            // chunk's padding overshoot.
++            let raw = |b64_chars: usize| ((b64_chars as u64) * 3 / 4).min(total);
++            let mut landed = b64.len() - unsent;
++            self.transfer_progress_set(
++                &transfer.upload_id,
++                &transfer.file_name,
++                raw(landed),
++                total,
++            );
+             let _progress = TransferProgressGuard {
+                 host: self,
+                 upload_id: &transfer.upload_id,
+             };
+-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+-            let mut start = 0usize;
+-            let mut seq = 0u64;
++            let mut todo = todo.into_iter();
++            let mut in_flight = FuturesUnordered::new();
+             loop {
+-                let end = (start + TRANSFER_CHUNK_B64).min(b64.len());
+-                let params = serde_json::json!({
+-                    "uploadId": transfer.upload_id, "seq": seq, "data": &b64[start..end],
+-                });
+-                let call = client.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
+-                match tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await {
++                while in_flight.len() < TRANSFER_WINDOW
++                    && let Some((seq, start, end)) = todo.next()
++                {
++                    let params = serde_json::json!({
++                        "uploadId": transfer.upload_id, "seq": seq, "data": &b64[start..end],
++                    });
++                    let call = client.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
++                    in_flight.push(async move {
++                        (
++                            end - start,
++                            tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await,
++                        )
++                    });
++                }
++                let Some((sent, outcome)) = in_flight.next().await else {
++                    break; // every chunk landed
++                };
++                match outcome {
+                     Err(_) => {
+                         links.invalidate(target);
+                         return Err(Transient("chunk push timed out; peer link suspect".into()));
+@@ -6117,15 +6229,13 @@ impl DocHost {
+                     }
+                     Ok(Ok(_)) => {}
+                 }
+-                start = end;
+-                seq += 1;
+-                // b64 → raw: 4 chars carry 3 bytes; min-clamp absorbs the
+-                // final chunk's padding overshoot.
+-                let done = ((start as u64) * 3 / 4).min(total);
+-                self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, done, total);
+-                if start >= b64.len() {
+-                    break;
+-                }
++                landed += sent;
++                self.transfer_progress_set(
++                    &transfer.upload_id,
++                    &transfer.file_name,
++                    raw(landed),
++                    total,
++                );
+             }
+             let params = serde_json::json!({
+                 "uploadId": transfer.upload_id, "fileName": transfer.file_name,
+@@ -6406,14 +6516,15 @@ impl DocHost {
+             // command must stay eligible): a Run/Steer naming `pending://`
+             // refs whose bytes haven't landed on this device yet waits for
+             // the transfer instead of running without its images. The wait is
+-            // bounded unless they're safely stored; past it the command fails
+-            // loudly.
++            // bounded unless they're safely stored or their sender is still
++            // sending them; past it the command fails loudly.
+             if matches!(disposition, CommandDisposition::Execute) {
+                 let missing = self.missing_attachments(&entry);
+                 if !missing.is_empty() {
+                     self.fetch_from_store(&handle.chat_id, &missing);
+                     if now_ms().saturating_sub(entry.issued_at) < ATTACHMENT_WAIT_MAX_MS
+                         || self.bytes_on_their_way(&missing)
++                        || self.sender_still_sending(&missing)
+                     {
+                         tracing::info!(chat = %handle.chat_id, command = %entry.id,
+                             missing = missing.len(), "command deferred: attachment bytes in transit");
+@@ -6546,6 +6657,55 @@ impl DocHost {
+     }
+ 
+     /// True while some pending, unprocessed command still waits on bytes.
++    /// Whether a command this device sent still waits for its host: pending
++    /// in the chat's doc and not expired. It stops waiting once its host
++    /// takes or refuses it, or it's removed.
++    fn command_waiting(&self, chat_id: &str, command_id: &str) -> bool {
++        let Ok(handle) = self.open(chat_id) else {
++            return false;
++        };
++        let now = now_ms();
++        handle.doc.read_commands().is_ok_and(|commands| {
++            commands.iter().any(|c| {
++                c.id == command_id
++                    && c.status == SessionCommandStatus::Pending
++                    && c.effective_expiry() > now
++            })
++        })
++    }
++
++    /// Whether what a transfer carries bytes for still waits for them.
++    fn still_awaited(&self, chat_id: &str, awaiting: &Awaiting) -> bool {
++        match awaiting {
++            Awaiting::Command(id) => self.command_waiting(chat_id, id),
++            // A queued row waits in the chat's queue until its host takes it,
++            // for as long as a command to the same device would.
++            Awaiting::Row { id, issued_at } => {
++                now_ms().saturating_sub(*issued_at) < zeron_doc::command_ttl_ms(false)
++                    && self.open(chat_id).is_ok_and(|handle| {
++                        handle
++                            .doc
++                            .read_queue()
++                            .is_ok_and(|queue| queue.iter().any(|row| &row.id == id))
++                    })
++            }
++        }
++    }
++
++    /// Whether the sender of any of these `pending://` refs was heard from
++    /// within [`ATTACHMENT_WAIT_MAX`]: a chunk of it landed, or the sender
++    /// asked what had. Its bytes are still on their way, however long a link
++    /// that keeps dropping makes them.
++    fn sender_still_sending(&self, refs: &[String]) -> bool {
++        let Some(uploads) = self.inner.uploads.get() else {
++            return false;
++        };
++        refs.iter()
++            .filter_map(|r| crate::uploads::parse_pending_ref(r))
++            .filter_map(|(upload_id, _)| uploads.last_heard(upload_id))
++            .any(|at| at.elapsed().is_ok_and(|age| age < ATTACHMENT_WAIT_MAX))
++    }
++
+     fn awaiting_attachments(&self, handle: &Arc<ChatDocHandle>) -> bool {
+         let commands = handle.doc.read_commands().unwrap_or_default();
+         let command_waiting = commands.iter().any(|c| {
+@@ -8576,3 +8736,35 @@ mod remote_delivery;
+ 
+ #[path = "doc_host_attachments.rs"]
+ mod attachment_store;
++
++#[cfg(test)]
++mod transfer_resume_tests {
++    use super::chunks_to_send;
++
++    #[test]
++    fn a_fresh_upload_sends_every_chunk_and_an_empty_file_sends_one() {
++        assert_eq!(
++            chunks_to_send(25, 10, &[]),
++            vec![(0, 0, 10), (1, 10, 20), (2, 20, 25)]
++        );
++        assert_eq!(chunks_to_send(20, 10, &[]), vec![(0, 0, 10), (1, 10, 20)]);
++        assert_eq!(chunks_to_send(0, 10, &[]), vec![(0, 0, 0)]);
++    }
++
++    #[test]
++    fn a_resumed_upload_sends_only_what_the_host_lacks() {
++        // Chunks 0 and 2 landed whole before the link dropped.
++        assert_eq!(
++            chunks_to_send(25, 10, &[(0, 10), (2, 5)]),
++            vec![(1, 10, 20)]
++        );
++        // A chunk of the wrong length (cut short, or chunked otherwise) goes again.
++        assert_eq!(
++            chunks_to_send(25, 10, &[(0, 7), (1, 10), (2, 5)]),
++            vec![(0, 0, 10)]
++        );
++        // Everything there: nothing to send, only the commit.
++        assert!(chunks_to_send(25, 10, &[(0, 10), (1, 10), (2, 5)]).is_empty());
++        assert!(chunks_to_send(0, 10, &[(0, 0)]).is_empty());
++    }
++}
+diff --git a/crates/engine/src/doc_host_attachments.rs b/crates/engine/src/doc_host_attachments.rs
+index 0189d4296503ad051bb3eb1a7b69217e5da57ce9..4eaaff54bdcdb86c1e3c40766c238ae048997e79 100644
+--- a/crates/engine/src/doc_host_attachments.rs
++++ b/crates/engine/src/doc_host_attachments.rs
+@@ -249,8 +249,15 @@ impl DocHost {
+         Ok(true)
+     }
+ 
+-    /// A row's bytes over the peer link, once the row is in the chat.
+-    pub(super) fn spawn_row_transfers(&self, chat_id: &str, transfers: Vec<AttachmentTransfer>) {
++    /// A row's bytes over the peer link, once the row is in the chat, for as
++    /// long as the row waits in the queue.
++    pub(super) fn spawn_row_transfers(
++        &self,
++        chat_id: &str,
++        row_id: &str,
++        issued_at: i64,
++        transfers: Vec<AttachmentTransfer>,
++    ) {
+         if transfers.is_empty() {
+             return;
+         }
+@@ -259,9 +266,13 @@ impl DocHost {
+         };
+         let host = self.clone();
+         let chat = chat_id.to_string();
++        let awaiting = super::Awaiting::Row {
++            id: row_id.to_string(),
++            issued_at,
++        };
+         self.spawn_worker_on(&runtime, async move {
+             if host.remote_host_for(&chat).is_some() {
+-                host.deliver_attachments(&chat, &transfers).await;
++                host.deliver_attachments(&chat, awaiting, &transfers).await;
+             }
+         });
+     }
+@@ -677,8 +688,15 @@ impl DocHost {
+         self.nudge_remote_host(&send.chat_id);
+         if let Some(entry) = escort {
+             self.spawn_command_delivery(&send.chat_id, entry, transfers);
+-        } else if matches!(send.payload.body, HeldBody::Row { .. }) {
+-            self.spawn_row_transfers(&send.chat_id, transfers);
++        } else if let HeldBody::Row { item } = &send.payload.body {
++            // Its clock, as the row now in the queue has it.
++            let issued_at = handle
++                .doc
++                .read_queue()?
++                .iter()
++                .find(|q| q.id == item.id)
++                .map_or_else(now_ms, |q| q.issued_at);
++            self.spawn_row_transfers(&send.chat_id, &item.id, issued_at, transfers);
+         }
+         Ok(())
+     }
+diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
+index 27dd574329a791e5ba3bb143963e861f5c8ac547..f4cc1abbc67537b8f1d8a8f4e38c12820016ab3a 100644
+--- a/crates/engine/src/rpc.rs
++++ b/crates/engine/src/rpc.rs
+@@ -2949,6 +2949,7 @@ fn forwardable(method: &str) -> bool {
+             // the committed file from that device's disk).
+             | methods::UPLOAD_CHUNK
+             | methods::UPLOAD_COMMIT
++            | methods::UPLOAD_STATUS
+             | methods::READ_ATTACHMENT_CHUNK
+             | methods::READ_CHAT_IMAGE_CHUNK
+             // A command's whole output lives in its host's run journal.
+@@ -6412,6 +6413,14 @@ impl RpcService for EngineRpc {
+                 self.doc_host.kick_drains();
+                 RpcReply::value(&serde_json::json!({ "path": path }))
+             }
++            methods::UPLOAD_STATUS => {
++                let p: UploadCommitParams = parse_params(params)?;
++                let status = self
++                    .uploads
++                    .status(&p.upload_id, &p.file_name)
++                    .map_err(|e| RpcError::Failed(e.to_string()))?;
++                RpcReply::value(&status)
++            }
+             methods::READ_ATTACHMENT_CHUNK => {
+                 let p: ReadAttachmentChunkParams = parse_params(params)?;
+                 // Path jail: the uploads dir plus every workspace-known chat cwd.
+diff --git a/crates/engine/src/uploads.rs b/crates/engine/src/uploads.rs
+index bd8aed720805287f66f1e32d48c560611f20acb1..79a6ccf5a556a4cec02dfcdb0d2bc1c22cae5af8 100644
+--- a/crates/engine/src/uploads.rs
++++ b/crates/engine/src/uploads.rs
+@@ -22,17 +22,39 @@
+ 
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+-use std::time::Duration;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, SystemTime};
+ 
+ use base64::Engine as _;
+ use base64::engine::general_purpose::STANDARD as BASE64;
+-use serde::Serialize;
++use serde::{Deserialize, Serialize};
+ 
+ use crate::EngineError;
+ 
+ /// A pending upload must finish within this window (covers slow mesh links).
++/// The window runs from the last sign of its sender: a chunk, or an
++/// `UploadStatus` asking what's here.
+ const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
+ 
++/// Written into an upload's staging dir each time its sender asks what's
++/// there (`status`): the sender is still at it, though no chunk got through.
++const HEARD_MARKER: &str = "heard";
++
++/// Unique suffixes for chunks being written, so two writers of one slot (an
++/// escort and a retry's) never share a temporary file.
++static NEXT_PART: AtomicU64 = AtomicU64::new(0);
++
++/// What a device already holds of one upload (`UploadStatus`), so its sender
++/// sends only the rest instead of starting over after a dropped link.
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct UploadStatus {
++    /// The file is assembled here already: nothing more to send.
++    pub committed: bool,
++    /// Staged chunks, as `[seq, length of its base64]`, by `seq`.
++    pub chunks: Vec<(u64, u64)>,
++}
++
+ /// Queued-attachment ref scheme (2026-08-19 incident: attachment staging was
+ /// a blocking pre-step in front of QueueCommand, so a send died with the peer
+ /// link instead of queueing). A ref names bytes by identity instead of by a
+@@ -245,10 +267,58 @@ impl Uploads {
+             let _ = std::fs::remove_dir_all(&dir);
+             return Err(EngineError::Other("Upload too large".into()));
+         }
+-        std::fs::write(dir.join(format!("{at:06}.b64")), data)?;
++        // Written aside and renamed: a chunk `status` reports must be whole,
++        // or a resumed sender would skip one that's cut short.
++        let part = dir.join(format!(
++            "{at:06}.{}.part",
++            NEXT_PART.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::write(&part, data)?;
++        if let Err(err) = std::fs::rename(&part, dir.join(format!("{at:06}.b64"))) {
++            let _ = std::fs::remove_file(&part);
++            return Err(err.into());
++        }
+         Ok(())
+     }
+ 
++    /// What's here of an upload: whether it's committed, else the chunks
++    /// staged so far. Asking counts as hearing from the sender: it keeps the
++    /// staged chunks past the sweep and a command waiting on them waiting
++    /// ([`Self::last_heard`]).
++    pub fn status(&self, upload_id: &str, file_name: &str) -> Result<UploadStatus, EngineError> {
++        let dir = self.staging_dir(upload_id)?;
++        if self.pending_target(upload_id, file_name).is_file() {
++            return Ok(UploadStatus {
++                committed: true,
++                chunks: Vec::new(),
++            });
++        }
++        std::fs::create_dir_all(&dir)?;
++        // The time itself, so the file changes and its modified time moves
++        // (rewriting an empty file doesn't move it on every filesystem).
++        let now = SystemTime::now()
++            .duration_since(SystemTime::UNIX_EPOCH)
++            .map(|d| d.as_millis())
++            .unwrap_or(0);
++        std::fs::write(dir.join(HEARD_MARKER), now.to_string())?;
++        let mut chunks: Vec<(u64, u64)> = chunk_files(&dir)?
++            .into_iter()
++            .filter_map(|(seq, path)| Some((seq, std::fs::metadata(&path).ok()?.len())))
++            .collect();
++        chunks.sort_unstable();
++        Ok(UploadStatus {
++            committed: false,
++            chunks,
++        })
++    }
++
++    /// When this device last heard from an upload's sender: its newest chunk
++    /// or status question. `None` when nothing of it is staged here.
++    pub fn last_heard(&self, upload_id: &str) -> Option<SystemTime> {
++        let dir = self.staging_dir(upload_id).ok()?;
++        newest_modified(&dir)
++    }
++
+     /// Assemble the staged chunks into a durable file and return its absolute
+     /// path.
+     pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
+@@ -420,13 +490,7 @@ impl Uploads {
+             return;
+         };
+         for entry in entries.flatten() {
+-            let newest = std::fs::read_dir(entry.path())
+-                .ok()
+-                .into_iter()
+-                .flatten()
+-                .flatten()
+-                .filter_map(|f| f.metadata().ok()?.modified().ok())
+-                .max();
++            let newest = newest_modified(&entry.path());
+             // An empty dir is NOT free to reclaim: `append` creates the dir
+             // before writing the first chunk, and parallel chunk uploads run
+             // 3-wide — a sibling's sweep landing in that window deleted the
+@@ -698,6 +762,15 @@ fn lexical_components(path: &Path) -> Option<Vec<std::ffi::OsString>> {
+     Some(out)
+ }
+ 
++/// The newest modified time of the files in a staging dir.
++fn newest_modified(dir: &Path) -> Option<SystemTime> {
++    std::fs::read_dir(dir)
++        .ok()?
++        .flatten()
++        .filter_map(|f| f.metadata().ok()?.modified().ok())
++        .max()
++}
++
+ fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
+     let Ok(entries) = std::fs::read_dir(dir) else {
+         return Ok(Vec::new());
+@@ -799,6 +872,39 @@ mod tests {
+         assert_eq!(std::fs::read_dir(uploads.dir()).unwrap().count(), 0);
+     }
+ 
++    #[test]
++    fn status_says_what_is_staged_so_a_sender_can_resume() {
++        let dir = tempfile::tempdir().unwrap();
++        let uploads = Uploads::from_root(dir.path());
++        // Nothing yet: no chunks, but asking counts as hearing from the sender.
++        assert_eq!(uploads.last_heard("up-1"), None);
++        let empty = uploads.status("up-1", "shot.png").unwrap();
++        assert_eq!(empty, UploadStatus::default());
++        assert!(uploads.last_heard("up-1").is_some());
++
++        // Two of three chunks landed, out of order; a resent one overwrites.
++        uploads.append("up-1", "AAAA", Some(2)).unwrap();
++        uploads.append("up-1", "QUJD", Some(0)).unwrap();
++        uploads.append("up-1", "QUJD", Some(0)).unwrap();
++        let staged = uploads.status("up-1", "shot.png").unwrap();
++        assert_eq!(staged.chunks, vec![(0, 4), (2, 4)]);
++        assert!(!staged.committed);
++        // Only whole chunks are ever there: nothing written aside is left.
++        let leftovers = std::fs::read_dir(uploads.inner.tmp.join("up-1"))
++            .unwrap()
++            .flatten()
++            .filter(|f| f.path().extension().is_some_and(|e| e == "part"))
++            .count();
++        assert_eq!(leftovers, 0);
++
++        // The marker isn't a chunk: the commit joins chunks alone.
++        uploads.append("up-1", "REVG", Some(1)).unwrap();
++        let path = uploads.commit("up-1", "shot.png").unwrap();
++        assert_eq!(std::fs::read(&path).unwrap(), b"ABCDEF\0\0\0");
++        let done = uploads.status("up-1", "shot.png").unwrap();
++        assert!(done.committed && done.chunks.is_empty());
++    }
++
+     fn encoded(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+         let mut bytes = std::io::Cursor::new(Vec::new());
+         image::DynamicImage::new_rgb8(width, height)
+diff --git a/crates/engine/tests/flaky_link_attachments.rs b/crates/engine/tests/flaky_link_attachments.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..23b3d9ab6b42e8580ef72991b748d06a45637a4e
+--- /dev/null
++++ b/crates/engine/tests/flaky_link_attachments.rs
+@@ -0,0 +1,377 @@
++//! A queued attachment over a peer link that keeps dropping. Engine A sends a
++//! message with a file to a chat hosted on engine B, through a device room
++//! that cuts A's connection after every few chunks it carries. A transfer that
++//! started over from its first byte after each drop never got past the cut;
++//! one that asks B what landed (`UploadStatus`) and sends only the rest
++//! finishes in a few connections, and B runs the message with the whole file.
++
++// tungstenite's `accept_hdr_async` callback signature fixes the Err type as a
++// full `Response` — its size is not ours to shrink.
++#![allow(clippy::result_large_err)]
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use base64::Engine as _;
++use base64::engine::general_purpose::STANDARD as BASE64;
++use futures::stream::BoxStream;
++use futures::{SinkExt, StreamExt};
++use tokio::net::TcpListener;
++use tokio::sync::mpsc;
++use tokio_tungstenite::tungstenite::Message as WsMessage;
++use tokio_tungstenite::tungstenite::handshake::server::{
++    Request as WsRequest, Response as WsResponse,
++};
++
++use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload};
++use zeron_engine::{EngineCore, HarnessRegistry};
++use zeron_harness::{Harness, HarnessError, RunControls};
++use zeron_proto::{
++    AgentEvent, Device, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
++    SteeringMode,
++};
++use zeron_rpc::{
++    DeviceFrameHeader, LinkCache, LinkCacheConfig, StaticToken, decode_device_frame,
++    encode_device_frame, methods,
++};
++
++const CHAT: &str = "chat-flaky-link";
++/// Chunks a client connection carries before the room cuts it.
++const CHUNKS_PER_CONNECTION: usize = 10;
++
++#[derive(Default)]
++struct RelayState {
++    host: Option<mpsc::UnboundedSender<Vec<u8>>>,
++    clients: HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
++}
++
++/// A device room (route-only, as relay_delivery.rs's) that closes a client's
++/// socket once it has carried [`CHUNKS_PER_CONNECTION`] `UploadChunk` calls.
++/// `chunks` counts every chunk it carried to the host.
++async fn flaky_device_room(chunks: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
++    let url = format!(
++        "http://127.0.0.1:{}",
++        listener.local_addr().expect("addr").port()
++    );
++    let state = Arc::new(Mutex::new(RelayState::default()));
++    let task = tokio::spawn(async move {
++        loop {
++            let Ok((stream, _)) = listener.accept().await else {
++                break;
++            };
++            let state = state.clone();
++            let chunks = chunks.clone();
++            tokio::spawn(async move {
++                let mut uri = String::new();
++                let Ok(ws) = tokio_tungstenite::accept_hdr_async(
++                    stream,
++                    |req: &WsRequest, res: WsResponse| {
++                        uri = req.uri().to_string();
++                        Ok(res)
++                    },
++                )
++                .await
++                else {
++                    return;
++                };
++                let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
++                let is_host = query.contains("role=host");
++                let conn_id = query
++                    .split('&')
++                    .find_map(|kv| kv.strip_prefix("connId="))
++                    .unwrap_or("anon")
++                    .to_string();
++                let (mut sink, mut ws_stream) = ws.split();
++                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
++                {
++                    let mut st = state.lock().expect("lock");
++                    if is_host {
++                        st.host = Some(tx);
++                    } else {
++                        st.clients.insert(conn_id.clone(), tx);
++                    }
++                }
++                let writer = tokio::spawn(async move {
++                    while let Some(bytes) = rx.recv().await {
++                        if sink.send(WsMessage::Binary(bytes)).await.is_err() {
++                            break;
++                        }
++                    }
++                });
++                let mut carried = 0usize;
++                while let Some(Ok(message)) = ws_stream.next().await {
++                    let WsMessage::Binary(bytes) = message else {
++                        continue;
++                    };
++                    let Ok((header, payload)) = decode_device_frame(&bytes) else {
++                        break;
++                    };
++                    let is_chunk = !is_host
++                        && payload
++                            .windows(b"\"UploadChunk\"".len())
++                            .any(|w| w == b"\"UploadChunk\"");
++                    {
++                        let st = state.lock().expect("lock");
++                        if is_host {
++                            let Some(to) = header.to else { continue };
++                            if let Some(client) = st.clients.get(&to) {
++                                let stripped = DeviceFrameHeader::new(header.s, header.k);
++                                let _ = client.send(
++                                    encode_device_frame(&stripped, &payload).expect("encode"),
++                                );
++                            }
++                        } else if let Some(host) = &st.host {
++                            let mut routed = DeviceFrameHeader::new(header.s, header.k);
++                            routed.from = Some(conn_id.clone());
++                            let _ =
++                                host.send(encode_device_frame(&routed, &payload).expect("encode"));
++                        }
++                    }
++                    if is_chunk {
++                        chunks.fetch_add(1, Ordering::SeqCst);
++                        carried += 1;
++                        if carried >= CHUNKS_PER_CONNECTION {
++                            break; // the link drops
++                        }
++                    }
++                }
++                state.lock().expect("lock").clients.remove(&conn_id);
++                writer.abort();
++            });
++        }
++    });
++    (url, task)
++}
++
++struct InstantHarness;
++
++#[async_trait]
++impl Harness for InstantHarness {
++    fn id(&self) -> HarnessId {
++        HarnessId::Mock
++    }
++    fn display_name(&self) -> &str {
++        "Instant"
++    }
++    fn supports_steering(&self) -> bool {
++        false
++    }
++    fn steering_mode(&self) -> SteeringMode {
++        SteeringMode::TurnBoundary
++    }
++    fn reasoning_levels(&self) -> &[ReasoningLevel] {
++        &[]
++    }
++    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
++        Ok(vec![])
++    }
++    async fn run(
++        &self,
++        request: RunRequest,
++        _controls: RunControls,
++    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
++        assert!(
++            !request.prompt.contains("pending://"),
++            "the run started before its file landed: {}",
++            request.prompt
++        );
++        Ok(futures::stream::iter([
++            Ok(AgentEvent::SessionStarted {
++                harness: HarnessId::Mock,
++                model: "instant-1".into(),
++                tools: vec![],
++                cwd: "/tmp".into(),
++                session_id: "hs-flaky".into(),
++                assistant_message_id: "a-1".into(),
++            }),
++            Ok(AgentEvent::TextDelta {
++                text: "got it".into(),
++            }),
++            Ok(AgentEvent::Done {
++                status: DoneStatus::Completed,
++                result: None,
++                error: None,
++                session_id: Some("hs-flaky".into()),
++            }),
++        ])
++        .boxed())
++    }
++}
++
++fn registry() -> Arc<HarnessRegistry> {
++    let registry = HarnessRegistry::new();
++    registry.register(Arc::new(InstantHarness));
++    Arc::new(registry)
++}
++
++fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
++    std::fs::create_dir_all(dir).expect("create data dir");
++    std::fs::write(dir.join("device-id"), device_id).expect("write device id");
++    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
++}
++
++fn complete_assistant_count(core: &EngineCore) -> usize {
++    core.doc_host
++        .open(CHAT)
++        .ok()
++        .and_then(|h| h.doc().read_entries().ok())
++        .unwrap_or_default()
++        .iter()
++        .filter(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
++        .count()
++}
++
++/// The file named `name` anywhere under `dir`.
++fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
++    for entry in std::fs::read_dir(dir).ok()?.flatten() {
++        let path = entry.path();
++        if path.is_dir() {
++            if let Some(found) = find_file(&path, name) {
++                return Some(found);
++            }
++        } else if path.file_name().is_some_and(|n| n == name) {
++            return Some(path);
++        }
++    }
++    None
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_file_over_a_link_that_keeps_dropping_resumes_and_lands_whole() {
++    let chunks = Arc::new(AtomicUsize::new(0));
++    let (relay_url, _relay) = flaky_device_room(chunks.clone()).await;
++    let dirs = tempfile::tempdir().expect("tempdir");
++
++    let core_b = assemble(&dirs.path().join("b"), "device-b");
++    let _host = core_b.start_host_relay(&relay_url);
++
++    let core_a = assemble(&dirs.path().join("a"), "device-a");
++    let mut link_config =
++        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
++    link_config.probe_timeout = Duration::from_secs(5);
++    link_config.cooldown_base = Duration::from_millis(100);
++    link_config.cooldown_max = Duration::from_millis(500);
++    core_a.set_links(LinkCache::new(link_config));
++    core_a.workspace.upsert_device_row(&Device {
++        id: "device-b".into(),
++        name: "b".into(),
++        platform: "linux".into(),
++        last_seen_at: Some(chrono::Utc::now()),
++        created_at: None,
++        version: Some("0.3.21".into()),
++        cursor_sdk_version: None,
++        capabilities: zeron_proto::capabilities::current(),
++    });
++    let client_a = zeron_rpc::memory_client(core_a.rpc_service());
++    client_a
++        .call(
++            methods::MUTATE,
++            serde_json::json!({ "op": "createChat", "chatId": CHAT, "deviceId": "device-b" }),
++        )
++        .await
++        .expect("createChat on A");
++    core_b
++        .workspace
++        .rename_chat(CHAT, "Pre-titled")
++        .expect("pre-title on B (no auto-title harness run)");
++
++    // A 1.5 MB file: 34 chunks of 60,000 base64 characters, more than three
++    // times what one connection carries.
++    let bytes: Vec<u8> = (0..1_500_000u32)
++        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
++        .collect();
++    let total_chunks = BASE64.encode(&bytes).len().div_ceil(60_000);
++    assert!(total_chunks > 3 * CHUNKS_PER_CONNECTION);
++    // Staged on A, as the composer does before it sends.
++    let encoded = BASE64.encode(&bytes);
++    for (seq, piece) in encoded.as_bytes().chunks(500_000).enumerate() {
++        client_a
++            .call(
++                methods::UPLOAD_CHUNK,
++                serde_json::json!({
++                    "uploadId": "att-flaky", "seq": seq,
++                    "data": std::str::from_utf8(piece).expect("base64 is ascii"),
++                }),
++            )
++            .await
++            .expect("stage chunk on A");
++    }
++    client_a
++        .call(
++            methods::UPLOAD_COMMIT,
++            serde_json::json!({ "uploadId": "att-flaky", "fileName": "big.bin" }),
++        )
++        .await
++        .expect("commit on A");
++
++    let reference = "pending://att-flaky/big.bin";
++    let command = serde_json::to_value(SessionCommandPayload::Run {
++        request: RunRequest {
++            mcp: None,
++            prompt: format!("look at this\n\nAttached files:\n- {reference}"),
++            harness: None,
++            model: None,
++            reasoning: None,
++            model_options: Default::default(),
++            cwd: "~".into(),
++            sandbox: SandboxLevel::WorkspaceWrite,
++            auto_approve: true,
++            access: Default::default(),
++            plan: false,
++            code_mode: false,
++            zeron_mcp_only: false,
++            attachments: vec![reference.into()],
++            worktree: None,
++            resume: None,
++            env: Default::default(),
++            extra_mcp: Vec::new(),
++        },
++        message_id: "msg-flaky-1".into(),
++    })
++    .expect("command json");
++    client_a
++        .call(
++            methods::QUEUE_COMMAND,
++            serde_json::json!({
++                "chatId": CHAT,
++                "command": command,
++                "transfers": [{ "uploadId": "att-flaky", "fileName": "big.bin" }],
++            }),
++        )
++        .await
++        .expect("queue on A");
++
++    // Each drop costs a backoff (2 s, 4 s, 8 s …) and a redial; four
++    // connections carry it.
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
++    while complete_assistant_count(&core_b) < 1 {
++        assert!(
++            tokio::time::Instant::now() < deadline,
++            "the message never ran on B; {} chunks carried for a {total_chunks}-chunk file",
++            chunks.load(Ordering::SeqCst)
++        );
++        tokio::time::sleep(Duration::from_millis(250)).await;
++    }
++
++    let landed = find_file(&dirs.path().join("b"), "att-flak-big.bin")
++        .expect("B committed the file under its upload's name");
++    assert_eq!(
++        std::fs::read(landed).expect("read landed file"),
++        bytes,
++        "B holds the file whole"
++    );
++    // Resumed, not restarted: each drop resends at most the chunks that were
++    // in flight when it cut, never the file from its start.
++    let carried = chunks.load(Ordering::SeqCst);
++    assert!(
++        carried < total_chunks + total_chunks / 2,
++        "{carried} chunks carried for a {total_chunks}-chunk file"
++    );
++
++    core_a.shutdown().await;
++    core_b.shutdown().await;
++}
+diff --git a/crates/rpc/src/lib.rs b/crates/rpc/src/lib.rs
+index f3189549fe70a42e6069d988269db32e797653cf..7095fda13a51074288be8b4cfdac57881f5b3363 100644
+--- a/crates/rpc/src/lib.rs
++++ b/crates/rpc/src/lib.rs
+@@ -416,6 +416,11 @@ pub mod methods {
+     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
+     pub const UPLOAD_CHUNK: &str = "UploadChunk";
+     pub const UPLOAD_COMMIT: &str = "UploadCommit";
++    /// `{uploadId, fileName}` → `{committed, chunks: [[seq, len]]}`: what this
++    /// device already holds of an upload, so a sender whose link dropped
++    /// sends only the rest. Hosts without it answer unknown method; the
++    /// sender then sends everything, as before.
++    pub const UPLOAD_STATUS: &str = "UploadStatus";
+     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+     /// One chunk of an image an agent's reply names in Markdown
+     /// (`![alt](path)`), read only from inside that chat's working folder.
+-- 
+2.55.0.windows.2
+
