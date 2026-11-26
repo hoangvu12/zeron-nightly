@@ -1,4 +1,4 @@
-From 7c20e0be53d203a6acf2554eaa87254b70867c0f Mon Sep 17 00:00:00 2001
+From fc5df36a7fc273fb99f8f8ef08622499a77c7338 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 26 Nov 2026 19:45:25 +0700
 Subject: [PATCH] A direct link proves which of the person's devices it's from,
@@ -21,9 +21,13 @@ and agent calls) kept to the relay, whose edge checks a dial's proof.
   (Caller::Peer{device: Some}), as a stamped relay dial's are. Not proven
   (no key yet, a host from before answering unknown method, keys
   unreadable): served as before.
-- The account's keys are read again when the copy here is 10 minutes old,
-  or lacks the key asked about (at most every 30 s); a revoked key stops
-  counting then. With the edge out of reach the copy counts for an hour.
+- The account's keys, by device with their revocations, are kept in
+  <data>/device-keys.json and checked from there. They're read from the
+  edge again when the copy lacks the key asked about (waited for), and
+  when it's 10 minutes old (waited for up to 2 s, then answered from the
+  copy while the read goes on), at most every 30 s; a revoked key stops
+  counting then. With the edge out of reach the copy counts whatever its
+  age, so a restart offline still proves the person's devices.
 - Roads::for_method sends a call that needs the verified caller
   (needs_verified_caller) down a direct link only once it proved this
   device (Links::proven_client), else the relay. Plugins take Roads now
@@ -32,28 +36,32 @@ and agent calls) kept to the relay, whose edge checks a dial's proof.
   methods follow the same rule.
 - Nothing in the check is tied to WebRTC: device_proof (Claim, Verifier,
   check, AccountKeys) and direct_rpc::proven_service / direct_rpc::prove
-  work over any byte stream between two devices.
+  work over any byte stream between two devices. A road with a handshake
+  of its own checks a device's key with AccountKeys::device_key (or
+  Plugins::device_key) and its signature with device_proof::verify_b64;
+  AccountKeys::fixed stands in for the account's keys in tests.
 
 Tests: device_proof's a_claim_proves_the_device_its_key_is_registered_to
-(another host, link, device, time, a revoked or unknown key) and
-keys_are_read_when_stale_or_missing_and_a_revocation_counts; direct_rpc's
+(another host, link, device, time, a revoked or unknown key),
+keys_are_read_when_stale_or_missing_and_a_revocation_counts and
+with_the_edge_out_of_reach_a_copy_of_any_age_counts_without_waiting; direct_rpc's
 a_link_that_proves_its_device_is_served_as_that_devices (and a host from
 before) and plugin_calls_take_a_link_that_proved_this_device.
 ---
- crates/engine/src/device_proof.rs | 300 +++++++++++++++++++++++
- crates/engine/src/direct_rpc.rs   | 385 ++++++++++++++++++++++++++++--
+ crates/engine/src/device_proof.rs | 498 ++++++++++++++++++++++++++++++
+ crates/engine/src/direct_rpc.rs   | 385 +++++++++++++++++++++--
  crates/engine/src/lib.rs          |  17 +-
- crates/engine/src/plugins/mod.rs  | 135 +++++++++--
+ crates/engine/src/plugins/mod.rs  | 148 ++++++++-
  crates/rpc/src/lib.rs             |   8 +
- 5 files changed, 807 insertions(+), 38 deletions(-)
+ 5 files changed, 1018 insertions(+), 38 deletions(-)
  create mode 100644 crates/engine/src/device_proof.rs
 
 diff --git a/crates/engine/src/device_proof.rs b/crates/engine/src/device_proof.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8e5f7be95
+index 0000000000000000000000000000000000000000..6b3df780abe25720b6ade1c98c06d3c9a01c6344
 --- /dev/null
 +++ b/crates/engine/src/device_proof.rs
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,498 @@
 +//! Which of the person's devices is at the far end of a link the edge doesn't
 +//! stand behind: a direct WebRTC link ([`crate::direct_rpc`]), or any other
 +//! road between two of their computers.
@@ -69,10 +77,14 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +//! named device's, not revoked, and the signature holds.
 +//!
 +//! Nothing here knows the transport: [`Claim`] crosses as JSON, and
-+//! [`Verifier`] is what a host asks.
++//! [`Verifier`] is what a host asks. A road with a handshake of its own
++//! checks the key a device signs with by [`AccountKeys::device_key`] (or
++//! `Plugins::device_key`) and its signature by [`verify_b64`].
 +
 +use std::path::{Path, PathBuf};
 +use std::sync::atomic::{AtomicI64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
 +
 +use base64::Engine as _;
 +use serde::{Deserialize, Serialize};
@@ -84,14 +96,16 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +/// How far a claim's time (epoch ms) may be from the host's, either way:
 +/// clocks differ, and a claim is made for a link as it opens.
 +pub const CLAIM_SKEW_MS: i64 = 5 * 60 * 1000;
-+/// The account's keys are read again when the copy here is older than this:
-+/// a revoked key stops counting within it.
++/// The account's keys are read again when the copy here is older than this,
++/// so a revoked key stops counting within it. With the edge out of reach the
++/// copy counts whatever its age, until the edge answers again.
 +pub const KEYS_FRESH_MS: i64 = 10 * 60 * 1000;
-+/// Past this the copy isn't trusted at all (the edge out of reach that long).
-+pub const KEYS_TRUSTED_MS: i64 = 60 * 60 * 1000;
-+/// A key not on the copy (made since it was read) sends for the keys again
-+/// at most this often.
-+pub const MISS_GAP_MS: i64 = 30 * 1000;
++/// The edge is asked for the keys at most this often (a key not on the copy,
++/// a stale copy, the edge out of reach).
++pub const READ_GAP_MS: i64 = 30 * 1000;
++/// How long a check waits for a stale copy to be read again before it
++/// answers from the copy (the read goes on behind it).
++pub const STALE_WAIT: Duration = Duration::from_secs(2);
 +
 +/// A device's word for who it is, for one link.
 +#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +147,8 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +    /// The key is another device's.
 +    OtherDevice,
 +    BadSignature,
-+    /// The account's keys couldn't be read, and no copy here is recent.
++    /// Signed out, or no copy of the account's keys here and the edge out of
++    /// reach.
 +    NoKeys,
 +}
 +
@@ -161,28 +176,49 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +    chrono::Utc::now().timestamp_millis()
 +}
 +
++/// Whether `key` is `device`'s among the account's key `rows`, and not
++/// revoked.
++pub fn key_owner(rows: &[KeyRow], device: &str, key: &str) -> Result<(), Refused> {
++    let row = rows.iter().find(|row| row.key == key).ok_or(Refused::UnknownKey)?;
++    if row.revoked_at.is_some() {
++        return Err(Refused::Revoked);
++    }
++    if row.device_id.is_empty() || row.device_id != device {
++        return Err(Refused::OtherDevice);
++    }
++    Ok(())
++}
++
++/// Whether `signature` (b64url, unpadded) is `key`'s (an Ed25519 public key,
++/// b64url unpadded, as the account's keys list them) over `message`.
++pub fn verify_b64(key: &str, message: &[u8], signature: &str) -> bool {
++    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
++    let (Ok(key), Ok(signature)) = (b64.decode(key), b64.decode(signature)) else {
++        return false;
++    };
++    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
++        .verify(message, &signature)
++        .is_ok()
++}
++
 +/// `claim` checked against the account's key `rows` at `now` (epoch ms): the
 +/// device it proves, or why not.
 +pub fn check(claim: &Claim, host: &str, link: &str, now: i64, rows: &[KeyRow]) -> Result<String, Refused> {
 +    if (now - claim.ts).abs() > CLAIM_SKEW_MS {
 +        return Err(Refused::Stale);
 +    }
-+    let row = rows.iter().find(|row| row.key == claim.key).ok_or(Refused::UnknownKey)?;
-+    if row.revoked_at.is_some() {
-+        return Err(Refused::Revoked);
-+    }
-+    if row.device_id.is_empty() || row.device_id != claim.device {
-+        return Err(Refused::OtherDevice);
-+    }
-+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-+    let (Ok(key), Ok(signature)) = (b64.decode(&claim.key), b64.decode(&claim.signature)) else {
-+        return Err(Refused::BadSignature);
-+    };
++    key_owner(rows, &claim.device, &claim.key)?;
++    signed(claim, host, link)
++}
++
++/// The device `claim` names, when its signature holds for `link` to `host`.
++fn signed(claim: &Claim, host: &str, link: &str) -> Result<String, Refused> {
 +    let message = zeron_rpc::caller_proof_message(host, link, claim.ts);
-+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-+        .verify(message.as_bytes(), &signature)
-+        .map_err(|_| Refused::BadSignature)?;
-+    Ok(claim.device.clone())
++    if verify_b64(&claim.key, message.as_bytes(), &claim.signature) {
++        Ok(claim.device.clone())
++    } else {
++        Err(Refused::BadSignature)
++    }
 +}
 +
 +/// The copy of the account's keys kept here.
@@ -194,73 +230,154 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +    read_at: i64,
 +}
 +
-+/// The account's keys as a host checks claims against them: read from the
-+/// edge when the copy here is stale or lacks the key asked about, kept in
-+/// `<data>/device-keys.json` so a restart offline still knows them.
-+pub struct AccountKeys {
-+    data_dir: PathBuf,
-+    copy: tokio::sync::Mutex<Option<Copy>>,
-+    missed_at: AtomicI64,
++#[derive(Default)]
++struct Held {
++    /// The file was read (once, the first time a copy is asked for).
++    loaded: bool,
++    copy: Option<Copy>,
 +}
++
++struct Shared {
++    /// `None`: kept in memory alone ([`AccountKeys::fixed`]).
++    file: Option<PathBuf>,
++    held: Mutex<Held>,
++    /// One read of the edge at a time.
++    reading: tokio::sync::Mutex<()>,
++    /// When the edge was last asked (epoch ms).
++    asked_at: AtomicI64,
++}
++
++/// The account's keys, by device, as any road between two of the person's
++/// devices checks a device's key against them: kept in
++/// `<data>/device-keys.json`, so a restart with the edge out of reach still
++/// knows them, and read from the edge again when the copy is stale or lacks
++/// the key asked about. Checks answer from the copy; they wait on the edge
++/// only for a key the copy lacks (or no copy at all), and up to
++/// [`STALE_WAIT`] for a stale copy.
++#[derive(Clone)]
++pub struct AccountKeys(Arc<Shared>);
 +
 +impl AccountKeys {
 +    pub fn new(data_dir: &Path) -> Self {
-+        Self {
-+            data_dir: data_dir.to_owned(),
-+            copy: tokio::sync::Mutex::new(None),
-+            missed_at: AtomicI64::new(i64::MIN / 2),
++        Self::with(Some(data_dir.join(FILE)), Held::default())
++    }
++
++    /// `rows` as `account`'s keys, never stale and never kept on disk, for
++    /// tests (with no directory, the edge is never asked either).
++    #[doc(hidden)]
++    pub fn fixed(account: &str, rows: Vec<KeyRow>) -> Self {
++        let copy = Copy {
++            account: account.to_owned(),
++            rows,
++            read_at: i64::MAX / 2,
++        };
++        Self::with(None, Held { loaded: true, copy: Some(copy) })
++    }
++
++    fn with(file: Option<PathBuf>, held: Held) -> Self {
++        Self(Arc::new(Shared {
++            file,
++            held: Mutex::new(held),
++            reading: tokio::sync::Mutex::new(()),
++            asked_at: AtomicI64::new(i64::MIN / 2),
++        }))
++    }
++
++    /// `account`'s keys as the copy here has them, whatever its age. `None`:
++    /// no copy for `account`.
++    pub fn cached(&self, account: &str) -> Option<Vec<KeyRow>> {
++        self.copy_for(account).map(|copy| copy.rows)
++    }
++
++    fn copy_for(&self, account: &str) -> Option<Copy> {
++        let mut held = self.0.held.lock().unwrap_or_else(|e| e.into_inner());
++        if !held.loaded {
++            held.loaded = true;
++            if held.copy.is_none()
++                && let Some(file) = &self.0.file
++            {
++                held.copy = std::fs::read(file)
++                    .ok()
++                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
++            }
 +        }
++        held.copy.clone().filter(|copy| copy.account == account)
++    }
++
++    /// Whether `key` is `device`'s, of `account`'s keys, and not revoked: the
++    /// check any road makes on the key a device signs with. `directory`: the
++    /// edge, asked as [`AccountKeys`] says.
++    pub async fn device_key(
++        &self,
++        directory: Option<&Arc<dyn KeyDirectory>>,
++        account: Option<&str>,
++        device: &str,
++        key: &str,
++    ) -> Result<(), Refused> {
++        let account = account.ok_or(Refused::NoKeys)?;
++        let copy = self.copy_for(account);
++        if let Some(directory) = directory {
++            let now = now_ms();
++            let known = copy.as_ref().is_some_and(|c| c.rows.iter().any(|row| row.key == key));
++            let stale = copy.as_ref().is_some_and(|c| now - c.read_at >= KEYS_FRESH_MS);
++            if !known {
++                self.read(directory, account).await;
++            } else if stale && now - self.0.asked_at.load(Ordering::SeqCst) >= READ_GAP_MS {
++                let (keys, directory, account) = (self.clone(), directory.clone(), account.to_owned());
++                let read = tokio::spawn(async move { keys.read(&directory, &account).await });
++                let _ = tokio::time::timeout(STALE_WAIT, read).await;
++            }
++        }
++        let rows = self.cached(account).ok_or(Refused::NoKeys)?;
++        key_owner(&rows, device, key)
 +    }
 +
 +    /// `claim` checked against `account`'s keys, read through `directory`
-+    /// (the edge) when the copy here won't do.
++    /// (the edge) as [`AccountKeys`] says.
 +    pub async fn verify(
 +        &self,
-+        directory: Option<&dyn KeyDirectory>,
++        directory: Option<&Arc<dyn KeyDirectory>>,
 +        account: Option<&str>,
 +        claim: &Claim,
 +        host: &str,
 +        link: &str,
 +    ) -> Result<String, Refused> {
-+        let account = account.ok_or(Refused::NoKeys)?;
-+        let now = now_ms();
-+        let mut copy = self.copy.lock().await;
-+        if copy.is_none() {
-+            *copy = std::fs::read(self.data_dir.join(FILE))
-+                .ok()
-+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
++        if (now_ms() - claim.ts).abs() > CLAIM_SKEW_MS {
++            return Err(Refused::Stale);
 +        }
-+        let ours = copy.as_ref().filter(|c| c.account == account);
-+        let stale = ours.is_none_or(|c| now - c.read_at >= KEYS_FRESH_MS);
-+        let missing = ours.is_some_and(|c| !c.rows.iter().any(|row| row.key == claim.key))
-+            && now - self.missed_at.load(Ordering::Relaxed) >= MISS_GAP_MS;
-+        if (stale || missing)
-+            && let Some(directory) = directory
-+        {
-+            if missing {
-+                self.missed_at.store(now, Ordering::Relaxed);
-+            }
-+            match directory.keys_since(0).await {
-+                Ok((rows, _)) => {
-+                    let read = Copy {
-+                        account: account.to_owned(),
-+                        rows,
-+                        read_at: now,
-+                    };
++        self.device_key(directory, account, &claim.device, &claim.key).await?;
++        signed(claim, host, link)
++    }
++
++    /// Reads `account`'s keys from the edge and keeps them, unless the edge
++    /// was asked less than [`READ_GAP_MS`] ago (a read under way is waited
++    /// for, then counts as that).
++    async fn read(&self, directory: &Arc<dyn KeyDirectory>, account: &str) {
++        let _reading = self.0.reading.lock().await;
++        let asked = now_ms();
++        if asked - self.0.asked_at.load(Ordering::SeqCst) < READ_GAP_MS {
++            return;
++        }
++        self.0.asked_at.store(asked, Ordering::SeqCst);
++        match directory.keys_since(0).await {
++            Ok((rows, _)) => {
++                let read = Copy {
++                    account: account.to_owned(),
++                    rows,
++                    read_at: now_ms(),
++                };
++                if let Some(file) = &self.0.file {
 +                    let bytes = serde_json::to_vec_pretty(&read).unwrap_or_default();
-+                    if let Err(error) = crate::runner::write_private_atomic(&self.data_dir.join(FILE), &bytes) {
++                    if let Err(error) = crate::runner::write_private_atomic(file, &bytes) {
 +                        tracing::warn!(%error, "couldn't keep the account's device keys");
 +                    }
-+                    *copy = Some(read);
 +                }
-+                Err(error) => tracing::info!(%error, "the account's device keys couldn't be read; the copy here is used"),
++                let mut held = self.0.held.lock().unwrap_or_else(|e| e.into_inner());
++                held.loaded = true;
++                held.copy = Some(read);
 +            }
++            Err(error) => tracing::info!(%error, "the account's device keys couldn't be read; the copy here is used"),
 +        }
-+        let copy = copy
-+            .as_ref()
-+            .filter(|c| c.account == account && now - c.read_at < KEYS_TRUSTED_MS)
-+            .ok_or(Refused::NoKeys)?;
-+        check(claim, host, link, now, &copy.rows)
 +    }
 +}
 +
@@ -268,6 +385,7 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +mod tests {
 +    use super::*;
 +    use crate::plugins::keys::tests::FakeDirectory;
++    use crate::plugins::keys::{Lookup, RegisterError};
 +    use crate::plugins::signing;
 +
 +    const HOST: &str = "desktop";
@@ -284,11 +402,39 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +            revoked_at: None,
 +        };
 +        let dir = dir.to_owned();
-+        let prove: zeron_rpc::CallerProofFn = std::sync::Arc::new(move |host: &str, link: &str, ts: i64| {
++        let prove: zeron_rpc::CallerProofFn = Arc::new(move |host: &str, link: &str, ts: i64| {
 +            let (key, signature) = signing::device_link_proof(&dir, host, link, ts)?;
 +            Some(zeron_rpc::CallerProof { device: "laptop".into(), key, signature })
 +        });
 +        (row, prove)
++    }
++
++    /// An edge that never answers.
++    struct Unanswering;
++
++    #[async_trait::async_trait]
++    impl KeyDirectory for Unanswering {
++        async fn lookup(&self, _: &str) -> Result<Lookup, String> {
++            std::future::pending().await
++        }
++        async fn register(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<(), RegisterError> {
++            std::future::pending().await
++        }
++        async fn revoke(&self, _: &str) -> Result<(), String> {
++            std::future::pending().await
++        }
++        async fn keys_since(&self, _: i64) -> Result<(Vec<KeyRow>, i64), String> {
++            std::future::pending().await
++        }
++    }
++
++    fn age(keys: &AccountKeys, by: i64) {
++        let mut held = keys.0.held.lock().unwrap();
++        held.copy.as_mut().unwrap().read_at -= by;
++    }
++
++    fn ask_again(keys: &AccountKeys) {
++        keys.0.asked_at.store(i64::MIN / 2, Ordering::SeqCst);
 +    }
 +
 +    #[test]
@@ -317,8 +463,17 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +        assert_eq!(check(&claim, HOST, LINK, now, &[revoked]), Err(Refused::Revoked));
 +        assert_eq!(check(&claim, HOST, LINK, now, &[]), Err(Refused::UnknownKey));
 +        // A key registered to no device in particular proves none.
-+        let anyone = KeyRow { device_id: String::new(), ..row };
++        let anyone = KeyRow { device_id: String::new(), ..row.clone() };
 +        assert_eq!(check(&claim, HOST, LINK, now, &[anyone]), Err(Refused::OtherDevice));
++
++        // The pieces a road with its own handshake uses.
++        let message = b"zeron-handshake:server:laptop";
++        let signature = signing::load_key(dir.path()).unwrap().sign(message);
++        assert!(verify_b64(&row.key, message, &signature));
++        assert!(!verify_b64(&row.key, b"zeron-handshake:laptop:server", &signature));
++        assert!(!verify_b64(&row.key, message, "not base64!"));
++        assert_eq!(key_owner(std::slice::from_ref(&row), "laptop", &row.key), Ok(()));
++        assert_eq!(key_owner(std::slice::from_ref(&row), "server", &row.key), Err(Refused::OtherDevice));
 +    }
 +
 +    #[tokio::test]
@@ -326,18 +481,27 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +        let host_dir = tempfile::tempdir().unwrap();
 +        let laptop_dir = tempfile::tempdir().unwrap();
 +        let (row, prove) = laptop(laptop_dir.path());
-+        let edge = FakeDirectory::default();
++        let edge = Arc::new(FakeDirectory::default());
++        let directory: Arc<dyn KeyDirectory> = edge.clone();
 +        let keys = AccountKeys::new(host_dir.path());
 +        let claim = Claim::make(&prove, HOST, LINK).unwrap();
 +
 +        // Signed out: no account to read keys for.
-+        assert_eq!(keys.verify(Some(&edge), None, &claim, HOST, LINK).await, Err(Refused::NoKeys));
++        assert_eq!(keys.verify(Some(&directory), None, &claim, HOST, LINK).await, Err(Refused::NoKeys));
 +        // The edge doesn't know it yet.
-+        assert_eq!(keys.verify(Some(&edge), Some("acct"), &claim, HOST, LINK).await, Err(Refused::UnknownKey));
++        assert_eq!(
++            keys.verify(Some(&directory), Some("acct"), &claim, HOST, LINK).await,
++            Err(Refused::UnknownKey)
++        );
 +        // Registered since: a missing key reads them again (once a while).
 +        edge.rows.lock().unwrap().push(row.clone());
-+        keys.missed_at.store(i64::MIN / 2, Ordering::Relaxed);
-+        assert_eq!(keys.verify(Some(&edge), Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
++        assert_eq!(
++            keys.verify(Some(&directory), Some("acct"), &claim, HOST, LINK).await,
++            Err(Refused::UnknownKey),
++            "asked again within {READ_GAP_MS} ms"
++        );
++        ask_again(&keys);
++        assert_eq!(keys.verify(Some(&directory), Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
 +        // Kept here: with the edge out of reach, a restart still knows them.
 +        let again = AccountKeys::new(host_dir.path());
 +        assert_eq!(again.verify(None, Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
@@ -346,12 +510,54 @@ index 0000000000000000000000000000000000000000..6ad775bd9eef4546d817d9b43b729ce8
 +
 +        // Revoked on the edge: counted once the copy is read again.
 +        edge.rows.lock().unwrap()[0].revoked_at = Some(5);
-+        keys.copy.lock().await.as_mut().unwrap().read_at -= KEYS_FRESH_MS;
-+        assert_eq!(keys.verify(Some(&edge), Some("acct"), &claim, HOST, LINK).await, Err(Refused::Revoked));
++        assert_eq!(keys.verify(Some(&directory), Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
++        age(&keys, KEYS_FRESH_MS);
++        ask_again(&keys);
++        assert_eq!(
++            keys.verify(Some(&directory), Some("acct"), &claim, HOST, LINK).await,
++            Err(Refused::Revoked)
++        );
++    }
 +
-+        // A copy too old to trust, the edge out of reach: nothing proven.
-+        keys.copy.lock().await.as_mut().unwrap().read_at -= KEYS_TRUSTED_MS;
-+        assert_eq!(keys.verify(None, Some("acct"), &claim, HOST, LINK).await, Err(Refused::NoKeys));
++    #[tokio::test]
++    async fn with_the_edge_out_of_reach_a_copy_of_any_age_counts_without_waiting() {
++        let host_dir = tempfile::tempdir().unwrap();
++        let laptop_dir = tempfile::tempdir().unwrap();
++        let (row, prove) = laptop(laptop_dir.path());
++        let claim = Claim::make(&prove, HOST, LINK).unwrap();
++        let edge = Arc::new(FakeDirectory::default());
++        edge.rows.lock().unwrap().push(row.clone());
++        let directory: Arc<dyn KeyDirectory> = edge;
++        assert_eq!(
++            AccountKeys::new(host_dir.path())
++                .verify(Some(&directory), Some("acct"), &claim, HOST, LINK)
++                .await,
++            Ok("laptop".into())
++        );
++
++        // A restart, a week on, the edge never answering.
++        let keys = AccountKeys::new(host_dir.path());
++        assert!(keys.cached("acct").is_some());
++        age(&keys, 7 * 24 * 60 * 60 * 1000);
++        let down: Arc<dyn KeyDirectory> = Arc::new(Unanswering);
++        let started = std::time::Instant::now();
++        assert_eq!(keys.verify(Some(&down), Some("acct"), &claim, HOST, LINK).await, Ok("laptop".into()));
++        let first = started.elapsed();
++        assert!(first < STALE_WAIT + Duration::from_secs(1), "waited {first:?}");
++        // The read under way isn't waited on again.
++        let started = std::time::Instant::now();
++        assert_eq!(keys.device_key(Some(&down), Some("acct"), "laptop", &row.key).await, Ok(()));
++        assert!(started.elapsed() < Duration::from_millis(200), "waited {:?}", started.elapsed());
++        // The key checks a road with its own handshake makes.
++        assert_eq!(
++            keys.device_key(Some(&down), Some("acct"), "server", &row.key).await,
++            Err(Refused::OtherDevice)
++        );
++
++        // A fixed list, for tests: no edge, no file.
++        let fixed = AccountKeys::fixed("acct", vec![row.clone()]);
++        assert_eq!(fixed.device_key(None, Some("acct"), "laptop", &row.key).await, Ok(()));
++        assert_eq!(fixed.device_key(None, Some("other"), "laptop", &row.key).await, Err(Refused::NoKeys));
 +    }
 +}
 diff --git a/crates/engine/src/direct_rpc.rs b/crates/engine/src/direct_rpc.rs
@@ -934,7 +1140,7 @@ index 9d2b31427088e9af97237ff5fea533a16bb9d58c..8aa345ef620cc80d103875aed5a301f0
          }
          zeron_rpc::HostRelay::spawn(config, service, on_nudge)
 diff --git a/crates/engine/src/plugins/mod.rs b/crates/engine/src/plugins/mod.rs
-index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4949c0b8d 100644
+index 5d85561a864eee876a4f9e28863d3515d099930e..c8026173480308bf3666563ee9882edfa6811ac4 100644
 --- a/crates/engine/src/plugins/mod.rs
 +++ b/crates/engine/src/plugins/mod.rs
 @@ -214,6 +214,62 @@ fn is_change(event: &notify::Event) -> bool {
@@ -992,7 +1198,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
 +        plugins
 +            .inner
 +            .device_keys
-+            .verify(directory.as_deref(), account.as_deref(), claim, host, link)
++            .verify(directory.as_ref(), account.as_deref(), claim, host, link)
 +            .await
 +    }
 +}
@@ -1022,13 +1228,26 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
                  state: Mutex::new(state),
                  cache: Mutex::new(cache),
                  lookup_failed: Mutex::new(HashMap::new()),
-@@ -624,6 +688,37 @@ impl Plugins {
+@@ -624,6 +688,50 @@ impl Plugins {
          *lock(&self.inner.links) = Some(links);
      }
  
 +    /// What checks another device's proof on a direct link to this one.
 +    pub fn device_verifier(&self) -> Arc<dyn crate::device_proof::Verifier> {
 +        Arc::new(DeviceVerifier(Arc::downgrade(&self.inner)))
++    }
++
++    /// Whether `key` is `device`'s registered signing key, not revoked, by
++    /// the account's keys kept here (device_proof::AccountKeys::device_key):
++    /// what any road between two of the person's devices checks the key a
++    /// device signs with against, whatever the road.
++    pub async fn device_key(&self, device: &str, key: &str) -> Result<(), crate::device_proof::Refused> {
++        let directory = self.directory();
++        let account = self.account();
++        self.inner
++            .device_keys
++            .device_key(directory.as_ref(), account.as_deref(), device, key)
++            .await
 +    }
 +
 +    /// What proves this device to another's direct link: its registered key
@@ -1060,7 +1279,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
      /// Follow `auth`: the account for lookups, and on every sign-in change a
      /// key registration and a rescan.
      pub fn attach_auth(&self, auth: crate::Auth) {
-@@ -1126,12 +1221,13 @@ impl Plugins {
+@@ -1126,12 +1234,13 @@ impl Plugins {
      /// Tell `device` a key was revoked, so it checks its own now rather
      /// than at its next regular check (best effort: offline, it checks then).
      fn tell_key_revoked(&self, device: String) {
@@ -1076,7 +1295,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
              })
              .await;
              if !matches!(told, Ok(Ok(_))) {
-@@ -2594,7 +2690,7 @@ impl Plugins {
+@@ -2594,7 +2703,7 @@ impl Plugins {
              "author_key": author_identity(&entry),
              "data": p.data,
          });
@@ -1085,7 +1304,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
          let results = futures::future::join_all(targets.into_iter().map(|target| {
              let deliver = deliver.clone();
              let links = links.clone();
-@@ -2606,8 +2702,10 @@ impl Plugins {
+@@ -2606,8 +2715,10 @@ impl Plugins {
                  let Some(links) = links else {
                      return (target, outcome::OFFLINE.to_owned());
                  };
@@ -1097,7 +1316,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
                      client.call(methods::PLUGIN_DELIVER, deliver).await
                  })
                  .await;
-@@ -2621,7 +2719,7 @@ impl Plugins {
+@@ -2621,7 +2732,7 @@ impl Plugins {
                      Ok(Err(RpcError::UnknownMethod(_))) => outcome::NOT_INSTALLED.to_owned(),
                      Ok(Err(_)) | Err(_) => {
                          if reply.is_err() {
@@ -1106,7 +1325,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
                          }
                          outcome::OFFLINE.to_owned()
                      }
-@@ -2932,12 +3030,15 @@ impl Plugins {
+@@ -2932,12 +3043,15 @@ impl Plugins {
              unverified_from: false,
          };
          let name = self.device_name(&target);
@@ -1124,7 +1343,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
          })
          .await;
          match reply {
-@@ -2949,12 +3050,12 @@ impl Plugins {
+@@ -2949,12 +3063,12 @@ impl Plugins {
              .to_json(),
              Ok(Err(error)) => {
                  if matches!(error, RpcError::Closed | RpcError::Transport(_)) {
@@ -1139,7 +1358,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
                  Refusal::new(reason::TIMEOUT, format!("{name} didn't answer in time")).to_json()
              }
          }
-@@ -3049,7 +3150,7 @@ impl Plugins {
+@@ -3049,7 +3163,7 @@ impl Plugins {
              devices.retain(|_, until| *until > now);
              devices.keys().cloned().collect()
          };
@@ -1148,7 +1367,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
          else {
              return;
          };
-@@ -3064,7 +3165,8 @@ impl Plugins {
+@@ -3064,7 +3178,8 @@ impl Plugins {
              let (links, deliver, this, plugin) = (links.clone(), deliver.clone(), self.clone(), plugin.to_owned());
              runtime.spawn(async move {
                  let reply = tokio::time::timeout(DELIVER_TIMEOUT, async {
@@ -1158,7 +1377,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
                  })
                  .await;
                  let gone = match &reply {
-@@ -3116,13 +3218,16 @@ impl Plugins {
+@@ -3116,13 +3231,16 @@ impl Plugins {
      /// One call to another device's service, over the device link.
      async fn forward_call(&self, target: &str, call: ServeParams) -> serde_json::Value {
          let name = self.device_name(target);
@@ -1177,7 +1396,7 @@ index 5d85561a864eee876a4f9e28863d3515d099930e..ee0167b2b27aa0fa9869d40bf279c2e4
          })
          .await;
          match reply {
-@@ -3135,13 +3240,13 @@ impl Plugins {
+@@ -3135,13 +3253,13 @@ impl Plugins {
              Ok(Err(RpcError::BadParams(why))) => Refusal::new(reason::BAD_CALL, why).to_json(),
              Ok(Err(error)) => {
                  if matches!(error, RpcError::Closed | RpcError::Transport(_)) {
