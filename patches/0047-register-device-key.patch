@@ -1,0 +1,2708 @@
+From a6384cd2faad1b9a3dd9a264bc6ae6fe40ee5955 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Fri, 27 Nov 2026 13:21:45 +0700
+Subject: [PATCH] Every device registers its signing key on the account,
+ headless Linux included, without signing out
+
+A device's signing key was registered only when the desktop engine did
+the sign-in itself: `zeron login` held the fresh ticket, never registered
+and exited, so headless Linux never registered, and devices signed in from
+before keys existed never did either. Unregistered, the Tailscale road
+refuses the device, its relay dials go unstamped and its plugins unsigned.
+
+- zeron login registers this device's key with its sign-in's ticket
+  before it exits (POST /plugin-keys with stepUp); the ticket stays in
+  memory only.
+- Already signed in, zeron login --confirm (or zeron login on a terminal
+  with the key unregistered) runs a paste-code step-up as the signed-in
+  account and registers the key; the session stays as it is, another
+  account's sign-in is refused, the code prompt times out.
+- Desktop: Settings > Account says whether this device's key is
+  registered and why not (key_status), and offers Confirm it's you: the
+  existing StepUp ({for: "key"}), its ticket let go once the key
+  registers with it. No sign-out.
+- Registered by the edge's word, not the file's; a revoked key is
+  replaced and registered again once; a key replaced by zeron login
+  re-signs this device's plugins at the next engine start; a revocation
+  zeron login found is answered at the next start, once, before start
+  spawns anything; only a delete's step-up can delete the account.
+- Failures are said: zeron login prints them and fails; the app shows
+  them, and a refused step-up at once.
+
+Tests: auth's 10 new, key_status' 4, plugins identity's 2 new,
+device_key's 1, key_cli's 1, zeron-cli's login_takes_confirm, zgx
+key_confirm's 3 (Rust) and 4 (Luau).
+---
+ apps/zeron/src/auth_cli.rs                    |  45 +-
+ apps/zeron/src/engine_commands.rs             |   8 +-
+ apps/zeron/src/key_cli.rs                     |  74 +++
+ apps/zeron/src/lib.rs                         |   1 +
+ apps/zgx/src/key_confirm.rs                   | 170 ++++++
+ apps/zgx/src/main.rs                          |   1 +
+ apps/zgx/src/settings.rs                      |  11 +-
+ apps/zgx/ui/locales/en.json                   |  12 +-
+ apps/zgx/ui/locales/zh-Hans.json              |  12 +-
+ apps/zgx/ui/screens/settings/key_confirm.luau | 126 +++++
+ .../zgx/ui/screens/settings/signing_keys.luau |   6 +
+ apps/zgx/ui/settings_stub.luau                |  38 +-
+ apps/zgx/ui/tests/key_confirm.test.luau       |  89 ++++
+ crates/cli/src/lib.rs                         |  35 +-
+ crates/engine/src/auth.rs                     | 128 ++++-
+ crates/engine/src/device_key.rs               | 190 +++++++
+ crates/engine/src/lib.rs                      |   5 +-
+ crates/engine/src/plugins/identity_tests.rs   | 105 ++++
+ crates/engine/src/plugins/key_status.rs       | 295 +++++++++++
+ crates/engine/src/plugins/keys.rs             |  47 ++
+ crates/engine/src/plugins/mod.rs              | 136 +++--
+ crates/engine/src/plugins/signing.rs          |  16 +
+ crates/engine/src/rpc.rs                      |  19 +-
+ crates/engine/tests/auth.rs                   | 495 +++++++++++++++++-
+ 24 files changed, 1980 insertions(+), 84 deletions(-)
+ create mode 100644 apps/zeron/src/key_cli.rs
+ create mode 100644 apps/zgx/src/key_confirm.rs
+ create mode 100644 apps/zgx/ui/screens/settings/key_confirm.luau
+ create mode 100644 apps/zgx/ui/tests/key_confirm.test.luau
+ create mode 100644 crates/engine/src/device_key.rs
+ create mode 100644 crates/engine/src/plugins/key_status.rs
+
+diff --git a/apps/zeron/src/auth_cli.rs b/apps/zeron/src/auth_cli.rs
+index c4bffe08c243cff26014b55cbf8fe6d406270057..d6b44dbeb8f4829fc0abd9a8c2f0c5f25b596f7c 100644
+--- a/apps/zeron/src/auth_cli.rs
++++ b/apps/zeron/src/auth_cli.rs
+@@ -77,8 +77,11 @@ fn account_status(scope: WorkspaceScope, auth: &AuthState) -> AccountStatus {
+ }
+ 
+ /// `zeron login`: authenticate via the paste-code flow (and workspace
+-/// onboarding), persist `session.json`, and exit.
+-pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
++/// onboarding), persist `session.json`, register this device's signing key
++/// while the sign-in's ticket is here (`crate::key_cli`), and exit. Already
++/// signed in, an unregistered key is registered after confirming it's the
++/// person (`confirm`: asked for, as `zeron login --confirm`).
++pub async fn login(config: EngineConfig, confirm: bool) -> anyhow::Result<()> {
+     std::fs::create_dir_all(&config.data_dir)?;
+     let _lock = engine_lock(&config, "sign in")?;
+     let auth = Engine::build_auth(&config).await;
+@@ -93,6 +96,7 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
+         println!("Auth is in dev mode (no WorkOS client id) — there is nothing to sign in to.");
+         return Ok(());
+     }
++    let interactive = std::io::stdin().is_terminal();
+     if let AuthState::SignedIn { user, org_id } = auth.state() {
+         println!(
+             "Already signed in as {}{}.",
+@@ -101,14 +105,22 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
+                 .map(|org| format!(" (workspace {org})"))
+                 .unwrap_or_default()
+         );
+-        println!("Run `zeron logout` first to switch accounts.");
+-        println!("The next engine start will use the synced workspace.");
++        // Registered by the edge's word, not this device's file alone (a key
++        // revoked from another device is replaced and registered again).
++        crate::key_cli::register_device_key(&auth, &config.data_dir, interactive).await?;
++        if !confirm {
++            println!("Run `zeron logout` first to switch accounts.");
++            println!("The next engine start will use the synced workspace.");
++        }
+         return Ok(());
+     }
+-    if !std::io::stdin().is_terminal() {
++    if !interactive {
+         anyhow::bail!("zeron login needs an interactive terminal");
+     }
+-    zeron_engine::terminal_sign_in(&auth).await?;
++    // Not waited on for ever: the engine lock is held meanwhile.
++    tokio::time::timeout(zeron_engine::device_key::CODE_WAIT, zeron_engine::terminal_sign_in(&auth))
++        .await
++        .map_err(|_| anyhow::anyhow!("Timed out waiting for the sign-in code; run `zeron login` again"))??;
+     match auth.state() {
+         AuthState::SignedIn { user, org_id } => {
+             println!(
+@@ -123,9 +135,12 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
+             );
+         }
+         // terminal_sign_in only returns Ok once signed in; keep an honest fallback.
+-        _ => println!("Sign-in did not complete."),
++        _ => {
++            println!("Sign-in did not complete.");
++            return Ok(());
++        }
+     }
+-    Ok(())
++    crate::key_cli::register_device_key(&auth, &config.data_dir, interactive).await
+ }
+ 
+ /// `zeron logout`: remove the persisted session.
+@@ -228,6 +243,12 @@ async fn live_engine_scope(ipc_port: u16, data_dir: &std::path::Path) -> Option<
+         .map(|info| info.workspace_scope)
+ }
+ 
++/// How to stop the engine here (`zeron daemon stop` wraps the service).
++#[cfg(target_os = "linux")]
++const STOP_ENGINE: &str = "`zeron daemon stop`, or `systemctl --user stop zeron`, or quit the Zeron app";
++#[cfg(not(target_os = "linux"))]
++const STOP_ENGINE: &str = "`zeron daemon stop`, or quit the Zeron app";
++
+ /// The same exclusive data-dir lock the engine holds for its lifetime: taken for
+ /// the whole login/logout mutation so we never rotate or delete a session out
+ /// from under a running engine (whose in-memory copy would fight back — the next
+@@ -235,8 +256,8 @@ async fn live_engine_scope(ipc_port: u16, data_dir: &std::path::Path) -> Option<
+ fn engine_lock(config: &EngineConfig, verb: &str) -> anyhow::Result<InstanceLock> {
+     InstanceLock::acquire(&config.data_dir).map_err(|err| {
+         anyhow::anyhow!(
+-            "{err}\nCannot {verb} while an engine is running — stop it first \
+-             (`zeron daemon stop`, or quit the Zeron app), or use the running UI instead."
++            "{err}\nCannot {verb} while an engine is running — stop it first: {STOP_ENGINE}; \
++             then run this again and start it after. Or use the running UI instead."
+         )
+     })
+ }
+@@ -303,6 +324,10 @@ mod tests {
+             let error = engine_lock(&config, verb).unwrap_err().to_string();
+             assert!(error.contains("while an engine is running"));
+             assert!(error.contains("stop it first"));
++            // How, on this machine (security review 9, L2).
++            assert!(error.contains("`zeron daemon stop`"), "{error}");
++            #[cfg(target_os = "linux")]
++            assert!(error.contains("`systemctl --user stop zeron`"), "{error}");
+         }
+     }
+ 
+diff --git a/apps/zeron/src/engine_commands.rs b/apps/zeron/src/engine_commands.rs
+index 0532a58c6a058cd8df4e1392e4cc3ee957f252e0..80f515a2d38feec5563632a2151923991fde8b3f 100644
+--- a/apps/zeron/src/engine_commands.rs
++++ b/apps/zeron/src/engine_commands.rs
+@@ -16,9 +16,13 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
+                 engine.run().await
+             })
+         }
+-        EngineCommand::Login => {
++        EngineCommand::Login { confirm } => {
+             let runtime = tokio::runtime::Runtime::new()?;
+-            runtime.block_on(auth_cli::login(engine_config_from_env()))
++            let done = runtime.block_on(auth_cli::login(engine_config_from_env(), confirm));
++            // A prompt given up on still has its stdin read pending: exit
++            // without waiting on it.
++            runtime.shutdown_background();
++            done
+         }
+         EngineCommand::Logout => {
+             let runtime = tokio::runtime::Runtime::new()?;
+diff --git a/apps/zeron/src/key_cli.rs b/apps/zeron/src/key_cli.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cd12f7a878594c15a512cb174cbc5034219d63a
+--- /dev/null
++++ b/apps/zeron/src/key_cli.rs
+@@ -0,0 +1,74 @@
++//! `zeron login`'s last step: this device's signing key registered on the
++//! account while the sign-in's ticket is in this process (memory only, so
++//! it's gone once `zeron login` exits). A device signed in from before keys
++//! existed has no ticket: it confirms it's the person first, with a
++//! paste-code step-up as the same account (`zeron login --confirm`).
++//!
++//! Without a registered key other devices refuse this one's direct road,
++//! its relay dials go unstamped, and the plugins it makes go unsigned, so a
++//! failure is said and exits non-zero: it never reads as success.
++
++use std::path::Path;
++
++use zeron_engine::Auth;
++use zeron_engine::device_key::{self, DeviceKey};
++
++/// Register this device's key, confirming it's the person first (on a
++/// terminal) when the edge wants a fresh sign-in.
++pub async fn register_device_key(auth: &Auth, data_dir: &Path, interactive: bool) -> anyhow::Result<()> {
++    let mut outcome = device_key::register(auth, data_dir).await;
++    if outcome == DeviceKey::NeedsConfirm && interactive {
++        println!(
++            "\nThis device's signing key isn't on your account yet. Confirm it's you to add it \
++             (you stay signed in as you are)."
++        );
++        if let Err(error) = device_key::terminal_confirm(auth).await {
++            anyhow::bail!(
++                "Couldn't confirm it's you: {error}\nThis device's signing key isn't registered. \
++                 Run `zeron login --confirm` to try again."
++            );
++        }
++        outcome = device_key::register(auth, data_dir).await;
++    }
++    let line = key_report(&outcome).map_err(anyhow::Error::msg)?;
++    println!("{line}");
++    Ok(())
++}
++
++/// What `zeron login` says about the key: `Ok` for a registered one,
++/// `Err` (the command fails) for anything else.
++fn key_report(outcome: &DeviceKey) -> Result<String, String> {
++    match outcome {
++        DeviceKey::Registered => Ok("This device's signing key is registered on your account now.".into()),
++        DeviceKey::AlreadyRegistered => Ok("This device's signing key is registered on your account.".into()),
++        DeviceKey::NeedsConfirm => Err(
++            "This device's signing key isn't registered: your account wants you to confirm it's you. \
++             Run `zeron login --confirm` in a terminal."
++                .into(),
++        ),
++        DeviceKey::Failed(why) => Err(format!(
++            "This device's signing key couldn't be registered: {why}\n\
++             Run `zeron login --confirm` to try again."
++        )),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_a_registered_key_reads_as_success() {
++        for done in [DeviceKey::Registered, DeviceKey::AlreadyRegistered] {
++            let said = key_report(&done).expect("success");
++            assert!(said.contains("signing key is registered"), "{said}");
++        }
++        let confirm = key_report(&DeviceKey::NeedsConfirm).expect_err("not registered");
++        assert!(confirm.contains("isn't registered"), "{confirm}");
++        assert!(confirm.contains("zeron login --confirm"), "{confirm}");
++        let failed = key_report(&DeviceKey::Failed("plugin-keys register: HTTP 500".into())).expect_err("not registered");
++        assert!(failed.contains("couldn't be registered"), "{failed}");
++        assert!(failed.contains("HTTP 500"), "says why: {failed}");
++        assert!(failed.contains("zeron login --confirm"), "{failed}");
++    }
++}
+diff --git a/apps/zeron/src/lib.rs b/apps/zeron/src/lib.rs
+index 3ca804f558f637ba0f31dffc7a0b1fda0da601cc..29dec459fc1e0cd4be57ccdcd4960368cbe8701f 100644
+--- a/apps/zeron/src/lib.rs
++++ b/apps/zeron/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod auth_cli;
+ pub mod background;
+ pub mod engine_commands;
+ pub mod ipc_cli;
++mod key_cli;
+ pub mod mcp_cli;
+ pub mod plugin_cli;
+ 
+diff --git a/apps/zgx/src/key_confirm.rs b/apps/zgx/src/key_confirm.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b7a8e7bf96cd33363e27e63d02015bd2bf9ec9c
+--- /dev/null
++++ b/apps/zgx/src/key_confirm.rs
+@@ -0,0 +1,170 @@
++//! Settings → Account's "Confirm it's you" for this device's signing key
++//! (ui/screens/settings/signing_keys.luau). A device signed in from before
++//! keys existed, or whose key the edge refused for want of a fresh
++//! sign-in, has no key on the account: other devices refuse its direct
++//! road and the plugins it makes go unsigned. Confirming signs in again as
++//! the same account (the engine's `StepUp` page, in the browser); when that
++//! lands, the engine registers the key with the step-up's ticket. The
++//! ticket stays in the engine: this side only watches `PluginSigningKey`.
++//! No sign-out, and the session stays as it is.
++//!
++//!   account.confirm_key           the sign-in page opened, then waited on
++//!                                 until the key registers: true; rejects
++//!                                 cancelled (account.cancel_confirm_key),
++//!                                 timed_out, failed (the registration
++//!                                 after it failed), step_up_refused (the
++//!                                 sign-in wasn't this account's), or an
++//!                                 engine outcome
++//!   account.cancel_confirm_key    stops waiting for that sign-in
++
++use serde_json::{Value as Json, json};
++use zgx_script::{ScriptHost, Value};
++
++use crate::engine;
++
++type Outcome = &'static str;
++
++pub fn install(host: &ScriptHost) {
++    host.async_action("account.confirm_key", |_| async {
++        crate::plugins::preview::refuse("account.confirm_key")?;
++        confirm_key().await.map(|()| Value::Bool(true)).map_err(String::from)
++    });
++    host.action("account.cancel_confirm_key", |_| {
++        CONFIRM.with(|n| n.set(n.get() + 1));
++    });
++}
++
++/// What `account.signing_keys` passes on about this device's own key, from
++/// `PluginSigningKey`'s answer: whether it's registered, and if not, why
++/// (`register_error`: `step_up_required` or `failed`, with its words).
++pub(crate) fn own_key(answer: &Json, into: &mut Json) {
++    for field in ["registered", "register_error", "register_message"] {
++        if let Some(value) = answer.get(field).filter(|value| !value.is_null()) {
++            into[field] = value.clone();
++        }
++    }
++}
++
++thread_local! {
++    /// Which wait for a confirm is the live one: cancelling moves it on.
++    static CONFIRM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// As long as the engine keeps a step-up's ticket (10 minutes at most),
++/// asked about every second (each ask is the engine's alone).
++const CONFIRM_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
++const CONFIRM_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
++
++/// `verify`: the edge asked whether the key is the account's (this
++/// device's file can be stale), not the file alone.
++async fn key_status(verify: bool) -> Result<Json, Outcome> {
++    engine::get()
++        .call("PluginSigningKey", json!({ "verify": verify }))
++        .await
++        .map_err(|error| engine::outcome(&error))
++}
++
++async fn confirm_key() -> Result<(), Outcome> {
++    let live = CONFIRM.with(|n| {
++        n.set(n.get() + 1);
++        n.get()
++    });
++    let start = key_status(true).await?;
++    if start["registered"].as_bool() == Some(true) {
++        return Ok(());
++    }
++    let from = start["register_attempts"].as_u64().unwrap_or(0);
++    let answer = engine::get().call("StepUp", json!({ "for": "key" })).await.map_err(|error| engine::outcome(&error))?;
++    let url = answer["url"].as_str().unwrap_or_default();
++    if !url.starts_with("https://") {
++        return Err("failed");
++    }
++    if let Err(error) = crate::auth::open_sign_in(url) {
++        eprintln!("zeron-zgx: account: the browser didn't open: {error}");
++        return Err("failed");
++    }
++    let until = std::time::Instant::now() + CONFIRM_WAIT;
++    loop {
++        zgx::timer::sleep(CONFIRM_EVERY).await;
++        if CONFIRM.with(std::cell::Cell::get) != live {
++            return Err("cancelled");
++        }
++        match progress(&key_status(false).await?, from) {
++            Progress::Registered => return Ok(()),
++            Progress::Failed(word) => return Err(word),
++            Progress::Waiting if std::time::Instant::now() < until => {}
++            Progress::Waiting => return Err("timed_out"),
++        }
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum Progress {
++    Registered,
++    Waiting,
++    Failed(Outcome),
++}
++
++/// `PluginSigningKey`'s answer while a confirm is waited on, registrations
++/// tried before it numbering `from`: registered; failed, by a registration
++/// since then, or a step-up refused since then (another account's sign-in:
++/// said at once); one still wanting the step-up is waited on (the sign-in
++/// may not have landed yet); or still waiting.
++fn progress(answer: &Json, from: u64) -> Progress {
++    if answer["registered"].as_bool() == Some(true) {
++        return Progress::Registered;
++    }
++    let tried_since = answer["register_attempts"].as_u64().is_some_and(|n| n > from);
++    match answer["register_error"].as_str() {
++        Some("failed") if tried_since => Progress::Failed("failed"),
++        Some("step_up_refused") if tried_since => Progress::Failed("step_up_refused"),
++        _ => Progress::Waiting,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_confirm_waits_until_the_key_registers_and_says_a_failure_after_it() {
++        // Still wanting the step-up (it hasn't landed): waited on.
++        let refused = json!({ "registered": false, "register_error": "step_up_required", "register_attempts": 1 });
++        assert_eq!(progress(&refused, 1), Progress::Waiting);
++        assert_eq!(progress(&json!({ "registered": false, "register_error": "step_up_required", "register_attempts": 2 }), 1), Progress::Waiting);
++        // A failure from before the confirm isn't this one's.
++        let failed = json!({ "registered": false, "register_error": "failed", "register_message": "HTTP 500", "register_attempts": 3 });
++        assert_eq!(progress(&failed, 3), Progress::Waiting);
++        // One after it is, and never reads as done.
++        assert_eq!(progress(&failed, 2), Progress::Failed("failed"));
++        assert_eq!(progress(&json!({ "registered": true, "register_attempts": 4 }), 3), Progress::Registered);
++        assert_eq!(progress(&json!({}), 0), Progress::Waiting);
++    }
++
++    /// Security review 9, L3: a sign-in again as another account (or one
++    /// without a ticket) left the wait going ten minutes.
++    #[test]
++    fn a_refused_step_up_ends_the_wait_at_once() {
++        let refused = json!({ "registered": false, "register_error": "step_up_refused", "register_attempts": 3 });
++        assert_eq!(progress(&refused, 2), Progress::Failed("step_up_refused"));
++        assert_eq!(progress(&refused, 3), Progress::Waiting, "one from before isn't this one's");
++    }
++
++    #[test]
++    fn the_signing_keys_say_whether_this_devices_key_is_registered_and_why_not() {
++        let mut read = json!({ "keys": [], "new_keys": [] });
++        own_key(&json!({ "key": "k1", "registered": false, "register_error": "step_up_required", "register_message": "Confirm it's you" }), &mut read);
++        assert_eq!(read["registered"], false);
++        assert_eq!(read["register_error"], "step_up_required");
++        assert_eq!(read["register_message"], "Confirm it's you");
++        assert_eq!(read["keys"], json!([]), "the rest kept");
++        let mut read = json!({});
++        own_key(&json!({ "key": "k1", "registered": true }), &mut read);
++        assert_eq!(read["registered"], true);
++        assert!(read.get("register_error").is_none_or(Json::is_null));
++        // An engine from before: nothing said, so nothing offered.
++        let mut read = json!({});
++        own_key(&json!({ "key": "k1" }), &mut read);
++        assert!(read.get("registered").is_none_or(Json::is_null));
++    }
++}
+diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
+index 99f558cff7a1ec797cd5e0c9665e7413d53b3d65..f55c17e27bae99e2d544946280af61422b410d81 100644
+--- a/apps/zgx/src/main.rs
++++ b/apps/zgx/src/main.rs
+@@ -52,6 +52,7 @@ mod haptics;
+ mod heap;
+ mod images;
+ mod intro_handoff;
++mod key_confirm;
+ mod links;
+ mod pasted;
+ mod math;
+diff --git a/apps/zgx/src/settings.rs b/apps/zgx/src/settings.rs
+index 8bc2d62b84556995cca4719657d23c4da915de2e..d16ccb9bf38e6e6fa67a7d289eb53234db0205ea 100644
+--- a/apps/zgx/src/settings.rs
++++ b/apps/zgx/src/settings.rs
+@@ -48,6 +48,12 @@
+ //!                                         `PluginSigningKey`; times in seconds),
+ //!                                         and those added on other devices
+ //!                                         since this one last looked
++//!                                       (and this device's own: registered,
++//!                                       register_error?, register_message?,
++//!                                       src/key_confirm.rs)
++//!   account.confirm_key / .cancel_confirm_key
++//!                                       "Confirm it's you" for this device's
++//!                                       key (src/key_confirm.rs)
+ //!   account.revoke_key(key)             one of them revoked
+ //!   account.members(organization_id)    { { id, name, email, role, you,
+ //!                                         avatar?, username?, joined_at? } }
+@@ -331,6 +337,7 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
+         }
+     });
+     crate::quit_prompt::install(host);
++    crate::key_confirm::install(host);
+     host.async_action("settings.engine", |args| {
+         let method = args.field("method").map(text).unwrap_or_default();
+         let params = args.field("params").map(value_json).unwrap_or(json!({}));
+@@ -828,7 +835,9 @@ fn signing_keys(answer: &Json) -> Json {
+         .as_array()
+         .map(|rows| rows.iter().filter_map(|row| row["key"].as_str().map(|key| json!(key))).collect())
+         .unwrap_or_default();
+-    json!({ "keys": keys, "new_keys": new_keys })
++    let mut read = json!({ "keys": keys, "new_keys": new_keys });
++    crate::key_confirm::own_key(answer, &mut read);
++    read
+ }
+ 
+ /// An object's keys in snake_case (`joinedAt` → `joined_at`), one level.
+diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
+index 46089b8b94b72ad68b8a3bfaa537a558a17f9f9e..0533241b2b24901b53b73478120b371f5d33e191 100644
+--- a/apps/zgx/ui/locales/en.json
++++ b/apps/zgx/ui/locales/en.json
+@@ -2288,7 +2288,17 @@
+         "none": "No signing keys yet.",
+         "none_how": "One is made when you sign a plugin.",
+         "failed": "Couldn't load your signing keys",
+-        "retry": "Try again"
++        "retry": "Try again",
++        "unregistered": "This computer's key isn't on your account",
++        "unregistered_step_up": "Confirm it's you to add it. Then your other devices reach this one directly, and what you make here is signed. You stay signed in.",
++        "unregistered_failed": "It couldn't be added: {why}",
++        "confirm": "Confirm it's you",
++        "confirm_cancel": "Cancel",
++        "confirming": "Waiting for you to sign in again in your browser…",
++        "confirmed": "This computer's key is on your account",
++        "confirm_failed": "Couldn't add this computer's key",
++        "confirm_timed_out": "Signing in again took too long. Try again.",
++        "step_up_refused": "That sign-in didn't confirm it's you. Sign in again as the account using Zeron here, then try again."
+       }
+     },
+     "browser": {
+diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
+index ac26ce40b7e1853feda2d6cf14ad04136b0b7264..ac9fc60d8d71e877faef345e9bb7268c27f32b33 100644
+--- a/apps/zgx/ui/locales/zh-Hans.json
++++ b/apps/zgx/ui/locales/zh-Hans.json
+@@ -2288,7 +2288,17 @@
+         "none": "还没有签名密钥。",
+         "none_how": "签名插件时会自动创建一个。",
+         "failed": "无法加载你的签名密钥",
+-        "retry": "重试"
++        "retry": "重试",
++        "unregistered": "这台电脑的密钥还不在你的账户上",
++        "unregistered_step_up": "确认是你本人即可添加。之后你的其他设备可以直接连接这台电脑，你在这里制作的内容也会被签名。你会保持登录状态。",
++        "unregistered_failed": "无法添加：{why}",
++        "confirm": "确认是你本人",
++        "confirm_cancel": "取消",
++        "confirming": "正在等待你在浏览器中重新登录…",
++        "confirmed": "这台电脑的密钥已在你的账户上",
++        "confirm_failed": "无法添加这台电脑的密钥",
++        "confirm_timed_out": "重新登录超时。请重试。",
++        "step_up_refused": "那次登录未能确认是你本人。请以在这里使用 Zeron 的账户重新登录，然后重试。"
+       }
+     },
+     "browser": {
+diff --git a/apps/zgx/ui/screens/settings/key_confirm.luau b/apps/zgx/ui/screens/settings/key_confirm.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a794660caae92fe5cd2ee73bed0e2f8df4ad6f0
+--- /dev/null
++++ b/apps/zgx/ui/screens/settings/key_confirm.luau
+@@ -0,0 +1,126 @@
++-- Settings → Account's "Confirm it's you" for this computer's signing key
++-- (src/key_confirm.rs). Shown only while the engine says the key isn't on
++-- the account, and why (`account.signing_keys`' `register_error`): the
++-- edge wanted a fresh sign-in ("step_up_required"), or registering failed
++-- ("failed", its words shown), or a sign-in again didn't confirm it's the
++-- person ("step_up_refused": another account's). Confirming opens the sign-in page in the
++-- browser; once that lands the engine registers the key with it. Waiting,
++-- it can be cancelled. You stay signed in throughout.
++--
++--   confirm.heard(answer)   what `account.signing_keys` said about this
++--                           computer's own key
++--   confirm.row(reload)     the row, for the signing keys section
++--                           (`reload`: ask for the keys again)
++
++local host = require("@app/screens/settings/host")
++local ds = require("@ds")
++local toast = require("@ds/toast")
++local store = require("@app/screens/settings/store")
++
++local M = {}
++
++-- "" (registered, or nothing said) | "step_up_required" | "failed"
++-- | "step_up_refused"
++M.error = ui.state("settings_own_key_error", "")
++M.message = ui.state("settings_own_key_message", "")
++-- Waiting on the sign-in again.
++M.confirming = ui.state("settings_own_key_confirming", false)
++
++function M.heard(answer: any)
++	local err = if answer.registered == false then (answer.register_error or "") else ""
++	ui.batch(function()
++		M.error:set(err)
++		M.message:set(answer.register_message or "")
++	end)
++end
++
++local function said(err: any): string
++	return if type(err) == "table" or type(err) == "userdata" then err.message else tostring(err)
++end
++
++local function confirm(reload: () -> ())
++	if M.confirming:peek() then
++		return
++	end
++	M.confirming:set(true)
++	host.call("account.confirm_key"):after(function()
++		ui.batch(function()
++			M.confirming:set(false)
++			M.error:set("")
++			M.message:set("")
++		end)
++		toast.show { title = ui.t("settings.profile.keys.confirmed"):get(), tone = "success" }
++		reload()
++	end, function(err: any)
++		M.confirming:set(false)
++		local word = said(err)
++		if word == "cancelled" then
++			return
++		end
++		toast.show {
++			title = ui.t("settings.profile.keys.confirm_failed"):get(),
++			body = if word == "timed_out"
++				then ui.t("settings.profile.keys.confirm_timed_out"):get()
++				elseif word == "step_up_refused" then ui.t("settings.profile.keys.step_up_refused"):get()
++				else store.says(word),
++			tone = "danger",
++		}
++		reload()
++	end)
++end
++
++function M.row(reload: () -> ()): Node
++	return ui.show(
++		function(): boolean
++			return M.error:get() ~= ""
++		end,
++		ds.Settings.Group {
++			ds.Settings.Row {
++				icon = "shield-check",
++				label = ui.t("settings.profile.keys.unregistered"),
++				description = function(): string
++					if M.confirming:get() then
++						return ui.t("settings.profile.keys.confirming"):get()
++					elseif M.error:get() == "failed" then
++						return ui.t("settings.profile.keys.unregistered_failed", { why = M.message:get() }):get()
++					elseif M.error:get() == "step_up_refused" then
++						return ui.t("settings.profile.keys.step_up_refused"):get()
++					end
++					return ui.t("settings.profile.keys.unregistered_step_up"):get()
++				end,
++				control = ui.row {
++					gap = "$space.2",
++					items = "center",
++					ui.show(
++						function(): boolean
++							return not M.confirming:get()
++						end,
++						ds.Button {
++							ui.t("settings.profile.keys.confirm"),
++							tone = "primary",
++							size = "sm",
++							on_click = function()
++								confirm(reload)
++							end,
++						}
++					),
++					ui.show(
++						function(): boolean
++							return M.confirming:get()
++						end,
++						ds.Button {
++							ui.t("settings.profile.keys.confirm_cancel"),
++							tone = "ghost",
++							size = "sm",
++							on_click = function()
++								host.invoke("account.cancel_confirm_key")
++							end,
++						}
++					),
++				},
++			},
++		}
++	)
++end
++
++return M
+diff --git a/apps/zgx/ui/screens/settings/signing_keys.luau b/apps/zgx/ui/screens/settings/signing_keys.luau
+index ad2b8df90f5352fc646b50d043f9d843f88bc366..649616c9bd980e3ba6d6f7a576ad979cd6785931 100644
+--- a/apps/zgx/ui/screens/settings/signing_keys.luau
++++ b/apps/zgx/ui/screens/settings/signing_keys.luau
+@@ -15,6 +15,8 @@ local ds = require("@ds")
+ local locale = require("@ds/locale")
+ local toast = require("@ds/toast")
+ local store = require("@app/screens/settings/store")
++-- This computer's own key, when it isn't on the account: "Confirm it's you".
++local confirm = require("@app/screens/settings/key_confirm")
+ 
+ local M = {}
+ 
+@@ -67,6 +69,7 @@ function M.load(visit: boolean?)
+ 		if mine ~= asked then
+ 			return
+ 		end
++		confirm.heard(answer)
+ 		local fresh: { [string]: boolean } = {}
+ 		local was = seen:peek()
+ 		for _, k in answer.new_keys or {} do
+@@ -212,6 +215,9 @@ function M.section(): Node
+ 	return ds.Settings.Section {
+ 		title = ui.t("settings.profile.keys.label"),
+ 		description = ui.t("settings.profile.keys.description"),
++		confirm.row(function()
++			M.load()
++		end),
+ 		ui.presence(function(): string
+ 			local s = M.status:get()
+ 			if #M.keys:get() > 0 then
+diff --git a/apps/zgx/ui/settings_stub.luau b/apps/zgx/ui/settings_stub.luau
+index 17db57d6dacc0495a5054806f9d250d18ec82a76..926f2e726dd1c1d0cd765ef38f50ae438c851161 100644
+--- a/apps/zgx/ui/settings_stub.luau
++++ b/apps/zgx/ui/settings_stub.luau
+@@ -14,7 +14,8 @@
+ --   settings_stub.member_joins     someone accepts an invitation
+ --   settings_stub.refuse_next      the next change is refused ("refused")
+ --   settings_stub.not_admin        you're a member, not an admin, from now on
+---   settings_stub.signed_in_again  the browser sign-in a delete waits on lands
++--   settings_stub.signed_in_again  the browser sign-in a delete (or a key's
++--                                  "Confirm it's you") waits on lands
+ 
+ local host = require("@app/screens/settings/host")
+ local api = require("@account/api")
+@@ -33,6 +34,10 @@ local step_up_word = ui.state("settings_stub_step_up_word", "ok")
+ -- The account's signing keys: "some" (this computer's, one new on another
+ -- device, one revoked; listed out of order) or "none".
+ local keys_mode = ui.state("settings_stub_keys", "some")
++-- This computer's own key, as the engine says: "registered", or why it
++-- isn't ("step_up_required", "failed"). Confirming (`account.confirm_key`)
++-- waits on `settings_stub.signed_in_again`, then it's registered.
++local own_key = ui.state("settings_stub_own_key", "registered")
+ local signing_keys = {
+ 	{ key = "k_dev", fingerprint = "9f3a 21c0 77be 04d1 aa10 bb20 cc30 dd40", device_name = "dev", device_id = "d_dev", this_device = false, created_at = 1793600000 },
+ 	{ key = "k_old", fingerprint = "0b0b 1c1c 2d2d 3e3e 4f4f 5a5a 6b6b 7c7c", device_name = "old-laptop", device_id = "d_old", this_device = false, created_at = 1780000000, revoked_at = 1785000000 },
+@@ -223,7 +228,27 @@ local answers: { [string]: (arg: any) -> any } = {
+ 		for _, k in signing_keys do
+ 			table.insert(out, table.clone(k))
+ 		end
+-		return settled({ keys = out, new_keys = { "k_dev" } })
++		local own = own_key:peek()
++		return settled({
++			keys = out,
++			new_keys = { "k_dev" },
++			registered = own == "registered",
++			register_error = if own == "registered" then nil else own,
++			register_message = if own == "failed" then "plugin-keys register: HTTP 500" else nil,
++		})
++	end,
++	["account.confirm_key"] = function()
++		local p = waiting()
++		local after = p.after
++		function p.after(self: any, ok: ((any) -> ())?, bad: ((any) -> ())?)
++			after(self, function(value: any)
++				own_key:set("registered")
++				if ok then
++					ok(value)
++				end
++			end, bad)
++		end
++		return p
+ 	end,
+ 	["account.revoke_key"] = function(key: string)
+ 		for _, k in signing_keys do
+@@ -412,7 +437,7 @@ stub.call = function(name: string, arg: any?): any
+ end
+ stub.invoke = function(name: string, arg: any?)
+ 	log(if detail(arg) ~= "" then `{name}:{detail(arg)}` else name)
+-	if name == "account.cancel_step_up" then
++	if name == "account.cancel_step_up" or name == "account.cancel_confirm_key" then
+ 		signed_in_again("cancelled")
+ 	end
+ end
+@@ -620,6 +645,13 @@ ui.command {
+ 		store.load_invitations()
+ 	end,
+ }
++ui.command {
++	id = "settings_stub.signed_in_as_another",
++	title = "Signed in again in the browser, as another account",
++	run = function()
++		signed_in_again("step_up_refused")
++	end,
++}
+ ui.command {
+ 	id = "settings_stub.signed_in_again",
+ 	title = "Signed in again in the browser",
+diff --git a/apps/zgx/ui/tests/key_confirm.test.luau b/apps/zgx/ui/tests/key_confirm.test.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c58dfa4c57827f7de945406dcf5e5cf21e8c3e5
+--- /dev/null
++++ b/apps/zgx/ui/tests/key_confirm.test.luau
+@@ -0,0 +1,89 @@
++-- Settings → Account's "Confirm it's you" for this computer's signing key
++-- (screens/settings/key_confirm.luau): offered only while the engine says
++-- the key isn't on the account, and why; confirming waits on the sign-in
++-- again in the browser, then the key is registered, with no sign-out. On
++-- the shell in ui/shell_fixture.luau, its host calls answered by
++-- ui/settings_stub.luau.
++
++local PAGE = "#settings-page"
++local NAV = "#settings-nav"
++
++local function shows(app: any, scope: string, text: string): boolean
++	return app:tree(scope):find(text, 1, true) ~= nil
++end
++
++local function asked(app: any, entry: string): boolean
++	for _, c in (app:state("settings_stub_calls") :: any) or {} do
++		if c == entry then
++			return true
++		end
++	end
++	return false
++end
++
++-- Settings → Account, this computer's key `own` ("registered",
++-- "step_up_required", "failed"), scrolled to the signing keys.
++local function open(own: string): any
++	local app = mount("shell_fixture.luau")
++	app:resize(1200, 900)
++	app:frames(30)
++	app:set_state("settings_stub_own_key", own)
++	app:command("settings_stub.sign_in")
++	app:command("shell.settings")
++	app:frames(20)
++	app:click(`{NAV} >> role:tab "Account"`)
++	app:frames(30)
++	app:scroll(PAGE, 2000)
++	app:frames(10)
++	return app
++end
++
++local UNREGISTERED = "This computer's key isn't on your account"
++
++test("a key the account refused offers Confirm it's you, and once signed in again it's registered", function()
++	local app = open("step_up_required")
++	expect(shows(app, PAGE, UNREGISTERED)).to_be(true)
++	expect(shows(app, PAGE, "Confirm it's you to add it.")).to_be(true)
++	app:click(`{PAGE} >> role:button "Confirm it's you"`)
++	app:frames(10)
++	expect(asked(app, "account.confirm_key")).to_be(true)
++	expect(shows(app, PAGE, "Waiting for you to sign in again in your browser")).to_be(true)
++	-- The sign-in lands: the engine registers the key; the row goes.
++	app:command("settings_stub.signed_in_again")
++	app:frames(30)
++	expect(shows(app, PAGE, UNREGISTERED)).to_be(false)
++	expect(asked(app, "account.sign_out")).to_be(false)
++end)
++
++test("a registration that failed says why, and a confirm can be cancelled", function()
++	local app = open("failed")
++	expect(shows(app, PAGE, "It couldn't be added: plugin-keys register: HTTP 500")).to_be(true)
++	app:click(`{PAGE} >> role:button "Confirm it's you"`)
++	app:frames(10)
++	app:click(`{PAGE} >> role:button "Cancel"`)
++	app:frames(20)
++	expect(asked(app, "account.cancel_confirm_key")).to_be(true)
++	-- Still not on the account: still offered.
++	expect(shows(app, PAGE, UNREGISTERED)).to_be(true)
++	expect(app:has(`{PAGE} >> role:button "Confirm it's you"`)).to_be(true)
++end)
++
++-- Security review 9, L3: a sign-in again as another account ended the wait
++-- only after ten minutes.
++test("a sign-in again as another account is said at once, and Confirm offered again", function()
++	local app = open("step_up_required")
++	app:click(`{PAGE} >> role:button "Confirm it's you"`)
++	app:frames(10)
++	app:command("settings_stub.signed_in_as_another")
++	app:frames(20)
++	expect(app:has('"That sign-in didn\'t confirm it\'s you. Sign in again as the account using Zeron here, then try again."')).to_be(true)
++	expect(shows(app, PAGE, "Waiting for you to sign in again")).to_be(false)
++	expect(app:has(`{PAGE} >> role:button "Confirm it's you"`)).to_be(true)
++	expect(asked(app, "account.sign_out")).to_be(false)
++end)
++
++test("a registered key offers nothing", function()
++	local app = open("registered")
++	expect(shows(app, PAGE, "Signing keys")).to_be(true)
++	expect(shows(app, PAGE, UNREGISTERED)).to_be(false)
++end)
+diff --git a/crates/cli/src/lib.rs b/crates/cli/src/lib.rs
+index 58a00c9623c5b9a61be2144c057ae23a94f76080..a8ae6dcaa71d98f937ba79ec8cd4f353d23b9815 100644
+--- a/crates/cli/src/lib.rs
++++ b/crates/cli/src/lib.rs
+@@ -59,8 +59,15 @@ enum Command {
+     /// app closed.
+     #[command(hide = true)]
+     Engine,
+-    /// Sign in and enable sync on the next engine start.
+-    Login,
++    /// Sign in and enable sync on the next engine start, and register this
++    /// device's signing key on the account.
++    Login {
++        /// Already signed in: confirm it's you (a fresh sign-in as the
++        /// same account, in the browser) to register this device's signing
++        /// key. The saved session stays as it is.
++        #[arg(long)]
++        confirm: bool,
++    },
+     /// Remove the saved session and return to local-only on the next start.
+     Logout,
+     /// Show workspace mode, optional auth, and engine status.
+@@ -354,7 +361,8 @@ fn non_empty(text: &str) -> Result<String, String> {
+ pub enum EngineCommand {
+     Headless,
+     Engine,
+-    Login,
++    /// `confirm`: `zeron login --confirm`.
++    Login { confirm: bool },
+     Logout,
+     Status,
+     Sync,
+@@ -470,7 +478,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
+     match cli.command {
+         Some(Command::Headless) => engine(EngineCommand::Headless),
+         Some(Command::Engine) => engine(EngineCommand::Engine),
+-        Some(Command::Login) => engine(EngineCommand::Login),
++        Some(Command::Login { confirm }) => engine(EngineCommand::Login { confirm }),
+         Some(Command::Logout) => engine(EngineCommand::Logout),
+         Some(Command::Status) => engine(EngineCommand::Status),
+         Some(Command::Sync) => engine(EngineCommand::Sync),
+@@ -509,7 +517,7 @@ impl Command {
+         match self {
+             Self::Headless
+             | Self::Engine
+-            | Self::Login
++            | Self::Login { .. }
+             | Self::Logout
+             | Self::Status
+             | Self::Sync
+@@ -683,6 +691,23 @@ mod tests {
+         assert!(command("0.0.0").try_get_matches_from(["zeron", "plugin", "export"]).is_err());
+     }
+ 
++    /// `zeron login --confirm` reaches the engine's login as a confirm.
++    #[test]
++    fn login_takes_confirm() {
++        let login = |args: &[&str]| {
++            let argv = ["zeron", "login"].into_iter().chain(args.iter().copied());
++            match Cli::from_arg_matches(&command("0.0.0").try_get_matches_from(argv).unwrap())
++                .unwrap()
++                .command
++            {
++                Some(Command::Login { confirm }) => confirm,
++                _ => panic!("not login"),
++            }
++        };
++        assert!(!login(&[]));
++        assert!(login(&["--confirm"]));
++    }
++
+     fn mcp(args: &[&str]) -> Result<Option<McpCommand>, clap::Error> {
+         let argv = ["zeron", "mcp"].into_iter().chain(args.iter().copied());
+         match Cli::from_arg_matches(&command("0.0.0").try_get_matches_from(argv)?)?.command {
+diff --git a/crates/engine/src/auth.rs b/crates/engine/src/auth.rs
+index 18c1b8ce80b73d85a6637b88168b834d37746e9b..fb33ca4b90fc9da563a7f421b7ecedc5e2ab1bee 100644
+--- a/crates/engine/src/auth.rs
++++ b/crates/engine/src/auth.rs
+@@ -36,7 +36,9 @@ use crate::EngineError;
+ use crate::http_error::describe_http_error;
+ use zeron_rpc::TokenError;
+ 
+-const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
++/// How long a sign-in begun here can be finished (and a terminal waits on
++/// its pasted code).
++pub(crate) const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
+ /// Refresh when the cached token has less than this much life left.
+ const TOKEN_SLACK: Duration = Duration::from_secs(30);
+ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+@@ -329,13 +331,26 @@ struct AuthInner {
+     /// `/auth/exchange`): proof a person just signed in, which binding a new
+     /// plugin signing key and deleting the account need. Memory only, never
+     /// on disk or over IPC; until it expires (10 min at most).
+-    step_up: Mutex<Option<(String, Instant)>>,
++    step_up: Mutex<Option<HeldTicket>>,
+     /// Sign-ins begun as a step-up for the account signed in now
+     /// ([`Auth::start_step_up`]): their exchange keeps the ticket and
+-    /// nothing else.
+-    step_up_states: Mutex<std::collections::HashSet<String>>,
++    /// nothing else. `true`: begun for deleting the account.
++    step_up_states: Mutex<std::collections::HashMap<String, bool>>,
+     /// [`Auth::on_fresh_ticket`].
+     fresh_ticket: Mutex<Option<FreshTicketHook>>,
++    /// [`Auth::on_step_up_refused`].
++    step_up_refused: Mutex<Option<StepUpRefusedHook>>,
++}
++
++/// A step-up ticket held ([`AuthInner::step_up`]), and what it may do.
++struct HeldTicket {
++    ticket: String,
++    until: Instant,
++    /// Begun for deleting the account ([`Auth::start_step_up`]): the only
++    /// kind [`Auth::delete_account`] takes, and kept once a key registers
++    /// with it. Any other (a key's step-up, a sign-in's) is let go once a
++    /// key registers with it ([`Auth::step_up_spent`]).
++    for_delete: bool,
+ }
+ 
+ /// The longest a step-up ticket is kept.
+@@ -350,6 +365,15 @@ const FRESH_TICKET_WAIT: Duration = Duration::from_secs(8);
+ pub type FreshTicketHook =
+     Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+ 
++/// What runs when a step-up lands without a ticket to use: signed in as
++/// another account, or the edge gave none. Given what to say.
++pub type StepUpRefusedHook = Arc<dyn Fn(&'static str) + Send + Sync>;
++
++/// A step-up signed in as someone other than the account here.
++pub(crate) const ANOTHER_ACCOUNT: &str = "That was another account: sign in as the one using Zeron here";
++/// A step-up the edge gave no ticket for.
++const NO_TICKET: &str = "That sign-in didn't confirm it's you: try again";
++
+ /// Why [`Auth::delete_account`] didn't.
+ #[derive(Debug)]
+ pub enum DeleteAccountError {
+@@ -490,8 +514,9 @@ impl Auth {
+                 runner,
+                 runner_rejected: std::sync::atomic::AtomicBool::new(false),
+                 step_up: Mutex::new(None),
+-                step_up_states: Mutex::new(std::collections::HashSet::new()),
++                step_up_states: Mutex::new(std::collections::HashMap::new()),
+                 fresh_ticket: Mutex::new(None),
++                step_up_refused: Mutex::new(None),
+             }),
+         }
+     }
+@@ -786,9 +811,17 @@ impl Auth {
+     /// fresh. Not used up here: the edge uses it up when it binds a new key
+     /// or deletes the account.
+     pub fn step_up(&self) -> Option<String> {
++        self.held_ticket(false)
++    }
++
++    /// The ticket held while it's fresh; `for_delete`: only one begun for
++    /// deleting the account.
++    fn held_ticket(&self, for_delete: bool) -> Option<String> {
+         let mut slot = lock(&self.inner.step_up);
+         match slot.as_ref() {
+-            Some((ticket, until)) if Instant::now() < *until => Some(ticket.clone()),
++            Some(held) if Instant::now() < held.until => {
++                (held.for_delete || !for_delete).then(|| held.ticket.clone())
++            }
+             _ => {
+                 *slot = None;
+                 None
+@@ -805,24 +838,50 @@ impl Auth {
+             return Err(EngineError::Other("Sign in first".into()));
+         }
+         let port = self.ensure_loopback().await?;
+-        let url = self.begin_sign_in(
+-            &format!("http://127.0.0.1:{port}/callback"),
+-            SignInOptions { fresh: true, ..SignInOptions::default() },
+-        );
++        Ok(self.begin_step_up(&format!("http://127.0.0.1:{port}/callback"), true))
++    }
++
++    /// [`Self::start_step_up`] for this device's key alone ("Confirm it's
++    /// you"): its ticket can't delete the account, and is let go once the
++    /// key registers with it.
++    pub async fn start_step_up_for_key(&self) -> Result<String, EngineError> {
++        if self.inner.workos.is_none() || self.user_id().is_none() {
++            return Err(EngineError::Other("Sign in first".into()));
++        }
++        let port = self.ensure_loopback().await?;
++        Ok(self.begin_step_up(&format!("http://127.0.0.1:{port}/callback"), false))
++    }
++
++    /// [`Self::start_step_up`] on a terminal (`zeron login --confirm`): the
++    /// edge's paste-code page, so the browser can be anywhere; finished with
++    /// [`Self::complete_sign_in`], as the account signed in now or refused.
++    pub fn start_headless_step_up(&self) -> Result<String, EngineError> {
++        if self.inner.workos.is_none() || self.user_id().is_none() {
++            return Err(EngineError::Other("Sign in first".into()));
++        }
++        let edge = self.inner.config.edge_url.trim_end_matches('/');
++        Ok(self.begin_step_up(&format!("{edge}/auth/cli/callback"), false))
++    }
++
++    /// A sign-in begun for a step-up ticket alone, redirecting to
++    /// `redirect_uri` (`for_delete`: [`HeldTicket::for_delete`]).
++    fn begin_step_up(&self, redirect_uri: &str, for_delete: bool) -> String {
++        let url = self.begin_sign_in(redirect_uri, SignInOptions { fresh: true, ..SignInOptions::default() });
+         if let Some(state) = url.split("&state=").nth(1).and_then(|rest| rest.split('&').next()) {
+-            lock(&self.inner.step_up_states).insert(state.to_owned());
++            lock(&self.inner.step_up_states).insert(state.to_owned(), for_delete);
+         }
+-        Ok(url)
++        url
+     }
+ 
+     /// Delete the signed-in account (`DELETE /auth/me`), with the step-up
+-    /// ticket of a fresh sign-in. `confirm`: the account's email, as typed.
++    /// ticket of a step-up begun for it ([`Self::start_step_up`]; a key's or
++    /// a sign-in's isn't taken). `confirm`: the account's email, as typed.
+     /// Signed out after.
+     pub async fn delete_account(&self, confirm: &str) -> Result<(), DeleteAccountError> {
+         if self.user_id().is_none() {
+             return Err(DeleteAccountError::SignedOut);
+         }
+-        let Some(ticket) = self.step_up() else {
++        let Some(ticket) = self.held_ticket(true) else {
+             return Err(DeleteAccountError::StepUpRequired);
+         };
+         let res = self
+@@ -859,14 +918,18 @@ impl Auth {
+     /// A code exchanged: a step-up keeps its ticket if it's the account
+     /// signed in now (and changes nothing else); a sign-in signs in.
+     async fn finish_exchange(&self, state: &str, result: SignInResult, generation: u64) -> Result<(), EngineError> {
+-        if lock(&self.inner.step_up_states).remove(state) {
++        let step_up = lock(&self.inner.step_up_states).remove(state);
++        if let Some(for_delete) = step_up {
+             if self.user_id().as_deref() != Some(result.user.id.as_str()) {
+-                return Err(EngineError::Other("That was another account: sign in as the one using Zeron here".into()));
++                self.step_up_refused(ANOTHER_ACCOUNT);
++                return Err(EngineError::Other(ANOTHER_ACCOUNT.into()));
+             }
+             let fresh = result.step_up.is_some();
+-            self.keep_step_up(result.step_up);
++            self.keep_step_up(result.step_up, for_delete);
+             if fresh {
+                 self.run_fresh_ticket(result.user.id).await;
++            } else {
++                self.step_up_refused(NO_TICKET);
+             }
+             return Ok(());
+         }
+@@ -877,8 +940,33 @@ impl Auth {
+         self.announce_sign_in(user, org_id, generation)
+     }
+ 
+-    fn keep_step_up(&self, step_up: Option<(String, Duration)>) {
+-        *lock(&self.inner.step_up) = step_up.map(|(ticket, ttl)| (ticket, Instant::now() + ttl.min(STEP_UP_TTL)));
++    /// What a step-up landing without a ticket to use runs
++    /// ([`StepUpRefusedHook`]): this device's key status, said at once.
++    pub fn on_step_up_refused(&self, hook: StepUpRefusedHook) {
++        *lock(&self.inner.step_up_refused) = Some(hook);
++    }
++
++    fn step_up_refused(&self, why: &'static str) {
++        tracing::info!(why, "auth: a step-up brought no ticket to use");
++        let hook = lock(&self.inner.step_up_refused).clone();
++        if let Some(hook) = hook {
++            hook(why);
++        }
++    }
++
++    /// A key registered with the ticket held now: let go of it (no
++    /// deletion can use it after), unless the step-up was for deleting
++    /// the account.
++    pub fn step_up_spent(&self) {
++        let mut slot = lock(&self.inner.step_up);
++        if slot.as_ref().is_some_and(|held| !held.for_delete) {
++            *slot = None;
++        }
++    }
++
++    fn keep_step_up(&self, step_up: Option<(String, Duration)>, for_delete: bool) {
++        *lock(&self.inner.step_up) = step_up
++            .map(|(ticket, ttl)| HeldTicket { ticket, until: Instant::now() + ttl.min(STEP_UP_TTL), for_delete });
+     }
+ 
+     pub fn sign_out(&self) {
+@@ -1111,7 +1199,7 @@ impl Auth {
+             ));
+         }
+         let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
+-        self.keep_step_up(result.step_up.clone());
++        self.keep_step_up(result.step_up.clone(), false);
+         *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
+         let session = StoredSession {
+             refresh_token: result.refresh_token,
+diff --git a/crates/engine/src/device_key.rs b/crates/engine/src/device_key.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..97ed813a92cd1ff2a8cb2b7e00865f4eb8093b17
+--- /dev/null
++++ b/crates/engine/src/device_key.rs
+@@ -0,0 +1,190 @@
++//! This device's signing key on the account, registered where the person
++//! proves a fresh sign-in.
++//!
++//! The desktop engine registers it itself (`plugins::Plugins::attach_auth`):
++//! a sign-in or a `StepUp` brings a ticket while the engine runs. `zeron
++//! login` holds the engine lock, so no engine runs then: it registers the
++//! key here with its own sign-in's ticket, before it exits and the ticket
++//! (memory only) is gone. A device signed in before keys existed confirms
++//! it's the person with a paste-code step-up (`zeron login --confirm`).
++
++use std::path::Path;
++
++use crate::Auth;
++use crate::plugins::{keys, signing};
++
++/// What became of registering this device's key.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum DeviceKey {
++    /// It was registered for the account already: nothing was asked.
++    AlreadyRegistered,
++    /// Registered now.
++    Registered,
++    /// The edge wants a fresh sign-in first (a step-up).
++    NeedsConfirm,
++    /// It couldn't be registered (why).
++    Failed(String),
++}
++
++/// Whether this device's own file says its key is registered for the
++/// account signed in (the edge may say otherwise: [`register`] asks it).
++pub fn is_registered(auth: &Auth, data_dir: &Path) -> bool {
++    let Some(account) = auth.user_id() else {
++        return false;
++    };
++    signing::load_key(data_dir)
++        .is_some_and(|key| keys::Registration::load(data_dir).covers(&key.public(), &account))
++}
++
++/// What the edge says this device's key is to the account signed in.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum OnAccount {
++    /// The account's, and live.
++    Live,
++    /// The account's, revoked (from another device).
++    Revoked,
++    /// Not the account's (nobody's, or someone else's).
++    Absent,
++}
++
++pub(crate) async fn on_account(directory: &dyn keys::KeyDirectory, key: &str) -> Result<OnAccount, String> {
++    Ok(match directory.lookup(key).await? {
++        keys::Lookup::Found { mine: true, revoked: false, .. } => OnAccount::Live,
++        keys::Lookup::Found { mine: true, revoked: true, .. } => OnAccount::Revoked,
++        _ => OnAccount::Absent,
++    })
++}
++
++/// Register this device's key for the account signed in, with the ticket
++/// of the sign-in (or step-up) just made, if there is one: through the edge
++/// it signs in against, with the session's own bearer (the engine's id,
++/// key and registration files, so the engine started next finds it done).
++/// The edge is asked first: only a key it calls the account's and live is
++/// registered already; any other has this device's file cleared and is
++/// registered again (a revoked one replaced, and the revocation owed its
++/// answer at the next engine start: your plugins re-signed and their
++/// code-running powers asked again, and you told). The ticket is let go
++/// once used.
++pub async fn register(auth: &Auth, data_dir: &Path) -> DeviceKey {
++    let Some(account) = auth.user_id() else {
++        return DeviceKey::Failed("not signed in".into());
++    };
++    let device_id = match crate::load_or_create_device_id(data_dir) {
++        Ok(id) => id,
++        Err(error) => return DeviceKey::Failed(format!("this device's id couldn't be read: {error}")),
++    };
++    let directory = keys::EdgeDirectory::new(auth.edge_url(), auth.session_bearer());
++    let before = signing::load_key(data_dir).map(|key| key.public());
++    if let Some(key) = &before {
++        match on_account(&directory, key).await {
++            Ok(OnAccount::Live) => {
++                keys::Registration { registered_for: Some(account), key: Some(key.clone()) }.save(data_dir);
++                return DeviceKey::AlreadyRegistered;
++            }
++            Ok(on) => {
++                if on == OnAccount::Revoked {
++                    // No engine runs to answer it: the next one does
++                    // (`Plugins::own_key_revoked`), not just a re-sign.
++                    keys::owe_revocation(data_dir, key);
++                }
++                let _ = std::fs::remove_file(data_dir.join(keys::REGISTRATION_FILE));
++            }
++            Err(error) => {
++                return DeviceKey::Failed(format!("couldn't check this device's key with Zeron's server: {error}"));
++            }
++        }
++    }
++    let ticket = auth.step_up();
++    let result = keys::ensure_registered(data_dir, &directory, &device_id, &account, ticket.as_deref()).await;
++    if before.is_some() && signing::load_key(data_dir).map(|key| key.public()) != before {
++        keys::owe_resign(data_dir);
++    }
++    match result {
++        Ok(_) => {
++            if ticket.is_some() {
++                auth.step_up_spent();
++            }
++            DeviceKey::Registered
++        }
++        Err(error) if is_step_up(&error) => DeviceKey::NeedsConfirm,
++        Err(error) => DeviceKey::Failed(error),
++    }
++}
++
++/// Whether [`keys::ensure_registered`]'s error is the edge wanting a fresh
++/// sign-in first.
++pub(crate) fn is_step_up(error: &str) -> bool {
++    error == STEP_UP
++}
++
++/// How long a terminal waits on a pasted code: as long as the sign-in it's
++/// for can be finished. (`zeron login` holds the engine lock meanwhile.)
++pub const CODE_WAIT: std::time::Duration = crate::auth::SIGN_IN_TTL;
++/// Sign-ins offered to paste a code from before giving up.
++const TRIES: usize = 3;
++
++/// Confirm it's the person on a terminal: the paste-code step-up
++/// ([`Auth::start_headless_step_up`]) printed, the code read from stdin.
++/// Its ticket stays in this process (memory only) for [`register`]; the
++/// session is left as it is. A sign-in as another account is refused.
++pub async fn terminal_confirm(auth: &Auth) -> Result<(), crate::EngineError> {
++    let who = auth.state().user().map(|u| u.email.clone()).unwrap_or_default();
++    confirm_with(auth, crate::read_stdin_line, CODE_WAIT, |url: &str| {
++        println!("Sign in again as {who} to confirm it's you:\n\n  {url}\n");
++        println!("Then paste the code shown in the browser here and press enter.");
++    })
++    .await
++}
++
++/// [`terminal_confirm`] with its lines from `read` and its sign-in pages
++/// shown by `show`: given up `wait` after it begins. A code that doesn't
++/// work (mistyped, expired) gets a fresh sign-in to try again, a few times;
++/// another account's is refused at once.
++pub async fn confirm_with<R, F>(
++    auth: &Auth,
++    mut read: R,
++    wait: std::time::Duration,
++    mut show: impl FnMut(&str),
++) -> Result<(), crate::EngineError>
++where
++    R: FnMut() -> F,
++    F: std::future::Future<Output = Option<String>>,
++{
++    let until = tokio::time::Instant::now() + wait;
++    let mut tries = 0;
++    loop {
++        tries += 1;
++        show(&auth.start_headless_step_up()?);
++        let pasted = loop {
++            match tokio::time::timeout_at(until, read()).await {
++                Err(_) => {
++                    return Err(crate::EngineError::Other(
++                        "timed out waiting for the code; run `zeron login --confirm` again".into(),
++                    ));
++                }
++                Ok(None) => return Err(crate::EngineError::Other("no code was pasted".into())),
++                Ok(Some(line)) if line.trim().is_empty() => {}
++                Ok(Some(line)) => break line.trim().to_owned(),
++            }
++        };
++        match auth.complete_sign_in(&pasted).await {
++            Ok(()) => return Ok(()),
++            Err(error) if tries >= TRIES || error.to_string().contains(crate::auth::ANOTHER_ACCOUNT) => return Err(error),
++            Err(error) => println!("That didn't work ({error}). Here's a fresh sign-in to try again."),
++        }
++    }
++}
++
++/// How [`keys::ensure_registered`] says the edge wants a fresh sign-in
++/// (`RegisterError::StepUp`, as its error text).
++const STEP_UP: &str = "StepUp";
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_refused_step_up_reads_as_one() {
++        assert_eq!(format!("{:?}", keys::RegisterError::StepUp), STEP_UP);
++    }
++}
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 4e3154595c0018f7d0667a411fcdce2854967098..7371a0d632e7df49873c6def36df43e87f176c96 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -54,6 +54,7 @@ pub mod desktop_notify;
+ pub mod device_stats;
+ pub mod diff_sync;
+ pub mod device_proof;
++pub mod device_key;
+ pub mod direct_rpc;
+ pub mod doc_host;
+ mod fs_watch;
+@@ -1847,7 +1848,7 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
+ }
+ 
+ /// One line from stdin (blocking read off the runtime). `None` = stdin closed.
+-async fn read_stdin_line() -> Option<String> {
++pub(crate) async fn read_stdin_line() -> Option<String> {
+     tokio::task::spawn_blocking(|| {
+         let mut line = String::new();
+         match std::io::stdin().read_line(&mut line) {
+@@ -2111,7 +2112,7 @@ fn env_or(key: &str, default: &str) -> String {
+ }
+ 
+ /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
+-fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
++pub(crate) fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
+     std::fs::create_dir_all(data_dir)?;
+     // EngineInfo is resolved before the lifetime InstanceLock is acquired, so
+     // identity creation and legacy repair need their own short critical section.
+diff --git a/crates/engine/src/plugins/identity_tests.rs b/crates/engine/src/plugins/identity_tests.rs
+index ea8fef09ff5d8a3cf194750454aa1194faaf4141..e56a913977e861a219f4e11514ce5ef91ff7d84c 100644
+--- a/crates/engine/src/plugins/identity_tests.rs
++++ b/crates/engine/src/plugins/identity_tests.rs
+@@ -609,6 +609,111 @@ async fn r13_this_devices_key_revoked_elsewhere_stops_being_yours() {
+     assert_eq!(status["registered"], false);
+ }
+ 
++/// Security review 10, N1: a revocation `zeron login` found (and answered
++/// by replacing the key, engine off) was only owed a re-sign, so the next
++/// start never withdrew your own plugins' code-running powers, kept the
++/// old key as yours, and said nothing. It answers it as a running engine
++/// would.
++#[tokio::test]
++async fn t11_a_revocation_the_cli_found_is_answered_at_the_next_start() {
++    let f = fixture();
++    let fake = Arc::new(FakeDirectory::default());
++    f.plugins.set_directory(fake.clone());
++    f.plugins.set_account(|| Some("user-1".into()));
++    shim::register(&f.plugins).await;
++    let old = signing::load_key(&f.data).unwrap().public();
++    fake.keys.lock().unwrap().insert(old.clone(), shim::found(Some("me"), true));
++    call(&f.plugins, methods::NEW_PLUGIN, serde_json::json!({ "id": "mine", "name": "Mine", "permissions": ["ui.add"] })).await.unwrap();
++    let dir = f.plugins.plugins_dir().join("mine");
++    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
++    manifest["permissions"] = serde_json::json!(["ui.add", "commands"]);
++    manifest["commands"] = serde_json::json!(["git"]);
++    std::fs::write(dir.join(MANIFEST_FILE), signing::pretty(&manifest)).unwrap();
++    f.plugins.auto_resign("mine");
++    assert_eq!(allow(&f.plugins, "mine").await["status"], "on");
++
++    // `zeron login`, engine off: the edge calls the key revoked; it's
++    // replaced, the new one registered, the revocation owed.
++    fake.keys.lock().unwrap().insert(old.clone(), Lookup::Found { username: Some("me".into()), mine: true, revoked: true, verified: Some(false) });
++    let new = signing::rotate_key(&f.data).unwrap().public();
++    keys::Registration { registered_for: Some("user-1".into()), key: Some(new.clone()) }.save(&f.data);
++    fake.keys.lock().unwrap().insert(new.clone(), shim::found(Some("me"), true));
++    keys::owe_revocation(&f.data, &old);
++    keys::owe_resign(&f.data);
++    assert_eq!(keys::owed_revocations(&f.data), vec![old.clone()]);
++
++    let plugins = Plugins::new(&f.data, "dev-1");
++    plugins.set_directory(fake.clone());
++    plugins.set_account(|| Some("user-1".into()));
++    let banners: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
++    let seen = banners.clone();
++    plugins.set_notifier(move |_, _, body, _| {
++        seen.lock().unwrap().push(body.to_owned());
++        "posted".into()
++    });
++    plugins.start();
++    // Review 11, L1: before anything start spawns runs (a rescan among
++    // them), the grants are withdrawn and the old key no longer yours.
++    let held = lock(&plugins.inner.state).decisions.get("mine").map(|d| d.permissions.clone()).unwrap_or_default();
++    assert!(!held.iter().any(|p| p == "commands"), "withdrawn at once: {held:?}");
++    assert!(lock(&plugins.inner.cache).0.get(&old).is_some_and(|c| !c.mine), "the old key not yours at once");
++    let answered = tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            if keys::owed_revocations(&f.data).is_empty() && item(&plugins, "mine").await["status"] == "pending" {
++                return;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await;
++    let mine = item(&plugins, "mine").await;
++    let list = call(&plugins, methods::LIST_PLUGINS, serde_json::json!({})).await.unwrap();
++    plugins.shutdown();
++    assert!(answered.is_ok(), "answered at start: {mine}");
++    // Its code-running powers ask again; what stays in its sandbox is kept.
++    assert_eq!(mine["allowed"], serde_json::json!(["ui.add"]));
++    assert_eq!(mine["ask"], serde_json::json!(["commands"]));
++    let notice = list["key_notices"].as_array().unwrap().iter().find(|n| n["kind"] == "own_key_revoked").cloned();
++    assert!(notice.is_some_and(|n| n["words"].as_str().unwrap().contains("revoked from another device")), "{list}");
++    assert!(banners.lock().unwrap().iter().any(|n| n.contains("revoked from another device")));
++    // The key the CLI made and registered is kept: not replaced again.
++    assert_eq!(signing::load_key(&f.data).unwrap().public(), new);
++    assert!(keys::Registration::load(&f.data).covers(&new, "user-1"));
++    assert_eq!(scan::inspect(&dir, true).sig, SigCheck::Valid(new.clone()), "re-signed with the new key");
++    assert!(!keys::resign_owed(&f.data));
++}
++
++/// N2: the revocation answered twice (the periodic check and a confirm's
++/// lookup at once) deleted the key the first had just made.
++#[tokio::test]
++async fn t11_a_revocation_answered_twice_replaces_the_key_once() {
++    let f = fixture();
++    let fake = Arc::new(FakeDirectory::default());
++    f.plugins.set_directory(fake.clone());
++    f.plugins.set_account(|| Some("user-1".into()));
++    shim::register(&f.plugins).await;
++    let old = signing::load_key(&f.data).unwrap().public();
++    f.plugins.own_key_revoked(&old).await;
++    let new = signing::load_key(&f.data).expect("a new key").public();
++    assert_ne!(new, old);
++    assert!(keys::Registration::load(&f.data).covers(&new, "user-1"));
++    // The same revocation again, late: the new key stays.
++    f.plugins.own_key_revoked(&old).await;
++    assert_eq!(signing::load_key(&f.data).unwrap().public(), new, "the new key kept");
++    assert!(keys::Registration::load(&f.data).covers(&new, "user-1"));
++    // And twice at once: one new key, registered.
++    let newer_from = signing::load_key(&f.data).unwrap().public();
++    tokio::join!(f.plugins.own_key_revoked(&newer_from), f.plugins.own_key_revoked(&newer_from));
++    let newer = signing::load_key(&f.data).unwrap().public();
++    assert_ne!(newer, newer_from);
++    assert!(keys::Registration::load(&f.data).covers(&newer, "user-1"), "the key left is the one registered");
++    // Review 11, L2: compared and deleted under one hold.
++    assert!(!signing::delete_key_if(&f.data, &old), "another key isn't deleted");
++    assert_eq!(signing::load_key(&f.data).unwrap().public(), newer);
++    assert!(signing::delete_key_if(&f.data, &newer));
++    assert!(signing::load_key(&f.data).is_none());
++}
++
+ /// Revoking another device's key from Settings tells that device at once.
+ #[tokio::test]
+ async fn r13_revoking_a_devices_key_tells_that_device() {
+diff --git a/crates/engine/src/plugins/key_status.rs b/crates/engine/src/plugins/key_status.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..41f3ad207638ebc47420666d8c2ef97adab53fbf
+--- /dev/null
++++ b/crates/engine/src/plugins/key_status.rs
+@@ -0,0 +1,295 @@
++//! What became of this device's last key registration, for Settings →
++//! Account (`PluginSigningKey`): a key the edge refused until the person
++//! confirms it's them (`step_up_required`; the app offers "Confirm it's
++//! you", which runs `StepUp`, and the step-up's ticket registers it), or a
++//! registration that failed (`failed`, and why). A registered key says
++//! nothing. Never the ticket: only what happened.
++
++/// The last registration's outcome, and how many were tried.
++#[derive(Debug, Default, Clone)]
++pub(super) struct KeyStatus {
++    attempts: u64,
++    error: Option<(&'static str, String)>,
++}
++
++impl KeyStatus {
++    /// `result`: [`super::keys::ensure_registered`]'s.
++    pub(super) fn record(&mut self, result: &Result<bool, String>) {
++        self.attempts += 1;
++        self.error = match result {
++            Ok(_) => None,
++            Err(error) if crate::device_key::is_step_up(error) => Some((
++                "step_up_required",
++                "Confirm it's you to add this device's key to your account".to_owned(),
++            )),
++            Err(error) => Some(("failed", error.clone())),
++        };
++    }
++
++    /// A step-up that landed with no ticket to use (`step_up_refused`):
++    /// another account's sign-in, or one the edge gave none for.
++    pub(super) fn refused(&mut self, why: &str) {
++        self.attempts += 1;
++        self.error = Some(("step_up_refused", why.to_owned()));
++    }
++
++    /// This device's key couldn't be checked with the edge.
++    fn unchecked(&mut self, why: String) {
++        self.attempts += 1;
++        self.error = Some(("failed", why));
++    }
++
++    /// Said on `reply`: `register_attempts`, and while the key isn't
++    /// `registered`, `register_error` with its `register_message`.
++    pub(super) fn add_to(&self, reply: &mut serde_json::Value, registered: bool) {
++        reply["register_attempts"] = serde_json::json!(self.attempts);
++        if let (false, Some((code, message))) = (registered, &self.error) {
++            reply["register_error"] = serde_json::json!(code);
++            reply["register_message"] = serde_json::json!(message);
++        }
++    }
++}
++
++impl super::Plugins {
++    /// Whether this device's key is the account's by the edge's word (this
++    /// device's file can be stale: revoked from another device while this
++    /// one was off). A revoked key is replaced; one the edge doesn't call
++    /// the account's has its file cleared; either is registered again.
++    /// `false` too when the edge can't be asked.
++    pub(super) async fn verify_own_key(&self) -> bool {
++        use crate::device_key::OnAccount;
++        let (Some(directory), Some(account)) = (self.directory(), self.account()) else {
++            return false;
++        };
++        let data_dir = self.inner.data_dir.clone();
++        let Some(key) = super::signing::load_key(&data_dir).map(|k| k.public()) else {
++            self.register_key().await;
++            return self.own_key_covers(&account);
++        };
++        match crate::device_key::on_account(directory.as_ref(), &key).await {
++            Ok(OnAccount::Live) => {
++                super::keys::Registration { registered_for: Some(account.clone()), key: Some(key) }.save(&data_dir);
++                super::lock(&self.inner.key_status).record(&Ok(false));
++                true
++            }
++            Ok(OnAccount::Revoked) => {
++                // Replaced, re-signed and registered again there.
++                self.own_key_revoked(&key).await;
++                self.own_key_covers(&account)
++            }
++            Ok(OnAccount::Absent) => {
++                let _ = std::fs::remove_file(data_dir.join(super::keys::REGISTRATION_FILE));
++                self.register_key().await;
++                self.own_key_covers(&account)
++            }
++            Err(error) => {
++                super::lock(&self.inner.key_status)
++                    .unchecked(format!("Couldn't check this device's key with Zeron's server: {error}"));
++                false
++            }
++        }
++    }
++
++    fn own_key_covers(&self, account: &str) -> bool {
++        super::signing::load_key(&self.inner.data_dir)
++            .is_some_and(|key| super::keys::Registration::load(&self.inner.data_dir).covers(&key.public(), account))
++    }
++
++    /// The revocations `zeron login` owed, withdrawn at once (the cache
++    /// and your own plugins' grants), before the rest of their answer
++    /// ([`Self::settle_owed_resign`]) waits on the network.
++    pub(super) fn withdraw_owed_revocations(&self) {
++        for key in super::keys::owed_revocations(&self.inner.data_dir) {
++            self.withdraw_as_revoked(&key);
++        }
++    }
++
++    /// What `zeron login` owed, having replaced the key with no engine
++    /// running: a revocation it found answered as a running engine would
++    /// (`keys::owe_revocation`, `own_key_revoked`, which re-signs too), or
++    /// else a re-sign (`keys::owe_resign`): this device's own plugins
++    /// signed with the key there is now.
++    pub(super) async fn settle_owed_resign(&self) {
++        let data_dir = self.inner.data_dir.clone();
++        let revoked = super::keys::owed_revocations(&data_dir);
++        if !revoked.is_empty() {
++            for key in &revoked {
++                self.own_key_revoked(key).await;
++            }
++            super::keys::settle_revocations(&data_dir);
++            super::keys::settle_resign(&data_dir);
++            return;
++        }
++        if !super::keys::resign_owed(&data_dir) {
++            return;
++        }
++        let this = self.clone();
++        let _ = tokio::task::spawn_blocking(move || {
++            if super::signing::load_key(&this.inner.data_dir).is_some() {
++                this.resign_all_own();
++                super::keys::settle_resign(&this.inner.data_dir);
++            }
++        })
++        .await;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use super::super::keys::tests::FakeDirectory;
++    use super::super::keys::{self, RegisterError};
++    use super::super::{Plugins, lock, signing};
++    use zeron_rpc::{RpcReply, methods};
++
++    async fn status(plugins: &Plugins) -> serde_json::Value {
++        match plugins.dispatch(methods::PLUGIN_SIGNING_KEY, serde_json::json!({})).await {
++            Ok(RpcReply::Value(value)) => value,
++            _ => panic!("PluginSigningKey didn't answer"),
++        }
++    }
++
++    /// A key the edge refused said only "not registered yet" in a log line:
++    /// Settings → Account now hears why (a step-up wanted, or a failure and
++    /// its words), and once a step-up's ticket registers it, nothing.
++    #[tokio::test]
++    async fn plugins_key_a_refused_registration_is_said_until_a_step_up_registers_it() {
++        let dir = tempfile::tempdir().unwrap();
++        let plugins = Plugins::new(dir.path(), "dev-1");
++        let fake = Arc::new(FakeDirectory::default());
++        plugins.set_directory(fake.clone());
++        plugins.set_account(|| Some("user-1".into()));
++        *lock(&plugins.inner.step_up) = Some(Arc::new(|| None));
++
++        // Signed in from before keys existed: no ticket, refused.
++        fake.register_answers.lock().unwrap().push(Err(RegisterError::StepUp));
++        plugins.register_key_as("user-1").await;
++        let said = status(&plugins).await;
++        assert_eq!(said["registered"], false);
++        assert_eq!(said["register_error"], "step_up_required", "{said}");
++        assert_eq!(said["register_attempts"], 1);
++        // Some other failure: said with its words, never as success.
++        fake.register_answers.lock().unwrap().push(Err(RegisterError::Other("plugin-keys register: HTTP 500".into())));
++        plugins.register_key_as("user-1").await;
++        let said = status(&plugins).await;
++        assert_eq!(said["register_error"], "failed", "{said}");
++        assert!(said["register_message"].as_str().unwrap().contains("HTTP 500"), "{said}");
++        assert_eq!(said["register_attempts"], 2);
++
++        // "Confirm it's you" → `StepUp` lands: its ticket registers the key.
++        *lock(&plugins.inner.step_up) = Some(Arc::new(|| Some("ticket-9".to_string())));
++        plugins.register_key_as("user-1").await;
++        let said = status(&plugins).await;
++        assert_eq!(said["registered"], true, "{said}");
++        assert!(said["register_error"].is_null() && said["register_message"].is_null(), "{said}");
++        assert_eq!(fake.step_ups.lock().unwrap().last().cloned().flatten().as_deref(), Some("ticket-9"));
++        let key = signing::load_key(dir.path()).unwrap().public();
++        assert!(keys::Registration::load(dir.path()).covers(&key, "user-1"));
++    }
++
++    /// Security review 9, M1: `registered` came from this device's file
++    /// alone, so "Confirm it's you" called a key revoked elsewhere done. Asked
++    /// to (`verify`), the engine asks the edge: a revoked key is replaced and
++    /// registered again (here wanting a step-up), and isn't `registered`.
++    #[tokio::test]
++    async fn plugins_key_a_confirm_asks_the_edge_not_the_file() {
++        let dir = tempfile::tempdir().unwrap();
++        let plugins = Plugins::new(dir.path(), "dev-1");
++        let fake = Arc::new(FakeDirectory::default());
++        plugins.set_directory(fake.clone());
++        plugins.set_account(|| Some("user-1".into()));
++        *lock(&plugins.inner.step_up) = Some(Arc::new(|| None));
++        plugins.register_key_as("user-1").await;
++        let old = signing::load_key(dir.path()).unwrap().public();
++        assert_eq!(status(&plugins).await["registered"], true);
++        // Live on the account: still registered, by the edge's word.
++        fake.keys.lock().unwrap().insert(old.clone(), FakeDirectory::found(Some("me"), true));
++        let said = verified(&plugins).await;
++        assert_eq!(said["registered"], true, "{said}");
++        // Revoked from another device.
++        fake.keys.lock().unwrap().insert(
++            old.clone(),
++            keys::Lookup::Found { username: Some("me".into()), mine: true, revoked: true, verified: Some(false) },
++        );
++        fake.register_answers.lock().unwrap().push(Err(RegisterError::StepUp));
++        let said = verified(&plugins).await;
++        assert_eq!(said["registered"], false, "{said}");
++        assert_eq!(said["register_error"], "step_up_required", "{said}");
++        assert_ne!(said["key"], old.as_str(), "a new key");
++        // The edge can't be reached: not called registered either.
++        fake.unreachable.store(true, std::sync::atomic::Ordering::SeqCst);
++        let said = verified(&plugins).await;
++        assert_eq!(said["registered"], false, "{said}");
++        assert_eq!(said["register_error"], "failed", "{said}");
++    }
++
++    async fn verified(plugins: &Plugins) -> serde_json::Value {
++        match plugins.dispatch(methods::PLUGIN_SIGNING_KEY, serde_json::json!({ "verify": true })).await {
++            Ok(RpcReply::Value(value)) => value,
++            _ => panic!("PluginSigningKey didn't answer"),
++        }
++    }
++
++    /// Security review 11, L2: a registration (which can replace the key)
++    /// ran alongside an answer to a revocation; it waits for it.
++    #[tokio::test]
++    async fn plugins_key_a_registration_waits_on_an_answer_to_a_revocation() {
++        let dir = tempfile::tempdir().unwrap();
++        let plugins = Plugins::new(dir.path(), "dev-1");
++        let fake = Arc::new(FakeDirectory::default());
++        plugins.set_directory(fake.clone());
++        plugins.set_account(|| Some("user-1".into()));
++        let answering = plugins.inner.own_key_op.lock().await;
++        let p = plugins.clone();
++        let registering = tokio::spawn(async move { p.register_key_as("user-1").await });
++        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++        assert!(!registering.is_finished(), "waits for the answer under way");
++        assert!(!dir.path().join(keys::REGISTRATION_FILE).exists());
++        drop(answering);
++        registering.await.unwrap();
++        let key = signing::load_key(dir.path()).unwrap().public();
++        assert!(keys::Registration::load(dir.path()).covers(&key, "user-1"));
++    }
++
++    /// Security review 9, L1: a key `zeron login` replaced left your own
++    /// plugins signed by the old one; the engine started next re-signs them.
++    #[tokio::test]
++    async fn plugins_key_a_resign_owed_by_the_cli_is_done_at_start() {
++        let dir = tempfile::tempdir().unwrap();
++        let plugins = Plugins::new(dir.path(), "dev-1");
++        std::fs::create_dir_all(plugins.plugins_dir()).unwrap();
++        let fake = Arc::new(FakeDirectory::default());
++        plugins.set_directory(fake.clone());
++        plugins.set_account(|| Some("user-1".into()));
++        plugins.register_key_as("user-1").await;
++        let made = plugins
++            .dispatch(methods::NEW_PLUGIN, serde_json::json!({ "id": "mine", "name": "Mine", "permissions": ["ui.add"] }))
++            .await;
++        assert!(made.is_ok());
++        let folder = plugins.plugins_dir().join("mine");
++        let old = signing::load_key(dir.path()).unwrap().public();
++        assert_eq!(super::super::scan::inspect(&folder, true).sig, signing::SigCheck::Valid(old.clone()));
++        drop(plugins);
++
++        // `zeron login` replaced the key (the old one revoked), engine off.
++        let new = signing::rotate_key(dir.path()).unwrap().public();
++        keys::owe_resign(dir.path());
++        let plugins = Plugins::new(dir.path(), "dev-1");
++        plugins.set_directory(fake.clone());
++        plugins.set_account(|| Some("user-1".into()));
++        plugins.start();
++        let signed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            loop {
++                if super::super::scan::inspect(&folder, true).sig == signing::SigCheck::Valid(new.clone()) {
++                    return;
++                }
++                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++            }
++        })
++        .await;
++        plugins.shutdown();
++        assert!(signed.is_ok(), "re-signed with the new key at start");
++        assert!(!keys::resign_owed(dir.path()), "and no longer owed");
++    }
++}
+diff --git a/crates/engine/src/plugins/keys.rs b/crates/engine/src/plugins/keys.rs
+index 9aac4fb0d264a3a2227ab0280eb5e19857b97c64..9c1f1ebe12310bfcc2a511554579259c32001e30 100644
+--- a/crates/engine/src/plugins/keys.rs
++++ b/crates/engine/src/plugins/keys.rs
+@@ -523,6 +523,53 @@ pub async fn ensure_registered(
+     Err("the new signing key couldn't be registered either".into())
+ }
+ 
++/// Owed by a key replaced while no engine ran (`zeron login`): this
++/// device's own plugins re-signed with the new key at the next start.
++pub const RESIGN_FILE: &str = "plugin-keys-resign";
++
++pub fn owe_resign(data_dir: &Path) {
++    if let Err(err) = crate::runner::write_private_atomic(&data_dir.join(RESIGN_FILE), b"owed\n") {
++        tracing::warn!(error = %err, "plugins: couldn't keep a re-sign owed");
++    }
++}
++
++pub fn resign_owed(data_dir: &Path) -> bool {
++    data_dir.join(RESIGN_FILE).exists()
++}
++
++pub fn settle_resign(data_dir: &Path) {
++    let _ = std::fs::remove_file(data_dir.join(RESIGN_FILE));
++}
++
++/// Owed by a key `zeron login` found revoked (and replaced) while no
++/// engine ran: the next start answers the revocation as a running engine
++/// would (`Plugins::own_key_revoked`): the old key no longer yours, your
++/// own plugins' code-running powers asked again, and you're told. One old
++/// key per line.
++pub const REVOKED_FILE: &str = "plugin-keys-revoked-owed";
++
++pub fn owe_revocation(data_dir: &Path, key: &str) {
++    let mut owed = owed_revocations(data_dir);
++    if owed.iter().any(|k| k == key) {
++        return;
++    }
++    owed.push(key.to_owned());
++    let body = format!("{}\n", owed.join("\n"));
++    if let Err(err) = crate::runner::write_private_atomic(&data_dir.join(REVOKED_FILE), body.as_bytes()) {
++        tracing::warn!(error = %err, "plugins: couldn't keep a revocation owed");
++    }
++}
++
++pub fn owed_revocations(data_dir: &Path) -> Vec<String> {
++    std::fs::read_to_string(data_dir.join(REVOKED_FILE))
++        .map(|body| body.lines().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned).collect())
++        .unwrap_or_default()
++}
++
++pub fn settle_revocations(data_dir: &Path) {
++    let _ = std::fs::remove_file(data_dir.join(REVOKED_FILE));
++}
++
+ /// `<data>/plugin-keys-seen.json`: the watermark per account.
+ pub fn watermark(data_dir: &Path, account: &str) -> Option<i64> {
+     let map: BTreeMap<String, i64> = std::fs::read(data_dir.join(WATERMARK_FILE))
+diff --git a/crates/engine/src/plugins/mod.rs b/crates/engine/src/plugins/mod.rs
+index c906a365b889d34a0b4664db5825cf2339f8968b..489ab174be4bb0cb01e015aa86b8b6bbbfe28295 100644
+--- a/crates/engine/src/plugins/mod.rs
++++ b/crates/engine/src/plugins/mod.rs
+@@ -21,6 +21,7 @@ pub mod files;
+ pub mod guides;
+ pub mod install;
+ pub mod keys;
++mod key_status;
+ mod lifecycle;
+ pub mod manifest;
+ pub mod package;
+@@ -413,6 +414,16 @@ struct Inner {
+     /// When this device's own key was last looked up on a peer's word
+     /// (`CheckPluginKey`): at most every few seconds.
+     own_key_checked: Mutex<Option<Instant>>,
++    /// What became of this device's last key registration (`key_status`).
++    key_status: Mutex<key_status::KeyStatus>,
++    /// A key registered with the ticket of `step_up`: let it go
++    /// (`Auth::step_up_spent`).
++    step_up_spent: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
++    /// One answer to this device's key revoked at a time
++    /// ([`Plugins::own_key_revoked`]), from whichever check found it.
++    own_key_op: tokio::sync::Mutex<()>,
++    /// The revoked keys answered already (each is answered once).
++    revocations_answered: Mutex<std::collections::HashSet<String>>,
+ }
+ 
+ type StepUpFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+@@ -679,6 +690,10 @@ impl Plugins {
+                 new_keys: Mutex::new(Vec::new()),
+                 key_notices: Mutex::new(Vec::new()),
+                 own_key_checked: Mutex::new(None),
++                key_status: Mutex::new(key_status::KeyStatus::default()),
++                step_up_spent: Mutex::new(None),
++                own_key_op: tokio::sync::Mutex::new(()),
++                revocations_answered: Mutex::new(std::collections::HashSet::new()),
+             }),
+         };
+         plugins.inner.services.set_hooks(Arc::new(ServiceHooks {
+@@ -814,6 +829,16 @@ impl Plugins {
+         self.set_account(move || for_account.user_id());
+         let for_step_up = auth.clone();
+         *lock(&self.inner.step_up) = Some(Arc::new(move || for_step_up.step_up()));
++        let for_spent = auth.clone();
++        *lock(&self.inner.step_up_spent) = Some(Arc::new(move || for_spent.step_up_spent()));
++        // A step-up with no ticket to use (another account, or none given):
++        // said at once, not waited on.
++        let weak = Arc::downgrade(&self.inner);
++        auth.on_step_up_refused(Arc::new(move |why: &'static str| {
++            if let Some(inner) = weak.upgrade() {
++                lock(&inner.key_status).refused(why);
++            }
++        }));
+         // Signed in on an engine with no edge of its own (local mode, where
+         // the first sign-in happens): its keys are looked up and registered
+         // with the edge it signs in against.
+@@ -899,6 +924,8 @@ impl Plugins {
+         if let Err(err) = std::fs::create_dir_all(&self.inner.plugins_dir) {
+             tracing::warn!(error = %err, "plugins: couldn't make the plugins folder");
+         }
++        // Before anything spawned here runs (a rescan among it).
++        self.withdraw_owed_revocations();
+         let (tx, rx) = mpsc::unbounded_channel();
+         *lock(&self.inner.kick) = Some(tx.clone());
+         let worker = runtime.spawn(Self::worker(Arc::downgrade(&self.inner), rx));
+@@ -909,6 +936,7 @@ impl Plugins {
+             let watcher = this.clone();
+             let _ = tokio::task::spawn_blocking(move || watcher.install_watch(tx)).await;
+             this.register_key().await;
++            this.settle_owed_resign().await;
+             this.rescan().await;
+         });
+         // This device's windows' watches on other devices' services, renewed
+@@ -1157,17 +1185,29 @@ impl Plugins {
+ 
+     /// Register this device's key for `account` through `directory`.
+     async fn register_key_through(&self, directory: &dyn KeyDirectory, account: &str) {
++        // It can replace the key: never alongside an answer to its revocation.
++        let _one = self.inner.own_key_op.lock().await;
+         let account = account.to_owned();
+         let step_up = lock(&self.inner.step_up).clone().and_then(|f| f());
+-        match keys::ensure_registered(
++        let was = signing::load_key(&self.inner.data_dir)
++            .is_some_and(|key| keys::Registration::load(&self.inner.data_dir).covers(&key.public(), &account));
++        let result = keys::ensure_registered(
+             &self.inner.data_dir,
+             directory,
+             &self.inner.device_id,
+             &account,
+             step_up.as_deref(),
+         )
+-        .await
+-        {
++        .await;
++        // Said in Settings → Account (`PluginSigningKey`), not just logged.
++        lock(&self.inner.key_status).record(&result);
++        if result.is_ok() && step_up.is_some() && !was {
++            let spent = lock(&self.inner.step_up_spent).clone();
++            if let Some(spent) = spent {
++                spent();
++            }
++        }
++        match result {
+             Ok(true) => {
+                 let this = self.clone();
+                 let _ = tokio::task::spawn_blocking(move || this.resign_all_own()).await;
+@@ -1259,31 +1299,30 @@ impl Plugins {
+         true
+     }
+ 
++    /// `key`, this device's (or, replaced by `zeron login` already, the
++    /// one it was), revoked: answered once, however many checks find it.
+     async fn own_key_revoked(&self, key: &str) {
+-        tracing::warn!("plugins: this device's signing key was revoked elsewhere; making a new one");
+-        // Revoked already: nothing to revoke, just never sign with it again.
+-        signing::delete_key(&self.inner.data_dir);
+-        let _ = std::fs::remove_file(self.inner.data_dir.join(keys::REGISTRATION_FILE));
+-        let cached = {
+-            let mut cache = lock(&self.inner.cache);
+-            if let Some(account) = self.account() {
+-                cache.0.insert(key.to_owned(), keys::CachedKey::from_lookup(&keys::Lookup::Unknown, &account, now_secs()));
+-            }
+-            cache.clone()
+-        };
+-        cached.save(&self.inner.data_dir);
+-        // What runs outside their sandbox was allowed your own plugins as
+-        // you: asked again (what stays inside it is kept).
+-        let _ = self.update_state(|state| {
+-            let own: Vec<String> = state.own.iter().cloned().collect();
+-            for id in own {
+-                if let Some(d) = state.decisions.get_mut(&id) {
+-                    let inside = capability::inside_sandbox(&d.allowed_record());
+-                    d.permissions.retain(|p| !capability::OUTSIDE_SANDBOX.contains(&p.as_str()));
+-                    d.grants = Some(inside);
+-                }
++        {
++            let _one = self.inner.own_key_op.lock().await;
++            if !lock(&self.inner.revocations_answered).insert(key.to_owned()) {
++                return;
+             }
+-        });
++            self.answer_revoked(key).await;
++        }
++        // (Takes `own_key_op` itself: it can replace the key.)
++        self.register_key().await;
++        self.kick(Kick::Rescan);
++    }
++
++    /// [`Self::own_key_revoked`]'s answer, `own_key_op` held.
++    async fn answer_revoked(&self, key: &str) {
++        tracing::warn!("plugins: this device's signing key was revoked elsewhere; making a new one");
++        // Revoked already: nothing to revoke, just never sign with it again
++        // (unless it's been replaced already: the new one is kept).
++        if signing::delete_key_if(&self.inner.data_dir, key) {
++            let _ = std::fs::remove_file(self.inner.data_dir.join(keys::REGISTRATION_FILE));
++        }
++        self.withdraw_as_revoked(key);
+         let this = self.clone();
+         let _ = tokio::task::spawn_blocking(move || {
+             if signing::load_or_create_key(&this.inner.data_dir).is_ok() {
+@@ -1302,8 +1341,31 @@ impl Plugins {
+                 "{here} signing key was revoked from another device. Plugins it signed no longer count as yours; your own plugins' programs, services and other code-running powers wait for you to allow them again. Sign in again to register a new key."
+             ),
+         );
+-        self.register_key().await;
+-        self.kick(Kick::Rescan);
++    }
++
++    /// `key` revoked: no longer yours (the cache says so), and what runs
++    /// outside their sandbox your own plugins were allowed as you is asked
++    /// again (what stays inside it is kept). Synchronous, so `start` can
++    /// do it before anything it spawns runs (`key_status`).
++    fn withdraw_as_revoked(&self, key: &str) {
++        let cached = {
++            let mut cache = lock(&self.inner.cache);
++            if let Some(account) = self.account() {
++                cache.0.insert(key.to_owned(), keys::CachedKey::from_lookup(&keys::Lookup::Unknown, &account, now_secs()));
++            }
++            cache.clone()
++        };
++        cached.save(&self.inner.data_dir);
++        let _ = self.update_state(|state| {
++            let own: Vec<String> = state.own.iter().cloned().collect();
++            for id in own {
++                if let Some(d) = state.decisions.get_mut(&id) {
++                    let inside = capability::inside_sandbox(&d.allowed_record());
++                    d.permissions.retain(|p| !capability::OUTSIDE_SANDBOX.contains(&p.as_str()));
++                    d.grants = Some(inside);
++                }
++            }
++        });
+     }
+ 
+     /// Tell `device` a key was revoked, so it checks its own now rather
+@@ -2568,6 +2630,10 @@ impl Plugins {
+                     keys: bool,
+                     #[serde(default)]
+                     revoke: Option<String>,
++                    /// Ask the edge whether this device's key is the
++                    /// account's (`key_status`), not this device's file.
++                    #[serde(default)]
++                    verify: bool,
+                 }
+                 let p: KeyParams = parse_params(params)?;
+                 if let Some(revoke) = p.revoke.map(|k| k.trim().to_owned()).filter(|k| !k.is_empty()) {
+@@ -2606,13 +2672,21 @@ impl Plugins {
+                         .await
+                         .map_err(|_| failed("Couldn't read this device's signing key"))?
+                         .map_err(failed)?;
+-                let registered = self.account().is_some_and(|account| {
+-                    keys::Registration::load(&self.inner.data_dir).covers(&key.public(), &account)
+-                });
++                let verified = if p.verify { Some(self.verify_own_key().await) } else { None };
++                let key = match verified {
++                    // (Replaced, when it was revoked.)
++                    Some(_) => signing::load_key(&self.inner.data_dir).unwrap_or(key),
++                    None => key,
++                };
++                let registered = verified != Some(false)
++                    && self.account().is_some_and(|account| {
++                        keys::Registration::load(&self.inner.data_dir).covers(&key.public(), &account)
++                    });
+                 // Only the public half, ever: the private key never leaves
+                 // the engine.
+                 let new_keys = lock(&self.inner.new_keys).clone();
+                 let mut reply = serde_json::json!({ "key": key.public(), "registered": registered, "new_keys": new_keys });
++                lock(&self.inner.key_status).add_to(&mut reply, registered);
+                 if let Some(rows) = listed {
+                     reply["keys"] = serde_json::json!(rows
+                         .iter()
+diff --git a/crates/engine/src/plugins/signing.rs b/crates/engine/src/plugins/signing.rs
+index 325c77adb27f9e71469d643ad710069a718f39c9..658ccf741ccf9c0439efac85c201dc035e9695b6 100644
+--- a/crates/engine/src/plugins/signing.rs
++++ b/crates/engine/src/plugins/signing.rs
+@@ -297,6 +297,22 @@ pub fn delete_key(data_dir: &Path) {
+     }
+ }
+ 
++/// [`delete_key`] only while the key is `public`, checked and deleted
++/// under one hold: one replaced meanwhile is kept. Whether it was deleted.
++pub fn delete_key_if(data_dir: &Path, public: &str) -> bool {
++    let _held = KEY_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    if !load_key(data_dir).is_some_and(|key| key.public() == public) {
++        return false;
++    }
++    match delete_locked(data_dir) {
++        Ok(()) => true,
++        Err(error) => {
++            tracing::warn!(%error, "plugins: couldn't delete the old signing key");
++            false
++        }
++    }
++}
++
+ fn delete_locked(data_dir: &Path) -> Result<(), String> {
+     let path = data_dir.join(KEY_FILE);
+     if std::fs::symlink_metadata(&path).is_ok() {
+diff --git a/crates/engine/src/rpc.rs b/crates/engine/src/rpc.rs
+index 7d6ef9232a97473b036b3c3740179e14c142a60f..12373d7fece3b7b3ae8c04cb1450be86b7d73773 100644
+--- a/crates/engine/src/rpc.rs
++++ b/crates/engine/src/rpc.rs
+@@ -3491,12 +3491,21 @@ impl RpcService for AuthRpc {
+             // Local IPC, the app's token only (agents and the relay are
+             // refused before here): a fresh interactive sign-in whose ticket
+             // stays in the engine, then the deletion it allows (R16).
++            // `{for: "key"}`: for this device's key alone ("Confirm it's
++            // you"), its ticket let go once the key registers with it.
+             methods::STEP_UP => {
+-                let url = self
+-                    .auth
+-                    .start_step_up()
+-                    .await
+-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
++                #[derive(Deserialize, Default)]
++                struct P {
++                    #[serde(default, rename = "for")]
++                    purpose: Option<String>,
++                }
++                let p: P = if params.is_null() { P::default() } else { parse_params(params)? };
++                let started = if p.purpose.as_deref() == Some("key") {
++                    self.auth.start_step_up_for_key().await
++                } else {
++                    self.auth.start_step_up().await
++                };
++                let url = started.map_err(|e| RpcError::Failed(e.to_string()))?;
+                 RpcReply::value(&serde_json::json!({ "url": url }))
+             }
+             methods::DELETE_ACCOUNT => {
+diff --git a/crates/engine/tests/auth.rs b/crates/engine/tests/auth.rs
+index 7f9ff067423cfaae54c12aa94478e90db764ff37..c7688af81c5e7ce6b571708761dc1fbec7f85475 100644
+--- a/crates/engine/tests/auth.rs
++++ b/crates/engine/tests/auth.rs
+@@ -73,6 +73,14 @@ struct StubState {
+     create_org_conflict: Mutex<String>,
+     /// Bodies of `POST /plugin-keys` (a device's signing key registered).
+     plugin_keys: Mutex<Vec<serde_json::Value>>,
++    /// The user `/auth/exchange` signs in ("" = `user_1`).
++    exchange_user: Mutex<String>,
++    /// `/auth/exchange` brings no step-up ticket.
++    exchange_no_ticket: AtomicBool,
++    /// Keys revoked on the account (from another device).
++    revoked_keys: Mutex<Vec<String>>,
++    /// The tickets `DELETE /auth/me` was sent (the account deleted).
++    deletions: Mutex<Vec<String>>,
+ }
+ 
+ struct StubEdge {
+@@ -185,13 +193,18 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
+             }
+             let org = state.exchange_org.lock().expect("lock").clone();
+             let token = fake_jwt(ttl, (!org.is_empty()).then_some(org.as_str()));
+-            let response = serde_json::json!({
+-                "user": { "id": "user_1", "email": "w@example.com",
++            let user = state.exchange_user.lock().expect("lock").clone();
++            let user = if user.is_empty() { "user_1".to_owned() } else { user };
++            let mut response = serde_json::json!({
++                "user": { "id": user, "email": "w@example.com",
+                           "firstName": "Wing", "lastName": "Test" },
+                 "accessToken": token,
+                 "refreshToken": format!("refresh-{n}"),
+                 "stepUp": { "token": format!("ticket-{n}"), "expiresAt": 0 },
+             });
++            if state.exchange_no_ticket.load(Ordering::SeqCst) {
++                response.as_object_mut().expect("an object").remove("stepUp");
++            }
+             respond(&mut stream, "200 OK", &response.to_string()).await;
+         }
+         ("POST", "/auth/refresh") => {
+@@ -252,12 +265,49 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
+         }
+         ("POST", "/plugin-keys") => {
+             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
++            // A new key needs the ticket of a fresh sign-in, as on the edge.
++            let ticketed = parsed["stepUp"].as_str().is_some_and(|t| t.starts_with("ticket-"));
++            let revoked = parsed["key"].as_str().is_some_and(|key| {
++                state.revoked_keys.lock().expect("lock").iter().any(|k| k == key)
++            });
+             state.plugin_keys.lock().expect("lock").push(parsed);
+-            respond(&mut stream, "200 OK", r#"{"ok":true}"#).await;
++            if revoked {
++                respond(&mut stream, "409 Conflict", r#"{"error":"key_revoked"}"#).await;
++            } else if ticketed {
++                respond(&mut stream, "200 OK", r#"{"ok":true}"#).await;
++            } else {
++                respond(&mut stream, "403 Forbidden", r#"{"error":"step_up_required"}"#).await;
++            }
+         }
+         ("GET", "/plugin-keys") => {
+             respond(&mut stream, "200 OK", r#"{"keys":[],"now":1}"#).await;
+         }
++        // A key registered here (with a ticket) is the account's; any other
++        // is nobody's, as on the edge.
++        ("GET", key_path) if key_path.starts_with("/plugin-keys/") => {
++            let key = &key_path["/plugin-keys/".len()..];
++            let registered = state.plugin_keys.lock().expect("lock").iter().any(|body| {
++                body["key"] == key && body["stepUp"].as_str().is_some_and(|t| t.starts_with("ticket-"))
++            });
++            let revoked = state.revoked_keys.lock().expect("lock").iter().any(|k| k == key);
++            if registered && revoked {
++                respond(&mut stream, "200 OK", r#"{"username":"wing","mine":true,"revoked":true,"verified":false}"#).await;
++            } else if registered {
++                respond(&mut stream, "200 OK", r#"{"username":"wing","mine":true,"revoked":false,"verified":true}"#).await;
++            } else {
++                respond(&mut stream, "404 Not Found", r#"{"error":"not_found"}"#).await;
++            }
++        }
++        ("DELETE", "/auth/me") => {
++            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
++            let ticket = parsed["stepUp"].as_str().unwrap_or_default().to_owned();
++            if ticket.starts_with("ticket-") {
++                state.deletions.lock().expect("lock").push(ticket);
++                respond(&mut stream, "200 OK", r#"{"ok":true}"#).await;
++            } else {
++                respond(&mut stream, "403 Forbidden", r#"{"error":"step_up_required"}"#).await;
++            }
++        }
+         _ => respond(&mut stream, "404 Not Found", r#"{"error":"not_found"}"#).await,
+     }
+ }
+@@ -382,6 +432,445 @@ async fn a_local_engine_registers_its_signing_key_with_the_sign_ins_ticket() {
+     assert_eq!((registration["registered_for"].as_str(), registration["key"].clone()), (Some("user_1"), registered[0]["key"].clone()));
+ }
+ 
++/// A local engine on `dir` (as `zeron headless` or the app starts one), with
++/// `auth` attached.
++fn engine_on(dir: &std::path::Path, auth: &Auth) -> zeron_engine::EngineCore {
++    let core = zeron_engine::EngineCore::assemble(
++        dir,
++        Arc::new(zeron_engine::HarnessRegistry::new()),
++        zeron_engine::HarnessId::Mock,
++        None,
++    )
++    .expect("a local engine");
++    core.set_auth(auth.clone());
++    core
++}
++
++/// `PluginSigningKey`'s answer (what Settings → Account reads).
++async fn signing_key_status(core: &zeron_engine::EngineCore) -> serde_json::Value {
++    match core
++        .plugins
++        .dispatch(zeron_rpc::methods::PLUGIN_SIGNING_KEY, serde_json::json!({}))
++        .await
++    {
++        Ok(zeron_rpc::RpcReply::Value(value)) => value,
++        _ => panic!("PluginSigningKey didn't answer"),
++    }
++}
++
++/// No file under `dir` holds a step-up ticket (they're memory only).
++fn no_ticket_on_disk(dir: &std::path::Path) {
++    for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
++        let path = entry.path();
++        if path.is_dir() {
++            no_ticket_on_disk(&path);
++        } else if let Ok(bytes) = std::fs::read(&path) {
++            assert!(
++                !String::from_utf8_lossy(&bytes).contains("ticket-"),
++                "a step-up ticket written to {}",
++                path.display()
++            );
++        }
++    }
++}
++
++/// Paste-code sign-in, as `zeron login` makes it.
++async fn paste_sign_in(auth: &Auth) {
++    let url = auth.start_headless_sign_in();
++    let state = query_param(&url, "state").expect("state param");
++    auth.complete_sign_in(&format!("{state}.code123")).await.expect("sign-in");
++}
++
++/// `zeron login` holds the engine lock, so no engine runs to register this
++/// device's key: it registers the key itself with its sign-in's ticket,
++/// before it exits. The engine started afterwards finds it registered, and
++/// asks the edge for nothing (no `StepUp`).
++#[tokio::test]
++async fn zeron_login_registers_this_devices_key_with_its_ticket() {
++    use zeron_engine::device_key::{self, DeviceKey};
++    let edge = StubEdge::start().await;
++    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-cli").unwrap();
++    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
++    paste_sign_in(&auth).await;
++    assert!(!device_key::is_registered(&auth, dir.path()));
++
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::Registered);
++    let registered = edge.state.plugin_keys.lock().unwrap().clone();
++    assert_eq!(registered.len(), 1, "{registered:?}");
++    assert_eq!(registered[0]["stepUp"], "ticket-1");
++    assert_eq!(registered[0]["deviceId"], "device-cli");
++    assert!(device_key::is_registered(&auth, dir.path()));
++    // Again: nothing to do, and nothing asked.
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::AlreadyRegistered);
++    drop(auth);
++
++    // The engine started afterwards, from the saved session.
++    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
++    let core = engine_on(dir.path(), &auth);
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    let status = signing_key_status(&core).await;
++    assert_eq!(status["registered"], true, "{status}");
++    assert_eq!(status["key"], registered[0]["key"]);
++    assert!(status["register_error"].is_null(), "{status}");
++    assert_eq!(edge.state.plugin_keys.lock().unwrap().len(), 1, "the engine registers nothing again");
++    no_ticket_on_disk(dir.path());
++}
++
++/// The saved session's account, as `session.json` has it.
++fn saved_account(dir: &std::path::Path) -> (String, String, String) {
++    let saved: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(dir.join("session.json")).expect("a saved session")).unwrap();
++    let field = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_owned();
++    (field(&saved["user"]["id"]), field(&saved["orgId"]), field(&saved["refreshToken"]))
++}
++
++/// A device signed in from before keys existed (no ticket now): `zeron
++/// login --confirm` signs in again as the account, by paste code, for a
++/// ticket alone, and registers the key with it. Still signed in as it was.
++#[tokio::test]
++async fn zeron_login_confirm_registers_without_changing_the_session() {
++    use zeron_engine::device_key::{self, DeviceKey};
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-old").unwrap();
++    let auth = persisted_auth(&edge, dir.path());
++    assert!(auth.state().is_signed_in());
++    // No ticket: the edge refuses a new key, and that's said as such.
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::NeedsConfirm);
++    assert!(!device_key::is_registered(&auth, dir.path()));
++    let before = saved_account(dir.path());
++
++    let url = auth.start_headless_step_up().expect("a step-up as the account signed in");
++    let redirect = query_param(&url, "redirect_uri").expect("redirect");
++    assert!(redirect.contains("auth%2Fcli%2Fcallback"), "the paste-code page: {redirect}");
++    assert!(url.contains("max_age=0"), "a fresh sign-in, not the browser's: {url}");
++    let state = query_param(&url, "state").expect("state param");
++    auth.complete_sign_in(&format!("{state}.code123")).await.expect("step-up");
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::Registered);
++
++    let registered = edge.state.plugin_keys.lock().unwrap().clone();
++    assert_eq!(registered.last().unwrap()["stepUp"], "ticket-1", "{registered:?}");
++    assert_eq!(registered.last().unwrap()["deviceId"], "device-old");
++    assert!(device_key::is_registered(&auth, dir.path()));
++    // No sign-out, no sign-in: the same account, and the step-up's own
++    // session (`refresh-1`) never kept.
++    assert!(matches!(auth.state(), AuthState::SignedIn { user, org_id: Some(org) } if user.id == "user_1" && org == "org_1"));
++    let after = saved_account(dir.path());
++    assert_eq!((&after.0, &after.1), (&before.0, &before.1));
++    assert_ne!(after.2, "refresh-1");
++    no_ticket_on_disk(dir.path());
++    assert!(auth.step_up().is_none(), "the ticket is let go once the key is registered");
++}
++
++/// The desktop: an engine signed in from before keys existed is refused its
++/// key, and says so (what Settings → Account offers "Confirm it's you"
++/// for). That runs the `StepUp` sign-in; when it lands, the key registers
++/// with its ticket. No sign-out, and the session as it was.
++#[tokio::test]
++async fn the_desktop_registers_its_key_once_a_step_up_lands() {
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-desk").unwrap();
++    let auth = persisted_auth(&edge, dir.path());
++    let core = engine_on(dir.path(), &auth);
++    let refused = tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            let status = signing_key_status(&core).await;
++            if !status["register_error"].is_null() {
++                return status;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("the refusal said");
++    assert_eq!(refused["registered"], false);
++    assert_eq!(refused["register_error"], "step_up_required", "{refused}");
++    let before = saved_account(dir.path());
++
++    // "Confirm it's you": the engine's `StepUp` page (`for: "key"`), signed
++    // in in the browser.
++    let url = auth.start_step_up_for_key().await.expect("a step-up");
++    let redirect = query_param(&url, "redirect_uri").expect("redirect");
++    let callback = redirect.replace("%3A", ":").replace("%2F", "/");
++    let state = query_param(&url, "state").expect("state");
++    let landed = reqwest::get(format!("{callback}?code=abc&state={state}")).await.expect("callback");
++    assert_eq!(landed.status().as_u16(), 200);
++    let status = tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            let status = signing_key_status(&core).await;
++            if status["registered"] == true {
++                return status;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("registered once the step-up landed");
++    assert!(status["register_error"].is_null(), "{status}");
++    // The ticket stays in the engine: not in what Settings reads, nor on disk.
++    assert!(!status.to_string().contains("ticket-"), "{status}");
++    assert!(!refused.to_string().contains("ticket-"), "{refused}");
++    no_ticket_on_disk(dir.path());
++    let registered = edge.state.plugin_keys.lock().unwrap().clone();
++    assert_eq!(registered.last().unwrap()["stepUp"], "ticket-1", "{registered:?}");
++    assert_eq!(registered.last().unwrap()["key"], status["key"]);
++    assert!(matches!(auth.state(), AuthState::SignedIn { user, .. } if user.id == "user_1"));
++    let after = saved_account(dir.path());
++    assert_eq!((&after.0, &after.1), (&before.0, &before.1));
++    assert_ne!(after.2, "refresh-1", "the step-up's own session isn't kept");
++    // Used up: nothing else (DeleteAccount) can take it in its ten minutes.
++    assert!(auth.step_up().is_none(), "the ticket is let go once the key is registered");
++}
++
++/// A step-up for deleting the account (Settings' `StepUp`, no `for`) that
++/// also registers a key on its way keeps its ticket: the delete it was
++/// signed in again for still has it.
++#[tokio::test]
++async fn a_delete_step_up_keeps_its_ticket_for_the_delete() {
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-desk").unwrap();
++    let auth = persisted_auth(&edge, dir.path());
++    let core = engine_on(dir.path(), &auth);
++    let url = auth.start_step_up().await.expect("a step-up");
++    let callback = query_param(&url, "redirect_uri").unwrap().replace("%3A", ":").replace("%2F", "/");
++    let state = query_param(&url, "state").unwrap();
++    let _ = reqwest::get(format!("{callback}?code=abc&state={state}")).await.expect("callback");
++    tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            if signing_key_status(&core).await["registered"] == true {
++                return;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("registered with the step-up's ticket");
++    assert_eq!(auth.step_up().as_deref(), Some("ticket-1"), "kept for the delete");
++}
++
++/// Security review 10, N3: any ticket held could delete the account: one a
++/// key's step-up (or a sign-in) brought and no registration used up. Only
++/// a step-up begun for deleting can.
++#[tokio::test]
++async fn only_a_step_up_for_deleting_can_delete_the_account() {
++    use zeron_engine::auth::DeleteAccountError;
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    let auth = persisted_auth(&edge, dir.path());
++    let land = |url: String| async move {
++        let callback = query_param(&url, "redirect_uri").unwrap().replace("%3A", ":").replace("%2F", "/");
++        let state = query_param(&url, "state").unwrap();
++        let _ = reqwest::get(format!("{callback}?code=abc&state={state}")).await.expect("callback");
++    };
++    // "Confirm it's you" landed; no engine here to register with it.
++    land(auth.start_step_up_for_key().await.expect("a step-up")).await;
++    assert!(auth.step_up().is_some(), "held, for the key");
++    let refused = auth.delete_account("w@example.com").await;
++    assert!(matches!(refused, Err(DeleteAccountError::StepUpRequired)), "{refused:?}");
++    assert!(edge.state.deletions.lock().unwrap().is_empty(), "nothing sent to delete with");
++    assert!(auth.step_up().is_some(), "still the key's");
++    // Signed in again to delete: that one does.
++    land(auth.start_step_up().await.expect("a step-up")).await;
++    auth.delete_account("w@example.com").await.expect("deleted");
++    assert_eq!(*edge.state.deletions.lock().unwrap(), vec!["ticket-2".to_string()]);
++}
++
++/// The step-up must be the account signed in here: another account's is
++/// refused, registers nothing, and leaves the session as it was.
++#[tokio::test]
++async fn zeron_login_confirm_refuses_another_accounts_sign_in() {
++    use zeron_engine::device_key::{self, DeviceKey};
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-old").unwrap();
++    let auth = persisted_auth(&edge, dir.path());
++    let before = saved_account(dir.path());
++    *edge.state.exchange_user.lock().expect("lock") = "user_2".into();
++
++    let url = auth.start_headless_step_up().expect("a step-up");
++    let state = query_param(&url, "state").expect("state param");
++    let refused = auth.complete_sign_in(&format!("{state}.code123")).await.expect_err("another account");
++    assert!(refused.to_string().contains("another account"), "{refused}");
++    assert!(auth.step_up().is_none(), "its ticket isn't kept");
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::NeedsConfirm);
++    assert!(
++        edge.state.plugin_keys.lock().unwrap().iter().all(|body| body["stepUp"].is_null()),
++        "no key registered with another account's ticket"
++    );
++    assert!(matches!(auth.state(), AuthState::SignedIn { user, .. } if user.id == "user_1"));
++    assert_eq!(saved_account(dir.path()).0, before.0);
++}
++
++/// Security review 9, M1: "registered" came from this device's own file, so
++/// a key revoked from another device read as registered. The edge is asked:
++/// only a key it calls this account's and live counts; anything else has
++/// its file cleared and is registered again (a revoked one replaced, and
++/// the plugins it signed owed a re-sign, L1).
++#[tokio::test]
++async fn zeron_login_asks_the_edge_before_calling_a_key_registered() {
++    use zeron_engine::device_key::{self, DeviceKey};
++    use zeron_engine::plugins::{keys, signing};
++    let edge = StubEdge::start().await;
++    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-box").unwrap();
++    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
++    paste_sign_in(&auth).await;
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::Registered);
++    let first = signing::load_key(dir.path()).unwrap().public();
++    let posts = || edge.state.plugin_keys.lock().unwrap().len();
++    assert_eq!(posts(), 1);
++    // This device's file lost, the key still the account's: the edge's
++    // word is enough, and the file is made again. Nothing registered anew.
++    std::fs::remove_file(dir.path().join(keys::REGISTRATION_FILE)).unwrap();
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::AlreadyRegistered);
++    assert_eq!(posts(), 1);
++    assert!(device_key::is_registered(&auth, dir.path()));
++    drop(auth);
++
++    // Revoked from the laptop while this box's engine was off.
++    edge.state.revoked_keys.lock().unwrap().push(first.clone());
++    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
++    assert_eq!(
++        device_key::register(&auth, dir.path()).await,
++        DeviceKey::NeedsConfirm,
++        "a revoked key never reads as registered"
++    );
++    assert!(!device_key::is_registered(&auth, dir.path()));
++    let second = signing::load_key(dir.path()).unwrap().public();
++    assert_ne!(second, first, "a new key, the revoked one never used again");
++    assert!(keys::resign_owed(dir.path()), "the plugins the old key signed are owed a re-sign");
++    assert_eq!(
++        keys::owed_revocations(dir.path()),
++        vec![first.clone()],
++        "and the revocation owed its answer at the next engine start (review 10, N1)"
++    );
++    // Confirmed: the new key registers.
++    let url = auth.start_headless_step_up().expect("a step-up");
++    let state = query_param(&url, "state").expect("state");
++    auth.complete_sign_in(&format!("{state}.code123")).await.expect("step-up");
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::Registered);
++    let last = edge.state.plugin_keys.lock().unwrap().last().cloned().unwrap();
++    assert_eq!((last["key"].as_str(), last["stepUp"].as_str()), (Some(second.as_str()), Some("ticket-2")));
++    assert!(auth.step_up().is_none(), "the ticket is let go once the key is registered");
++}
++
++/// Security review 9, L2: the paste prompt waited for ever, holding the
++/// engine lock (so systemd couldn't start the engine meanwhile).
++#[tokio::test]
++async fn a_confirm_that_gets_no_code_gives_up() {
++    use zeron_engine::device_key;
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    let auth = persisted_auth(&edge, dir.path());
++    let started = std::time::Instant::now();
++    let gave_up = device_key::confirm_with(
++        &auth,
++        || std::future::pending::<Option<String>>(),
++        Duration::from_millis(200),
++        |_url: &str| {},
++    )
++    .await
++    .expect_err("no code came");
++    assert!(gave_up.to_string().contains("timed out"), "{gave_up}");
++    assert!(started.elapsed() < Duration::from_secs(5));
++}
++
++/// L2: a mistyped code used the sign-in up, with no way to try again but
++/// running the command again. A fresh sign-in is offered to try with.
++#[tokio::test]
++async fn a_mistyped_code_gets_a_fresh_sign_in_to_try_again() {
++    use zeron_engine::device_key::{self, DeviceKey};
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-box").unwrap();
++    let auth = persisted_auth(&edge, dir.path());
++    let shown: Arc<Mutex<Vec<String>>> = Arc::default();
++    let (show_into, read_from) = (shown.clone(), shown.clone());
++    let pasted = Arc::new(AtomicUsize::new(0));
++    device_key::confirm_with(
++        &auth,
++        move || {
++            let n = pasted.fetch_add(1, Ordering::SeqCst);
++            let url = read_from.lock().unwrap().last().cloned().unwrap_or_default();
++            async move {
++                Some(match n {
++                    0 => "not-the-code".to_owned(),
++                    _ => format!("{}.code123", query_param(&url, "state").expect("state")),
++                })
++            }
++        },
++        Duration::from_secs(5),
++        move |url: &str| show_into.lock().unwrap().push(url.to_owned()),
++    )
++    .await
++    .expect("confirmed on the second try");
++    assert_eq!(shown.lock().unwrap().len(), 2, "a fresh sign-in after the mistake");
++    assert_eq!(device_key::register(&auth, dir.path()).await, DeviceKey::Registered);
++}
++
++/// Security review 9, L3: a step-up refused (another account) or bringing
++/// no ticket changed nothing the desktop could see, so it waited ten
++/// minutes. It's said at once.
++#[tokio::test]
++async fn the_desktop_hears_at_once_when_a_step_up_is_refused() {
++    let edge = StubEdge::start().await;
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::write(dir.path().join("device-id"), "device-desk").unwrap();
++    let auth = persisted_auth(&edge, dir.path());
++    let core = engine_on(dir.path(), &auth);
++    let said = |want: &'static str| {
++        let core = &core;
++        async move {
++            tokio::time::timeout(Duration::from_secs(3), async {
++                loop {
++                    let status = signing_key_status(core).await;
++                    if status["register_error"] == want {
++                        return status;
++                    }
++                    tokio::time::sleep(Duration::from_millis(20)).await;
++                }
++            })
++            .await
++            .unwrap_or_else(|_| panic!("{want} said in time"))
++        }
++    };
++    let refused = said("step_up_required").await;
++    let step_up = |auth: Auth| async move {
++        let url = auth.start_step_up_for_key().await.expect("a step-up");
++        let callback = query_param(&url, "redirect_uri").unwrap().replace("%3A", ":").replace("%2F", "/");
++        let state = query_param(&url, "state").unwrap();
++        let _ = reqwest::get(format!("{callback}?code=abc&state={state}")).await.expect("callback");
++    };
++    // Signed in again as someone else.
++    *edge.state.exchange_user.lock().unwrap() = "user_2".into();
++    step_up(auth.clone()).await;
++    let other = said("step_up_refused").await;
++    assert!(other["register_message"].as_str().unwrap().contains("another account"), "{other}");
++    assert!(other["register_attempts"].as_u64() > refused["register_attempts"].as_u64());
++    // Signed in, but the edge gave no ticket.
++    *edge.state.exchange_user.lock().unwrap() = String::new();
++    edge.state.exchange_no_ticket.store(true, Ordering::SeqCst);
++    step_up(auth.clone()).await;
++    let none = tokio::time::timeout(Duration::from_secs(3), async {
++        loop {
++            let status = signing_key_status(&core).await;
++            if status["register_attempts"].as_u64() > other["register_attempts"].as_u64() {
++                return status;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("said in time");
++    assert_eq!(none["register_error"], "step_up_refused", "{none}");
++    assert_eq!(none["registered"], false);
++}
++
+ #[tokio::test]
+ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
+     let edge = StubEdge::start().await;
+-- 
+2.55.0.windows.2
+
