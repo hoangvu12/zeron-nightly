@@ -1,4 +1,4 @@
-From d6dd85b073952a040bee27d8ed855dee63f8038b Mon Sep 17 00:00:00 2001
+From 99b9361c842c76259b4c4c4324826838599e4c43 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 26 Nov 2026 10:31:03 +0700
 Subject: [PATCH] zgx: text below 2x is drawn for the screen's subpixels, as
@@ -10,8 +10,8 @@ greyscale coverage leaves each stem over two columns at part strength
 firmed edges can't do better. Windows' text is sharp because ClearType
 covers each subpixel apart.
 
-apps/zgx's zgx moves to hoangvu12/zgx 998140e69 (branch
-nightly-lcd-998140e6): main's pin, zeronsh/zgx b9e744ddd, with one commit
+apps/zgx's zgx moves to hoangvu12/zgx 0d60ffa19 (branch
+nightly-lcd-0d60ffa1): main's pin, zeronsh/zgx b9e744ddd, with two commits
 on it. Glyphs keyed CacheKeyFlags::LCD are swash subpixel masks, drawn by a
 dual-source pipeline (Shading::Lcd) that blends each channel by its own
 coverage. Only into an opaque window's own target, below 2x, off macOS, on
@@ -20,14 +20,38 @@ isolated layers keep greyscale, since their pixels are blended again. The
 desktop host follows Windows' ClearType setting (on, RGB or BGR) and reads
 it again on a settings change; ZGX_LCD_TEXT=0, rgb or bgr overrides it.
 
-Only the zgx pin and the lockfile's sources change here.
+The second commit makes it show in a Windows window: LCD text turned
+itself off wherever a frame could present in a single pass (every Windows
+window), so a frame with LCD glyphs is now drawn into the target and
+presented after; and a glass window whose glass is dropped is cleared
+opaque in its theme's background.
+
+Zeron's main window is made with glass, and its themes' backgrounds are
+translucent (72-80%), so even with frosted glass off its text stayed grey.
+Now the glass is kept only while something shows through it (ui/app.luau
+asks `window.glass` with ds/material's see_through(); src/main.rs sets or
+drops zeron_glass on app.luau's windows), and a solid window's background
+is its theme's with the alpha dropped (ds/glass_tint `opaque`, used by
+ds/material's solid theme). These go with the zgx pin in one patch: on a
+zgx without the second commit, a window whose glass is dropped would clear
+transparent.
+
+Checked in the real app on Windows (1080p, 110%): chat text's edges went
+from 0 coloured pixels of 3045 to 2812 of 2932, the spread of Discord's
+ClearType text beside it.
 ---
- apps/zgx/Cargo.lock | 52 ++++++++++++++++++++++-----------------------
- apps/zgx/Cargo.toml | 28 ++++++++++++------------
- 2 files changed, 40 insertions(+), 40 deletions(-)
+ apps/zgx/Cargo.lock                        | 52 +++++++++++-----------
+ apps/zgx/Cargo.toml                        | 28 ++++++------
+ apps/zgx/src/main.rs                       | 18 ++++++++
+ apps/zgx/ui/app.luau                       | 11 +++++
+ apps/zgx/ui/ds/glass_tint.luau             | 20 +++++++++
+ apps/zgx/ui/ds/material.luau               |  8 ++++
+ apps/zgx/ui/tests/material_solid.test.luau | 25 +++++++++++
+ 7 files changed, 122 insertions(+), 40 deletions(-)
+ create mode 100644 apps/zgx/ui/tests/material_solid.test.luau
 
 diff --git a/apps/zgx/Cargo.lock b/apps/zgx/Cargo.lock
-index 92274b2c21f2f1c10aa8e2ebae21fd67bb83aaed..2c30666e5f6a0a186b405028d3069253fc214982 100644
+index 6b3e1a4dad1f40db3a186f80d635a45ec42603d7..a3238d8e85928234ce3c71e9a160aa13e2f6d3e8 100644
 --- a/apps/zgx/Cargo.lock
 +++ b/apps/zgx/Cargo.lock
 @@ -30,7 +30,7 @@ dependencies = [
@@ -35,7 +59,7 @@ index 92274b2c21f2f1c10aa8e2ebae21fd67bb83aaed..2c30666e5f6a0a186b405028d3069253
  name = "accesskit_atspi_common"
  version = "0.19.1"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
@@ -44,7 +68,7 @@ index 92274b2c21f2f1c10aa8e2ebae21fd67bb83aaed..2c30666e5f6a0a186b405028d3069253
  name = "accesskit_consumer"
  version = "0.38.0"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "accesskit",
   "hashbrown 0.16.1",
@@ -53,7 +77,7 @@ index 92274b2c21f2f1c10aa8e2ebae21fd67bb83aaed..2c30666e5f6a0a186b405028d3069253
  name = "accesskit_macos"
  version = "0.26.3"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
@@ -62,7 +86,7 @@ index 92274b2c21f2f1c10aa8e2ebae21fd67bb83aaed..2c30666e5f6a0a186b405028d3069253
  name = "accesskit_unix"
  version = "0.22.1"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "accesskit",
   "accesskit_atspi_common",
@@ -71,198 +95,198 @@ index 92274b2c21f2f1c10aa8e2ebae21fd67bb83aaed..2c30666e5f6a0a186b405028d3069253
  name = "accesskit_windows"
  version = "0.34.0"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
-@@ -6430,7 +6430,7 @@ dependencies = [
+@@ -5841,7 +5841,7 @@ dependencies = [
  [[package]]
  name = "wgpu-hal"
  version = "29.0.4"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "android_system_properties",
   "arrayvec",
-@@ -6868,7 +6868,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
+@@ -6279,7 +6279,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
  [[package]]
  name = "winit"
  version = "0.30.13"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "ahash",
   "android-activity",
-@@ -7436,7 +7436,7 @@ dependencies = [
+@@ -6855,7 +6855,7 @@ dependencies = [
  [[package]]
  name = "zgx"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "fixed_decimal",
   "foldhash 0.2.0",
-@@ -7465,7 +7465,7 @@ dependencies = [
+@@ -6884,7 +6884,7 @@ dependencies = [
  [[package]]
  name = "zgx-3d"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "bytemuck",
   "zgx",
-@@ -7475,7 +7475,7 @@ dependencies = [
+@@ -6894,7 +6894,7 @@ dependencies = [
  [[package]]
  name = "zgx-alacritty-terminal"
  version = "0.26.8"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "base64 0.22.1",
   "bitflags 2.13.2",
-@@ -7500,7 +7500,7 @@ dependencies = [
+@@ -6919,7 +6919,7 @@ dependencies = [
  [[package]]
  name = "zgx-arboard"
  version = "3.6.2"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "clipboard-win",
   "image",
-@@ -7519,7 +7519,7 @@ dependencies = [
+@@ -6938,7 +6938,7 @@ dependencies = [
  [[package]]
  name = "zgx-components"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "zgx",
  ]
-@@ -7527,7 +7527,7 @@ dependencies = [
+@@ -6946,7 +6946,7 @@ dependencies = [
  [[package]]
  name = "zgx-cosmic-text"
  version = "0.19.14"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "bitflags 2.13.2",
   "fontdb",
-@@ -7551,7 +7551,7 @@ dependencies = [
+@@ -6970,7 +6970,7 @@ dependencies = [
  [[package]]
  name = "zgx-desktop"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "accesskit",
   "accesskit_consumer",
-@@ -7602,12 +7602,12 @@ dependencies = [
+@@ -7021,12 +7021,12 @@ dependencies = [
  [[package]]
  name = "zgx-ghostty-sys"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  
  [[package]]
  name = "zgx-gpu"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "ash",
   "block2 0.6.2",
-@@ -7647,7 +7647,7 @@ dependencies = [
+@@ -7066,7 +7066,7 @@ dependencies = [
  [[package]]
  name = "zgx-harfrust"
  version = "0.5.4"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "bitflags 2.13.2",
   "bytemuck",
-@@ -7659,7 +7659,7 @@ dependencies = [
+@@ -7078,7 +7078,7 @@ dependencies = [
  [[package]]
  name = "zgx-mlua"
  version = "0.12.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "bstr",
   "either",
-@@ -7674,7 +7674,7 @@ dependencies = [
+@@ -7093,7 +7093,7 @@ dependencies = [
  [[package]]
  name = "zgx-run"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "serde_json",
   "ureq 3.5.0",
-@@ -7686,7 +7686,7 @@ dependencies = [
+@@ -7105,7 +7105,7 @@ dependencies = [
  [[package]]
  name = "zgx-script"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "base64 0.22.1",
   "crc32fast",
-@@ -7713,7 +7713,7 @@ dependencies = [
+@@ -7132,7 +7132,7 @@ dependencies = [
  [[package]]
  name = "zgx-swash"
  version = "0.2.11"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "skrifa",
   "yazi",
-@@ -7723,7 +7723,7 @@ dependencies = [
+@@ -7142,7 +7142,7 @@ dependencies = [
  [[package]]
  name = "zgx-taffy"
  version = "0.9.2"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "arrayvec",
   "grid",
-@@ -7734,7 +7734,7 @@ dependencies = [
+@@ -7153,7 +7153,7 @@ dependencies = [
  [[package]]
  name = "zgx-terminal"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "base64 0.22.1",
   "flate2",
-@@ -7751,7 +7751,7 @@ dependencies = [
+@@ -7170,7 +7170,7 @@ dependencies = [
  [[package]]
  name = "zgx-text"
  version = "0.1.10"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "fontconfig-parser",
   "rustc-hash 2.1.3",
-@@ -7764,7 +7764,7 @@ dependencies = [
+@@ -7183,7 +7183,7 @@ dependencies = [
  [[package]]
  name = "zgx-vte"
  version = "0.15.4"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "arrayvec",
   "bitflags 2.13.2",
-@@ -7776,7 +7776,7 @@ dependencies = [
+@@ -7195,7 +7195,7 @@ dependencies = [
  [[package]]
  name = "zgx-zune-jpeg"
  version = "0.5.15"
 -source = "git+https://github.com/zeronsh/zgx?rev=b9e744dddf5f05affba571f0c69aa579c34e1e3a#b9e744dddf5f05affba571f0c69aa579c34e1e3a"
-+source = "git+https://github.com/hoangvu12/zgx?rev=998140e6977bfed376176c9554a0ea8411759bf4#998140e6977bfed376176c9554a0ea8411759bf4"
++source = "git+https://github.com/hoangvu12/zgx?rev=0d60ffa192d230f1933bda20e7fbaa13dba8e495#0d60ffa192d230f1933bda20e7fbaa13dba8e495"
  dependencies = [
   "zune-core",
  ]
 diff --git a/apps/zgx/Cargo.toml b/apps/zgx/Cargo.toml
-index 652bb32a9246b7bda0ca744f7e802eb19b906fc6..a3f1a19f9ac6bff7647fe382dee14d67d5d57ce2 100644
+index 135e61a421f9ebc53a51634dca89eba11566eabc..676dc0a09cebf04e7733b2b94536309c8c5a11cd 100644
 --- a/apps/zgx/Cargo.toml
 +++ b/apps/zgx/Cargo.toml
 @@ -32,7 +32,7 @@ layout_probe = []
@@ -270,7 +294,7 @@ index 652bb32a9246b7bda0ca744f7e802eb19b906fc6..a3f1a19f9ac6bff7647fe382dee14d67
  [dependencies]
  lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 -zgx = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a" }
-+zgx = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
++zgx = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
  # `mimalloc`: the program's allocator, in place of the system's. It hands
  # freed memory back to the system (the system's keeps the most it ever
  # held), and zgx measures 1-10% less CPU for script, text and layout work.
@@ -279,7 +303,7 @@ index 652bb32a9246b7bda0ca744f7e802eb19b906fc6..a3f1a19f9ac6bff7647fe382dee14d67
  # zgx-run turns it on by default, but this app takes zgx-run without its
  # defaults (below). Nothing on macOS or Windows.
 -zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a", features = ["mimalloc", "terminal", "webkitgtk"] }
-+zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4", features = ["mimalloc", "terminal", "webkitgtk"] }
++zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495", features = ["mimalloc", "terminal", "webkitgtk"] }
  # `inspect`: devtools for `zgx inspect` (and its MCP server), asked for
  # with `--inspect`. `i18n`: `ui.t`'s plurals and numbers by each locale's
  # own rules (ICU4X's data, about 90 KB), for ui/locales' translations.
@@ -288,42 +312,42 @@ index 652bb32a9246b7bda0ca744f7e802eb19b906fc6..a3f1a19f9ac6bff7647fe382dee14d67
  # hands it its own triangles (`geometry = { positions, indices, … }`). It
  # asks no grant; a scene draws a frame only when something in it changes.
 -zgx-script = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a", features = ["inspect", "i18n", "scene3d"] }
-+zgx-script = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4", features = ["inspect", "i18n", "scene3d"] }
++zgx-script = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495", features = ["inspect", "i18n", "scene3d"] }
  # A picture's pixels for the clipboard (src/images.rs): zgx's own decoder,
  # the formats `ui.image` shows (no features of its own: the ones zgx-desktop
  # turns on).
 -zgx-gpu = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a", default-features = false }
-+zgx-gpu = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4", default-features = false }
++zgx-gpu = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495", default-features = false }
  # Each plugin's own database (`zeron.db`, src/plugins/db.rs): SQLite,
- # built in; `limits` to keep one from attaching any other file.
- rusqlite = { version = "0.32", features = ["bundled", "limits", "hooks"] }
+ # the one file its service (the engine) opens too.
+ zeron-plugin-db = { path = "../../crates/plugin-db" }
  # `fetch`: zgx's own transport for `ui.fetch` and remote images (HTTP and
  # HTTPS, rustls), given to every window (src/main.rs): the app's scripts,
  # and plugins granted "network". Nothing else of the runner.
 -zgx-run = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a", default-features = false, features = ["fetch"] }
-+zgx-run = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4", default-features = false, features = ["fetch"] }
++zgx-run = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495", default-features = false, features = ["fetch"] }
  # `webp`: `ui.image` decodes through this crate, by what its features
  # allow, so turning WebP on here is all it takes (the member cards' art).
  # `ico`: sites' favicons (the browser tab's: src/favicons.rs), most of
-@@ -162,7 +162,7 @@ foreign-types = "0.5"
+@@ -165,7 +165,7 @@ foreign-types = "0.5"
  # elements, box drawing and Powerline glyphs to the cell; zgx's own renderer
  # draws them from the font at its text line height, gapped. Builds Ghostty
  # with Zig 0.16 (cached in ~/Library/Caches/zgx-ghostty).
 -zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a", features = ["ghostty"] }
-+zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4", features = ["ghostty"] }
++zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495", features = ["ghostty"] }
  
  # Windows' Transparency effects (src/transparency.rs), read and watched in
  # the registry, until zgx reports them (zgx-asks/windows-transparency); a
-@@ -173,7 +173,7 @@ zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05aff
+@@ -176,7 +176,7 @@ zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05aff
  # 11 (and with Edge on Windows 10); without it, pages are placeholders.
  [target.'cfg(windows)'.dependencies]
  windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_WindowsAndMessaging"] }
 -zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a", features = ["webview2"] }
-+zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4", features = ["webview2"] }
++zgx-desktop = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495", features = ["webview2"] }
  
  # zgx's D-Bus (menus, portals) linked in rather than loaded: `zeron` is also
  # what a headless Linux server and every Cloud machine runs (`zeron
-@@ -185,13 +185,13 @@ libdbus-sys = { version = "0.2.7", features = ["vendored"] }
+@@ -188,13 +188,13 @@ libdbus-sys = { version = "0.2.7", features = ["vendored"] }
  # zgx's own patches (its root Cargo.toml): a git dependency does not bring
  # them, so every consumer repeats them.
  [patch.crates-io]
@@ -334,16 +358,146 @@ index 652bb32a9246b7bda0ca744f7e802eb19b906fc6..a3f1a19f9ac6bff7647fe382dee14d67
 -accesskit_atspi_common = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a" }
 -accesskit_unix = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a" }
 -accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "b9e744dddf5f05affba571f0c69aa579c34e1e3a" }
-+wgpu-hal = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
-+winit = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
-+accesskit_macos = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
-+accesskit_consumer = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
-+accesskit_atspi_common = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
-+accesskit_unix = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
-+accesskit_windows = { git = "https://github.com/hoangvu12/zgx", rev = "998140e6977bfed376176c9554a0ea8411759bf4" }
++wgpu-hal = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
++winit = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
++accesskit_macos = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
++accesskit_consumer = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
++accesskit_atspi_common = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
++accesskit_unix = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
++accesskit_windows = { git = "https://github.com/hoangvu12/zgx", rev = "0d60ffa192d230f1933bda20e7fbaa13dba8e495" }
  
  # zgx is slow unoptimized (its own setting): optimize dependencies, keep
  # this crate quick to build.
+diff --git a/apps/zgx/src/main.rs b/apps/zgx/src/main.rs
+index 9e754e375d32ea34024794195b41ac9b7b31a8ee..82cd46f68da2666e5d8dd170830fcb387a1f5dc8 100644
+--- a/apps/zgx/src/main.rs
++++ b/apps/zgx/src/main.rs
+@@ -745,6 +745,24 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
+     // bar's slide with it).
+     let window = cx.window.clone();
+     host.action("window.full_screen", move |on| window.set_fullscreen(matches!(on, Value::Bool(true))));
++    // The glass under the window, kept while something shows through it
++    // and dropped where every surface is solid (`ui.invoke("window.glass",
++    // see_through)`, ui/app.luau): zgx then clears the window opaque, as its
++    // theme's background, and draws its text for the screen's subpixels,
++    // which it never does over glass. Only app.luau's windows (setup's and
++    // the main one), which are made with glass (`zeron_window`): glass
++    // given to a window made opaque would clear it transparent.
++    if entry == "app.luau" {
++        let window = cx.window.clone();
++        // (Made with it: only a change goes to the window.)
++        let last = std::cell::Cell::new(Some(true));
++        host.action("window.glass", move |on| {
++            let see_through = !matches!(on, Value::Bool(false));
++            if last.replace(Some(see_through)) != Some(see_through) {
++                window.set_glass(see_through.then(zeron_glass));
++            }
++        });
++    }
+     // Reload Zeron: the app quits and starts again, the same launch
+     // (src/relaunch.rs).
+     let windows = cx.windows.clone();
+diff --git a/apps/zgx/ui/app.luau b/apps/zgx/ui/app.luau
+index 0715df51a43ee19de7849234d5b8258077100de1..5dfa75024dd3804b7ad204a01e13d2e0387f0d73 100644
+--- a/apps/zgx/ui/app.luau
++++ b/apps/zgx/ui/app.luau
+@@ -15,6 +15,17 @@ end
+ ui.theme.strict("warn")
+ local ds = require("@ds")
+ ds.setup()
++-- The window's glass only while something shows through it (ds/material:
++-- Settings → Appearance's frosted, and the system's transparency). Solid,
++-- the host drops it and the window is cleared opaque, so its text is drawn
++-- for an LCD screen's subpixels (ClearType's sharpness), which a window
++-- over glass can't be. (A host without it, as tests', nothing.)
++do
++	local material = require("@ds/material")
++	ui.effect(function()
++		pcall(ui.invoke, "window.glass", material.see_through())
++	end)
++end
+ -- The language chosen (Settings → General), before any screen builds.
+ require("@app/screens/language")
+ 
+diff --git a/apps/zgx/ui/ds/glass_tint.luau b/apps/zgx/ui/ds/glass_tint.luau
+index 9e1fb176526fa491edcf1e225025a1fbb5ccd2c7..a39f4624b578ffbe53ff1a2f61724ebb49197762 100644
+--- a/apps/zgx/ui/ds/glass_tint.luau
++++ b/apps/zgx/ui/ds/glass_tint.luau
+@@ -31,4 +31,24 @@ function M.thicker(tint: string, keep: number): string?
+ 	return string.format("#%s%02x", rgb, math.floor(thick * 255 + 0.5))
+ end
+ 
++-- `value` ("#rrggbbaa" or "#rgba") with its alpha dropped, for a window with
++-- no glass under it (ds/material's solid theme); nil where there's nothing
++-- to drop: opaque already, a `$token`, not a colour written so.
++function M.opaque(value: any): string?
++	if type(value) ~= "string" then
++		return nil
++	end
++	local rgb, alpha = string.match(value, "^(#%x%x%x%x%x%x)(%x%x)$")
++	if not rgb then
++		local r, g, b, a = string.match(value, "^#(%x)(%x)(%x)(%x)$")
++		if r then
++			rgb, alpha = "#" .. r .. r .. g .. g .. b .. b, a .. a
++		end
++	end
++	if not rgb or string.lower(alpha :: string) == "ff" then
++		return nil
++	end
++	return rgb
++end
++
+ return M
+diff --git a/apps/zgx/ui/ds/material.luau b/apps/zgx/ui/ds/material.luau
+index e0f267d8aa11077a5a387fcab9e9a15c742118ec..3b884944c1a37ed21f8e7d40335c6f2c9900f016 100644
+--- a/apps/zgx/ui/ds/material.luau
++++ b/apps/zgx/ui/ds/material.luau
+@@ -50,6 +50,14 @@ function M.solid_theme(): { [string]: any }?
+ 		["zeron.island.tint"] = "$zeron.menu.solid",
+ 		["zeron.island.blur"] = 0,
+ 	}
++	-- The window's own fill whole: a solid window has no glass under it
++	-- (app.luau drops it), so a translucent `background` (the themes' are
++	-- 72-80%) would show the desktop through unblurred, and only a window
++	-- cleared opaque draws its text for an LCD screen's subpixels.
++	local background = glass_tint.opaque(ui.theme.get("background"))
++	if background then
++		out.background = background
++	end
+ 	if ui.theme.get("zeron.solid.secondary") ~= nil then
+ 		out["text.secondary"] = "$zeron.solid.secondary"
+ 		out["text.tertiary"] = "$zeron.solid.tertiary"
+diff --git a/apps/zgx/ui/tests/material_solid.test.luau b/apps/zgx/ui/tests/material_solid.test.luau
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca9f52761e60de47f86e804ae28d191abcec2855
+--- /dev/null
++++ b/apps/zgx/ui/tests/material_solid.test.luau
+@@ -0,0 +1,25 @@
++-- A solid window (ds/material: frosted off, or the system's transparency
++-- off) has no glass under it (ui/app.luau drops it), so its own fill is
++-- whole (ds/glass_tint `opaque`): the themes' translucent `background`
++-- (72-80%) would show the desktop through unblurred, and only a window
++-- cleared opaque draws its text for an LCD screen's subpixels.
++
++local glass_tint = require("@ds/glass_tint")
++
++test("Material: a solid window's background, its colour's alpha dropped", function()
++	-- Zeron dark's and light's backgrounds.
++	expect(glass_tint.opaque("#0b0b0dcc")).to_be("#0b0b0d")
++	expect(glass_tint.opaque("#f5f5f7b8")).to_be("#f5f5f7")
++	expect(glass_tint.opaque("#ABCDEF80")).to_be("#ABCDEF")
++	-- The short form.
++	expect(glass_tint.opaque("#abc8")).to_be("#aabbcc")
++end)
++
++test("Material: nothing to drop, nothing changed", function()
++	expect(glass_tint.opaque("#0b0b0dff")).to_be_nil()
++	expect(glass_tint.opaque("#0b0b0dFF")).to_be_nil()
++	expect(glass_tint.opaque("#0b0b0d")).to_be_nil()
++	expect(glass_tint.opaque("$zeron.menu.solid")).to_be_nil()
++	expect(glass_tint.opaque(nil)).to_be_nil()
++	expect(glass_tint.opaque(3)).to_be_nil()
++end)
 -- 
 2.55.0.windows.2
 

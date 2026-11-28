@@ -1,4 +1,4 @@
-From 60635786590c8add66b22970aaea3bd1cc1c4185 Mon Sep 17 00:00:00 2001
+From fb0c3ed6f83c0cb6274e200b7c089646a946dedb Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Thu, 26 Nov 2026 19:32:37 +0700
 Subject: [PATCH] The direct link to a shown chat's computer is kept up, says
@@ -36,16 +36,18 @@ a_virtual_switch_carrying_the_lan_stays and
 nothing_usable_binds_nothing_so_the_wildcard_stays. The Windows listing
 type-checks for x86_64-pc-windows-msvc; it hasn't run on Windows yet.
 ---
- apps/zgx/src/chat.rs             |  30 ++++
- crates/preview/Cargo.toml        |   7 +-
- crates/preview/src/interfaces.rs | 259 +++++++++++++++++++++++++++++++
- crates/preview/src/lib.rs        |   1 +
- crates/preview/src/peer.rs       | 116 +++++++++++++-
- 5 files changed, 409 insertions(+), 4 deletions(-)
+ apps/zgx/src/chat.rs               |  36 ++++
+ apps/zgx/src/chat_pending_tests.rs |   2 +
+ apps/zgx/src/chat_stream_tests.rs  |   1 +
+ crates/preview/Cargo.toml          |   7 +-
+ crates/preview/src/interfaces.rs   | 259 +++++++++++++++++++++++++++++
+ crates/preview/src/lib.rs          |   1 +
+ crates/preview/src/peer.rs         | 116 ++++++++++++-
+ 7 files changed, 418 insertions(+), 4 deletions(-)
  create mode 100644 crates/preview/src/interfaces.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c3449ce40 100644
+index ce04a494f6df89a5b69a997368c9e3777846a72f..90eeaabd47c5d5461a7945c026d63b8964d9d7bc 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
 @@ -876,6 +876,8 @@ struct View {
@@ -65,7 +67,7 @@ index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c
          snapshot: Cell::new(false),
      });
      chats.views.borrow_mut().push(Rc::downgrade(&view));
-@@ -1515,6 +1518,7 @@ fn lane_view(host: &ScriptHost, slot: &str) -> Rc<View> {
+@@ -1519,6 +1522,7 @@ fn lane_view(host: &ScriptHost, slot: &str) -> Rc<View> {
          open: RefCell::default(),
          pending: RefCell::default(),
          generation: Cell::new(0),
@@ -73,7 +75,7 @@ index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c
          snapshot: Cell::new(false),
      });
      chats.views.borrow_mut().push(Rc::downgrade(&view));
-@@ -2609,6 +2613,7 @@ impl View {
+@@ -2613,6 +2617,7 @@ impl View {
          }
          self.draft.set(draft_value("", ""));
          self.subscribe();
@@ -81,7 +83,7 @@ index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c
          let held = chats.held.borrow().clone();
          self.follow_held(&held);
          self.publish_messages();
-@@ -2657,6 +2662,28 @@ impl View {
+@@ -2661,6 +2666,28 @@ impl View {
          });
      }
  
@@ -110,7 +112,7 @@ index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c
      fn open_id(&self) -> Option<String> {
          self.open.borrow().as_ref().map(|o| o.id.clone())
      }
-@@ -4113,6 +4140,9 @@ async fn warm(args: Value) -> Result<Value, Outcome> {
+@@ -4117,6 +4144,9 @@ async fn warm(args: Value) -> Result<Value, Outcome> {
      Ok(answer["outcome"].as_str().map(Value::from).unwrap_or(Value::Nil))
  }
  
@@ -120,6 +122,86 @@ index a675ac80a421b69ca05a516053fb957bae8d65a3..d7301f520045c2ae335aa7fe48691a7c
  /// Ask the engine to get the direct link to `chat`'s host ready
  /// (`WarmDeviceLink`): pairing takes most of a second, and a file sent while
  /// it's under way used to start, and stay, on the slow relay. `false`: the
+@@ -9530,6 +9560,7 @@ mod tests {
+                 open: RefCell::new(Some(open)),
+                 pending: RefCell::default(),
+                 generation: Cell::new(0),
++                link_kept: Cell::new(0),
+                 snapshot: Cell::new(false),
+             })
+         };
+@@ -9586,6 +9617,7 @@ mod tests {
+             open: RefCell::new(Some(Open { id: "c".into(), ..Open::default() })),
+             pending: RefCell::default(),
+             generation: Cell::new(0),
++            link_kept: Cell::new(0),
+             snapshot: Cell::new(false),
+         });
+         for (n, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
+@@ -9627,6 +9659,7 @@ mod tests {
+             open: RefCell::new(Some(Open { id: "c".into(), entries: held, heard: true, has_whole: true, ..Open::default() })),
+             pending: RefCell::default(),
+             generation: Cell::new(0),
++            link_kept: Cell::new(0),
+             snapshot: Cell::new(false),
+         });
+         let rows = || format!("{:?}", view.messages.signal().with_untracked(Clone::clone));
+@@ -9715,6 +9748,7 @@ mod tests {
+             open: RefCell::new(Some(Open { id: "c".into(), entries: held, heard: true, has_whole: true, ..Open::default() })),
+             pending: RefCell::default(),
+             generation: Cell::new(0),
++            link_kept: Cell::new(0),
+             snapshot: Cell::new(false),
+         });
+         let draft = || format!("{:?}", view.draft.signal().with_untracked(Clone::clone));
+@@ -9765,6 +9799,7 @@ mod tests {
+             open: RefCell::new(Some(Open { id: "c".into(), entries: held, heard: true, has_whole: true, ..Open::default() })),
+             pending: RefCell::default(),
+             generation: Cell::new(0),
++            link_kept: Cell::new(0),
+             snapshot: Cell::new(false),
+         });
+         let ids = || view.open.borrow().as_ref().unwrap().entries.iter().map(|e| e.id.to_string()).collect::<Vec<_>>();
+@@ -9821,6 +9856,7 @@ mod tests {
+             open: RefCell::new(Some(Open { id: "c".into(), entries: held, heard: true, has_whole: true, ..Open::default() })),
+             pending: RefCell::default(),
+             generation: Cell::new(0),
++            link_kept: Cell::new(0),
+             snapshot: Cell::new(false),
+         });
+         view.pending.borrow_mut().insert(
+diff --git a/apps/zgx/src/chat_pending_tests.rs b/apps/zgx/src/chat_pending_tests.rs
+index 7b9c635a4ee0f302ef17f96bd92cd65cf1b59a02..85b161aef7536204c28f5b96c378459170158c6d 100644
+--- a/apps/zgx/src/chat_pending_tests.rs
++++ b/apps/zgx/src/chat_pending_tests.rs
+@@ -26,6 +26,7 @@ fn pending_chat() -> (TestApp, Rc<View>, Sending) {
+         pending: RefCell::default(),
+         subagents: app.host.shared("test.subagents", Value::Nil),
+         generation: Cell::new(0),
++        link_kept: Cell::new(0),
+         snapshot: Cell::new(false),
+     });
+     CHATS.with(|chats| {
+@@ -334,6 +335,7 @@ fn switch_chat_view(chat_id: &str) -> (TestApp, Rc<View>, Vec<Json>) {
+         pending: RefCell::default(),
+         subagents: app.host.shared("test.subagents", Value::Nil),
+         generation: Cell::new(0),
++        link_kept: Cell::new(0),
+         snapshot: Cell::new(false),
+     });
+     CHATS.with(|chats| {
+diff --git a/apps/zgx/src/chat_stream_tests.rs b/apps/zgx/src/chat_stream_tests.rs
+index e66d7677e7b334afbdc56d603fd4863f6413cbb1..893163c096dbb567d27a9b6366f418117510c526 100644
+--- a/apps/zgx/src/chat_stream_tests.rs
++++ b/apps/zgx/src/chat_stream_tests.rs
+@@ -19,6 +19,7 @@ fn open_chat() -> (TestApp, Rc<View>) {
+         pending: RefCell::default(),
+         subagents: app.host.shared("test.subagents", Value::Nil),
+         generation: Cell::new(0),
++        link_kept: Cell::new(0),
+         snapshot: Cell::new(false),
+     });
+     CHATS.with(|chats| chats.made("stream-chat", json!({ "id": "stream-chat" })));
 diff --git a/crates/preview/Cargo.toml b/crates/preview/Cargo.toml
 index 04cf0a014894162d66411309c4ac08a55add24eb..f687494df8a937eb5e2b3e93e5a192464130ef17 100644
 --- a/crates/preview/Cargo.toml

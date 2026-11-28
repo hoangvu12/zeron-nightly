@@ -1,0 +1,125 @@
+From 540bcf8c5a493669d901f744d0b051689e1f4175 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Sat, 28 Nov 2026 12:03:42 +0700
+Subject: [PATCH] zgx: the app's update messages reach its log
+
+The app reported its updates (a download staged or failed, an install
+on quit or for Restart to update that failed, a held update, an engine
+that didn't stop) with eprintln!, which a GUI app on Windows sends
+nowhere: when an update went wrong there, the app's side of it left no
+trace, only the installer's log.
+
+They go through zeron_update (the app has no tracing of its own) into
+<data>/logs/zeron-headed.log, as warnings when something failed.
+---
+ apps/zgx/src/about.rs    | 22 +++++++++++-----------
+ crates/update/src/lib.rs | 13 +++++++++++++
+ 2 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/apps/zgx/src/about.rs b/apps/zgx/src/about.rs
+index f27bc630cb87e30c6b90b74b460e3dfc6d19bb28..a57f42ffbffebea9e6422b4045b2f3b6ce289ec1 100644
+--- a/apps/zgx/src/about.rs
++++ b/apps/zgx/src/about.rs
+@@ -132,17 +132,17 @@ impl Desktop {
+         // build: a later choice of Stable in it sticks).
+         if zeron_update::Channel::of_version(APP_VERSION) == Channel::Beta {
+             match zeron_update::channel::claim_for_beta_build(&data_dir, APP_VERSION) {
+-                Ok(true) => eprintln!("zeron-zgx: updates: this computer now gets beta updates"),
++                Ok(true) => zeron_update::app_note("this computer now gets beta updates"),
+                 Ok(false) => {}
+-                Err(error) => eprintln!("zeron-zgx: updates: couldn't claim the beta channel: {error}"),
++                Err(error) => zeron_update::app_warning(&format!("couldn't claim the beta channel: {error}")),
+             }
+         } else {
+             // A stable release has reached a beta download: it's on stable now,
+             // unless its person chose beta (crates/update `channel`).
+             match zeron_update::channel::release_claim_for_stable_build(&data_dir) {
+-                Ok(true) => eprintln!("zeron-zgx: updates: this computer now gets stable updates"),
++                Ok(true) => zeron_update::app_note("this computer now gets stable updates"),
+                 Ok(false) => {}
+-                Err(error) => eprintln!("zeron-zgx: updates: couldn't leave the beta channel: {error}"),
++                Err(error) => zeron_update::app_warning(&format!("couldn't leave the beta channel: {error}")),
+             }
+         }
+         let edge = crate::auth::endpoint().edge;
+@@ -227,11 +227,11 @@ impl Desktop {
+             .unwrap_or_else(|| Err("the download stopped".into()));
+             *me.flow.borrow_mut() = match staged {
+                 Ok((version, staged)) => {
+-                    eprintln!("zeron-zgx: updates: {version} staged at {}", staged.display());
++                    zeron_update::app_note(&format!("{version} staged at {}", staged.display()));
+                     Flow::Ready { version, staged }
+                 }
+                 Err(message) => {
+-                    eprintln!("zeron-zgx: updates: the download failed: {message}");
++                    zeron_update::app_warning(&format!("the download failed: {message}"));
+                     Flow::Failed { version, message }
+                 }
+             };
+@@ -264,10 +264,10 @@ impl Desktop {
+         let Flow::Ready { version, staged } = self.flow.borrow().clone() else { return };
+         match self.install.apply_desktop(&staged, false) {
+             Ok(()) => {
+-                eprintln!("zeron-zgx: updates: installed {version} on quit");
++                zeron_update::app_note(&format!("installed {version} on quit"));
+                 *self.flow.borrow_mut() = Flow::Installed;
+             }
+-            Err(error) => eprintln!("zeron-zgx: updates: installing {version} on quit failed: {error:#}"),
++            Err(error) => zeron_update::app_warning(&format!("installing {version} on quit failed: {error:#}")),
+         }
+     }
+ 
+@@ -366,7 +366,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+             let desktop = a.desktop.borrow().clone();
+             if let Some(desktop) = desktop {
+                 if let Some(why) = desktop.status.borrow().as_ref().and_then(|s| s.held.clone()) {
+-                    eprintln!("zeron-zgx: updates: held: {why}");
++                    zeron_update::app_warning(&format!("held: {why}"));
+                     return Err("held".to_string());
+                 }
+                 // Its engine already updated this Mac, from another device: the
+@@ -382,7 +382,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+                 }
+                 if matches!(*desktop.flow.borrow(), Flow::Ready { .. }) {
+                     let version = desktop.install_for_restart().map_err(|message| {
+-                        eprintln!("zeron-zgx: updates: install failed: {message}");
++                        zeron_update::app_warning(&format!("install failed: {message}"));
+                         publish();
+                         "failed".to_string()
+                     })?;
+@@ -398,7 +398,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+                         let done = stopped.clone();
+                         engine.spawn(async move {
+                             if let Err(error) = engine::get().stop().await {
+-                                eprintln!("zeron-zgx: updates: the engine didn't stop: {error}");
++                                zeron_update::app_warning(&format!("the engine didn't stop: {error}"));
+                             }
+                             done.set(true);
+                         });
+diff --git a/crates/update/src/lib.rs b/crates/update/src/lib.rs
+index 48f467d50434ecc34232b510e31fcec3e66a5727..9c0a885a456fcbd1fb1dc286229ad085e9da4a5d 100644
+--- a/crates/update/src/lib.rs
++++ b/crates/update/src/lib.rs
+@@ -1779,6 +1779,19 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++/// The app's own account of its updates (apps/zgx/src/about.rs), into its
++/// log (`<data>/logs/zeron-headed.log`). It said it with `eprintln!`, which a
++/// GUI app on Windows sends nowhere: a download or install that failed left
++/// no trace. (The app has no `tracing` of its own; this crate does.)
++pub fn app_note(message: &str) {
++    tracing::info!(target: "zeron_zgx::updates", "{message}");
++}
++
++/// [`app_note`] for what went wrong.
++pub fn app_warning(message: &str) {
++    tracing::warn!(target: "zeron_zgx::updates", "{message}");
++}
++
+ /// Detached relauncher: waits for THIS process to exit, then runs `program`
+ /// (with `argument` unless empty). Launching before exit would race the
+ /// single-instance engine lock and the IPC port. Paths travel as positional
+-- 
+2.55.0.windows.2
+

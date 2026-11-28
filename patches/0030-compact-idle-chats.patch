@@ -1,4 +1,4 @@
-From 240ffd70d2b3d45c2254bfae02769a6301e569ce Mon Sep 17 00:00:00 2001
+From aa5008f6bf134d0d5681832a21f00b7c4d0d542a Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Tue, 24 Nov 2026 20:30:42 +0700
 Subject: [PATCH] Compact idle chats before their prompt cache expires
@@ -81,7 +81,7 @@ the engine's own compaction, warm or after the agent's idle stop).
  create mode 100644 crates/engine/tests/idle_compact_live.rs
 
 diff --git a/apps/zgx/src/chat.rs b/apps/zgx/src/chat.rs
-index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a044b0d4669 100644
+index e5acb4e21f78ccf1fdb796d038bea2c1818152e4..1d9c82faf9959a0956e03c35b9046b880fc9cdeb 100644
 --- a/apps/zgx/src/chat.rs
 +++ b/apps/zgx/src/chat.rs
 @@ -723,7 +723,7 @@ struct LetGo {
@@ -105,7 +105,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
      queue: Vec<Json>,
      /// Its messages on their way and not yet taken by its agent, as the engine's
      /// `WatchWaitingMessages` lists them (none from an engine without it).
-@@ -2751,7 +2752,7 @@ impl View {
+@@ -2755,7 +2756,7 @@ impl View {
              if let Some(usage) = frame.get("contextUsage").filter(|u| !u.is_null()) {
                  let (tokens, window) = (usage["tokens"].as_f64(), usage["window"].as_f64());
                  open.context = tokens.zip(window).filter(|(_, w)| *w > 0.).map(|(t, w)| (t / w).min(1.));
@@ -114,7 +114,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
              }
              // Opened with all its rows (another view's, or its own with the
              // model's name moved): not down to the newest few, until the
-@@ -5704,6 +5705,11 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -5708,6 +5709,11 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
              if zeron_proto::delegation::wake_notice(&text).is_some() {
                  return Some(wake_row(id));
              }
@@ -126,7 +126,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
              // A message from another chat: its routing header is the agent's to
              // read; the transcript shows who sent it, over its words.
              let sender = zeron_proto::agent_messages::agent_message_sender(&text);
-@@ -5742,6 +5748,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
+@@ -5746,6 +5752,9 @@ pub(crate) fn message(entry: &Json, model: Option<&str>) -> Option<Value> {
          }
          "assistant" => {
              let streaming = entry["status"].as_str() == Some("streaming");
@@ -136,7 +136,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
              let created = entry["createdAt"].as_f64().unwrap_or(0.) / 1000.;
              let tools: Vec<Value> = entry["parts"]
                  .as_array()
-@@ -5934,6 +5943,48 @@ fn delegated_block(parts: &mut Vec<&Json>) -> Option<Value> {
+@@ -5938,6 +5947,48 @@ fn delegated_block(parts: &mut Vec<&Json>) -> Option<Value> {
  }
  
  /// The blocks of these parts of a reply (`streaming`: still being written).
@@ -185,7 +185,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
  fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
      let last_ix = parts.len().saturating_sub(1);
      let mut out: Vec<Value> = Vec::new();
-@@ -6026,6 +6077,10 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
+@@ -6030,6 +6081,10 @@ fn blocks_of(parts: &[&Json], streaming: bool) -> Value {
                      out.push(visual_block(part));
                      continue;
                  }
@@ -196,7 +196,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
                  let words = match kind {
                      Some("text") => part["text"].as_str().unwrap_or_default().to_owned(),
                      Some("error") => format!("> {}", part["message"].as_str().unwrap_or_default()),
-@@ -7049,6 +7104,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
+@@ -7053,6 +7108,11 @@ fn session_value(chats: &Chats, open: &Open, offline: bool) -> Value {
          ("context", open.context.map(Value::Num).unwrap_or(Value::Nil)),
          ("context_tokens", open.context_usage.0.map(Value::Num).unwrap_or(Value::Nil)),
          ("context_window", open.context_usage.1.map(Value::Num).unwrap_or(Value::Nil)),
@@ -208,7 +208,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
          ("ask", ask),
          ("queue", Value::List(queue.into())),
          ("waiting", waiting_value(&open.waiting)),
-@@ -9178,6 +9238,63 @@ mod tests {
+@@ -9182,6 +9242,63 @@ mod tests {
          }
      }
  
@@ -273,7 +273,7 @@ index e7d9bd088d1e3804b96e32960360cefb0e5f18cd..6c74b2309f76bacf439b902c08d62a04
      fn a_subagent_is_named_in_its_part_or_is_in_no_row() {
          let part = |extra: Json| {
 diff --git a/apps/zgx/src/sessions.rs b/apps/zgx/src/sessions.rs
-index acbc51e0339753e0d56847f246465a604bb95bb4..83d290d272d04a8c8dbc676ba18abeda70bb4228 100644
+index 8991190df38bf0a6d9951116c5978b2677f3abe0..a9776d1b05399682579b7be8b39d0176c95bf6cc 100644
 --- a/apps/zgx/src/sessions.rs
 +++ b/apps/zgx/src/sessions.rs
 @@ -764,6 +764,9 @@ fn top_row(
@@ -311,7 +311,7 @@ index acbc51e0339753e0d56847f246465a604bb95bb4..83d290d272d04a8c8dbc676ba18abeda
      host.action("sessions.seen", move |id| {
          let a = a.clone();
 diff --git a/apps/zgx/src/settings.rs b/apps/zgx/src/settings.rs
-index dbda3eb5a63b634414abf9f4c8908577c738907b..8bc2d62b84556995cca4719657d23c4da915de2e 100644
+index 14a6c0a472c5a179e29d28585538e6731535054f..88439b58bcb58a228102bb62d3de202b6b18811c 100644
 --- a/apps/zgx/src/settings.rs
 +++ b/apps/zgx/src/settings.rs
 @@ -105,6 +105,9 @@ const ENGINE_METHODS: &[&str] = &[
@@ -690,7 +690,7 @@ index c7027c3900c65b9d4cc2061c40b7be26930d54d1..c77e32bd8e435cefe722848662747bfd
  						hook = "chat.message.prompt",
  						-- What it is, for a plugin's selector (and the
 diff --git a/apps/zgx/ui/locales/en.json b/apps/zgx/ui/locales/en.json
-index 0153baa1a78a419b089065a72999565311554ebd..46089b8b94b72ad68b8a3bfaa537a558a17f9f9e 100644
+index 352443be596f875e2123784320c7ec8cdd11de51..3db25f5c115943b624d0759de00aa24a9863db6a 100644
 --- a/apps/zgx/ui/locales/en.json
 +++ b/apps/zgx/ui/locales/en.json
 @@ -781,6 +781,13 @@
@@ -719,7 +719,7 @@ index 0153baa1a78a419b089065a72999565311554ebd..46089b8b94b72ad68b8a3bfaa537a558
        }
      },
      "engine": {
-@@ -2662,7 +2674,9 @@
+@@ -2680,7 +2692,9 @@
          "delete": "Delete…",
          "rename": "Rename…",
          "remove": "Remove…",
@@ -730,7 +730,7 @@ index 0153baa1a78a419b089065a72999565311554ebd..46089b8b94b72ad68b8a3bfaa537a558
        },
        "project": {
          "rename_title": "Rename project",
-@@ -3234,6 +3248,10 @@
+@@ -3252,6 +3266,10 @@
          "appshot": "Appshot",
          "image": "Image",
          "file": "File"
@@ -742,7 +742,7 @@ index 0153baa1a78a419b089065a72999565311554ebd..46089b8b94b72ad68b8a3bfaa537a558
      },
      "dictation": {
 diff --git a/apps/zgx/ui/locales/zh-Hans.json b/apps/zgx/ui/locales/zh-Hans.json
-index a22bed075b24e502e8061e74208d820ade923630..ac26ce40b7e1853feda2d6cf14ad04136b0b7264 100644
+index 1080dcdcd318b09594ce0097364bce595c355985..73f350877d91a52f413de345a0a739884485bd21 100644
 --- a/apps/zgx/ui/locales/zh-Hans.json
 +++ b/apps/zgx/ui/locales/zh-Hans.json
 @@ -781,6 +781,13 @@
@@ -771,7 +771,7 @@ index a22bed075b24e502e8061e74208d820ade923630..ac26ce40b7e1853feda2d6cf14ad0413
        }
      },
      "engine": {
-@@ -2662,7 +2674,9 @@
+@@ -2680,7 +2692,9 @@
          "delete": "删除…",
          "rename": "重命名…",
          "remove": "移除…",
@@ -782,7 +782,7 @@ index a22bed075b24e502e8061e74208d820ade923630..ac26ce40b7e1853feda2d6cf14ad0413
        },
        "project": {
          "rename_title": "重命名项目",
-@@ -3234,6 +3248,10 @@
+@@ -3252,6 +3266,10 @@
          "appshot": "应用截图",
          "image": "图片",
          "file": "文件"
@@ -1159,10 +1159,10 @@ index 16326ca4c08cbd723270431cad11278336487276..c450fd283393bb6c8f5727f4345f1d42
  		{
  			-- (No key: ⌘⌫ is a text field's, deleting to the line's start.)
 diff --git a/apps/zgx/ui/settings_stub.luau b/apps/zgx/ui/settings_stub.luau
-index 287481f7265e0ee482806748e80ccfe6a8ea50f7..17db57d6dacc0495a5054806f9d250d18ec82a76 100644
+index 6dfe18008470d56de2983eebf5dd002d69c1ea15..9c6597645fd02b4092fdd80195c2027944f96d8e 100644
 --- a/apps/zgx/ui/settings_stub.luau
 +++ b/apps/zgx/ui/settings_stub.luau
-@@ -128,6 +128,7 @@ local engine: { [string]: any } = {
+@@ -129,6 +129,7 @@ local engine: { [string]: any } = {
  	GetCodeMode = { supported = { "codex", "muse" }, enabled = {} },
  	GetZeronMcpOnly = { supported = { "claude-code", "codex", "pi" }, on = {} },
  	GetBackgroundSettings = { keepRunningAfterQuit = true },
@@ -1170,7 +1170,7 @@ index 287481f7265e0ee482806748e80ccfe6a8ea50f7..17db57d6dacc0495a5054806f9d250d1
  }
  local banners = { desktop = true, background_only = true, agent_updates = true }
  
-@@ -305,7 +306,7 @@ local answers: { [string]: (arg: any) -> any } = {
+@@ -319,7 +320,7 @@ local answers: { [string]: (arg: any) -> any } = {
  				local w = table.clone(engine[get])
  				w.settings = arg.params
  				engine[get] = w

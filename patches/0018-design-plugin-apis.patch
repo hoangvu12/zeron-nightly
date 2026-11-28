@@ -1,4 +1,4 @@
-From 77bc13f7b8bccc7ef5233795b2b500ec98f6a25c Mon Sep 17 00:00:00 2001
+From cfc2c427a7e32549b154e12f7f4ab2ee696dd9e5 Mon Sep 17 00:00:00 2001
 From: hoangvu12 <hggaming91@gmail.com>
 Date: Fri, 27 Nov 2026 13:20:31 +0700
 Subject: [PATCH] Plugins: the APIs a design plugin needs, in one pull request
@@ -48,7 +48,7 @@ PR is rebased onto main.
  create mode 100644 crates/plugin-db/src/lib.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 4cd03bddcd62965a026ee4d8eed57e716109aba6..de6673902bca6e9ef12b49c625d0d9e51acf609f 100644
+index a0e52600a7bf533eb29ad8ffc6a279bb12f99630..f6147a0c2cf39d3052aba08f0127dfac128a4154 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -195,6 +195,15 @@ version = "0.1.12"
@@ -411,7 +411,7 @@ index 4cd03bddcd62965a026ee4d8eed57e716109aba6..de6673902bca6e9ef12b49c625d0d9e5
  
 @@ -8654,6 +8853,14 @@ dependencies = [
  name = "zeron-orb"
- version = "0.3.20"
+ version = "0.3.21"
  
 +[[package]]
 +name = "zeron-plugin-db"
@@ -423,7 +423,7 @@ index 4cd03bddcd62965a026ee4d8eed57e716109aba6..de6673902bca6e9ef12b49c625d0d9e5
 +
  [[package]]
  name = "zeron-plugin-guard"
- version = "0.3.20"
+ version = "0.3.21"
 @@ -8973,6 +9180,96 @@ dependencies = [
   "syn 3.0.3",
  ]
@@ -522,7 +522,7 @@ index 4cd03bddcd62965a026ee4d8eed57e716109aba6..de6673902bca6e9ef12b49c625d0d9e5
  name = "zip"
  version = "7.2.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index bfb1e23cc8cdcb565b1a7926fde05936e836c247..e9d1468b84f6da0fbda198eb0ef5db576db88c07 100644
+index 78c3dd5ce0f4d01d73c778f24ed4c3e0cc12bc96..24c30bd12db44a9745f33d83676f760a2f07459a 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -33,6 +33,7 @@ members = [
@@ -542,7 +542,7 @@ index bfb1e23cc8cdcb565b1a7926fde05936e836c247..e9d1468b84f6da0fbda198eb0ef5db57
  # CRDT
  loro = "1.17"
 diff --git a/apps/zgx/Cargo.lock b/apps/zgx/Cargo.lock
-index 4439207b8eeaf2e40260609ab29c0d90d0904336..d776b5e34722c681aa99f9a5fdd78339a7a27699 100644
+index 4800be40032df2c7aeb46517f8e7e81e50b4217a..5e9d92de20496e8313ccc20a5ff239f83168c11b 100644
 --- a/apps/zgx/Cargo.lock
 +++ b/apps/zgx/Cargo.lock
 @@ -6654,6 +6654,14 @@ dependencies = [
@@ -559,7 +559,7 @@ index 4439207b8eeaf2e40260609ab29c0d90d0904336..d776b5e34722c681aa99f9a5fdd78339
 +
  [[package]]
  name = "zeron-plugin-guard"
- version = "0.3.20"
+ version = "0.3.21"
 @@ -6771,7 +6779,6 @@ dependencies = [
   "open",
   "png 0.18.1",
@@ -1019,7 +1019,7 @@ index 294e7553d656e10b5ca91f887b6b34f8ec4d6a82..3f37895d994569faf0f5a3002aca639b
 +    assert!(made("plain") < 32, "the default: under 32 MB");
 +}
 diff --git a/apps/zgx/src/plugins/mod.rs b/apps/zgx/src/plugins/mod.rs
-index e009314eda327167a0fd1421ab9a538cc8cb967b..601933ae893c4f66521407c876ff5d68435c1415 100644
+index 73d949802886db97cee536591047c528e520cac4..b0d5d707d0eb80fa9bb63000273bbe6c2da8f37a 100644
 --- a/apps/zgx/src/plugins/mod.rs
 +++ b/apps/zgx/src/plugins/mod.rs
 @@ -174,6 +174,23 @@ impl Item {
@@ -1046,7 +1046,7 @@ index e009314eda327167a0fd1421ab9a538cc8cb967b..601933ae893c4f66521407c876ff5d68
  }
  
  #[derive(Default)]
-@@ -1488,6 +1505,7 @@ impl Bridge {
+@@ -1597,6 +1614,7 @@ impl Bridge {
          }
          *self.loaded.borrow_mut() = want.clone();
          self.host.set_plugins(want);
@@ -1054,8 +1054,8 @@ index e009314eda327167a0fd1421ab9a538cc8cb967b..601933ae893c4f66521407c876ff5d68
          // (Before the window's first load: that load takes them.)
          if !self.first_load.get() {
              self.reload();
-@@ -3174,6 +3192,12 @@ impl Bridge {
-                 async move { crate::plugins::preview::refuse("plugins.remove")?;
+@@ -3342,6 +3360,12 @@ impl Bridge {
+                 { let allowed = crate::plugins::preview::refuse("plugins.remove"); async move { allowed?;
                      let (id, device) = remote::id_and_device(&arg);
                      let elsewhere = device.is_some();
 +                    // (Its windows' connection to its database first: the engine deletes it.)
