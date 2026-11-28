@@ -1,0 +1,830 @@
+From dfae2a5a3754def5e83489d22d1639a755b425b0 Mon Sep 17 00:00:00 2001
+From: hoangvu12 <hggaming91@gmail.com>
+Date: Sat, 28 Nov 2026 14:47:27 +0700
+Subject: [PATCH] engine: a message sent while Claude works goes in after the
+ running tool calls, as in Claude Code's terminal
+
+In Claude Code's own terminal, a message typed while Claude works is read
+in the same turn as soon as the tool calls under way finish (the SDK's
+priority "next"): Claude can change course without the turn being
+stopped. Zeron held every message sent mid-turn in its queue until the
+whole turn was over (the SDK's "later"), so a correction reached Claude
+only after it had finished the work it corrected; only a queued row's
+Steer went in sooner, and that one moves running work to the background.
+
+Now, while a Claude Code turn runs, the chat host's queue hands a message
+sent meanwhile to the turn at once, marked after_tools (SteerMessage, new
+field), which the Claude driver writes as priority "next": nothing is
+stopped or moved, and a turn that ends first takes it as its next prompt.
+It shows in the transcript as a sent message, and the reply splits where
+Claude reads it, as a steer's does. What still waits for the turn's end,
+as before: a command (/name, which Claude Code also runs after the
+turn), a row sent with another model or effort, a row whose images are
+still on their way, anything after a Stop (the queue stays paused), and
+everything while the context compacts, while Claude waits on a question,
+or while an agent update is pending; and every row of any other agent.
+A row that can't go in goes back to the head of the queue. The queue's
+Steer and Send now buttons are unchanged.
+
+crates/harness (SteerMessage::after_tools; the Claude driver's
+message_priority; every SteerMessage literal gets the field) and
+crates/engine (sessions: takes_after_tools, steer_after_tools; doc_host:
+QueueSend::AfterTools in drain_queue and dispatch_queued). Tests:
+claude's a_message_sent_mid_turn_waits_for_the_open_tools, engine's
+a_message_sent_mid_turn_goes_in_after_the_open_tools (a command at the
+head holds the queue; once it's gone the message reaches the agent
+mid-turn marked after_tools, and the queue empties).
+---
+ crates/engine/src/doc_host.rs                 |  58 +++++++-
+ crates/engine/src/sessions.rs                 | 129 ++++++++++++++++++
+ .../examples/cursor_stability_probe.rs        |   5 +-
+ .../harness/examples/cursor_steering_probe.rs |   1 +
+ crates/harness/examples/steering_probe.rs     |   2 +-
+ crates/harness/src/claude/mod.rs              |  41 +++++-
+ crates/harness/src/lib.rs                     |   7 +
+ crates/harness/src/opencode/tests.rs          |   3 +
+ crates/harness/tests/acp.rs                   |   4 +
+ crates/harness/tests/acp_quiet.rs             |   4 +
+ crates/harness/tests/claude.rs                |   7 +
+ crates/harness/tests/codex.rs                 |   6 +
+ crates/harness/tests/cursor.rs                |   5 +
+ crates/harness/tests/opencode.rs              |   2 +
+ crates/harness/tests/pi_live.rs               |   2 +
+ crates/harness/tests/pi_rpc.rs                |   5 +
+ crates/harness/tests/real_acp_lifecycle.rs    |   2 +-
+ 17 files changed, 277 insertions(+), 6 deletions(-)
+
+diff --git a/crates/engine/src/doc_host.rs b/crates/engine/src/doc_host.rs
+index e14122782f80fa3b92a332117f2e788cf3739afb..0653d33021e60f51f6664d8d23c0af0bf8421b80 100644
+--- a/crates/engine/src/doc_host.rs
++++ b/crates/engine/src/doc_host.rs
+@@ -636,6 +636,11 @@ enum QueueSend {
+     NextTurn,
+     /// Something is running and can take input mid-turn: steer it in.
+     Steer,
++    /// Sent while a Claude Code turn runs: into that turn once its open tool
++    /// calls return, as its own terminal delivers a message typed mid-turn
++    /// ([`crate::sessions::SessionsEngine::takes_after_tools`]). Never starts
++    /// or stops a turn: a row it can't place stays queued for the turn end.
++    AfterTools,
+     /// The user said now: stop what is running first.
+     Interrupt,
+ }
+@@ -5386,7 +5391,36 @@ impl DocHost {
+             // `AwaitingInput` for idle would send the follow-up as a fresh turn
+             // and abandon the question.
+             if sessions.turn_in_flight(&handle.chat_id) {
+-                return; // All queued messages wait, including rows from older clients.
++                // A Claude Code turn takes a message sent meanwhile once the
++                // tool calls under way return, as its own terminal does with
++                // one typed mid-turn: the head goes in now, in order. Anything
++                // else waits for the turn's end, as every row did (a command,
++                // a row on another model, images still on their way, a send
++                // held for a turn-boundary agent, and every row of any other
++                // agent).
++                let takes = !lock(&handle.held_sends).contains_key(&head.id)
++                    && self.missing_row_attachments(&head).is_empty()
++                    && head
++                        .config
++                        .as_ref()
++                        .is_none_or(|cfg| sessions.live_run_matches_config(&handle.chat_id, cfg))
++                    && sessions.takes_after_tools(&handle.chat_id, &head.text);
++                if !takes {
++                    return;
++                }
++                let Ok(Some(item)) = handle.doc.take_queued(&head.id) else {
++                    return;
++                };
++                lock(&handle.steered_rows).retain(|row| row != &item.id);
++                handle.publish_queue();
++                if let Err(err) = self.dispatch_queued(handle, &item, QueueSend::AfterTools).await {
++                    // Back where it was: it goes at the turn's end instead.
++                    tracing::info!(chat = %handle.chat_id, error = %err, "a message sent mid-turn waits for the turn's end");
++                    let _ = handle.doc.insert_queued(0, &item);
++                    handle.publish_queue();
++                    return;
++                }
++                continue;
+             }
+             // A row from another device names its images by `pending://` ref
+             // while the bytes chase it over the peer link. Hold it (in order)
+@@ -5608,6 +5642,28 @@ impl DocHost {
+             queued_message_prompt(&item.text, &attachments)
+         };
+         self.resolve_attachment_refs(&mut prompt, &mut attachments);
++        if send == QueueSend::AfterTools {
++            let matches = item
++                .config
++                .as_ref()
++                .is_none_or(|cfg| sessions.live_run_matches_config(chat_id, cfg));
++            let outcome = if matches {
++                sessions
++                    .steer_after_tools(chat_id, &prompt, attachments, Some(message_id), now_ms())
++                    .await?
++            } else {
++                SteerOutcome::NotSteerable
++            };
++            return match outcome {
++                SteerOutcome::Accepted => Ok(()),
++                SteerOutcome::DeferredByUpdate => Err(EngineError::Other(
++                    "agent update pending; the message remains queued".into(),
++                )),
++                SteerOutcome::NotSteerable => Err(EngineError::Other(
++                    "the turn can't take it now; it waits for the turn's end".into(),
++                )),
++            };
++        }
+         if send == QueueSend::Steer
+             && item
+                 .config
+diff --git a/crates/engine/src/sessions.rs b/crates/engine/src/sessions.rs
+index a0368973f7f87bd283ff7ef795244fb72061ba46..d92687e0b8840040062104f2a379d25224067875 100644
+--- a/crates/engine/src/sessions.rs
++++ b/crates/engine/src/sessions.rs
+@@ -1525,6 +1525,7 @@ impl SessionsEngine {
+                     // A changed model/effort/option the live process adopts
+                     // in place: replacing it killed its background work.
+                     config: reconfigure.then(|| Box::new(request.clone())),
++                    after_tools: false,
+                 };
+                 if let Ok(permit) = steer_tx.reserve().await {
+                     // Commit the reserved slot atomically with the update
+@@ -2127,6 +2128,58 @@ impl SessionsEngine {
+         attachments: Vec<String>,
+         message_id: Option<String>,
+         issued_at: i64,
++    ) -> Result<SteerOutcome, EngineError> {
++        self.steer_into(chat_id, prompt, attachments, message_id, issued_at, false)
++            .await
++    }
++
++    /// Whether a message sent while `chat_id`'s turn runs goes into that
++    /// turn once the tool calls under way return ([`Self::steer_after_tools`]),
++    /// as one typed into Claude Code's own terminal mid-turn does, rather
++    /// than waiting in the queue for the turn's end. Only a Claude Code turn
++    /// that takes a word now: not while it compacts, waits on a question or
++    /// an agent update, or is being stopped; and never a command (`/name`),
++    /// which Claude Code too runs only once the turn is over.
++    pub(crate) fn takes_after_tools(&self, chat_id: &str, prompt: &str) -> bool {
++        use std::sync::atomic::Ordering::Acquire;
++        if !self.turn_in_flight(chat_id)
++            || self.defers_to_turn_end(chat_id, None)
++            || self.live_run_update_pending(chat_id)
++            || native_command(prompt, HarnessId::ClaudeCode)
++        {
++            return false;
++        }
++        lock(&self.inner.runs).get(chat_id).is_some_and(|h| {
++            h.runtime_config.harness_id == HarnessId::ClaudeCode
++                && h.steerable
++                && !h.retiring.load(Acquire)
++                && lock(&h.pending_inputs).is_empty()
++        })
++    }
++
++    /// A message sent while the turn runs, into that turn once the tool
++    /// calls under way return ([`SteerMessage::after_tools`]): nothing is
++    /// stopped or moved to the background, unlike [`Self::steer_now`].
++    pub(crate) async fn steer_after_tools(
++        &self,
++        chat_id: &str,
++        prompt: &str,
++        attachments: Vec<String>,
++        message_id: Option<String>,
++        issued_at: i64,
++    ) -> Result<SteerOutcome, EngineError> {
++        self.steer_into(chat_id, prompt, attachments, message_id, issued_at, true)
++            .await
++    }
++
++    async fn steer_into(
++        &self,
++        chat_id: &str,
++        prompt: &str,
++        attachments: Vec<String>,
++        message_id: Option<String>,
++        issued_at: i64,
++        after_tools: bool,
+     ) -> Result<SteerOutcome, EngineError> {
+         let target = lock(&self.inner.runs)
+             .get(chat_id)
+@@ -2165,6 +2218,7 @@ impl SessionsEngine {
+             message_id: Some(user_id.clone()),
+             attachments,
+             config: None,
++            after_tools,
+         };
+         // Saturation is backpressure, not a dead runtime. Waiting for room
+         // preserves the live process and every accepted message in a burst.
+@@ -8895,6 +8949,9 @@ mod tests {
+         id: HarnessId,
+         feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
+         turn: Arc<Mutex<Option<TurnControl>>>,
++        /// Where the run's mailbox goes, for a test that reads what reaches
++        /// the agent; none: it closes with the run's start, as before.
++        steers: Option<Arc<Mutex<Option<mpsc::Receiver<SteerMessage>>>>>,
+     }
+ 
+     #[async_trait::async_trait]
+@@ -8926,6 +8983,9 @@ mod tests {
+             zeron_harness::HarnessError,
+         > {
+             *self.turn.lock().unwrap() = Some(controls.turn.clone());
++            if let Some(steers) = &self.steers {
++                *steers.lock().unwrap() = Some(controls.steering);
++            }
+             let mut feed = self
+                 .feed
+                 .lock()
+@@ -8957,6 +9017,7 @@ mod tests {
+             id: HarnessId::Mock,
+             feed: Mutex::new(Some(rx)),
+             turn: turn_slot.clone(),
++            steers: None,
+         }));
+         let dir = tempfile::tempdir().unwrap();
+         let core =
+@@ -9091,6 +9152,7 @@ mod tests {
+             id: HarnessId::ClaudeCode,
+             feed: Mutex::new(Some(rx)),
+             turn: turn_slot.clone(),
++            steers: None,
+         }));
+         let dir = tempfile::tempdir().unwrap();
+         let core = crate::EngineCore::assemble(
+@@ -9156,6 +9218,73 @@ mod tests {
+         core.sessions.shutdown().await;
+     }
+ 
++    /// A message queued while a Claude Code turn runs goes into that turn
++    /// once its open tool calls return (Claude Code's `next`), as one typed
++    /// into its own terminal mid-turn does, rather than waiting for the
++    /// turn's end; a command waits for the end, and holds the rows behind it.
++    #[tokio::test]
++    async fn a_message_sent_mid_turn_goes_in_after_the_open_tools() {
++        let chat = "chat-after-tools";
++        let (feed, rx) = mpsc::unbounded_channel();
++        let turn_slot = Arc::new(Mutex::new(None));
++        let steers = Arc::new(Mutex::new(None));
++        let registry = HarnessRegistry::new();
++        registry.register(Arc::new(WakeHarness {
++            id: HarnessId::ClaudeCode,
++            feed: Mutex::new(Some(rx)),
++            turn: turn_slot.clone(),
++            steers: Some(steers.clone()),
++        }));
++        let dir = tempfile::tempdir().unwrap();
++        let core = crate::EngineCore::assemble(
++            dir.path(),
++            Arc::new(registry),
++            HarnessId::ClaudeCode,
++            None,
++        )
++        .unwrap();
++        core.workspace
++            .create_space(chat, &core.device_id, "/tmp", None, false)
++            .unwrap();
++        core.workspace
++            .create_chat(chat, Some(chat), None, None, None)
++            .unwrap();
++        core.sessions
++            .dispatch(chat, HarnessId::ClaudeCode, request(), None)
++            .await
++            .unwrap();
++        feed.send(started()).unwrap();
++        let mut steering = loop {
++            if let Some(rx) = steers.lock().unwrap().take() {
++                break rx;
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
++        };
++        feed.send(AgentEvent::TextDelta { text: "on it".into() }).unwrap();
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++
++        let command = core.doc_host.queue_message(chat, "/review", vec![]).unwrap();
++        core.doc_host
++            .queue_message(chat, "also check the tests", vec![])
++            .unwrap();
++        let handle = core.doc_host.open(chat).unwrap();
++        core.doc_host.drain_queue(&handle).await;
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        assert!(steering.try_recv().is_err(), "a command waits for the turn's end");
++        assert_eq!(handle.doc().read_queue().unwrap().len(), 2);
++
++        assert!(core.doc_host.remove_queued_message(chat, &command).await.unwrap());
++        core.doc_host.drain_queue(&handle).await;
++        let message = tokio::time::timeout(std::time::Duration::from_secs(2), steering.recv())
++            .await
++            .expect("the message reaches the agent mid-turn")
++            .unwrap();
++        assert!(message.after_tools, "read once the open tools return");
++        assert!(message.prompt.ends_with("also check the tests"), "{}", message.prompt);
++        assert!(handle.doc().read_queue().unwrap().is_empty());
++        core.sessions.shutdown().await;
++    }
++
+     #[tokio::test]
+     async fn work_ending_with_no_wake_turn_marks_the_held_end_after_its_grace() {
+         let rig = wake_rig("chat-wait-lost", true).await;
+diff --git a/crates/harness/examples/cursor_stability_probe.rs b/crates/harness/examples/cursor_stability_probe.rs
+index e5d5b125fd5c155607d3465fcd5f49f334258d81..0953323033fae77ef8a840673e11871d53999673 100644
+--- a/crates/harness/examples/cursor_stability_probe.rs
++++ b/crates/harness/examples/cursor_stability_probe.rs
+@@ -218,7 +218,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
+                             println!("auth_clock_advanced_ms={offset} exchanges_before={}",exchanges.lines().count());
+                         }
+                     }
+-                    tx.send(zeron_harness::SteerMessage{prompt:"Repeat the exact PARKED-STABILITY token from earlier. Reply only the token. Do not use tools or files.".into(),message_id:None, attachments: Vec::new(), config: None}).await.unwrap();
++                    tx.send(zeron_harness::SteerMessage{prompt:"Repeat the exact PARKED-STABILITY token from earlier. Reply only the token. Do not use tools or files.".into(),message_id:None, attachments: Vec::new(), config: None, after_tools: false}).await.unwrap();
+                 }
+                 _=>{}
+             }
+@@ -321,6 +321,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
+                     message_id: None,
+                     attachments: Vec::new(),
+                     config: None,
++                    after_tools: false,
+                 })
+                 .await
+                 .is_err()
+@@ -456,7 +457,7 @@ async fn history(harness: &CursorHarness, count: usize) {
+     let producer = tokio::spawn(async move {
+         start_rx.await.unwrap();
+         for token in sent.iter().skip(1) {
+-            tx.send(zeron_harness::SteerMessage{prompt:format!("Add token {token} to your remembered conversation history. Reply with the token from the immediately previous user message, followed by this new token. Do not use tools."),message_id:Some(uuid::Uuid::new_v4().to_string()),attachments:Vec::new(),config:None}).await.unwrap();
++            tx.send(zeron_harness::SteerMessage{prompt:format!("Add token {token} to your remembered conversation history. Reply with the token from the immediately previous user message, followed by this new token. Do not use tools."),message_id:Some(uuid::Uuid::new_v4().to_string()),attachments:Vec::new(),config:None, after_tools: false}).await.unwrap();
+         }
+     });
+     let mut id = String::new();
+diff --git a/crates/harness/examples/cursor_steering_probe.rs b/crates/harness/examples/cursor_steering_probe.rs
+index b785fe060a1619d10136b7cf1b9efed923f891d5..83688921d917a204601d379220f47e2535a4d2c3 100644
+--- a/crates/harness/examples/cursor_steering_probe.rs
++++ b/crates/harness/examples/cursor_steering_probe.rs
+@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
+                                         message_id: Some(format!("digit-{i}")),
+                                         attachments: Vec::new(),
+                                         config: None,
++                                        after_tools: false,
+                                     })
+                                     .await
+                                     .is_err()
+diff --git a/crates/harness/examples/steering_probe.rs b/crates/harness/examples/steering_probe.rs
+index e3d3cae4d85a24d16e0713542336fb4784b21e4e..02769fe8cff1e0633256bf4c775d4c9416c33097 100644
+--- a/crates/harness/examples/steering_probe.rs
++++ b/crates/harness/examples/steering_probe.rs
+@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
+                 _ = ticker.tick(), if !injected => {
+                     if workspace.path().join("started").exists() {
+                         for index in 0..3 {
+-                            steer.send(SteerMessage { prompt: format!("Additive follow-up {index}: keep all earlier work running. Write ONLY the secret from the first user message into file followup-{index}. Do not read it from another file. Use a shell command to append {index} as one line to receipts. Reply FOLLOWUP-{index}-DONE."), message_id: Some(format!("probe-{index}")), attachments: Vec::new(), config: None }).await?;
++                            steer.send(SteerMessage { prompt: format!("Additive follow-up {index}: keep all earlier work running. Write ONLY the secret from the first user message into file followup-{index}. Do not read it from another file. Use a shell command to append {index} as one line to receipts. Reply FOLLOWUP-{index}-DONE."), message_id: Some(format!("probe-{index}")), attachments: Vec::new(), config: None, after_tools: false }).await?;
+                         }
+                         injected = true;
+                         println!("{name}: injected 3 steers while shell was running");
+diff --git a/crates/harness/src/claude/mod.rs b/crates/harness/src/claude/mod.rs
+index 3eedd701cfdaa01ff3a478a1f131c6f3d33f4a0c..f923a0f5568de4cbfc0347e3c379ccced1ef2adf 100644
+--- a/crates/harness/src/claude/mod.rs
++++ b/crates/harness/src/claude/mod.rs
+@@ -218,6 +218,24 @@ fn steer_priority(moves_tools: bool, from_another_chat: bool, tools_open: bool)
+     }
+ }
+ 
++/// How a mailbox message goes out: one sent while the agent works
++/// ([`crate::SteerMessage::after_tools`]) as Claude Code's terminal sends a message
++/// typed mid-turn, `next`: read in the same turn once the open tool calls
++/// return, nothing stopped or moved (a turn that ends first takes it as its
++/// next prompt); a steer by [`steer_priority`].
++fn message_priority(
++    after_tools: bool,
++    moves_tools: bool,
++    from_another_chat: bool,
++    tools_open: bool,
++) -> wire::SteerPriority {
++    if after_tools {
++        wire::SteerPriority::Next
++    } else {
++        steer_priority(moves_tools, from_another_chat, tools_open)
++    }
++}
++
+ /// Shown when a chat's Claude session could not be restored.
+ const SESSION_LOST: &str = "The previous Claude session could not be restored, so this chat \
+      continues in a new one without its earlier context.";
+@@ -2193,7 +2211,8 @@ async fn run_session(session: Session) {
+                     }
+                     let id = uuid::Uuid::new_v4().to_string();
+                     let images = load_image_blocks(&msg.attachments).await;
+-                    let priority = steer_priority(
++                    let priority = message_priority(
++                        msg.after_tools,
+                         moves_tools,
+                         zeron_proto::agent_messages::agent_message_sender(&msg.prompt).is_some(),
+                         !open_tools.is_empty(),
+@@ -3306,6 +3325,26 @@ mod mcp_injection_tests {
+         assert_eq!(steer_priority(false, true, true), Next);
+     }
+ 
++    /// A message sent while the agent works goes as Claude Code's terminal
++    /// sends one typed mid-turn: `next`, whatever the CLI or the tools; a
++    /// steer keeps its own priority.
++    #[test]
++    fn a_message_sent_mid_turn_waits_for_the_open_tools() {
++        use wire::SteerPriority::{Next, Now, NowFromPerson};
++        for moves_tools in [true, false] {
++            for from_another_chat in [true, false] {
++                for tools_open in [true, false] {
++                    assert_eq!(
++                        message_priority(true, moves_tools, from_another_chat, tools_open),
++                        Next
++                    );
++                }
++            }
++        }
++        assert_eq!(message_priority(false, true, false, true), NowFromPerson);
++        assert_eq!(message_priority(false, false, false, false), Now);
++    }
++
+     fn engine_served() -> zeron_proto::McpServer {
+         zeron_proto::McpServer {
+             name: "zeron".into(),
+diff --git a/crates/harness/src/lib.rs b/crates/harness/src/lib.rs
+index 352f7798284272c6d7d97ed97073df42865d859c..1c78188737b6043e03eda6f9c9d1d82c03dbc998 100644
+--- a/crates/harness/src/lib.rs
++++ b/crates/harness/src/lib.rs
+@@ -56,6 +56,12 @@ pub struct SteerMessage {
+     /// from the live runtime's and the driver adopts it in place
+     /// ([`Harness::reconfigures_in_place`]): apply it before the prompt.
+     pub config: Option<Box<RunRequest>>,
++    /// Read once the tool calls under way return, in the same turn, as a
++    /// message typed into Claude Code's own terminal mid-turn is (its
++    /// `next`): nothing running is stopped or moved. A message sent while
++    /// the agent works, not one the person steered in. Drivers without
++    /// such a boundary deliver it as any steer.
++    pub after_tools: bool,
+ }
+ 
+ impl SteerMessage {
+@@ -65,6 +71,7 @@ impl SteerMessage {
+             message_id: None,
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         }
+     }
+ }
+diff --git a/crates/harness/src/opencode/tests.rs b/crates/harness/src/opencode/tests.rs
+index 95f3629d5e121802a4d0acba3c0683506fcd2f35..d45eccff4eb6c1724108295f972cc6f5508665b0 100644
+--- a/crates/harness/src/opencode/tests.rs
++++ b/crates/harness/src/opencode/tests.rs
+@@ -308,6 +308,7 @@ impl TurnWire {
+                     message_id: None,
+                     attachments: Vec::new(),
+                     config: None,
++                    after_tools: false,
+                 })
+                 .await
+                 .unwrap();
+@@ -508,6 +509,7 @@ async fn completed_turn_keeps_mailbox_alive_for_the_next_queued_request() {
+             message_id: Some("second".into()),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -2114,6 +2116,7 @@ fn plan_config(plan: bool) -> crate::SteerMessage {
+         message_id: None,
+         attachments: Vec::new(),
+         config: Some(Box::new(config)),
++        after_tools: false,
+     }
+ }
+ 
+diff --git a/crates/harness/tests/acp.rs b/crates/harness/tests/acp.rs
+index 1076e28b775326f28fa26fe08e72221fbd05ed82..d679b1fb54c8f5ff301e29e6cc9a0754b6678b08 100644
+--- a/crates/harness/tests/acp.rs
++++ b/crates/harness/tests/acp.rs
+@@ -555,6 +555,7 @@ async fn steering_extension_injects_mid_turn() {
+                         message_id: None,
+                         attachments: Vec::new(),
+                         config: None,
++                        after_tools: false,
+                     })
+                     .await
+                     .expect("steer sent");
+@@ -603,6 +604,7 @@ async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
+                         message_id: None,
+                         attachments: Vec::new(),
+                         config: None,
++                        after_tools: false,
+                     })
+                     .await
+                     .expect("steer sent");
+@@ -656,6 +658,7 @@ async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
+                         message_id: None,
+                         attachments: Vec::new(),
+                         config: None,
++                        after_tools: false,
+                     })
+                     .await
+                     .expect("steer sent");
+@@ -2640,6 +2643,7 @@ async fn acp_boundary_steer(scenario: &str, trigger_on_done: bool) {
+                         message_id: None,
+                         attachments: Vec::new(),
+                         config: None,
++                        after_tools: false,
+                     })
+                     .await
+                     .unwrap();
+diff --git a/crates/harness/tests/acp_quiet.rs b/crates/harness/tests/acp_quiet.rs
+index b60c11c53d70fd7f2c1d757046c91cadd70ff56b..97d4a2eeba33de5b7342eb582bda3d78c80652b6 100644
+--- a/crates/harness/tests/acp_quiet.rs
++++ b/crates/harness/tests/acp_quiet.rs
+@@ -168,6 +168,7 @@ async fn delayed_turn(scenario: &str) {
+             prompt: "second".into(),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -177,6 +178,7 @@ async fn delayed_turn(scenario: &str) {
+             prompt: "third".into(),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -221,6 +223,7 @@ async fn delayed_turn(scenario: &str) {
+             prompt: "fourth".into(),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -287,6 +290,7 @@ async fn cancel_quiet(scenario: &str) {
+             prompt: "must not run".into(),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+diff --git a/crates/harness/tests/claude.rs b/crates/harness/tests/claude.rs
+index d34d7dbd99f8378d4a9bdf86f4a98bad80381ac7..d530dfa8f7943b510c58b7a729c5bb3ba30dca79 100644
+--- a/crates/harness/tests/claude.rs
++++ b/crates/harness/tests/claude.rs
+@@ -510,6 +510,7 @@ async fn ultrathink_preserves_selected_commands_on_initial_and_steered_sends() {
+                     message_id: None,
+                     attachments: Vec::new(),
+                     config: None,
++                    after_tools: false,
+                 })
+                 .await
+                 .unwrap();
+@@ -535,6 +536,7 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
+             message_id: None,
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .expect("steer queued");
+@@ -1465,6 +1467,7 @@ async fn a_replay_confirms_superseded_steers_and_the_turn_ends() {
+                 message_id: None,
+                 attachments: Vec::new(),
+                 config: None,
++                after_tools: false,
+             })
+             .await
+             .expect("steer queued");
+@@ -1503,6 +1506,7 @@ fn steer_msg(prompt: &str) -> SteerMessage {
+         message_id: None,
+         attachments: Vec::new(),
+         config: None,
++        after_tools: false,
+     }
+ }
+ 
+@@ -2214,6 +2218,7 @@ async fn an_unreplayed_steer_releases_the_turn_end() {
+             message_id: None,
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .expect("steer queued");
+@@ -2356,6 +2361,7 @@ async fn a_stopped_turn_keeps_the_process_and_its_background_work() {
+             message_id: None,
+             attachments: vec![image.to_string_lossy().into_owned()],
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -3072,6 +3078,7 @@ async fn a_steer_reaches_a_warm_started_run() {
+             message_id: None,
+             attachments: vec![],
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+diff --git a/crates/harness/tests/codex.rs b/crates/harness/tests/codex.rs
+index f361ca8300129a1303db289cf3582558ea031991..f561cb1cdd182663075af6ca5f7155700167665b 100644
+--- a/crates/harness/tests/codex.rs
++++ b/crates/harness/tests/codex.rs
+@@ -385,6 +385,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
+             message_id: None,
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .expect("steer queued");
+@@ -624,6 +625,7 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
+             message_id: None,
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .expect("steer queued");
+@@ -1613,6 +1615,7 @@ async fn live_subagent_spawn_and_followup_keep_one_transcript() {
+                 message_id: None,
+                 attachments: Vec::new(),
+                 config: None,
++                after_tools: false,
+             }).await.unwrap();
+         }
+         if turn == 2 {
+@@ -2073,6 +2076,7 @@ async fn native_command_during_a_turn_waits_for_its_boundary() {
+                             message_id: None,
+                             attachments: Vec::new(),
+                             config: None,
++                            after_tools: false,
+                         })
+                         .await
+                         .unwrap();
+@@ -2110,6 +2114,7 @@ async fn native_skill_and_file_references_survive_initial_and_steered_turns() {
+             message_id: Some("skill-steer".into()),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -2161,6 +2166,7 @@ async fn ordinary_followup_cannot_overtake_a_queued_native_command() {
+                                 message_id: None,
+                                 attachments: Vec::new(),
+                                 config: None,
++                                after_tools: false,
+                             })
+                             .await
+                             .unwrap();
+diff --git a/crates/harness/tests/cursor.rs b/crates/harness/tests/cursor.rs
+index ca5f604a9782865ca0c822baa36388aefd683d39..6683eb33f2cf6bcc0b5296fa3f3a30d98c3f159f 100644
+--- a/crates/harness/tests/cursor.rs
++++ b/crates/harness/tests/cursor.rs
+@@ -208,6 +208,7 @@ async fn model_switch_mid_session_sends_catalog_defaults() {
+                             message_id: None,
+                             attachments: Vec::new(),
+                             config: Some(Box::new(next.clone())),
++                            after_tools: false,
+                         })
+                         .await
+                         .unwrap();
+@@ -388,6 +389,7 @@ async fn steer_after_done_becomes_the_next_turn() {
+                             message_id: None,
+                             attachments: Vec::new(),
+                             config: None,
++                            after_tools: false,
+                         })
+                         .await
+                         .expect("steer sent");
+@@ -541,6 +543,7 @@ async fn followup_crash_is_not_hidden_by_a_previous_completed_turn() {
+                             message_id: None,
+                             attachments: Vec::new(),
+                             config: None,
++                            after_tools: false,
+                         })
+                         .await
+                         .unwrap();
+@@ -598,6 +601,7 @@ async fn steering_spam_preserves_every_turn_in_order_and_closes_cleanly() {
+                         message_id: None,
+                         attachments: Vec::new(),
+                         config: None,
++                        after_tools: false,
+                     })
+                     .await
+                     .unwrap();
+@@ -667,6 +671,7 @@ async fn cancelling_a_native_steering_burst_stops_without_starting_another_turn(
+                     message_id: None,
+                     attachments: Vec::new(),
+                     config: None,
++                    after_tools: false,
+                 })
+                 .await
+                 .unwrap();
+diff --git a/crates/harness/tests/opencode.rs b/crates/harness/tests/opencode.rs
+index 98cd591a91cff7bd5188bcd9aa2be2b3f2cba2ef..628385619c9ea8661a6a286ceae3a34207653280 100644
+--- a/crates/harness/tests/opencode.rs
++++ b/crates/harness/tests/opencode.rs
+@@ -590,6 +590,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
+             message_id: None,
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+@@ -848,6 +849,7 @@ async fn images_sent_mid_turn_ride_the_queued_prompt() {
+                 message_id: None,
+                 attachments: vec![image.into()],
+                 config: None,
++                after_tools: false,
+             })
+             .await
+             .unwrap();
+diff --git a/crates/harness/tests/pi_live.rs b/crates/harness/tests/pi_live.rs
+index ca179fd26a494dd1fc6bdedacc13a76f42f508da..8c2ec2b4b44b6db53c2f6efe1efddc6697282dc5 100644
+--- a/crates/harness/tests/pi_live.rs
++++ b/crates/harness/tests/pi_live.rs
+@@ -128,6 +128,7 @@ async fn real_pi_mock_lifecycle() {
+                                     message_id: None,
+                                     attachments: Vec::new(),
+                                     config: None,
++                                    after_tools: false,
+                                 })
+                                 .await
+                                 .unwrap();
+@@ -303,6 +304,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
+             message_id: Some(format!("burst-user-{i}")),
+             attachments: Vec::new(),
+             config: None,
++            after_tools: false,
+         })
+         .await
+         .unwrap();
+diff --git a/crates/harness/tests/pi_rpc.rs b/crates/harness/tests/pi_rpc.rs
+index e975b2970fac4453a3a7587a4799946277d8eb70..ecd9470f179ef8bfcc06e33a21740f9164b3f148 100644
+--- a/crates/harness/tests/pi_rpc.rs
++++ b/crates/harness/tests/pi_rpc.rs
+@@ -224,6 +224,7 @@ async fn steers_confirm_on_consumption_and_interrupt_is_terminal_once() {
+         message_id: Some("user-id".into()),
+         attachments: Vec::new(),
+         config: None,
++        after_tools: false,
+     })
+     .await
+     .unwrap();
+@@ -274,6 +275,7 @@ async fn idle_mailbox_starts_another_turn_without_restarting_process() {
+                             message_id: None,
+                             attachments: Vec::new(),
+                             config: None,
++                            after_tools: false,
+                         })
+                         .await
+                         .unwrap();
+@@ -523,6 +525,7 @@ async fn steering_burst_reaches_one_model_step_and_confirms_each_message_on_cons
+                 message_id: Some(format!("user-{i}")),
+                 attachments: Vec::new(),
+                 config: None,
++                after_tools: false,
+             })
+             .await
+             .unwrap();
+@@ -604,6 +607,7 @@ async fn handled_input_between_steers_keeps_its_own_delivery_receipt() {
+                 message_id: None,
+                 attachments: Vec::new(),
+                 config: None,
++                after_tools: false,
+             })
+             .await
+             .unwrap();
+@@ -744,6 +748,7 @@ async fn late_extension_notifications_do_not_reopen_completed_turns() {
+         message_id: None,
+         attachments: Vec::new(),
+         config: None,
++        after_tools: false,
+     })
+     .await
+     .unwrap();
+diff --git a/crates/harness/tests/real_acp_lifecycle.rs b/crates/harness/tests/real_acp_lifecycle.rs
+index d4b819f6f29d26918deecbc763f081d98c8e60c7..a3c580de95ac466362d702a9a0f153b522df6784 100644
+--- a/crates/harness/tests/real_acp_lifecycle.rs
++++ b/crates/harness/tests/real_acp_lifecycle.rs
+@@ -65,7 +65,7 @@ async fn live_run(cancel: bool) {
+                     // Both messages must queue until the slow original prompt
+                     // responds. The real adapter rejects overlapping prompts.
+                     for word in ["SECOND-DONE", "THIRD-DONE"] {
+-                        steer.send(SteerMessage { prompt: format!("Do not call tools. Reply exactly {word}."), message_id: None, attachments: Vec::new(), config: None }).await.unwrap();
++                        steer.send(SteerMessage { prompt: format!("Do not call tools. Reply exactly {word}."), message_id: None, attachments: Vec::new(), config: None, after_tools: false }).await.unwrap();
+                     }
+                 }
+                 AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+-- 
+2.55.0.windows.2
+
